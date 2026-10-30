@@ -96,6 +96,7 @@ rag:
     heapSize: 1g           # container limit = heap x 2
     storage: 20Gi
     nodeName: ""
+    fixVolumePermissions: false   # true for storage that ignores fsGroup (minikube hostPath)
 
 # Phase 3 executor: the only component with write access. It acts only in these namespaces
 # (one RoleBinding each, verbs limited to the allowlisted actions), plus diagnostics.namespace.

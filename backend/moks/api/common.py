@@ -30,7 +30,7 @@ def max_window(env: Environment) -> timedelta:
 
 
 async def live_executor(request: Request, db: AsyncSession, ctx: AuthContext, env_name: str, minutes: int | None,
-                        perm: P = P.EXPLORER_READ) -> ToolExecutor:
+                        perm: P = P.EXPLORER_READ, audit_success: bool = True) -> ToolExecutor:
     """Executor for interactive (non-investigation) reads: same policy checks, no evidence rows."""
     env = await env_or_404(db, env_name)
     try:
@@ -41,7 +41,7 @@ async def live_executor(request: Request, db: AsyncSession, ctx: AuthContext, en
     now = datetime.now(timezone.utc)
     window = min(timedelta(minutes=minutes or get_settings().default_query_window_minutes), max_window(env))
     tctx = ToolContext(None, env, scope, ctx.principal, now - window, now, connectors, max_window(env))
-    ex = ToolExecutor(db, tctx, timeout_seconds=30, read_permissions=(perm,))
+    ex = ToolExecutor(db, tctx, timeout_seconds=30, read_permissions=(perm,), audit_success=audit_success)
     ex.connector_errors = errors  # type: ignore[attr-defined]
     return ex
 

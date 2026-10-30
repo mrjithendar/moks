@@ -80,6 +80,7 @@ class Environment(Base):
     max_query_window_minutes: Mapped[int] = mapped_column(Integer, default=360)
     grafana_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     auto_investigate: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
     alert_cooldown_minutes: Mapped[int] = mapped_column(Integer, default=30)
     max_replicas: Mapped[int] = mapped_column(Integer, default=10)
     allow_scale_to_zero: Mapped[bool] = mapped_column(Boolean, default=False)

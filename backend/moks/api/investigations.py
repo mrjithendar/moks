@@ -41,8 +41,9 @@ def window_from_question(question: str) -> int | None:
 
 class CreateIn(BaseModel):
     question: str = Field(min_length=3, max_length=2000)
-    environment: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,99}$")
-    namespace: str = Field(pattern=r"^(\*|[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$")
+    # Both optional: MOKS resolves them from the question (see resolve_scope).
+    environment: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,99}$")
+    namespace: str | None = Field(default=None, pattern=r"^(\*|[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$")
     minutes: int | None = Field(default=None, ge=5, le=10080)
     incident_id: uuid.UUID | None = None
 
@@ -64,11 +65,55 @@ def serialize(inv: Investigation, env_name: str, user_email: str | None = None, 
     return out
 
 
+@router.get("/investigate/config")
+async def investigate_config(ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """What an investigation will use: the active chat LLM (or rule-based) and the loaded skills."""
+    from .. import skills
+    from ..models import LLMConfig
+
+    cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none()
+    envs = (await db.execute(select(Environment).where(~Environment.name.startswith("eval-")).order_by(Environment.name))).scalars().all()
+    return {"llm": {"provider": cfg.provider, "model": cfg.model} if cfg else None,
+            "skills": sorted(skills.library().skills), "environments": [e.name for e in envs if ctx.principal.namespace_patterns(P.INVESTIGATION_RUN, e.name)]}
+
+
+async def resolve_scope(db: AsyncSession, ctx: AuthContext, question: str, environment: str | None, namespace: str | None) -> tuple[Environment, str, str]:
+    """Environment: the one named, one mentioned in the question, the default one, or the only one
+    the user can investigate. Namespace: the one named, one mentioned in the question among the
+    user's concrete patterns, otherwise "*" (the worker narrows it from cluster data) when the user
+    may read all namespaces, else their single concrete namespace."""
+    words = set(re.findall(r"[a-z0-9][a-z0-9-]{1,62}", question.lower()))
+    if environment:
+        env = await env_or_404(db, environment)
+        why_env = "chosen"
+    else:
+        envs = [e for e in (await db.execute(select(Environment).where(~Environment.name.startswith("eval-")).order_by(Environment.name))).scalars()
+                if ctx.principal.namespace_patterns(P.INVESTIGATION_RUN, e.name)]
+        if not envs:
+            raise HTTPException(403, "You cannot run investigations in any environment")
+        named = [e for e in envs if e.name in words or (e.display_name and e.display_name.lower() in question.lower())]
+        env = named[0] if named else next((e for e in envs if e.is_default), None) or next((e for e in envs if e.is_production), None) or envs[0]
+        why_env = "named in the question" if named else ("default environment" if env.is_default else "only/first environment you can investigate")
+    if namespace:
+        return env, namespace, why_env
+    patterns = ctx.principal.namespace_patterns(P.INVESTIGATION_RUN, env.name)
+    concrete = [p for p in patterns if not any(c in p for c in "*?[")]
+    hit = [p for p in concrete if p in words]
+    if hit:
+        return env, hit[0], why_env
+    if "*" in patterns:
+        return env, "*", why_env
+    if len(concrete) == 1:
+        return env, concrete[0], why_env
+    raise HTTPException(422, f"Mention one of your namespaces ({', '.join(concrete[:10]) or 'none'}) in the question")
+
+
 @router.post("/investigations", status_code=201)
 async def create(body: CreateIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     s = get_settings()
     limiter.check(f"inv:{ctx.user.id}", s.rate_investigations_per_minute)
-    env = await env_or_404(db, body.environment)
+    env, ns, why_env = await resolve_scope(db, ctx, body.question, body.environment, body.namespace)
+    body = body.model_copy(update={"environment": env.name, "namespace": ns})
     # "*" (all namespaces) is matched literally: only bindings whose namespace pattern is "*" allow it.
     await require(request, ctx, P.INVESTIGATION_RUN, env.name, body.namespace)
     try:
@@ -100,7 +145,8 @@ async def create(body: CreateIn, request: Request, ctx: AuthContext = Depends(ge
     if inv.incident_id:
         await add_event(db, inv.incident_id, "investigation", {"text": f"Investigation started: {body.question[:200]}", "investigation_id": str(inv.id)}, ctx.user.id)
     db.add(InvestigationEvent(investigation_id=inv.id, seq=0, type="queued",
-                              payload={"window_minutes": int(window.total_seconds() // 60), "requested_minutes": minutes}))
+                              payload={"window_minutes": int(window.total_seconds() // 60), "requested_minutes": minutes,
+                                       "environment": env.name, "environment_reason": why_env, "namespace": ns}))
     await audit.record(db, action="investigation.create", actor_id=ctx.user.id, actor_email=ctx.user.email,
                        resource_type="investigation", resource_id=str(inv.id), environment=env.name, namespace=body.namespace,
                        decision="allow", details={"question_chars": len(body.question), "window_minutes": int(window.total_seconds() // 60)},

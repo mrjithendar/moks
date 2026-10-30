@@ -9,7 +9,7 @@
 | 3 | Approvals, allowlisted remediation with pre/post validation and recovery, diagnostic sessions | Implemented and tested with fakes; executor never run against a cluster |
 | 4 | Alert-triggered investigations (webhook + poller) with dedup/cooldowns, incident reports and postmortems, evaluation datasets | Implemented and tested |
 | + | FinOps (AWS cost, anomalies, budgets, Kubernetes allocation and rightsizing, LLM spend) | Implemented; Kubernetes side verified live, AWS side stub-tested |
-| + | SRE skills (`SKILL.md`) | 13 built-in skills; custom skills via ConfigMap |
+| + | SRE skills (`SKILL.md`) | 14 built-in skills; custom skills via ConfigMap |
 
 ## Known limitations (Phases 2–4)
 
@@ -24,6 +24,16 @@
 - **Alerts:** the poller reads Prometheus rule state only (no Alertmanager silences or inhibition).
   The automatic-investigation cap (6/hour/environment) is fixed in code.
 - **FinOps:** allocation covers current pods only; Cost Explorer lags up to 24 h and costs $0.01/request (cached and capped).
+- **Multi-environment views:** each environment queries at most 40 namespaces (the view says so
+  when it stops), 6 at a time. Log results are merged and cut to the line limit, so a busy
+  environment can crowd out a quiet one; filter by environment to see it. The metric catalog shows
+  3,000 names per environment.
+- **Analyze with AI** covers one environment: the one selected, or the default when the filter is
+  "All environments".
+- **EKS:** MOKS reads workloads, the control plane (`eks_cluster`: version, node groups, add-ons,
+  Fargate profiles) and CloudWatch. It changes only Deployments, Services and HPAs through approved
+  plans, and opens pull requests. Node groups, add-ons, ConfigMaps and Secrets are not changed by
+  MOKS; configuration fixes are proposed as pull requests or suggested steps.
 - **Evaluation:** fixture-based datasets only test detectors and report discipline against
   recorded state; they do not measure LLM reasoning quality beyond the listed checks.
 

@@ -25,7 +25,8 @@ NS_PATTERN = r"^[a-z0-9*?\-]{1,63}$"
 class EnvIn(BaseModel):
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,99}$")
     display_name: str = Field(default="", max_length=200)
-    kind: Literal["minikube", "eks"]
+    kind: Literal["minikube", "eks", "kubernetes"]
+    is_default: bool = False
     is_production: bool = False
     allowed_namespaces: list[str] = Field(default_factory=lambda: ["*"])
     denied_namespaces: list[str] = Field(default_factory=list)
@@ -42,7 +43,7 @@ def env_out(e: Environment) -> dict[str, Any]:
     return {"id": str(e.id), "name": e.name, "display_name": e.display_name or e.name, "kind": e.kind,
             "is_production": e.is_production, "allowed_namespaces": e.allowed_namespaces, "denied_namespaces": e.denied_namespaces,
             "max_query_window_minutes": e.max_query_window_minutes, "grafana_url": e.grafana_url,
-            "auto_investigate": e.auto_investigate, "alert_cooldown_minutes": e.alert_cooldown_minutes, "max_replicas": e.max_replicas,
+            "auto_investigate": e.auto_investigate, "is_default": e.is_default, "alert_cooldown_minutes": e.alert_cooldown_minutes, "max_replicas": e.max_replicas,
             "allow_scale_to_zero": e.allow_scale_to_zero, "plan_ttl_minutes": e.plan_ttl_minutes}
 
 
@@ -68,7 +69,8 @@ def _validate_patterns(body: EnvIn) -> None:
             raise HTTPException(422, f"invalid namespace pattern {p!r}")
 
 
-EVAL_PREFIX = "eval-"  # internal fixture environments created by evaluation runs
+EVAL_PREFIX = "eval-"
+_HEALTH_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}  # internal fixture environments created by evaluation runs
 
 
 @router.get("/environments")
@@ -136,8 +138,16 @@ async def overview(ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depe
 @router.get("/overview/{environment}/health")
 async def env_health(environment: str, request: Request, ctx: AuthContext = Depends(get_auth),
                      db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
-    """Bounded live health snapshot: nodes, unhealthy pods in up to 12 permitted namespaces, firing alerts."""
-    ex = await live_executor(request, db, ctx, environment, 60, perm=P.OVERVIEW_READ)
+    """Bounded live health snapshot: nodes, unhealthy pods in up to 12 permitted namespaces, firing alerts.
+    Cached 4 s per user and environment so a 5-second auto-refresh stays cheap; reads are not audited
+    individually (one summary per minute would be noise-free; denials/errors still are)."""
+    import time as _time
+
+    key = (str(ctx.user.id), environment)
+    hit = _HEALTH_CACHE.get(key)
+    if hit and hit[0] > _time.monotonic():
+        return hit[1]
+    ex = await live_executor(request, db, ctx, environment, 60, perm=P.OVERVIEW_READ, audit_success=False)
     result: dict[str, Any] = {"collected_at": None, "nodes": None, "unhealthy_pods": [], "alerts": None, "errors": {}}
     result["errors"].update(getattr(ex, "connector_errors", {}))
     k = ex.ctx.connectors.get("kubernetes")
@@ -166,4 +176,8 @@ async def env_health(environment: str, request: Request, ctx: AuthContext = Depe
         result["alerts"] = a.data if a.ok else None
         if not a.ok:
             result["errors"]["prometheus"] = a.summary
+    result["collected_at"] = result["collected_at"] or __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+    _HEALTH_CACHE[key] = (_time.monotonic() + 4, result)
+    if len(_HEALTH_CACHE) > 2000:
+        _HEALTH_CACHE.clear()
     return result

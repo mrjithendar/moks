@@ -14,6 +14,23 @@ query, window and cost model it came from. All FinOps tools are read-only and ne
 | Rightsizing (requests/limits) with savings and OOM/throttling risk | p95 CPU and max memory over the window | same |
 | MOKS's own LLM spend | `llm_usage` table | none |
 
+## FinOps page
+
+The page opens on all environments and needs no namespace. Filter by environment, then optionally
+by namespace, workload or kind. It shows:
+
+- totals by resource type: CPU, memory, storage, cloud services and LLM calls, per environment
+- LLM calls by model (calls, input and output tokens, cost). Cost uses the prices set on each LLM
+  provider, so 0 means no price is set, not free
+- cost per workload, split by CPU, memory and storage, with idle cost
+- rightsizing across environments, with **Propose** to open an action plan
+- AWS anomalies, budgets and forecast, when one environment with `aws_cost` is selected
+
+A namespace that cannot be read is skipped and listed; the rest of the report still loads.
+
+**Analyze with AI** starts an investigation with the FinOps question. It uses the active LLM and the
+`cost-spike-finops` and `config-rightsizing-hygiene` skills, and cites its evidence.
+
 ## Cost model
 
 Kubernetes capacity has no bill of its own, so you tell MOKS what it costs:

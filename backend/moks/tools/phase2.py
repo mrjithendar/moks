@@ -188,8 +188,15 @@ class NoArgs(ToolArgs):
 
 
 class AllocArgs(ToolArgs):
-    namespace: str = Namespace
+    namespace: str | None = Field(default=None, pattern=K8S_NAME, max_length=63, description="omit for every permitted namespace")
     days: int = Field(default=7, ge=1, le=30)
+
+
+async def _namespaces(ctx: ToolContext, namespace: str | None) -> list[str]:
+    if namespace:
+        ctx.scope.require(namespace)
+        return [namespace]
+    return ctx.scope.filter(await ctx.connector("kubernetes").list_namespaces())[:40]
 
 
 async def finops_aws_costs(ctx: ToolContext, a: CostArgs) -> ToolResult:
@@ -226,22 +233,25 @@ def _workload_of(pod: dict) -> str:
     return f"{owner.get('kind', 'Pod') if owner.get('kind') != 'ReplicaSet' else 'Deployment'}/{name}"
 
 
-async def _usage(ctx: ToolContext, namespace: str, days: int) -> tuple[dict, dict, list[str]]:
+async def _usage(ctx: ToolContext, namespaces: list[str], days: int) -> tuple[dict, dict, list[str]]:
     prom = ctx.connector("prometheus")
     rng = f"{days * 24}h"
     step = "5m" if days <= 2 else "15m"
-    sel = f'namespace="{namespace}", container!="", container!="POD"'
+    ns = namespaces[0] if len(namespaces) == 1 else "^(" + "|".join(re.escape(n) for n in namespaces) + ")$"
+    sel = (f'namespace="{ns}"' if len(namespaces) == 1 else f'namespace=~"{ns}"') + ', container!="", container!="POD"'
     queries = {
-        "cpu_avg": f"avg_over_time(sum by (pod, container) (rate(container_cpu_usage_seconds_total{{{sel}}}[5m]))[{rng}:{step}])",
-        "cpu_p95": f"quantile_over_time(0.95, sum by (pod, container) (rate(container_cpu_usage_seconds_total{{{sel}}}[5m]))[{rng}:{step}])",
-        "mem_avg": f"avg_over_time(sum by (pod, container) (container_memory_working_set_bytes{{{sel}}})[{rng}:{step}])",
-        "mem_max": f"max_over_time(sum by (pod, container) (container_memory_working_set_bytes{{{sel}}})[{rng}:{step}])",
+        "cpu_avg": f"avg_over_time(sum by (namespace, pod, container) (rate(container_cpu_usage_seconds_total{{{sel}}}[5m]))[{rng}:{step}])",
+        "cpu_p95": f"quantile_over_time(0.95, sum by (namespace, pod, container) (rate(container_cpu_usage_seconds_total{{{sel}}}[5m]))[{rng}:{step}])",
+        "mem_avg": f"avg_over_time(sum by (namespace, pod, container) (container_memory_working_set_bytes{{{sel}}})[{rng}:{step}])",
+        "mem_max": f"max_over_time(sum by (namespace, pod, container) (container_memory_working_set_bytes{{{sel}}})[{rng}:{step}])",
     }
     now = datetime.now(timezone.utc)
-    values: dict[str, dict[tuple[str, str], float]] = {}
+    values: dict[str, dict[tuple[str, str, str], float]] = {}
     for key, q in queries.items():
         r = await prom.instant(q, now)
-        values[key] = {(s["metric"].get("pod", ""), s["metric"].get("container", "")): (s.get("value") or [0, 0])[1] or 0.0 for s in r["series"]}
+        # The series cap (25) is too small for whole namespaces: re-query unshaped when needed.
+        values[key] = {(s["metric"].get("namespace", ""), s["metric"].get("pod", ""), s["metric"].get("container", "")): (s.get("value") or [0, 0])[1] or 0.0
+                       for s in r.get("all_series", r["series"])}
     return values, queries, list(queries.values())
 
 
@@ -254,67 +264,126 @@ async def _prices(ctx: ToolContext) -> tuple[float, float, str]:
     return cpu_p, gib_p, model.describe()
 
 
+async def _pods_by_namespace(ctx: ToolContext, namespaces: list[str], named: str | None) -> tuple[dict[str, list[dict]], dict[str, str]]:
+    """One unreachable namespace must not fail an all-namespaces report; a namespace asked for by name still does."""
+    k = ctx.connector("kubernetes")
+    pods: dict[str, list[dict]] = {}
+    skipped: dict[str, str] = {}
+    for ns in namespaces:
+        try:
+            pods[ns] = await k.raw_pods(ns)
+        except ConnectorError as exc:
+            if named:
+                raise
+            skipped[ns] = exc.message
+    return pods, skipped
+
+
 async def finops_k8s_allocation(ctx: ToolContext, a: AllocArgs) -> ToolResult:
-    pods = await ctx.connector("kubernetes").raw_pods(a.namespace)
-    usage, queries, _ = await _usage(ctx, a.namespace, a.days)
+    k = ctx.connector("kubernetes")
+    namespaces = await _namespaces(ctx, a.namespace)
+    pods_by_ns, skipped = await _pods_by_namespace(ctx, namespaces, a.namespace)
+    usage, queries, _ = await _usage(ctx, namespaces, a.days)
     cpu_p, gib_p, model = await _prices(ctx)
-    agg: dict[str, dict] = {}
-    for p in pods:
-        if p.get("status", {}).get("phase") not in ("Running", "Pending"):
-            continue
-        wl = _workload_of(p)
-        w = agg.setdefault(wl, {"namespace": a.namespace, "workload": wl, "pods": 0, "cpu_request": 0.0, "mem_request": 0.0, "cpu_avg": 0.0, "mem_avg": 0.0})
-        w["pods"] += 1
-        for c in p["spec"].get("containers", []):
-            req = (c.get("resources") or {}).get("requests") or {}
-            w["cpu_request"] += parse_cpu(req.get("cpu"))
-            w["mem_request"] += parse_mem(req.get("memory"))
-            key = (p["metadata"]["name"], c["name"])
-            w["cpu_avg"] += float(usage["cpu_avg"].get(key, 0.0))
-            w["mem_avg"] += float(usage["mem_avg"].get(key, 0.0))
-    rows = allocate(list(agg.values()), cpu_p, gib_p, a.days * 24)
-    total, idle = round(sum(r["cost"] for r in rows), 2), round(sum(r["idle_cost"] for r in rows), 2)
+    storage_price = ctx.connector("cost_model").storage_gib_month
+    agg: dict[tuple[str, str], dict] = {}
+    for ns, pods in pods_by_ns.items():
+        pvc_size = {}
+        if storage_price:
+            for pvc in await k.pvcs(ns):
+                pvc_size[pvc["name"]] = parse_mem(pvc["capacity"] or pvc["request"])
+        for p in pods:
+            if p.get("status", {}).get("phase") not in ("Running", "Pending"):
+                continue
+            wl = _workload_of(p)
+            w = agg.setdefault((ns, wl), {"namespace": ns, "workload": wl, "kind": wl.split("/")[0], "pods": 0, "cpu_request": 0.0, "mem_request": 0.0,
+                                          "cpu_avg": 0.0, "mem_avg": 0.0, "storage_bytes": 0.0})
+            w["pods"] += 1
+            for v in p["spec"].get("volumes") or []:
+                claim = (v.get("persistentVolumeClaim") or {}).get("claimName")
+                if claim:
+                    w["storage_bytes"] += pvc_size.get(claim, 0.0)
+            for c in p["spec"].get("containers", []):
+                req = (c.get("resources") or {}).get("requests") or {}
+                w["cpu_request"] += parse_cpu(req.get("cpu"))
+                w["mem_request"] += parse_mem(req.get("memory"))
+                key = (ns, p["metadata"]["name"], c["name"])
+                w["cpu_avg"] += float(usage["cpu_avg"].get(key, 0.0))
+                w["mem_avg"] += float(usage["mem_avg"].get(key, 0.0))
+    rows = allocate(list(agg.values()), cpu_p, gib_p, a.days * 24, storage_price)
+    by_resource = {r: round(sum(x["cost_by_resource"][r] for x in rows), 4) for r in ("cpu", "memory", "storage")}
+    by_ns: dict[str, float] = {}
+    by_kind: dict[str, float] = {}
     for r in rows:
         r["cpu_request"], r["cpu_avg"] = round(r["cpu_request"], 3), round(r["cpu_avg"], 3)
         r["mem_request_mib"], r["mem_avg_mib"] = round(r.pop("mem_request") / 1024**2), round(r.pop("mem_avg") / 1024**2)
-    return ToolResult(f"{a.namespace}: est. cost {total} over {a.days} d ({len(rows)} workloads), of which idle (requested but unused) {idle}",
-                      {"workloads": rows, "total": total, "idle": idle, "days": a.days,
-                       "unit_prices": {"cpu_hour": round(cpu_p, 6), "gib_hour": round(gib_p, 6)}, "cost_model": model,
+        r["storage_gib"] = round(r.pop("storage_bytes") / 1024**3, 2)
+        by_ns[r["namespace"]] = by_ns.get(r["namespace"], 0) + r["cost"]
+        by_kind[r["kind"]] = by_kind.get(r["kind"], 0) + r["cost"]
+    total, idle = round(sum(r["cost"] for r in rows), 2), round(sum(r["idle_cost"] for r in rows), 2)
+    scope_txt = a.namespace or f"{len(namespaces)} namespaces"
+    return ToolResult(f"{scope_txt}: est. cost {total} over {a.days} d ({len(rows)} workloads; cpu {by_resource['cpu']}, memory {by_resource['memory']}, "
+                      f"storage {by_resource['storage']}), idle {idle}",
+                      {"workloads": rows, "total": total, "idle": idle, "days": a.days, "namespaces": namespaces, "skipped_namespaces": skipped,
+                       "by_resource": by_resource, "by_namespace": {k: round(v, 4) for k, v in sorted(by_ns.items(), key=lambda kv: -kv[1])},
+                       "by_kind": {k: round(v, 4) for k, v in sorted(by_kind.items(), key=lambda kv: -kv[1])},
+                       "unit_prices": {"cpu_hour": round(cpu_p, 6), "gib_hour": round(gib_p, 6), "storage_gib_month": storage_price}, "cost_model": model,
                        "note": "Current pods only; usage from cAdvisor via Prometheus; cost charged on max(request, usage)."},
                       {"queries": list(queries.values())})
 
 
 async def finops_rightsizing(ctx: ToolContext, a: AllocArgs) -> ToolResult:
-    pods = await ctx.connector("kubernetes").raw_pods(a.namespace)
-    usage, queries, _ = await _usage(ctx, a.namespace, a.days)
+    namespaces = await _namespaces(ctx, a.namespace)
+    pods_by_ns, skipped = await _pods_by_namespace(ctx, namespaces, a.namespace)
+    pods = [p for rows in pods_by_ns.values() for p in rows]
+    usage, queries, _ = await _usage(ctx, namespaces, a.days)
     cpu_p, gib_p, model = await _prices(ctx)
-    per: dict[tuple[str, str], dict] = {}
+    per: dict[tuple[str, str, str], dict] = {}
     for p in pods:
         if p.get("status", {}).get("phase") != "Running":
             continue
         wl = _workload_of(p)
         for c in p["spec"].get("containers", []):
             res = c.get("resources") or {}
-            key = (wl, c["name"])
-            e = per.setdefault(key, {"namespace": a.namespace, "workload": wl, "container": c["name"], "replicas": 0,
+            pns = p["metadata"]["namespace"]
+            key = (pns, wl, c["name"])
+            e = per.setdefault(key, {"namespace": pns, "workload": wl, "container": c["name"], "replicas": 0,
                                      "cpu_request": parse_cpu((res.get("requests") or {}).get("cpu")),
                                      "cpu_limit": parse_cpu((res.get("limits") or {}).get("cpu")),
                                      "mem_request": parse_mem((res.get("requests") or {}).get("memory")),
                                      "mem_limit": parse_mem((res.get("limits") or {}).get("memory")), "cpu_p95": 0.0, "mem_max": 0.0})
             e["replicas"] += 1
-            k = (p["metadata"]["name"], c["name"])
+            k = (pns, p["metadata"]["name"], c["name"])
             e["cpu_p95"] = max(e["cpu_p95"], float(usage["cpu_p95"].get(k, 0.0)))
             e["mem_max"] = max(e["mem_max"], float(usage["mem_max"].get(k, 0.0)))
     recs = rightsize(list(per.values()), cpu_p, gib_p)
     saving = round(sum(r["monthly_saving"] for r in recs if r["action"] == "reduce"), 2)
     risks = sum(1 for r in recs if r["action"] == "increase")
-    return ToolResult(f"{a.namespace}: {len(recs)} rightsizing recommendations; potential saving {saving}/month; {risks} under-provisioned",
-                      {"recommendations": recs, "monthly_saving": saving, "days": a.days, "cost_model": model,
+    return ToolResult(f"{a.namespace or f'{len(namespaces)} namespaces'}: {len(recs)} rightsizing recommendations; potential saving {saving}/month; {risks} under-provisioned",
+                      {"recommendations": recs, "monthly_saving": saving, "days": a.days, "cost_model": model, "skipped_namespaces": skipped,
                        "note": "Recommendations need a reviewed config patch (action plan) to apply."},
                       {"queries": list(queries.values())})
 
 
+async def eks_cluster(ctx: ToolContext, a: NoArgs) -> ToolResult:
+    """EKS control plane (read-only): needs config.cluster_name and config.region on the kubernetes connector."""
+    import asyncio
+
+    from ..connectors.kubernetes import eks_control_plane
+
+    entry = ctx.connectors.get("kubernetes")
+    cfg = (entry[0].config or {}) if entry and entry[0] is not None else {}
+    if not cfg.get("cluster_name"):
+        raise ConnectorError("config", "set cluster_name and region on this environment's kubernetes connector to read the EKS control plane")
+    r = await asyncio.to_thread(eks_control_plane, cfg["cluster_name"], cfg.get("region") or "us-east-1", cfg.get("role_arn"))
+    issues = len(r["cluster"]["health_issues"]) + sum(len(n["health_issues"]) for n in r["nodegroups"]) + sum(len(x["health_issues"]) for x in r["addons"])
+    return ToolResult(f"EKS {r['cluster']['name']} {r['cluster']['version']} {r['cluster']['status']}: {len(r['nodegroups'])} node groups, "
+                      f"{len(r['addons'])} add-ons, {issues} health issues", r, {"api": "eks:DescribeCluster, ListNodegroups/DescribeNodegroup, ListAddons/DescribeAddon"})
+
+
 TOOLS: list[ToolSpec] = [
+    ToolSpec("eks_cluster", "EKS control plane: version, status, endpoint access, logging, node groups (scaling, health), add-ons and Fargate profiles.",
+             "kubernetes", NoArgs, eks_cluster, cluster_scoped=True, namespace_arg=None),
     ToolSpec("grafana_dashboards", "Search Grafana dashboards (links open at the investigation window).", "grafana", DashSearchArgs, grafana_dashboards, namespace_arg=None),
     ToolSpec("grafana_dashboard", "Panels and their queries for one Grafana dashboard.", "grafana", DashArgs, grafana_dashboard, namespace_arg=None),
     ToolSpec("grafana_alerts", "Grafana-managed alert rules and their firing instances within your scope.", "grafana", FiringArgs, grafana_alerts, namespace_arg=None),
@@ -332,8 +401,8 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("finops_aws_anomalies", "AWS Cost Anomaly Detection findings with root causes.", "aws_cost", DaysArgs, finops_aws_anomalies,
              cluster_scoped=True, namespace_arg=None, extra_permission=P.FINOPS_READ),
     ToolSpec("finops_budgets", "AWS Budgets: limit, actual and forecast spend.", "aws_cost", NoArgs, finops_budgets, cluster_scoped=True, namespace_arg=None, extra_permission=P.FINOPS_READ),
-    ToolSpec("finops_k8s_allocation", "Estimated cost per workload in a namespace (requests vs usage, idle cost).", "cost_model", AllocArgs, finops_k8s_allocation,
-             extra_permission=P.FINOPS_READ),
-    ToolSpec("finops_rightsizing", "CPU/memory request recommendations from p95/max usage, with savings and OOM risk.", "cost_model", AllocArgs, finops_rightsizing,
-             extra_permission=P.FINOPS_READ),
+    ToolSpec("finops_k8s_allocation", "Estimated cost per workload (cpu/memory/storage, idle) in one namespace or all permitted ones.", "cost_model",
+             AllocArgs, finops_k8s_allocation, extra_permission=P.FINOPS_READ, namespace_arg=None),
+    ToolSpec("finops_rightsizing", "CPU/memory request recommendations from p95/max usage, with savings and OOM risk (one or all namespaces).", "cost_model",
+             AllocArgs, finops_rightsizing, extra_permission=P.FINOPS_READ, namespace_arg=None),
 ]

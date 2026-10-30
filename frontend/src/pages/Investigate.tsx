@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, API } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, LineChart, LogLines, PageHead, ScopePicker, SourceRef, StatusBadge, Time, fmtBytes, useLoad } from "../components";
+import { Badge, ErrorBox, LineChart, LogLines, PageHead, SourceRef, StatusBadge, Time, fmtBytes, useLoad } from "../components";
 import { PlanForm } from "./Ops";
 
 const SUGGESTIONS = [
@@ -18,22 +18,21 @@ export function NewInvestigation() {
   const { can } = useAuth();
   const nav = useNavigate();
   const [params] = useSearchParams();
-  const [env, setEnv] = useState(params.get("env") ?? "");
-  const [ns, setNs] = useState(params.get("ns") ?? "");
   const [q, setQ] = useState(params.get("q") ?? "");
   const [minutes, setMinutes] = useState<string>("");
   const [error, setError] = useState<unknown>();
   const [busy, setBusy] = useState(false);
-  const onEnv = useCallback((e: string) => setEnv(e), []);
-  const onNs = useCallback((n: string) => setNs(n), []);
+  const config = useLoad(() => api<{ llm: { provider: string; model: string } | null; skills: string[] }>("/investigate/config"), []);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError(null);
     try {
+      // Scope comes from the question (or a deep link from the explorer); the backend resolves the rest.
       const inv = await api<{ id: string }>("/investigations", {
-        method: "POST", body: { question: q, environment: env, namespace: ns, minutes: minutes ? Number(minutes) : undefined, incident_id: params.get("incident") || undefined },
+        method: "POST", body: { question: q, environment: params.get("env") || undefined, namespace: params.get("ns") || undefined,
+          minutes: minutes ? Number(minutes) : undefined, incident_id: params.get("incident") || undefined },
       });
       nav(`/investigations/${inv.id}`);
     } catch (err) {
@@ -44,24 +43,34 @@ export function NewInvestigation() {
 
   return (
     <>
-      <PageHead title="Investigate" sub="Ask a question. MOKS collects live evidence with read-only tools, correlates it and cites every fact." />
+      <PageHead title="Investigate" sub="Ask a question. MOKS finds the environment and workload, runs the matching SRE skills, and cites every fact." />
       {!can("investigation.run") && <div className="alert info">You can read investigations but not start them (needs the Investigator role).</div>}
+      {config.data && !config.data.llm && (
+        <div className="alert warn small" style={{ marginBottom: 12 }}>
+          No active chat model: reports are rule-based. {can("admin.llm") && <Link to="/admin/llm">Activate an LLM provider →</Link>}
+        </div>
+      )}
       <form className="card stack" onSubmit={submit}>
-        <div className="row">
-          <ScopePicker env={env} ns={ns} onEnv={onEnv} onNs={onNs} allowAll />
+        <div className="row between">
           <label>Time window
             <select value={minutes} onChange={(e) => setMinutes(e.target.value)}>
               <option value="">From question, else 1 hour</option>
               <option value="15">Last 15 minutes</option><option value="30">Last 30 minutes</option><option value="60">Last hour</option>
-              <option value="180">Last 3 hours</option><option value="360">Last 6 hours</option>
+              <option value="180">Last 3 hours</option><option value="360">Last 6 hours</option><option value="1440">Last 24 hours</option>
             </select>
           </label>
+          {config.data && (
+            <div className="row small muted">
+              {config.data.llm && <span>LLM <Badge kind="ok">{config.data.llm.provider} / {config.data.llm.model}</Badge></span>}
+              <span><Link to="/skills">{config.data.skills.length} SRE skills</Link> available</span>
+            </div>
+          )}
         </div>
         <div className="chat-input">
           <textarea rows={3} required minLength={3} maxLength={2000} value={q} onChange={(e) => setQ(e.target.value)}
             placeholder="e.g. Why is checkout returning 502 errors?"
             onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) (e.currentTarget.form as HTMLFormElement).requestSubmit(); }} />
-          <button disabled={busy || !env || !ns || !can("investigation.run")}>{busy ? "Starting…" : "Investigate"}</button>
+          <button disabled={busy || !can("investigation.run")}>{busy ? "Starting…" : "Investigate"}</button>
         </div>
         <div className="suggestions">
           {SUGGESTIONS.map((s) => <button type="button" key={s} onClick={() => setQ(s)}>{s}</button>)}
@@ -69,7 +78,7 @@ export function NewInvestigation() {
         <ErrorBox error={error} />
       </form>
       <div className="small muted" style={{ marginTop: 10 }}>
-        Phase 1 is read-only: MOKS proposes remediation but executes nothing. Evidence and tool calls are recorded in the audit log.
+        Investigations are read-only. Remediation runs only through an approved action plan. Evidence and tool calls are recorded in the audit log.
       </div>
     </>
   );

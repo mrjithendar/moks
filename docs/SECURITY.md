@@ -104,7 +104,7 @@ call, including calls planned by the LLM) and the worker, which re-loads the req
   with sensitive names in pod specs. It runs on evidence, prompts, audit details and API
   responses. It is pattern-based, so treat it as a safety net.
 - Nothing sensitive goes to browser storage. The SPA keeps the CSRF token in memory, and
-  `localStorage` holds only the last selected environment and namespace.
+  `localStorage` is not used.
 
 ## Audit
 

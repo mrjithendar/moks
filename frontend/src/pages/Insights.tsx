@@ -1,8 +1,8 @@
-import { useCallback, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, apiForm, qs } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, LineChart, PageHead, ScopePicker, SourceRef, Time, useLoad } from "../components";
+import { Badge, type Env, ErrorBox, LineChart, PageHead, Stat, Time, useLoad } from "../components";
 import { PlanForm } from "./Ops";
 
 // ---- Knowledge ----------------------------------------------------------------------------------
@@ -90,7 +90,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
       </table>
       <form className="stack" onSubmit={add}>
         <div className="row">
-          <label>Name<input required pattern="[a-z0-9][a-z0-9-]*" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></label>
+          <label>Name<input required pattern="[a-z0-9][a-z0-9\-]*" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></label>
           <label>Type<select value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })}><option value="github">GitHub repository</option><option value="upload">Uploads</option></select></label>
           {f.type === "github" && <label>Repository<input required placeholder="owner/name" value={f.repository} onChange={(e) => setF({ ...f, repository: e.target.value })} /></label>}
           <label>Scope env<input value={f.scope_environment} onChange={(e) => setF({ ...f, scope_environment: e.target.value })} /></label>
@@ -110,88 +110,190 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
 
 // ---- FinOps -----------------------------------------------------------------------------------
 
-const money = (v: number | null | undefined) => (v == null ? "—" : v >= 100 ? v.toFixed(0) : v.toFixed(2));
+const money = (v: number | null | undefined) => (v == null ? "—" : v >= 100 ? v.toFixed(0) : v >= 1 || v === 0 ? v.toFixed(2) : v.toFixed(4));
+
+function Share({ value, total }: { value: number; total: number }) {
+  const pct = total > 0 ? Math.round((value / total) * 100) : 0;
+  return <div className="row"><div className="bar" style={{ flex: 1 }}><span style={{ width: `${pct}%` }} /></div><span className="small muted">{pct}%</span></div>;
+}
 
 export function FinOps() {
   const { can } = useAuth();
-  const [env, setEnv] = useState(localStorage.getItem("moks.env") ?? "");
-  const [ns, setNs] = useState(localStorage.getItem("moks.ns") ?? "");
-  const [days, setDays] = useState(7);
-  const onEnv = useCallback((e: string) => setEnv(e), []);
-  const onNs = useCallback((n: string) => setNs(n), []);
-  const ok = (p: Promise<any>) => p.catch((e) => ({ error: e.message }));
-  const alloc = useLoad(() => (env && ns ? ok(api(`/finops/${env}/k8s/allocation${qs({ namespace: ns, days })}`)) : Promise.resolve(null)), [env, ns, days]);
-  const rs = useLoad(() => (env && ns ? ok(api(`/finops/${env}/k8s/rightsizing${qs({ namespace: ns, days })}`)) : Promise.resolve(null)), [env, ns, days]);
-  const aws = useLoad(() => (env ? ok(api(`/finops/${env}/aws/costs${qs({ group_by: "service", days: 30 })}`)) : Promise.resolve(null)), [env]);
-  const anomalies = useLoad(() => (env ? ok(api(`/finops/${env}/aws/anomalies${qs({ days: 30 })}`)) : Promise.resolve(null)), [env]);
-  const budgets = useLoad(() => (env ? ok(api(`/finops/${env}/aws/budgets`)) : Promise.resolve(null)), [env]);
-  const forecast = useLoad(() => (env ? ok(api(`/finops/${env}/aws/forecast${qs({ days: 30 })}`)) : Promise.resolve(null)), [env]);
-  const llm = useLoad(() => (can("admin.llm") ? api<any>("/finops/llm?days=30") : Promise.resolve(null)), []);
-  const [propose, setPropose] = useState<any>(null);
   const nav = useNavigate();
+  const envs = useLoad(() => api<Env[]>("/environments"), []);
+  const [env, setEnv] = useState("all");
+  const [ns, setNs] = useState("");
+  const [days, setDays] = useState(7);
+  const [text, setText] = useState("");
+  const [kind, setKind] = useState("");
+  const [propose, setPropose] = useState<any>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState<unknown>();
+  const one = env !== "all";
+  const nss = useLoad(() => (one ? api<{ namespaces: string[] }>(`/explore/${env}/namespaces`).catch(() => null) : Promise.resolve(null)), [env]);
+  const ov = useLoad(() => api<any>(`/finops/overview${qs({ environment: env, namespace: ns || undefined, days })}`), [env, ns, days]);
+  const d = ov.data;
+  const t = d?.totals;
+  const rows: any[] = d?.environments ?? [];
+  const hasAws = one && rows.some((r) => r.aws || r.errors?.aws); // Cost Explorer calls are billed: only ask when connected
+  const ok = (p: Promise<any>) => p.catch((e) => ({ error: e.message }));
+  const anomalies = useLoad(() => (hasAws ? ok(api(`/finops/${env}/aws/anomalies${qs({ days: 30 })}`)) : Promise.resolve(null)), [env, hasAws]);
+  const budgets = useLoad(() => (hasAws ? ok(api(`/finops/${env}/aws/budgets`)) : Promise.resolve(null)), [env, hasAws]);
+  const forecast = useLoad(() => (hasAws ? ok(api(`/finops/${env}/aws/forecast${qs({ days: 30 })}`)) : Promise.resolve(null)), [env, hasAws]);
+  const tag = (r: any) => (x: any) => ({ ...x, environment: r.environment });
+  const workloads = rows.flatMap((r) => (r.workloads ?? []).map(tag(r))).sort((a, b) => b.cost - a.cost);
+  const recs = rows.flatMap((r) => (r.rightsizing ?? []).map(tag(r)));
+  const aws = rows.flatMap((r) => (r.aws?.groups ?? []).map(tag(r))).sort((a, b) => b.amount - a.amount);
+  const kinds = [...new Set(workloads.map((w) => w.kind))];
+  const match = (w: any) => (!kind || w.kind === kind) && (!text || JSON.stringify([w.workload, w.namespace, w.environment]).toLowerCase().includes(text.toLowerCase()));
+  const shownWorkloads = workloads.filter(match);
+  const saving = rows.reduce((n, r) => n + (r.monthly_saving ?? 0), 0);
+  const unpriced = rows.some((r) => r.kubernetes && !r.kubernetes.unit_prices.cpu_hour);
+  const typeRows = t ? [["CPU", t.cpu], ["Memory", t.memory], ["Storage", t.storage], ["Cloud services (AWS)", t.aws], ["LLM calls", t.llm]] as [string, number][] : [];
+
+  async function analyze() {
+    setAnalyzing(true);
+    setAnalyzeError(null);
+    try {
+      const r = await api<{ id: string }>("/finops/analyze", { method: "POST", body: { environment: env, namespace: ns || undefined, days } });
+      nav(`/investigations/${r.id}`);
+    } catch (e) {
+      setAnalyzeError(e);
+      setAnalyzing(false);
+    }
+  }
+
   return (
     <>
-      <PageHead title="FinOps" sub="Cloud spend, Kubernetes cost allocation and rightsizing, and MOKS's own LLM spend">
-        <ScopePicker env={env} ns={ns} onEnv={onEnv} onNs={onNs} />
-        <label>Usage window<select value={days} onChange={(e) => setDays(Number(e.target.value))}>{[1, 7, 14, 30].map((d) => <option key={d} value={d}>{d} days</option>)}</select></label>
+      <PageHead title="FinOps" sub="Cost by resource type across all environments, including MOKS's own LLM calls">
+        {can("investigation.run") && <button onClick={analyze} disabled={analyzing}>{analyzing ? "Starting…" : "Analyze with AI"}</button>}
       </PageHead>
-      <div className="grid cols-2">
-        <div className="card">
-          <h2>Kubernetes allocation · {ns}</h2>
-          {alloc.data?.error ? <div className="alert warn small">{alloc.data.error}</div> : alloc.data && <>
-            <div className="row"><div><div className="stat">{money(alloc.data.data.total)}</div><div className="small muted">est. cost, {days} d</div></div>
-              <div style={{ marginLeft: 24 }}><div className="stat">{money(alloc.data.data.idle)}</div><div className="small muted">idle (requested, unused)</div></div></div>
-            <div className="small muted" style={{ margin: "6px 0" }}>{alloc.data.data.cost_model}</div>
-            <table><thead><tr><th>Workload</th><th>Pods</th><th>CPU req / used</th><th>Mem req / used</th><th>Cost</th><th>Idle</th></tr></thead>
-              <tbody>{alloc.data.data.workloads.map((w: any) => <tr key={w.workload}><td className="mono small">{w.workload}</td><td>{w.pods}</td>
-                <td className="small">{w.cpu_request} / {w.cpu_avg}</td><td className="small">{w.mem_request_mib} / {w.mem_avg_mib} MiB</td><td>{money(w.cost)}</td><td>{money(w.idle_cost)}</td></tr>)}</tbody></table>
-          </>}
+      <ErrorBox error={ov.error ?? analyzeError} />
+      <form className="card filters" onSubmit={(e) => e.preventDefault()}>
+        <label>Environment
+          <select value={env} onChange={(e) => { setEnv(e.target.value); setNs(""); }}>
+            <option value="all">All environments</option>
+            {envs.data?.map((e) => <option key={e.name} value={e.name}>{e.display_name}</option>)}
+          </select>
+        </label>
+        {one && <label>Namespace
+          <select value={ns} onChange={(e) => setNs(e.target.value)}>
+            <option value="">All namespaces</option>
+            {nss.data?.namespaces.map((n) => <option key={n}>{n}</option>)}
+          </select>
+        </label>}
+        <label>Window<select value={days} onChange={(e) => setDays(Number(e.target.value))}>{[1, 7, 14, 30].map((n) => <option key={n} value={n}>{n} day{n > 1 ? "s" : ""}</option>)}</select></label>
+        <label>Workload<input value={text} onChange={(e) => setText(e.target.value)} placeholder="name or namespace" /></label>
+        <label>Kind<select value={kind} onChange={(e) => setKind(e.target.value)}><option value="">All kinds</option>{kinds.map((k) => <option key={k}>{k}</option>)}</select></label>
+        {ov.loading && <span className="small muted">Loading…</span>}
+      </form>
+      {t && <>
+        <div className="stat-row" style={{ marginTop: 14 }}>
+          <Stat value={`$${money(t.all)}`} label={`total, ${days} d`} />
+          <Stat value={`$${money(t.cpu)}`} label="CPU" />
+          <Stat value={`$${money(t.memory)}`} label="memory" />
+          <Stat value={`$${money(t.storage)}`} label="storage" />
+          <Stat value={`$${money(t.aws)}`} label="cloud services" />
+          <Stat value={`$${money(t.llm)}`} label={`LLM (${d.llm.calls} calls)`} />
+          <Stat value={`$${money(t.idle)}`} label="idle (requested, unused)" />
+          <Stat value={`$${money(saving)}`} label="possible saving / month" />
         </div>
-        <div className="card">
-          <h2>Rightsizing · {ns}</h2>
-          {rs.data?.error ? <div className="alert warn small">{rs.data.error}</div> : rs.data && <>
-            <div className="small muted">Potential saving {money(rs.data.data.monthly_saving)}/month from p95 CPU and max memory over {days} days (+25% headroom).</div>
-            <table><thead><tr><th>Container</th><th>Action</th><th>Current → recommended</th><th>Saving / mo</th><th /></tr></thead>
-              <tbody>{rs.data.data.recommendations.map((r: any, i: number) => <tr key={i}>
-                <td className="mono small">{r.workload}/{r.container}<div className="muted">{r.findings.join("; ")}</div></td>
-                <td><Badge kind={r.action === "increase" ? "bad" : r.action === "reduce" ? "ok" : "warn"}>{r.action}</Badge></td>
-                <td className="small mono">cpu {r.current.cpu_request ?? "—"}→{r.recommended.cpu_request}<br />mem {r.current.mem_request ?? "—"}→{r.recommended.mem_request}</td>
-                <td>{r.monthly_saving < 0 ? <span className="small">+{money(-r.monthly_saving)} cost</span> : money(r.monthly_saving)}</td>
-                <td>{can("action.request") && r.workload.startsWith("Deployment/") && <button className="small ghost" onClick={() => setPropose(r)}>Propose</button>}</td>
-              </tr>)}</tbody></table>
-            {!rs.data.data.recommendations.length && <div className="empty">Requests match usage.</div>}
-          </>}
+        {unpriced && <div className="alert warn small" style={{ marginBottom: 14 }}>Kubernetes costs are $0 until a cost_model connector has a price: set monthly_cost_usd, or cpu_hour_usd and gib_hour_usd, under Connectors.</div>}
+        <div className="grid cols-2">
+          <div className="card">
+            <h2>Cost by resource type</h2>
+            <table>
+              <thead><tr><th>Resource</th><th>Cost</th><th>Share</th></tr></thead>
+              <tbody>{typeRows.map(([k, v]) => <tr key={k}><td>{k}</td><td>${money(v)}</td><td><Share value={v} total={t.all} /></td></tr>)}</tbody>
+            </table>
+          </div>
+          <div className="card">
+            <h2>Cost by environment</h2>
+            <table>
+              <thead><tr><th>Environment</th><th>CPU</th><th>Memory</th><th>Storage</th><th>AWS</th><th>LLM</th></tr></thead>
+              <tbody>{rows.map((r) => {
+                const k = r.kubernetes?.by_resource;
+                return (
+                  <tr key={r.environment}>
+                    <td>{r.environment}{Object.entries(r.errors).map(([src, msg]) => <div key={src} className="small muted">{src}: {String(msg)}</div>)}</td>
+                    <td>{k ? money(k.cpu) : "—"}</td><td>{k ? money(k.memory) : "—"}</td><td>{k ? money(k.storage) : "—"}</td>
+                    <td>{r.aws ? money(r.aws.total) : "—"}</td><td>{money(d.llm.by_environment[r.environment] ?? 0)}</td>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
+          </div>
         </div>
-      </div>
+        <div className="card" style={{ marginTop: 14 }}>
+          <h2>LLM calls ({days} days)</h2>
+          <div className="small muted" style={{ marginBottom: 6 }}>{d.llm.calls} calls, {d.llm.tokens.toLocaleString()} tokens. {d.llm.note}</div>
+          <table>
+            <thead><tr><th>Provider / model</th><th>Calls</th><th>Tokens in</th><th>Tokens out</th><th>Cost</th></tr></thead>
+            <tbody>{d.llm.by_model.map((m: any) => <tr key={m.model}><td className="mono small">{m.model}</td><td>{m.calls}</td><td>{m.tokens_in.toLocaleString()}</td><td>{m.tokens_out.toLocaleString()}</td><td>${money(m.cost_usd)}</td></tr>)}</tbody>
+          </table>
+          {!d.llm.by_model.length && <div className="empty">No LLM calls in this window.</div>}
+          {d.llm.series.length > 0 && <LineChart series={d.llm.series} />}
+        </div>
+        <div className="card" style={{ marginTop: 14 }}>
+          <h2>Workloads ({shownWorkloads.length})</h2>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Environment</th><th>Namespace</th><th>Workload</th><th>Pods</th><th>CPU req / used</th><th>Mem req / used</th><th>CPU $</th><th>Mem $</th><th>Storage $</th><th>Total</th><th>Idle</th></tr></thead>
+              <tbody>{shownWorkloads.slice(0, 200).map((w) => (
+                <tr key={w.environment + w.namespace + w.workload}>
+                  <td className="small">{w.environment}</td><td className="mono small">{w.namespace}</td><td className="mono small">{w.workload}</td><td>{w.pods}</td>
+                  <td className="small">{w.cpu_request} / {w.cpu_avg}</td><td className="small">{w.mem_request_mib} / {w.mem_avg_mib} MiB</td>
+                  <td>{money(w.cost_by_resource.cpu)}</td><td>{money(w.cost_by_resource.memory)}</td><td>{money(w.cost_by_resource.storage)}</td>
+                  <td>{money(w.cost)}</td><td>{money(w.idle_cost)}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+          {!shownWorkloads.length && <div className="empty">No workloads match.</div>}
+        </div>
+        <div className="card" style={{ marginTop: 14 }}>
+          <h2>Rightsizing</h2>
+          <div className="small muted">From p95 CPU and max memory over {days} days (+25% headroom).</div>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Scope</th><th>Container</th><th>Action</th><th>Current → recommended</th><th>Saving / mo</th><th /></tr></thead>
+              <tbody>{recs.filter(match).map((r, i) => (
+                <tr key={i}>
+                  <td className="mono small">{r.environment}/{r.namespace}</td>
+                  <td className="mono small">{r.workload}/{r.container}<div className="muted">{r.findings.join("; ")}</div></td>
+                  <td><Badge kind={r.action === "increase" ? "bad" : r.action === "reduce" ? "ok" : "warn"}>{r.action}</Badge></td>
+                  <td className="small mono">cpu {r.current.cpu_request ?? "—"}→{r.recommended.cpu_request}<br />mem {r.current.mem_request ?? "—"}→{r.recommended.mem_request}</td>
+                  <td>{r.monthly_saving < 0 ? <span className="small">+{money(-r.monthly_saving)} cost</span> : money(r.monthly_saving)}</td>
+                  <td>{can("action.request") && r.workload.startsWith("Deployment/") && <button className="small ghost" onClick={() => setPropose(r)}>Propose</button>}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+          {!recs.length && <div className="empty">Requests match usage.</div>}
+        </div>
+        {aws.length > 0 && <div className="card" style={{ marginTop: 14 }}>
+          <h2>Cloud services</h2>
+          <table>
+            <thead><tr><th>Environment</th><th>Service</th><th>Cost</th></tr></thead>
+            <tbody>{aws.map((g, i) => <tr key={i}><td className="small">{g.environment}</td><td>{g.name}</td><td>${money(g.amount)}</td></tr>)}</tbody>
+          </table>
+        </div>}
+      </>}
       {propose && <div className="drawer"><div className="row between"><h2>Propose resize</h2><button className="ghost small" onClick={() => setPropose(null)}>Close</button></div>
-        <PlanForm env={env} ns={ns} initial={{ action: "patch_resources", target_kind: "Deployment", target_name: propose.workload.split("/")[1],
+        <PlanForm env={propose.environment} ns={propose.namespace} initial={{ action: "patch_resources", target_kind: "Deployment", target_name: propose.workload.split("/")[1],
           params: { container: propose.container, requests: { cpu: propose.recommended.cpu_request, memory: propose.recommended.mem_request },
             limits: propose.recommended.mem_limit ? { memory: propose.recommended.mem_limit } : {} },
           reason: `Rightsizing from ${days}-day usage: p95 CPU ${propose.observed.cpu_p95}, max memory ${propose.observed.mem_max}. ${propose.findings.join("; ")}` }}
           onDone={(id) => nav(`/actions/${id}`)} /></div>}
-      <div className="grid cols-2" style={{ marginTop: 14 }}>
-        <div className="card">
-          <h2>AWS spend (30 days, by service)</h2>
-          {aws.data?.error ? <div className="alert info small">{aws.data.error}</div> : aws.data && <>
-            <div className="row"><div><div className="stat">{money(aws.data.data.total)} {aws.data.data.unit}</div><div className="small muted">{aws.data.data.metric}</div></div>
-              {forecast.data && !forecast.data.error && <div style={{ marginLeft: 24 }}><div className="stat">{money(forecast.data.data.total)}</div><div className="small muted">forecast next 30 d</div></div>}</div>
-            <LineChart series={aws.data.data.series} />
-            <SourceRef source={aws.data.source} />
-          </>}
-        </div>
-        <div className="card stack">
-          <h2>Anomalies & budgets</h2>
-          {anomalies.data?.error ? <div className="alert info small">{anomalies.data.error}</div> : anomalies.data?.data?.map((a: any) => (
-            <div key={a.id} className="small"><Badge kind="warn">impact {money(a.impact)}</Badge> {a.start} – {a.end ?? "ongoing"} · {a.root_causes.map((c: any) => [c.Service, c.Region, c.UsageType].filter(Boolean).join(" ")).join("; ")}</div>))}
-          {anomalies.data?.data?.length === 0 && <div className="small muted">No cost anomalies in 30 days.</div>}
-          {budgets.data && !budgets.data.error && budgets.data.data.map((b: any) => (
-            <div key={b.name} className="small"><strong>{b.name}</strong> {money(b.actual)} of {money(b.limit)} {b.unit} ({b.actual_pct}%)
-              {b.forecast_pct != null && <Badge kind={b.forecast_pct >= 100 ? "bad" : b.forecast_pct >= 80 ? "warn" : "ok"}>forecast {b.forecast_pct}%</Badge>}</div>))}
-        </div>
-      </div>
-      {llm.data && <div className="card" style={{ marginTop: 14 }}>
-        <h2>MOKS LLM spend (30 days): ${llm.data.total_usd.toFixed(2)}</h2>
-        <LineChart series={llm.data.series} />
+      {hasAws && <div className="card stack" style={{ marginTop: 14 }}>
+        <h2>Anomalies, budgets and forecast · {env}</h2>
+        {forecast.data && !forecast.data.error && <div className="small">Forecast next 30 days: ${money(forecast.data.data.total)}</div>}
+        {anomalies.data?.error ? <div className="small muted">{anomalies.data.error}</div> : anomalies.data?.data?.map((a: any) => (
+          <div key={a.id} className="small"><Badge kind="warn">impact {money(a.impact)}</Badge> {a.start} – {a.end ?? "ongoing"} · {a.root_causes.map((c: any) => [c.Service, c.Region, c.UsageType].filter(Boolean).join(" ")).join("; ")}</div>))}
+        {anomalies.data?.data?.length === 0 && <div className="small muted">No cost anomalies in 30 days.</div>}
+        {budgets.data && !budgets.data.error && budgets.data.data.map((b: any) => (
+          <div key={b.name} className="small"><strong>{b.name}</strong> {money(b.actual)} of {money(b.limit)} {b.unit} ({b.actual_pct}%)
+            {b.forecast_pct != null && <Badge kind={b.forecast_pct >= 100 ? "bad" : b.forecast_pct >= 80 ? "warn" : "ok"}>forecast {b.forecast_pct}%</Badge>}</div>))}
       </div>}
     </>
   );

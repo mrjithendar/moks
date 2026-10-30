@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 import { api, qs } from "./api";
 import { useAuth } from "./auth";
@@ -100,6 +100,73 @@ export function useLoad<T>(fn: () => Promise<T>, deps: unknown[]): { data: T | u
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [...deps, tick]);
   return { data, error, loading, reload: () => setTick((t) => t + 1) };
+}
+
+/** Calls fn every ms while the tab is visible. */
+export function useInterval(fn: () => void, ms: number, enabled = true) {
+  const ref = useRef(fn);
+  ref.current = fn;
+  useEffect(() => {
+    if (!enabled) return;
+    const id = setInterval(() => { if (!document.hidden) ref.current(); }, ms);
+    return () => clearInterval(id);
+  }, [ms, enabled]);
+}
+
+export interface Multi<T = any> {
+  items: T[]; errors: { environment: string; namespace: string | null; error: string; denied: boolean }[]; environments: string[];
+  queries: Record<string, string>; collected_at: string | null; step?: number; missing_references?: any[];
+}
+export interface Scope { environment: string; display_name: string; namespaces: string[]; error?: string }
+
+export function useScopes() {
+  return useLoad(() => api<{ scopes: Scope[] }>("/multi/scopes").then((r) => r.scopes), []);
+}
+
+/** "All environments / All namespaces" filters; namespaces follow the chosen environment. */
+export function EnvNsFilter({ scopes, env, ns, onEnv, onNs, noNamespace = false }: {
+  scopes?: Scope[]; env: string; ns: string; onEnv: (e: string) => void; onNs: (n: string) => void; noNamespace?: boolean;
+}) {
+  const shown = (scopes ?? []).filter((s) => env === "all" || s.environment === env);
+  const namespaces = [...new Set(shown.flatMap((s) => s.namespaces))].sort();
+  return (
+    <>
+      <label>Environment
+        <select value={env} onChange={(e) => {
+          const next = e.target.value;
+          onEnv(next);
+          const list = next === "all" ? scopes?.flatMap((s) => s.namespaces) : scopes?.find((s) => s.environment === next)?.namespaces;
+          if (ns !== "all" && !list?.includes(ns)) onNs("all");
+        }}>
+          <option value="all">All environments</option>
+          {scopes?.map((s) => <option key={s.environment} value={s.environment}>{s.display_name}</option>)}
+        </select>
+      </label>
+      {!noNamespace && (
+        <label>Namespace
+          <select value={ns} onChange={(e) => onNs(e.target.value)}>
+            <option value="all">All namespaces</option>
+            {namespaces.map((n) => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </label>
+      )}
+    </>
+  );
+}
+
+/** Per-environment/namespace failures: the rest of the view still renders. */
+export function PartialErrors({ errors }: { errors?: Multi["errors"] }) {
+  if (!errors?.length) return null;
+  return (
+    <details className="alert warn small" style={{ marginBottom: 10 }}>
+      <summary>{errors.length} source{errors.length > 1 ? "s" : ""} returned partial data</summary>
+      {errors.slice(0, 40).map((e, i) => <div key={i}><span className="mono">{e.environment}{e.namespace ? `/${e.namespace}` : ""}</span>: {e.error}</div>)}
+    </details>
+  );
+}
+
+export function Stat({ value, label }: { value: ReactNode; label: ReactNode }) {
+  return <div className="stat-tile"><div className="stat">{value}</div><div className="small muted">{label}</div></div>;
 }
 
 export interface Env { name: string; display_name: string; kind: string; is_production: boolean; can_investigate?: boolean; grafana_url?: string | null }

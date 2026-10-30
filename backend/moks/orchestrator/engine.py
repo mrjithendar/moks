@@ -81,6 +81,7 @@ class Investigator:
         self.rejected: list[dict[str, Any]] = []
         self._window: tuple[datetime, datetime] | None = None
         self.skills: list = []  # (Skill, score, reasons) selected for this investigation
+        self.focus_namespace: str | None = None
 
     async def _emit(self, type_: str, payload: dict[str, Any]) -> None:
         self.seq += 1
@@ -196,6 +197,8 @@ class Investigator:
             # 1. Baseline evidence (always, deterministic)
             await self._emit("phase", {"phase": "evidence", "label": "Collecting baseline evidence"})
             await self._baseline(executor, ctx, namespace, question)
+            namespace = self.focus_namespace or namespace
+            scope_info["namespace"] = namespace
             await db.commit()
 
             # 2. SRE skills matching the question and findings run their playbook steps
@@ -262,8 +265,48 @@ class Investigator:
         await self._emit("tool_result", {k: v for k, v in record.items() if k != "data"} | {"duration_ms": out.duration_ms})
         return out
 
+    async def _focus(self, ctx: ToolContext, question: str) -> tuple[str | None, str]:
+        """For all-namespace investigations: find the namespace the question is about by matching
+        its words against namespace names, then Deployment/StatefulSet names (one list call)."""
+        if "kubernetes" not in ctx.connectors:
+            return None, "no kubernetes connector"
+        words = set(re.findall(r"[a-z0-9][a-z0-9-]{2,62}", question.lower()))
+        k = ctx.connector("kubernetes")
+        try:
+            nss = ctx.scope.filter(await k.list_namespaces())
+        except Exception:
+            return None, "could not list namespaces"
+        direct = [n for n in nss if n in words]
+        if len(direct) == 1:
+            return direct[0], f"namespace {direct[0]} is named in the question"
+        hits: dict[str, list[str]] = {}
+        for ns in nss[:40]:
+            try:
+                for w in await k.workloads(ns):
+                    base = w["name"]
+                    parts = set(base.split("-")) | {base}
+                    if words & parts - {"service", "server", "api", "app", "web", "db", "the", "and"}:
+                        hits.setdefault(ns, []).append(base)
+            except Exception:
+                continue
+        if len(hits) == 1:
+            ns, names = next(iter(hits.items()))
+            return ns, f"workload {', '.join(sorted(set(names))[:3])} named in the question lives in {ns}"
+        if hits:
+            return None, "the question matches workloads in several namespaces (" + ", ".join(sorted(hits)) + "); sweeping all"
+        return None, "no namespace or workload named; sweeping all permitted namespaces"
+
     async def _baseline(self, executor: ToolExecutor, ctx: ToolContext, namespace: str, question: str) -> None:
         namespaces: list[str]
+        if namespace == "*":
+            focus, why = await self._focus(ctx, question)
+            self.notes.append(f"Scope: {why}.")
+            await self._emit("note", {"message": f"Scope: {why}"})
+            if focus:
+                async with session_scope() as db:
+                    await db.execute(update(Investigation).where(Investigation.id == self.id).values(namespace=focus))
+                self.focus_namespace = focus
+                namespace = focus
         if namespace == "*":
             if "kubernetes" not in ctx.connectors:
                 namespaces = []
@@ -384,13 +427,20 @@ class Investigator:
                     target = skill_lib.render(r.target, c) if r.target else ""
                     if r.target and target is None:
                         continue
+                    if not r.target and f.get("resources"):
+                        res = f["resources"][0]
+                        rk, _, rn = res.partition("/")
+                        target = {"deployment": f"Deployment/{rn}", "service": f"Service/{rn}"}.get(rk, "")
                     kind, _, name = (target or "").partition("/")
-                    key = (r.action, target)
+                    params = dict(r.params) or (f.get("suggested") or {}).get(r.action, {})
+                    if r.action == "patch_resources" and (kind != "Deployment" or not params):
+                        continue  # only Deployments with concrete, measured values
+                    key = (r.action, target, str(params))
                     if key in seen:
                         continue
                     seen.add(key)
                     out.append({"skill": sk.name, "action": r.action, "target_kind": kind or None, "target_name": name or None,
-                                "namespace": c.get("namespace") or namespace, "params": r.params, "note": r.note,
+                                "namespace": c.get("namespace") or f.get("namespace") or namespace, "params": params, "note": r.note,
                                 "finding": f["title"], "evidence": f.get("evidence", [])})
         return out
 
@@ -466,12 +516,33 @@ class Investigator:
     def _correlate(self) -> None:
         """Time correlation between rollouts and problem onset (correlation, not causation), and
         capacity risks from rightsizing evidence."""
+        from ..diagnosis.config_audit import findings_from
+
+        for e in [e for e in self.evidence if e["tool"] == "k8s_config_audit" and e["ok"]]:
+            known = {(f["kind"], tuple(f.get("resources", []))) for f in self.findings}
+            for f in findings_from(e["data"] or {}, e["args"].get("namespace", ""), e["ref"]):
+                if (f["kind"], tuple(f["resources"])) not in known:
+                    self.findings.append(f)
         for e in [e for e in self.evidence if e["tool"] == "finops_rightsizing" and e["ok"]]:
-            for r in ((e["data"] or {}).get("recommendations") or [])[:8]:
+            for r in ((e["data"] or {}).get("recommendations") or [])[:12]:
+                rec = r["recommended"]
+                params = {"container": r["container"], "requests": {"cpu": rec["cpu_request"], "memory": rec["mem_request"]},
+                          "limits": {"memory": rec["mem_limit"]} if rec.get("mem_limit") else {}}
+                suggested = {"patch_resources": params} if r["workload"].startswith("Deployment/") else {}
+                if r["action"] == "reduce":
+                    self.findings.append({
+                        "kind": "over_provisioned", "severity": "low",
+                        "title": f"{r['workload']} container {r['container']} requests more than it uses (save ~{r['monthly_saving']}/month)",
+                        "detail": f"Observed p95 CPU {r['observed']['cpu_p95']} cores, max memory {r['observed']['mem_max']}; current {r['current']}; recommended {rec}.",
+                        "resources": [r["workload"].lower()], "suspected_cause": None, "next_checks": [], "suggested": suggested,
+                        "remediation_hint": f"Reduce {r['container']} requests to the recommendation via a reviewed patch_resources plan.",
+                        "evidence": [e["ref"]], "namespace": r["namespace"]})
+                    continue
                 if r["action"] != "increase":
                     continue
                 oom = any("OOM" in f for f in r["findings"])
                 self.findings.append({
+                    "suggested": suggested,
                     "kind": "memory_near_limit" if oom else "under_provisioned", "severity": "medium",
                     "title": f"{r['workload']} container {r['container']} " + ("is within 10% of its memory limit" if oom else "uses more CPU than it requests"),
                     "detail": f"Observed max memory {r['observed']['mem_max']}, p95 CPU {r['observed']['cpu_p95']} cores; current {r['current']}; "

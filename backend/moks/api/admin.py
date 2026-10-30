@@ -338,16 +338,37 @@ async def remove_binding(uid: uuid.UUID, bid: uuid.UUID, ctx: AuthContext = Depe
 
 @router.get("/audit")
 async def list_audit(action: str | None = None, actor: str | None = None, decision: str | None = None, environment: str | None = None,
+                     namespace: str | None = None, outcome: str | None = None, resource: str | None = None, q_text: str | None = None,
+                     since: str | None = None, until: str | None = None,
                      before_id: int | None = None, limit: int = 100, ctx: AuthContext = Depends(needs(P.AUDIT_READ)),
                      db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    from datetime import datetime as _dt
+
+    from sqlalchemy import String, cast, or_
+
     q = select(AuditEvent).order_by(AuditEvent.id.desc()).limit(min(max(limit, 1), 500))
+    if namespace:
+        q = q.where(AuditEvent.namespace == namespace)
+    if outcome:
+        q = q.where(AuditEvent.outcome == outcome)
+    if resource:
+        q = q.where(or_(AuditEvent.resource_type.ilike(f"%{resource}%"), AuditEvent.resource_id.ilike(f"%{resource}%")))
+    if q_text:
+        q = q.where(cast(AuditEvent.details, String).ilike(f"%{q_text[:200]}%"))
+    for value, op in ((since, "ge"), (until, "le")):
+        if value:
+            try:
+                t = _dt.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                raise HTTPException(422, f"invalid time {value!r}") from None
+            q = q.where(AuditEvent.ts >= t if op == "ge" else AuditEvent.ts <= t)
     if action:
         q = q.where(AuditEvent.action.like(action.replace("*", "%")))
     if actor:
         q = q.where(AuditEvent.actor_email.ilike(f"%{actor}%"))
     if decision:
         q = q.where(AuditEvent.decision == decision)
-    if environment:
+    if environment and environment != "all":
         q = q.where(AuditEvent.environment == environment)
     if before_id:
         q = q.where(AuditEvent.id < before_id)
@@ -357,6 +378,18 @@ async def list_audit(action: str | None = None, actor: str | None = None, decisi
         "resource_id": r.resource_id, "environment": r.environment, "namespace": r.namespace, "decision": r.decision,
         "outcome": r.outcome, "details": r.details, "ip": r.ip, "chain_seq": r.chain_seq, "hash": r.hash,
     } for r in rows]}
+
+
+@router.get("/audit/facets")
+async def audit_facets(ctx: AuthContext = Depends(needs(P.AUDIT_READ)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """Distinct values for the audit filter dropdowns (most recent 20k records)."""
+    from sqlalchemy import text as _text
+
+    rows = {}
+    for col in ("action", "environment", "namespace", "outcome", "resource_type", "actor_email"):
+        rows[col] = [r[0] for r in (await db.execute(_text(
+            f"SELECT DISTINCT {col} FROM (SELECT {col} FROM audit_events ORDER BY id DESC LIMIT 20000) t WHERE {col} IS NOT NULL ORDER BY 1 LIMIT 200"))).all()]
+    return rows
 
 
 @router.get("/audit/verify")

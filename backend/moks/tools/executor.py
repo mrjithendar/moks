@@ -9,6 +9,7 @@ the same way. None of these checks depend on who asked: the UI, the API or the L
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -106,8 +107,11 @@ def tools_for_planner(ctx: ToolContext) -> list[ToolSpec]:
 
 class ToolExecutor:
     def __init__(self, db: AsyncSession | None, ctx: ToolContext, *, next_ref=None, timeout_seconds: float = 30.0,
-                 read_permissions: tuple[P, ...] = (P.EXPLORER_READ, P.INVESTIGATION_RUN)):
+                 read_permissions: tuple[P, ...] = (P.EXPLORER_READ, P.INVESTIGATION_RUN), audit_success: bool = True):
         self.db = db
+        # Dashboards (overview refresh, multi-environment views) audit one summary per request
+        # instead of every successful read; denials and errors are always audited.
+        self.audit_success = audit_success
         self.read_permissions = read_permissions
         self.ctx = ctx
         self.settings = get_settings()
@@ -197,11 +201,16 @@ class ToolExecutor:
                 ok=outcome.ok, summary=outcome.summary, data=outcome.data, source=outcome.source or {},
                 truncated=outcome.truncated, error=outcome.error, duration_ms=outcome.duration_ms,
             ))
-        await audit.record(
-            self.db, action="tool.call", actor_id=self.ctx.principal.user_id, actor_email=self.ctx.principal.email,
-            resource_type="tool", resource_id=tool, environment=self.ctx.environment.name,
-            namespace=clean_args.get("namespace"), decision="allow", outcome="success" if outcome.ok else "error",
-            details={"args": clean_args, "evidence": outcome.evidence_ref, "error_kind": outcome.error_kind,
-                     "duration_ms": outcome.duration_ms, "investigation_id": str(self.ctx.investigation_id) if self.ctx.investigation_id else None},
-        )
+        if outcome.ok and not self.audit_success:
+            return outcome
+        # Dashboards fan out with gather() over one session, which allows a single operation at a time.
+        lock = self.db.info.setdefault("moks_audit_lock", asyncio.Lock()) if self.db is not None else None
+        async with lock or contextlib.nullcontext():
+            await audit.record(
+                self.db, action="tool.call", actor_id=self.ctx.principal.user_id, actor_email=self.ctx.principal.email,
+                resource_type="tool", resource_id=tool, environment=self.ctx.environment.name,
+                namespace=clean_args.get("namespace"), decision="allow", outcome="success" if outcome.ok else "error",
+                details={"args": clean_args, "evidence": outcome.evidence_ref, "error_kind": outcome.error_kind,
+                         "duration_ms": outcome.duration_ms, "investigation_id": str(self.ctx.investigation_id) if self.ctx.investigation_id else None},
+            )
         return outcome

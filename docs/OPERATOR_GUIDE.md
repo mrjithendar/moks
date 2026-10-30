@@ -116,7 +116,7 @@ curl -fsS https://jithendar.com/moks/investigations/x | grep -q 'id="root"' && e
 curl -fsS https://jithendar.com/ | head -c 100                      # site unaffected
 ```
 
-In the browser: sign in, open **Overview → Check live health**, start an investigation and watch
+In the browser: sign in, open **Overview** (health loads by itself and refreshes every 5 seconds), start an investigation and watch
 it stream. Refresh the investigation page, which is a deep link. In **Connectors**, press **Test**
 on each connector.
 
@@ -194,10 +194,34 @@ The API's init container runs migration `0002` automatically. Take a backup firs
    `Authorization: Bearer <token>`.
 6. **Diagnostic sessions:** the chart creates `moks-diagnostics` (quota, limits, egress policy).
    Request sessions under **Diagnostics**; on mk4 (production) each needs an approval.
-7. **SRE skills:** 13 built-in skills are active. Add your own through `customSkills` in the values
+7. **SRE skills:** 14 built-in skills are active. Add your own through `customSkills` in the values
    ([SKILLS.md](SKILLS.md)).
 8. **Evaluation:** **Evaluation → Run lab** (rules mode) should score 1.0. Run it again in LLM mode
    after configuring a provider, to compare.
+9. **LLM:** the mk4 seed adds an active Bedrock model (`us.amazon.nova-2-lite-v1:0`). Run
+   `scripts/create-runtime-key.sh` once so the pods have AWS keys, then restart `moks-api` and
+   `moks-worker`. Until then, investigations and **Analyze with AI** fall back to rule-based reports
+   and the model call fails with a credentials error. Set its input and output prices under
+   **LLM providers** so FinOps can show cost as well as tokens.
+
+## Using the portal
+
+- **Overview** shows live health for every environment and refreshes every 5 seconds. Polling
+  pauses while the browser tab is hidden. Routine refreshes are not written to the audit log;
+  denials and errors are.
+- **Metrics, Logs and Kubernetes explorer** start from all environments and all namespaces you can
+  read, and each has its own filters. A source that fails shows up as "partial data" and the rest
+  of the view still loads.
+- **Audit log** filters by action, actor, decision, outcome, environment, namespace, time range,
+  resource and details text.
+- **Investigate** needs only a question and, optionally, a time window. MOKS uses an environment
+  named in the question, otherwise the default one (**default for investigations**), otherwise a
+  production one. It then narrows to the namespace from the namespace or workload names in the
+  question. Name the environment or namespace in the question when several could match.
+- **Adding an environment:** choose the cluster type and MOKS proposes its data sources (EKS:
+  EKS, CloudWatch Logs, AWS Cost Explorer; Minikube: this cluster, Prometheus, Loki, cost model).
+  Remove any, or add others from **Add data source**. Data sources are created after the environment; if
+  one fails, the message says which, and you add it under **Connectors**.
 
 ## Local development
 
@@ -260,5 +284,5 @@ image digest (step 4). Roll back data by restoring the backup.
 | Plan execution fails with "changed after review" | The Deployment changed (another rollout, HPA) after the plan was made; create a new plan |
 | Plan stays `queued` | `kubectl -n moks logs deploy/moks-executor`; the executor needs a RoleBinding in that namespace (`executor.namespaces`) |
 | Knowledge search empty | **Runbooks & knowledge → Sources**: last sync status/error; `kubectl -n moks logs deploy/moks-worker` |
-| OpenSearch pod restarting | Needs ~2 GiB; check node memory and `rag.opensearch.nodeName` pinning |
+| OpenSearch pod restarting | Needs ~2 GiB; check node memory and `rag.opensearch.nodeName` pinning. `AccessDeniedException` on `data/nodes`: set `rag.opensearch.fixVolumePermissions: true` |
 | SSE updates only arrive at the end | Something buffers the response: do not attach compress or buffering middleware to the MOKS router |

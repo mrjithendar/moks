@@ -172,6 +172,7 @@ class CostModelConnector:
         self.cpu_hour = config.get("cpu_hour_usd")
         self.gib_hour = config.get("gib_hour_usd")
         self.cpu_share = float(config.get("cpu_share", 0.5))
+        self.storage_gib_month = float(config.get("storage_gib_month_usd", 0) or 0)
         if self.monthly_cost is None and (self.cpu_hour is None or self.gib_hour is None):
             raise ConnectorError("config", "cost_model needs monthly_cost_usd, or both cpu_hour_usd and gib_hour_usd")
         if not 0 < self.cpu_share < 1:
@@ -227,24 +228,32 @@ def parse_mem(v: str | None) -> float:
 
 
 def fmt_mem(b: float) -> str:
+    """Whole Mi rounded up to 16 Mi (valid in patch_resources, which accepts integer quantities)."""
+    import math
+
     mi = b / 1024**2
-    return f"{int(round(mi / 16.0) * 16) or 16}Mi" if mi < 2048 else f"{round(mi / 1024, 1)}Gi"
+    return f"{max(16, int(math.ceil(mi / 16.0) * 16))}Mi"
 
 
 def fmt_cpu(c: float) -> str:
     return f"{max(10, int(round(c * 1000 / 10.0) * 10))}m"
 
 
-def allocate(workloads: list[dict], cpu_price: float, gib_price: float, hours: float) -> list[dict]:
-    """workloads: {namespace, workload, cpu_request, mem_request (bytes), cpu_avg, mem_avg (bytes)}.
-    Cost is charged on max(request, usage): requested capacity is reserved whether used or not."""
+def allocate(workloads: list[dict], cpu_price: float, gib_price: float, hours: float, storage_gib_month: float = 0.0) -> list[dict]:
+    """workloads: {namespace, workload, cpu_request, mem_request (bytes), cpu_avg, mem_avg (bytes), storage_bytes?}.
+    Cost is charged on max(request, usage): requested capacity is reserved whether used or not.
+    Each row carries cost per resource type (cpu, memory, storage)."""
     out = []
     for w in workloads:
         cpu_alloc = max(w["cpu_request"], w["cpu_avg"])
         mem_alloc = max(w["mem_request"], w["mem_avg"]) / 1024**3
-        cost = (cpu_alloc * cpu_price + mem_alloc * gib_price) * hours
+        cpu_cost = cpu_alloc * cpu_price * hours
+        mem_cost = mem_alloc * gib_price * hours
+        storage_cost = w.get("storage_bytes", 0) / 1024**3 * storage_gib_month * hours / 730.0
+        cost = cpu_cost + mem_cost + storage_cost
         idle = (max(0.0, w["cpu_request"] - w["cpu_avg"]) * cpu_price + max(0.0, (w["mem_request"] - w["mem_avg"]) / 1024**3) * gib_price) * hours
         out.append({**w, "cost": round(cost, 4), "idle_cost": round(idle, 4),
+                    "cost_by_resource": {"cpu": round(cpu_cost, 4), "memory": round(mem_cost, 4), "storage": round(storage_cost, 4)},
                     "cpu_efficiency": round(w["cpu_avg"] / w["cpu_request"], 3) if w["cpu_request"] else None,
                     "mem_efficiency": round(w["mem_avg"] / w["mem_request"], 3) if w["mem_request"] else None})
     out.sort(key=lambda r: r["cost"], reverse=True)

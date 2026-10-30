@@ -193,6 +193,14 @@ class KubernetesConnector:
         items, _ = await self._list(f"list pods in {namespace}", core.list_namespaced_pod, namespace)
         return items
 
+    async def pvcs(self, namespace: str) -> list[dict]:
+        core = await self.core()
+        items, _ = await self._list(f"list pvcs in {namespace}", core.list_namespaced_persistent_volume_claim, namespace)
+        return [{"name": i["metadata"]["name"], "storage_class": i["spec"].get("storageClassName"),
+                 "request": ((i["spec"].get("resources") or {}).get("requests") or {}).get("storage"),
+                 "capacity": (i.get("status") or {}).get("capacity", {}).get("storage"), "phase": (i.get("status") or {}).get("phase")}
+                for i in items]
+
     async def describe_pod(self, namespace: str, name: str) -> dict:
         core = await self.core()
         api = await self._client()
@@ -558,3 +566,38 @@ def eks_token(session, cluster: str, region: str) -> str:
          "body": {}, "headers": {"x-k8s-aws-id": cluster}, "context": {}},
         region_name=region, expires_in=60, operation_name="")
     return "k8s-aws-v1." + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+
+
+def eks_control_plane(cluster: str, region: str, role_arn: str | None = None, session=None) -> dict:
+    """Read-only EKS control-plane view: cluster, node groups, add-ons, Fargate profiles."""
+    import boto3
+
+    session = session or boto3.session.Session(region_name=region)
+    if role_arn:
+        c = session.client("sts").assume_role(RoleArn=role_arn, RoleSessionName="moks-eks-read", DurationSeconds=900)["Credentials"]
+        session = boto3.session.Session(aws_access_key_id=c["AccessKeyId"], aws_secret_access_key=c["SecretAccessKey"],
+                                        aws_session_token=c["SessionToken"], region_name=region)
+    eks = session.client("eks", region_name=region)
+    try:
+        cl = eks.describe_cluster(name=cluster)["cluster"]
+        ngs = [eks.describe_nodegroup(clusterName=cluster, nodegroupName=n)["nodegroup"] for n in eks.list_nodegroups(clusterName=cluster)["nodegroups"][:30]]
+        addons = [eks.describe_addon(clusterName=cluster, addonName=a)["addon"] for a in eks.list_addons(clusterName=cluster)["addons"][:40]]
+        fargate = eks.list_fargate_profiles(clusterName=cluster).get("fargateProfileNames", [])
+    except Exception as exc:
+        code = getattr(exc, "response", {}).get("Error", {}).get("Code", type(exc).__name__)
+        raise ConnectorError("forbidden" if "AccessDenied" in code else "unavailable", f"EKS API {code} for cluster {cluster}") from None
+    return {
+        "cluster": {"name": cl["name"], "version": cl.get("version"), "status": cl.get("status"), "platformVersion": cl.get("platformVersion"),
+                    "endpointPublic": (cl.get("resourcesVpcConfig") or {}).get("endpointPublicAccess"),
+                    "endpointPrivate": (cl.get("resourcesVpcConfig") or {}).get("endpointPrivateAccess"),
+                    "logging": [t for g in (cl.get("logging") or {}).get("clusterLogging", []) if g.get("enabled") for t in g.get("types", [])],
+                    "health_issues": (cl.get("health") or {}).get("issues", [])},
+        "nodegroups": [{"name": n["nodegroupName"], "status": n.get("status"), "version": n.get("version"), "releaseVersion": n.get("releaseVersion"),
+                        "capacityType": n.get("capacityType"), "instanceTypes": n.get("instanceTypes"), "scaling": n.get("scalingConfig"),
+                        "health_issues": [{"code": i.get("code"), "message": i.get("message")} for i in (n.get("health") or {}).get("issues", [])]}
+                       for n in ngs],
+        "addons": [{"name": a["addonName"], "version": a.get("addonVersion"), "status": a.get("status"),
+                    "health_issues": [{"code": i.get("code"), "message": i.get("message")} for i in (a.get("health") or {}).get("issues", [])]}
+                   for a in addons],
+        "fargate_profiles": fargate,
+    }

@@ -49,7 +49,11 @@ class PrometheusConnector:
 
     async def instant(self, promql: str, at: datetime) -> dict[str, Any]:
         data, warnings = await self._api("query", "/api/v1/query", {"query": promql, "time": at.timestamp()}, method="POST")
-        return {"resultType": data.get("resultType"), "series": _shape(data), "warnings": warnings}
+        out = {"resultType": data.get("resultType"), "series": _shape(data), "warnings": warnings}
+        if data.get("resultType") == "vector" and len(data.get("result") or []) > MAX_SERIES:
+            # Instant vectors are small per series; aggregation callers (FinOps) need all of them.
+            out["all_series"] = [{"metric": i.get("metric", {}), "value": [i["value"][0], _num(i["value"][1])]} for i in data["result"][:5000]]
+        return out
 
     async def range(self, promql: str, start: datetime, end: datetime, step_seconds: int) -> dict[str, Any]:
         if end <= start:

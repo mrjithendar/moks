@@ -57,6 +57,22 @@ Defects found and fixed during this round:
 - Evaluation environments leaked into environment pickers.
 - Policy denials returned 409 instead of 403.
 
+### Portal UX checks (headless Chrome, real API, simulated connectors)
+
+These ran the real backend and built frontend against PostgreSQL, with simulated Kubernetes,
+Prometheus and Loki connectors and two environments, one of them with a failing namespace. **They
+are not checks against mk4.** Results: 120 backend tests passed (4 skipped), 5 frontend tests passed,
+Helm lint clean.
+
+Driven in the browser: Overview polling every 5 s, all Explorer tabs and pod drawer, Metrics catalog
+and label filters, Logs filters and line details, Audit filters, FinOps by environment, creating an
+EKS environment with its data sources, editing a connector, and an investigation with no
+environment or namespace.
+
+Bugs this found and fixed: connector errors during fan-out collided on one database session; one
+unreadable namespace failed the whole FinOps report; the name field's validation pattern was invalid
+in current Chrome and was silently ignored.
+
 ## Coverage of the required areas
 
 | Area | Tests |

@@ -2,7 +2,7 @@
 name: cost-spike-finops
 description: "Investigate cost increases and waste: AWS anomalies and spend by service, Kubernetes idle cost and rightsizing."
 triggers:
-  keywords: [cost, costs, spend, spending, bill, billing, budget, finops, expensive, waste, idle, rightsizing, savings]
+  keywords: [finops, cost, costs, spend, spending, bill, billing, budget, finops, expensive, waste, idle, rightsizing, savings]
   findings: []
 steps:
   - tool: finops_aws_anomalies
@@ -14,10 +14,10 @@ steps:
   - tool: finops_budgets
     purpose: budgets at risk
   - tool: finops_k8s_allocation
-    args: {namespace: "{namespace}", days: 7}
+    args: {days: 7}
     purpose: cost and idle cost per workload
   - tool: finops_rightsizing
-    args: {namespace: "{namespace}", days: 7}
+    args: {days: 7}
     purpose: request changes with savings and OOM risk
 remediation:
   - when: cost

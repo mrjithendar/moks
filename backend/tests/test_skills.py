@@ -86,3 +86,42 @@ async def test_skills_api(client):
     assert any(s["name"] == "dns-resolution" for s in lst["skills"]) and lst["errors"] == []
     one = (await client.get("/moks/api/skills/dns-resolution")).json()
     assert one["steps"] and "CoreDNS" in one["body"]
+
+
+def test_config_audit_never_exposes_values_and_finds_risks():
+    from moks.diagnosis.config_audit import audit, findings_from
+
+    pod = {"metadata": {"name": "api-7d9f-x", "namespace": "shop", "labels": {"pod-template-hash": "7d9f"},
+                        "ownerReferences": [{"kind": "ReplicaSet", "name": "api-7d9f"}]},
+           "spec": {"containers": [{"name": "app", "image": "registry/api:latest",
+                                    "env": [{"name": "DB_PASSWORD", "value": "hunter2-literal"},
+                                            {"name": "MODE", "value": "prod"},
+                                            {"name": "TOKEN", "valueFrom": {"secretKeyRef": {"name": "api", "key": "token", "optional": True}}}],
+                                    "envFrom": [{"secretRef": {"name": "all-keys"}}, {"configMapRef": {"name": "api-config"}}],
+                                    "securityContext": {"privileged": True}}],
+                    "volumes": [{"name": "h", "hostPath": {"path": "/var/run"}}]}}
+    events = [{"type": "Warning", "reason": "Failed", "object": "Pod/api-7d9f-x",
+               "message": 'Error: couldn\'t find key DB_URL in ConfigMap shop/api-config', "lastSeen": "now"}]
+    r = audit([pod], events)
+    import json
+
+    assert "hunter2-literal" not in json.dumps(r)
+    kinds = {i["kind"] for i in r["workloads"][0]["issues"]}
+    assert {"plaintext_secret_env", "missing_requests", "missing_memory_limit", "missing_readiness_probe", "mutable_image_tag",
+            "privileged_container", "host_path_volume", "optional_secret_ref", "secret_envfrom"} <= kinds
+    assert r["workloads"][0]["workload"] == "Deployment/api" and r["workloads"][0]["references"]["secrets"] == ["all-keys", "api"]
+    assert r["missing_references"][0]["key"] == "DB_URL"
+    f = {x["kind"] for x in findings_from(r, "shop", "E1")}
+    assert {"config_ref_missing", "plaintext_secret_env", "privileged_container"} <= f and "optional_secret_ref" not in f  # low severity not promoted
+
+
+def test_rightsizing_suggestions_carry_valid_patch_parameters():
+    from moks.actions.catalog import PatchResourcesP
+    from moks.connectors.finops import fmt_mem, rightsize
+
+    assert fmt_mem(2.5 * 1024**3) == "2560Mi"  # integer Mi only: accepted by patch_resources
+    recs = rightsize([{"namespace": "shop", "workload": "Deployment/big", "container": "app", "replicas": 2, "cpu_request": 2.0, "cpu_limit": 0,
+                       "mem_request": 8 * 1024**3, "mem_limit": 8 * 1024**3, "cpu_p95": 0.2, "mem_max": 2.4 * 1024**3}], 0.04, 0.005)
+    rec = recs[0]["recommended"]
+    PatchResourcesP.model_validate({"container": "app", "requests": {"cpu": rec["cpu_request"], "memory": rec["mem_request"]},
+                                    "limits": {"memory": rec["mem_limit"]} if rec["mem_limit"] else {}})

@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, PageHead, StatusBadge, Time, useLoad } from "../components";
+import { Badge, ErrorBox, PageHead, StatusBadge, Time, useInterval, useLoad } from "../components";
+
+const REFRESH_MS = 5000;
 
 interface Conn { id: string; type: string; name: string; enabled: boolean; last_test_ok: boolean | null; last_test_at: string | null; last_test_message: string | null }
 interface EnvOverview { name: string; display_name: string; kind: string; is_production: boolean; active_investigations: number; connectors: Conn[]; grafana_url?: string | null }
@@ -11,9 +13,16 @@ export default function Overview() {
   const { me } = useAuth();
   const ov = useLoad(() => api<{ environments: EnvOverview[] }>("/overview"), []);
   const recent = useLoad(() => api<any[]>("/investigations?limit=8"), []);
+  const [live, setLive] = useState(true);
+  useInterval(() => {
+    if (!ov.loading) ov.reload();
+    if (!recent.loading) recent.reload();
+  }, REFRESH_MS, live);
   return (
     <>
-      <PageHead title="Overview" sub="Environment health, connector status and recent investigations" />
+      <PageHead title="Overview" sub="Live environment health, connector status and recent investigations">
+        <label className="inline"><input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} /> Refresh every 5 s</label>
+      </PageHead>
       <ErrorBox error={ov.error} />
       {me && !me.roles.length && (
         <div className="alert info" style={{ marginBottom: 14 }}>
@@ -21,7 +30,7 @@ export default function Overview() {
         </div>
       )}
       <div className="grid cols-2">
-        {ov.data?.environments.map((e) => <EnvCard key={e.name} env={e} />)}
+        {ov.data?.environments.map((e) => <EnvCard key={e.name} env={e} live={live} />)}
         {ov.data && !ov.data.environments.length && <div className="card empty">No environments are visible to you.</div>}
       </div>
       <div className="card" style={{ marginTop: 14 }}>
@@ -45,22 +54,25 @@ export default function Overview() {
   );
 }
 
-function EnvCard({ env }: { env: EnvOverview }) {
+function EnvCard({ env, live }: { env: EnvOverview; live: boolean }) {
   const [health, setHealth] = useState<any>();
   const [error, setError] = useState<unknown>();
-  const [busy, setBusy] = useState(false);
+  const inFlight = useRef(false);
 
   async function refresh() {
-    setBusy(true);
-    setError(null);
+    if (inFlight.current) return; // a slow cluster must not stack requests
+    inFlight.current = true;
     try {
       setHealth(await api(`/overview/${env.name}/health`));
+      setError(null);
     } catch (e) {
       setError(e);
     } finally {
-      setBusy(false);
+      inFlight.current = false;
     }
   }
+  useEffect(() => { refresh(); }, [env.name]); // eslint-disable-line react-hooks/exhaustive-deps
+  useInterval(refresh, REFRESH_MS, live);
 
   const firing = health?.alerts?.reduce((n: number, r: any) => n + r.active.filter((a: any) => a.state === "firing").length, 0) ?? null;
   const nodesReady = health?.nodes ? `${health.nodes.filter((n: any) => n.ready).length}/${health.nodes.length}` : null;
@@ -77,7 +89,7 @@ function EnvCard({ env }: { env: EnvOverview }) {
         </div>
         <div className="row">
           {env.grafana_url && <a href={env.grafana_url} target="_blank" rel="noreferrer noopener" className="small">Grafana ↗</a>}
-          <button className="ghost small" onClick={refresh} disabled={busy}>{busy ? "Checking…" : "Check live health"}</button>
+          {live && <span className="live-dot" title="Refreshes every 5 seconds">live</span>}
         </div>
       </div>
       <div>
@@ -94,6 +106,7 @@ function EnvCard({ env }: { env: EnvOverview }) {
         </div>
       </div>
       <ErrorBox error={error} />
+      {!health && !error && <div className="small muted">Checking live health…</div>}
       {health && (
         <div className="stack">
           <div className="row">

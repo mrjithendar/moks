@@ -91,6 +91,20 @@ async def k8s_triage(ctx: ToolContext, a: NamespaceArgs) -> ToolResult:
     }, {"api": f"GET pods, events, services, endpointslices, deployments, ingresses in namespace {a.namespace}"})
 
 
+async def k8s_config_audit(ctx: ToolContext, a: NamespaceArgs) -> ToolResult:
+    """Configuration hygiene from pod specs and events; Secret/ConfigMap contents are never read."""
+    from ..diagnosis.config_audit import audit
+
+    k = ctx.connector("kubernetes")
+    pods = await k.raw_pods(a.namespace)
+    events = await k.events(a.namespace, warnings_only=True, limit=100)
+    r = audit(pods, events)
+    high = sum(1 for w in r["workloads"] for i in w["issues"] if i["severity"] == "high")
+    return ToolResult(f"{len(r['workloads'])} workloads audited in {a.namespace}: {high} high-severity issues, "
+                      f"{len(r['missing_references'])} missing ConfigMap/Secret references; {r['issue_counts']}", r,
+                      {"api": f"GET pods and warning events in {a.namespace} (Secret/ConfigMap contents are not read)"})
+
+
 async def k8s_list_pods(ctx: ToolContext, a: ListPodsArgs) -> ToolResult:
     pods, truncated = await ctx.connector("kubernetes").list_pods(a.namespace, a.label_selector)
     if a.unhealthy_only:
@@ -309,6 +323,122 @@ async def _loki_run(ctx: ToolContext, logql: str, limit: int, minutes: int | Non
     return ToolResult(f"LogQL returned {n} {'lines' if r['resultType'] == 'streams' else 'series'}", r, {"query": logql})
 
 
+class LokiLogsArgs(ToolArgs):
+    namespace: str | None = Field(default=None, pattern=K8S_NAME, max_length=63, description="omit for every namespace you may read")
+    pod: str | None = Field(default=None, pattern=r"^[a-z0-9.*\-]{1,253}$")
+    container: str | None = Field(default=None, pattern=K8S_NAME)
+    contains: str | None = Field(default=None, max_length=200)
+    trace_id: str | None = Field(default=None, pattern=r"^[A-Fa-f0-9]{16,32}$")
+    request_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:-]{4,100}$")
+    level: Literal["error", "warn", "info", "debug"] | None = None
+    limit: int = Field(default=200, ge=1, le=500)
+    minutes: int | None = Field(default=None, ge=1, le=10080)
+
+
+LEVELS = {"error": "error|err|fatal|critical|panic", "warn": "warn|warning", "info": "info", "debug": "debug|trace"}
+
+
+async def loki_logs(ctx: ToolContext, a: LokiLogsArgs) -> ToolResult:
+    """Logs across every permitted namespace (or one), newest first, with detailed filters."""
+    loki = ctx.connector("loki")
+    start, end = ctx.window(a.minutes)
+    if a.namespace:
+        ctx.scope.require(a.namespace)
+        namespaces = [a.namespace]
+    else:
+        namespaces = [n for n in await loki.label_values(loki.namespace_label, start, end) if ctx.scope.allows(n)]
+    if not namespaces:
+        return ToolResult("no permitted namespaces have logs in this window", {"resultType": "streams", "lines": []}, {})
+    ns_re = "|".join(re.escape(n) for n in namespaces[:200])
+    matchers = [f'{loki.namespace_label}=~"^({logql_escape(ns_re)})$"']
+    if a.pod:
+        matchers.append(f'pod=~"{logql_escape(a.pod.replace("*", ".*"))}"')
+    if a.container:
+        matchers.append(f'container="{a.container}"')
+    labels = await loki.labels(start, end)
+    if a.level and "level" in labels:
+        matchers.append(f'level=~"(?i){LEVELS[a.level]}"')
+    q = "{" + ", ".join(matchers) + "}"
+    if a.level and "level" not in labels:
+        q += f' |~ "(?i)(level\\W{{0,3}}({LEVELS[a.level]})\\b)"'
+    if a.trace_id:
+        q += f' |= "{a.trace_id.lower()}"'
+    if a.request_id:
+        q += f' |= "{logql_escape(a.request_id)}"'
+    if a.contains:
+        q += f' |~ "(?i){logql_escape(re.escape(a.contains))}"'
+    r = await loki.query_range(q, start, end, limit=a.limit)
+    for row in r.get("lines", []):
+        row["line"] = redact(row["line"])
+    r["namespaces"] = namespaces
+    r["start"], r["end"] = start.isoformat(), end.isoformat()
+    return ToolResult(f"{len(r.get('lines', []))} log lines from {len(namespaces)} namespace(s)", r, {"query": q})
+
+
+# ---- Metric catalog and builder ----------------------------------------------------------------
+
+METRIC_NAME = r"^[a-zA-Z_:][a-zA-Z0-9_:]{0,200}$"
+LABEL_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,100}$")
+
+
+class MetricNamesArgs(ToolArgs):
+    search: str | None = Field(default=None, max_length=100, pattern=r"^[a-zA-Z0-9_:]*$")
+
+
+class MetricArgs(ToolArgs):
+    metric: str = Field(pattern=METRIC_NAME)
+    namespace: str | None = Field(default=None, pattern=K8S_NAME, max_length=63)
+    labels: dict[str, str] = Field(default_factory=dict, max_length=10, description="label -> exact value, or ~regex")
+    aggregate: Literal["none", "sum", "avg", "max", "min", "count"] = "sum"
+    by: list[str] = Field(default_factory=list, max_length=5)
+    rate: bool | None = Field(default=None, description="apply rate() over 5m; default: on for counters")
+    minutes: int | None = Field(default=None, ge=5, le=10080)
+
+
+async def prom_metric_names(ctx: ToolContext, a: MetricNamesArgs) -> ToolResult:
+    prom = ctx.connector("prometheus")
+    start, end = ctx.window(60)
+    names = await prom.label_values("__name__", None, start, end)
+    if a.search:
+        names = [n for n in names if a.search.lower() in n.lower()]
+    return ToolResult(f"{len(names)} metric names", {"names": names[:3000]}, {"api": "GET /api/v1/label/__name__/values"})
+
+
+def build_promql(a: MetricArgs) -> str:
+    matchers = []
+    if a.namespace:
+        matchers.append(f'namespace="{a.namespace}"')
+    for k, v in a.labels.items():
+        if not LABEL_NAME.match(k) or k == "namespace" and a.namespace:
+            raise ConnectorError("bad_request", f"invalid label {k!r}")
+        val = v[1:] if v.startswith("~") else v
+        op = "=~" if v.startswith("~") else "="
+        matchers.append(f'{k}{op}"{logql_escape(val)}"')
+    sel = a.metric + ("{" + ", ".join(matchers) + "}" if matchers else "")
+    counter = a.metric.endswith(("_total", "_count", "_sum", "_bucket"))
+    expr = f"rate({sel}[5m])" if (a.rate if a.rate is not None else counter) else sel
+    by = [b for b in a.by if LABEL_NAME.match(b)]
+    if a.aggregate != "none":
+        expr = f"{a.aggregate}{' by (' + ', '.join(by) + ')' if by else ''} ({expr})"
+    return expr
+
+
+async def prom_metric(ctx: ToolContext, a: MetricArgs) -> ToolResult:
+    """Chart a metric with label filters; without a namespace it needs environment-wide metric access."""
+    env = ctx.environment.name
+    if a.namespace:
+        ctx.scope.require(a.namespace)
+    elif not (ctx.principal.can(P.METRICS_RAW_QUERY, env, "*") and ctx.scope.cluster_wide):
+        raise ScopeError("choose a namespace: querying a metric across all namespaces needs metrics.raw_query for all namespaces")
+    q = build_promql(a)
+    prom = ctx.connector("prometheus")
+    start, end = ctx.window(a.minutes)
+    step = auto_step(start, end)
+    r = await prom.range(q, start, end, step)
+    r.update(step=step, start=start.isoformat(), end=end.isoformat())
+    return ToolResult(f"{a.metric}: {len(r['series'])} series", r, _range_link(prom, q, int((end - start).total_seconds() // 60)))
+
+
 async def loki_search(ctx: ToolContext, a: LokiSearchArgs) -> ToolResult:
     return await _loki_run(ctx, build_logql(a, ctx.connector("loki").namespace_label), a.limit, a.minutes)
 
@@ -331,6 +461,8 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("k8s_describe_pod", "Pod details: containers, images, resources, probes, state, last state, env names, events.", "kubernetes", PodArgs, k8s_describe_pod),
     ToolSpec("k8s_pod_logs", "Container logs (tail), optionally from the previous crashed instance.", "kubernetes", PodLogArgs, k8s_pod_logs),
     ToolSpec("k8s_events", "Kubernetes events in a namespace, optionally for one object.", "kubernetes", EventArgs, k8s_events),
+    ToolSpec("k8s_config_audit", "Configuration hygiene per workload: requests/limits, probes, image pinning, security context, literal secret-looking env vars, Secret/ConfigMap references and missing ones (contents never read).",
+             "kubernetes", NamespaceArgs, k8s_config_audit),
     ToolSpec("k8s_workloads", "Deployments, StatefulSets and DaemonSets with replica health and images.", "kubernetes", NamespaceArgs, k8s_workloads),
     ToolSpec("k8s_rollout_history", "Deployment revisions (ReplicaSets) with images and creation times.", "kubernetes", DeploymentArgs, k8s_rollout_history),
     ToolSpec("k8s_services", "Services with selectors, ports, ready endpoints and matching pods.", "kubernetes", NamespaceArgs, k8s_services),
@@ -347,6 +479,12 @@ TOOLS: list[ToolSpec] = [
              namespace_arg=None),
     ToolSpec("prom_targets", "Scrape targets that are down (cluster-scoped).", "prometheus", NoArgs, prom_targets, cluster_scoped=True, namespace_arg=None),
     ToolSpec("loki_search", "Search logs by namespace/pod/container, text, trace ID or request ID (builds LogQL).", "loki", LokiSearchArgs, loki_search),
+    ToolSpec("loki_logs", "Recent logs across every permitted namespace (or one) with pod/container/level/text/trace/request filters.",
+             "loki", LokiLogsArgs, loki_logs, namespace_arg=None),
+    ToolSpec("prom_metric_names", "Catalog of metric names in Prometheus (optionally filtered).", "prometheus", MetricNamesArgs, prom_metric_names,
+             namespace_arg=None),
+    ToolSpec("prom_metric", "Chart one metric with label filters, aggregation and rate (query built safely; exact PromQL returned).",
+             "prometheus", MetricArgs, prom_metric, namespace_arg=None),
     ToolSpec("loki_query", "Run a bounded LogQL query; selectors must pin a permitted namespace.", "loki", LokiQueryArgs, loki_query, namespace_arg=None),
 ]
 

@@ -19,6 +19,23 @@ spec:
       nodeSelector: {kubernetes.io/hostname: {{ . }}}
       {{- end }}
       securityContext: {fsGroup: 1000, runAsUser: 1000, runAsNonRoot: true}
+      {{- if .Values.rag.opensearch.fixVolumePermissions }}
+      # hostPath volumes (minikube) ignore fsGroup and arrive root-owned, so OpenSearch (uid 1000)
+      # cannot create data/nodes. Hand the volume to uid 1000 once; root here, but only CHOWN/FOWNER.
+      initContainers:
+        - name: volume-permissions
+          image: {{ .Values.rag.opensearch.image }}
+          # Not the real mount path: /usr/share/opensearch is closed to root without DAC_READ_SEARCH.
+          command: [sh, -c, "chown 1000:1000 /mnt/data"]
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL], add: [CHOWN, FOWNER]}
+          resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {cpu: 100m, memory: 64Mi}}
+          volumeMounts: [{name: data, mountPath: /mnt/data}]
+      {{- end }}
       containers:
         - name: opensearch
           image: {{ .Values.rag.opensearch.image }}

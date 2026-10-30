@@ -152,10 +152,15 @@ and `phase2.py`.
 | `k8s_ingresses` | kubernetes | `namespace`* (≤63) | `namespace` in scope | — |
 | `k8s_nodes` | kubernetes | — | environment-wide | — |
 | `k8s_dns_health` | kubernetes | — | environment-wide | — |
+| `k8s_config_audit` | kubernetes | `namespace`* (≤63) | `namespace` in scope | — |
+| `eks_cluster` | kubernetes | — | environment-wide | — |
 | `prom_query` | prometheus | `promql`* (≤2000), `mode` (default range), `minutes` | result filtering / query pinning | metrics.raw_query |
 | `prom_pod_resources` | prometheus | `namespace`* (≤63), `pod_regex` (≤200, default .+), `minutes` | `namespace` in scope | — |
 | `prom_alerts` | prometheus | `firing_only` (default True) | result filtering / query pinning | — |
 | `prom_targets` | prometheus | — | environment-wide | — |
+| `prom_metric_names` | prometheus | `search` (≤100) | result filtering / query pinning | — |
+| `prom_metric` | prometheus | `metric`*, `namespace` (≤63), `labels` (≤10), `aggregate` (default sum), `by` (≤5), `rate`, `minutes` | `namespace` in scope; without one, metrics.raw_query for all namespaces | — |
+| `loki_logs` | loki | `namespace` (≤63; omit for all permitted), `pod`, `container`, `contains`, `trace_id`, `request_id`, `level`, `limit` (≤500, default 200), `minutes` | `namespace` in scope, or filtered to permitted namespaces | — |
 | `loki_search` | loki | `namespace`* (≤63), `pod`, `container`, `contains`, `trace_id`, `request_id`, `errors_only` (default False), `limit` (≤500, default 100), `minutes` | `namespace` in scope | — |
 | `loki_query` | loki | `logql`* (≤2000), `limit` (≤500, default 100), `minutes` | result filtering / query pinning | — |
 | `grafana_dashboards` | grafana | `query`, `tag`, `limit` (≤100, default 20) | result filtering / query pinning | — |
@@ -173,8 +178,8 @@ and `phase2.py`.
 | `finops_aws_forecast` | aws_cost | `days` (≤90, default 30) | environment-wide | finops.read |
 | `finops_aws_anomalies` | aws_cost | `days` (≤90, default 30) | environment-wide | finops.read |
 | `finops_budgets` | aws_cost | — | environment-wide | finops.read |
-| `finops_k8s_allocation` | cost_model, kubernetes, prometheus | `namespace`* (≤63), `days` (≤30, default 7) | `namespace` in scope | finops.read |
-| `finops_rightsizing` | cost_model, kubernetes, prometheus | `namespace`* (≤63), `days` (≤30, default 7) | `namespace` in scope | finops.read |
+| `finops_k8s_allocation` | cost_model, kubernetes, prometheus | `namespace` (≤63; omit for all permitted), `days` (≤30, default 7) | `namespace` in scope | finops.read |
+| `finops_rightsizing` | cost_model, kubernetes, prometheus | `namespace` (≤63; omit for all permitted), `days` (≤30, default 7) | `namespace` in scope | finops.read |
 
 
 Each call produces an evidence row (`E<n>`) with the tool, validated arguments, scope, summary,

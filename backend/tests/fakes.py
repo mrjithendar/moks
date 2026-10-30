@@ -140,7 +140,7 @@ class FakeKubernetes:
         return []
 
     async def nodes(self):
-        return [{"name": "node-1", "ready": True, "pressure": [], "unschedulable": False, "taints": []}]
+        return [{"name": "node-1", "ready": True, "pressure": [], "unschedulable": False, "taints": [], "allocatable": {"cpu": "4", "memory": "8Gi", "pods": "110"}}]
 
     async def dns_health(self):
         return {"deployment": {}, "services": [], "pods": []}
