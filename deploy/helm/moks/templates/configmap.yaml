@@ -22,6 +22,15 @@ data:
   MOKS_MAX_QUERY_WINDOW_MINUTES: {{ .Values.config.maxQueryWindowMinutes | quote }}
   MOKS_WORKER_CONCURRENCY: {{ .Values.config.workerConcurrency | quote }}
   MOKS_COOKIE_SECURE: "true"
+  MOKS_RAG_BACKEND: {{ ternary "opensearch" "postgres" (eq .Values.rag.backend "opensearch") | quote }}
+  {{- if eq .Values.rag.backend "opensearch" }}
+  MOKS_OPENSEARCH_URL: "http://moks-opensearch:9200"
+  {{- end }}
+  MOKS_DIAGNOSTICS_NAMESPACE: {{ .Values.diagnostics.namespace | quote }}
+  MOKS_ALERT_POLL_SECONDS: {{ .Values.config.alertPollSeconds | quote }}
+  {{- if .Values.customSkills }}
+  MOKS_SKILLS_DIR: /etc/moks-skills
+  {{- end }}
   {{- with .Values.config.otelEndpoint }}
   OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
   {{- end }}
@@ -34,3 +43,15 @@ metadata:
 data:
   seed.yaml: |
 {{ toYaml .Values.seed | indent 4 }}
+{{- if .Values.customSkills }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moks-skills
+  labels: {{- include "moks.labels" . | nindent 4 }}
+data:
+  {{- range $name, $body := .Values.customSkills }}
+  {{ $name }}.skill.md: {{ $body | quote }}
+  {{- end }}
+{{- end }}

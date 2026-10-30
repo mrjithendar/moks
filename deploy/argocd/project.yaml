@@ -12,6 +12,10 @@ spec:
   destinations:
     - server: https://kubernetes.default.svc
       namespace: moks
+    - server: https://kubernetes.default.svc
+      namespace: moks-diagnostics      # diagnostic session namespace (chart-managed)
+    - server: https://kubernetes.default.svc
+      namespace: moks-lab              # executor RoleBinding; add every namespace listed in executor.namespaces
   clusterResourceWhitelist:
     - {group: "", kind: Namespace}
     - {group: rbac.authorization.k8s.io, kind: ClusterRole}
@@ -28,6 +32,8 @@ spec:
     - {group: policy, kind: PodDisruptionBudget}
     - {group: traefik.io, kind: Middleware}
     - {group: rbac.authorization.k8s.io, kind: Role}
+    - {group: "", kind: ResourceQuota}
+    - {group: "", kind: LimitRange}
     - {group: rbac.authorization.k8s.io, kind: RoleBinding}
   # Secrets are deliberately absent: they are created out of band (deploy/secrets) and Argo CD
   # can neither create nor prune them.

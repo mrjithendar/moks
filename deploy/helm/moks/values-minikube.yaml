@@ -37,6 +37,24 @@ seed:
         - type: loki
           name: loki
           config: {base_url: "http://loki.monitoring.svc.cluster.local:3100", timeout_seconds: 20}
+        - type: grafana
+          name: grafana
+          config: {base_url: "http://grafana.monitoring.svc.cluster.local/grafana", public_url: "https://jithendar.com/grafana", timeout_seconds: 15}
+          credential_ref: {type: env, name: MOKS_CRED_GRAFANA_TOKEN}   # Grafana service-account token (Viewer) in moks-secrets
+        - type: git
+          name: github
+          config: {provider: github, repositories: [mrjithendar/moks, mrjithendar/roboshop-ai, mrjithendar/tools, mrjithendar/jithendar.com]}
+        - type: cost_model
+          name: hetzner
+          config: {monthly_cost_usd: 0, cpu_share: 0.5, currency: USD}   # SET the server's real monthly price
+        # AWS spend (Cost Explorer, anomalies, budgets) using the moks-mk4-runtime keys (deploy/terraform):
+        # - type: aws_cost
+        #   name: aws
+        #   config: {cache_minutes: 60, max_requests_per_hour: 60}
+  knowledge_sources:
+    - name: moks-docs
+      type: github
+      config: {repository: mrjithendar/moks, include: ["docs/**", "lab/**", "backend/moks/skills/**"], sync_interval_minutes: 360}
 
 api:
   replicas: 2
@@ -54,7 +72,18 @@ postgres:
   fixVolumePermissions: true   # hostPath ignores fsGroup; chown the data dir to postgres (uid 70)
 
 rag:
-  backend: none         # Phase 2 sets opensearch (needs ~2.5 GiB) or pgvector
+  backend: opensearch   # ~2.5 GiB; mk4 nodes have ~32 GiB. Use "postgres" for keyword-only without extra pods.
+  opensearch:
+    storage: 20Gi
+    nodeName: mk4-m02   # hostPath volume: keep OpenSearch on the node holding its data
+
+executor:
+  enabled: true
+  namespaces: [moks-lab]   # add namespaces (e.g. roboshop-ai) only when you want MOKS to act there
+
+diagnostics:
+  enabled: true
+  namespace: moks-diagnostics
 
 networkPolicy:
   apiServer:

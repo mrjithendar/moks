@@ -44,6 +44,10 @@ volumes:
     emptyDir: {sizeLimit: 64Mi}
   - name: seed
     configMap: {name: moks-seed}
+  {{- if .Values.customSkills }}
+  - name: skills
+    configMap: {name: moks-skills}
+  {{- end }}
   {{- if .Values.credentialsSecret }}
   - name: credentials
     secret: {secretName: {{ .Values.credentialsSecret }}, defaultMode: 0400}
@@ -54,6 +58,9 @@ volumes:
 volumeMounts:
   - {name: tmp, mountPath: /tmp}
   - {name: seed, mountPath: /etc/moks, readOnly: true}
+  {{- if .Values.customSkills }}
+  - {name: skills, mountPath: /etc/moks-skills, readOnly: true}
+  {{- end }}
   {{- if .Values.credentialsSecret }}
   - {name: credentials, mountPath: /var/run/moks-credentials, readOnly: true}
   {{- end }}

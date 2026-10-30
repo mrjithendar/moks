@@ -1,0 +1,85 @@
+{{- if .Values.executor.enabled }}
+# The executor is the only MOKS component with write credentials: its own ServiceAccount, bound
+# per namespace (executor.namespaces) to exactly what the allowlisted actions need. The API and
+# worker ServiceAccount (moks) stays read-only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: moks-executor
+  labels: {{- include "moks.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: moks-executor
+  labels: {{- include "moks.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, update, patch]       # restart, scale, rollback, resources, reviewed patch
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [get, list]                             # rollback source and validation
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, patch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources: [pods, events]
+    verbs: [get, list]                             # rollout validation
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list]
+{{- range .Values.executor.namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: moks-executor
+  namespace: {{ . }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: moks-executor}
+subjects:
+  - {kind: ServiceAccount, name: moks-executor, namespace: {{ $.Release.Namespace }}}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moks-executor
+  labels: {{- include "moks.labels" . | nindent 4 }}
+    app.kubernetes.io/component: executor
+spec:
+  replicas: {{ .Values.executor.replicas }}
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: moks, component: executor}
+  template:
+    metadata:
+      labels: {app: moks, component: executor}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: moks-executor
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "moks.podSecurity" . | nindent 6 }}
+      terminationGracePeriodSeconds: 240     # let an in-flight action finish validating
+      containers:
+        - name: executor
+          image: {{ include "moks.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [executor]
+          ports: [{name: metrics, containerPort: 9464}]
+          {{- include "moks.env" . | nindent 10 }}
+          env:
+            - {name: MOKS_PROCESS_ROLE, value: executor}
+          {{- include "moks.containerSecurity" . | nindent 10 }}
+          {{- include "moks.volumeMounts" . | nindent 10 }}
+          livenessProbe: {tcpSocket: {port: metrics}, periodSeconds: 20, failureThreshold: 3}
+          resources: {{- toYaml .Values.executor.resources | nindent 12 }}
+      {{- include "moks.volumes" . | nindent 6 }}
+{{- end }}

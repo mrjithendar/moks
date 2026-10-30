@@ -29,6 +29,8 @@ config:
   maxQueryWindowMinutes: 360
   workerConcurrency: 2
   otelEndpoint: ""        # e.g. http://otel-collector.observability:4318
+  alertPollSeconds: 60    # Prometheus alert polling for environments with auto_investigate
+  # Alertmanager/Grafana webhook: put MOKS_ALERT_WEBHOOK_TOKEN in existingSecret (unset = webhook disabled)
 
 # Existing Secret with MOKS_DATABASE_URL, MOKS_SESSION_SECRET, MOKS_OIDC_CLIENT_SECRET and any
 # MOKS_CRED_* connector/LLM credentials. Never committed; see deploy/secrets/.
@@ -79,16 +81,37 @@ postgres:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {cpu: "1", memory: 1Gi}
   passwordSecret: moks-postgres   # key: password
+  uid: 70                         # 70 for postgres:*-alpine; 999 for Debian images such as pgvector/pgvector
   fixVolumePermissions: false     # true for storage that ignores fsGroup (minikube hostPath)
 
-# Phase 2 retrieval backend. Exactly one may be enabled; nothing uses it in Phase 1.
+# Retrieval (RAG) backend. Exactly one runs:
+#   postgres   - full-text search in the MOKS database (no extra pods; keyword-only)
+#   pgvector   - postgres + vectors: set postgres.image to pgvector/pgvector:0.8.7-pg17 and postgres.uid 999
+#                (fresh installs; moving an existing alpine database to the Debian image needs dump/restore)
+#   opensearch - single-node OpenSearch (BM25 + k-NN), ~2.5 GiB memory, persistent volume
 rag:
-  backend: none            # none | opensearch | pgvector
+  backend: postgres
   opensearch:
     image: opensearchproject/opensearch:3.9.0
     heapSize: 1g           # container limit = heap x 2
     storage: 20Gi
     nodeName: ""
+
+# Phase 3 executor: the only component with write access. It acts only in these namespaces
+# (one RoleBinding each, verbs limited to the allowlisted actions), plus diagnostics.namespace.
+executor:
+  enabled: true
+  replicas: 1
+  namespaces: []
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 384Mi}
+
+# Disposable diagnostic session pods (no service account token, quota, egress-only network policy).
+diagnostics:
+  enabled: true
+  namespace: moks-diagnostics
+  quota: {pods: "5", cpu: "1", memory: 1Gi}
 
 networkPolicy:
   enabled: true
@@ -118,3 +141,17 @@ ecrRefresh:
   enabled: false
   serviceAccount: ecr-refresh
   namespace: roboshop-ai
+
+# Extra SRE skills (SKILL.md content keyed by skill name), mounted at /etc/moks-skills and loaded
+# alongside the built-in ones; a custom skill with a built-in's name replaces it. Review like code:
+# skills are trusted instructions for the investigator (steps are still read-only and policy-checked).
+customSkills: {}
+#  checkout-runbook: |
+#    ---
+#    name: checkout-runbook
+#    description: "Checkout-specific triage: payment provider timeouts and cart service dependencies."
+#    triggers: {keywords: [checkout, payment], findings: []}
+#    steps:
+#      - {tool: loki_search, args: {namespace: "{namespace}", contains: "payment timeout", limit: 50}}
+#    ---
+#    # Checkout runbook ...

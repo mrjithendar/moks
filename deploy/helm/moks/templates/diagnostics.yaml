@@ -1,0 +1,69 @@
+{{- if and .Values.diagnostics.enabled .Values.executor.enabled }}
+{{- $ns := .Values.diagnostics.namespace }}
+# Diagnostic sessions: disposable pods with no service-account token, CPU/memory quota, and
+# egress-only networking that excludes cloud metadata and the Kubernetes API.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: moks
+    pod-security.kubernetes.io/enforce: baseline     # elevated (approved) sessions run as root without privileges
+    pod-security.kubernetes.io/warn: restricted
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata: {name: diagnostics, namespace: {{ $ns }}}
+spec:
+  hard:
+    pods: {{ .Values.diagnostics.quota.pods | quote }}
+    limits.cpu: {{ .Values.diagnostics.quota.cpu | quote }}
+    limits.memory: {{ .Values.diagnostics.quota.memory | quote }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata: {name: diagnostics, namespace: {{ $ns }}}
+spec:
+  limits:
+    - type: Container
+      max: {cpu: 500m, memory: 512Mi}
+      default: {cpu: 250m, memory: 128Mi}
+      defaultRequest: {cpu: 10m, memory: 32Mi}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: diagnostics, namespace: {{ $ns }}}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+              {{- range .Values.networkPolicy.apiServer.cidrs }}
+              - {{ . }}
+              {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: moks-diagnostics, namespace: {{ $ns }}}
+rules:
+  - {apiGroups: [""], resources: [pods], verbs: [create, get, list, delete]}
+  - {apiGroups: [""], resources: [pods/exec], verbs: [create, get]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: moks-diagnostics, namespace: {{ $ns }}}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: moks-diagnostics}
+subjects:
+  - {kind: ServiceAccount, name: moks-executor, namespace: {{ .Release.Namespace }}}
+{{- end }}

@@ -61,3 +61,33 @@ resource "aws_iam_user_policy" "cloudwatch" {
     ]
   })
 }
+
+resource "aws_iam_user_policy" "finops" {
+  count = var.runtime_user_enabled && var.finops_enabled ? 1 : 0
+  name  = "read-cost-and-budgets"
+  user  = aws_iam_user.runtime[0].name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Read-only; these APIs have no resource-level permissions.
+        Sid      = "CostExplorerRead"
+        Effect   = "Allow"
+        Action   = ["ce:GetCostAndUsage", "ce:GetCostForecast", "ce:GetAnomalies", "ce:GetAnomalyMonitors"]
+        Resource = "*"
+      },
+      {
+        Sid      = "BudgetsRead"
+        Effect   = "Allow"
+        Action   = ["budgets:ViewBudget"]
+        Resource = "arn:${local.partition}:budgets::${local.account_id}:budget/*"
+      },
+      {
+        Sid      = "WhoAmI"
+        Effect   = "Allow"
+        Action   = ["sts:GetCallerIdentity"]
+        Resource = "*"
+      },
+    ]
+  })
+}

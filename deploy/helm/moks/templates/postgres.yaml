@@ -22,14 +22,14 @@ spec:
       # hostPath volumes on minikube have no node affinity: a pod scheduled elsewhere sees an empty disk.
       nodeSelector: {kubernetes.io/hostname: {{ . }}}
       {{- end }}
-      securityContext: {runAsNonRoot: true, runAsUser: 70, runAsGroup: 70, fsGroup: 70, seccompProfile: {type: RuntimeDefault}}
+      securityContext: {runAsNonRoot: true, runAsUser: {{ .Values.postgres.uid }}, runAsGroup: {{ .Values.postgres.uid }}, fsGroup: {{ .Values.postgres.uid }}, seccompProfile: {type: RuntimeDefault}}
       {{- if .Values.postgres.fixVolumePermissions }}
       # hostPath volumes (minikube) ignore fsGroup and arrive root-owned, so postgres (uid 70) cannot
       # create PGDATA. Hand the volume to uid 70 once; root here, but only CHOWN/FOWNER.
       initContainers:
         - name: volume-permissions
           image: {{ .Values.postgres.image }}
-          command: [sh, -c, "chown 70:70 /var/lib/postgresql/data && chmod 0700 /var/lib/postgresql/data"]
+          command: [sh, -c, "chown {{ .Values.postgres.uid }}:{{ .Values.postgres.uid }} /var/lib/postgresql/data && chmod 0700 /var/lib/postgresql/data"]
           securityContext:
             runAsNonRoot: false
             runAsUser: 0

@@ -25,6 +25,10 @@ spec:
       ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
     - to: [{podSelector: {matchLabels: {app: moks-postgres}}}]
       ports: [{port: 5432, protocol: TCP}]
+    {{- if eq .Values.rag.backend "opensearch" }}
+    - to: [{podSelector: {matchLabels: {app: moks-opensearch}}}]
+      ports: [{port: 9200, protocol: TCP}]
+    {{- end }}
     {{- with .Values.networkPolicy.apiServer.cidrs }}
     - to:
         {{- range . }}

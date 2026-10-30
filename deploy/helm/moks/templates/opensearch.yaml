@@ -26,8 +26,10 @@ spec:
             - {name: discovery.type, value: single-node}
             - {name: OPENSEARCH_JAVA_OPTS, value: "-Xms{{ $heap }} -Xmx{{ $heap }}"}
             - {name: bootstrap.memory_lock, value: "false"}
-            - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
-              valueFrom: {secretKeyRef: {name: moks-opensearch, key: admin-password}}
+            - {name: node.store.allow_mmap, value: "false"}      # no vm.max_map_count tuning needed on the nodes
+            # Reachable only from MOKS pods (NetworkPolicy below); plain HTTP inside the namespace.
+            - {name: DISABLE_SECURITY_PLUGIN, value: "true"}
+            - {name: DISABLE_INSTALL_DEMO_CONFIG, value: "true"}
           ports: [{name: http, containerPort: 9200}]
           resources:
             requests: {cpu: 250m, memory: 2Gi}
@@ -48,6 +50,18 @@ metadata:
 spec:
   selector: {app: moks-opensearch}
   ports: [{name: http, port: 9200, targetPort: http}]
-{{- else if not (has .Values.rag.backend (list "none" "pgvector")) }}
-{{- fail "rag.backend must be none, opensearch or pgvector (only one vector backend at a time)" }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: moks-opensearch
+spec:
+  podSelector: {matchLabels: {app: moks-opensearch}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: moks}}}]
+      ports: [{port: 9200, protocol: TCP}]
+  egress: []
+{{- else if not (has .Values.rag.backend (list "postgres" "pgvector")) }}
+{{- fail "rag.backend must be postgres, pgvector or opensearch (only one backend at a time)" }}
 {{- end }}

@@ -108,3 +108,9 @@ variable "tags" {
   type    = map(string)
   default = {}
 }
+
+variable "finops_enabled" {
+  description = "Allow the runtime user to read Cost Explorer (costs, forecast, anomalies) and Budgets. Cost Explorer bills $0.01 per request; MOKS caches and caps requests."
+  type        = bool
+  default     = false
+}
