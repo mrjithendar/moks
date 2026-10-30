@@ -233,6 +233,10 @@ approval requirements, the requester's and executor's permissions, the approver'
 the target's identity. It commits an `intent` checkpoint, mutates once, reads the result back and
 commits `applied`. A heartbeat renews a 90-second lease.
 
+Every claim gets a unique token, and heartbeats, checkpoints and the final result are written only while the row holds that token in status `executing`. Leases are judged by database time. If a renewal is refused, or the database stays unreachable until the lease could have lapsed, the work is cancelled and writes nothing more, and `reconcile_stale` decides the outcome from the durable checkpoint. An `intent` with no confirmed result becomes `reconciliation_required`. Nothing is replayed.
+
+A database lease cannot atomically fence a request to the Kubernetes API: one sent just before the lease lapses can land after it. UID and resourceVersion preconditions limit such a request to the exact object version that was reviewed, and the checkpoint sends the plan to a person.
+
 ```
 pending -> approved -> queued -> executing -> succeeded
                                      |-> failed                     (definitely not applied, or validation failed)
@@ -280,6 +284,12 @@ cannot block a dedupe key. What happens next depends on the operation:
 
 A worker that loses its lease cancels its own run and cannot overwrite the new owner's result.
 
+Each type has a class with its own capacity, so a long reindex cannot delay detection: `detection` (`alert_poll`, `detection_tick`), `knowledge` (sync, reindex) and `maintenance` (the rest). Investigations are the `interactive` class, in their own table. `MOKS_WORKER_CLASSES` chooses what a worker runs and `MOKS_WORKER_CAPACITY` how many at once. mk4 runs them all in one pod; `worker.pools` gives each its own Deployment on EKS.
+
+Within a class, one environment holds at most `MOKS_JOB_ENVIRONMENT_LIMIT` running jobs. A class with `MOKS_JOB_QUEUE_LIMIT` jobs waiting refuses more: people get a 429, and scheduled work tries again on the next tick. On shutdown, knowledge and maintenance jobs hand themselves back at once, and detection and investigations finish within the grace period. Periodic scheduling and index cleanup run in their own task, so they cannot hold back claiming. PostgreSQL remains the only queue.
+
+Metrics: `moks_jobs_queued`, `moks_jobs_running`, `moks_jobs_oldest_age_seconds`, `moks_job_schedule_delay_seconds`, `moks_job_runtime_seconds`, `moks_job_retries_total`, `moks_jobs_abandoned_total`, `moks_jobs_rejected_total`.
+
 ## Investigations
 
 Causes have two tiers. **Verified** causes come only from detectors that observe the fault directly
@@ -299,6 +309,10 @@ becomes a `crash_log_reason` finding, quoted verbatim.
 OpenSearch and Pinecone offer the same index lifecycle: versioned indexes, a build beside the active one, and
 cleanup after the switch commits. Pinecone holds vectors only, so its keyword half is PostgreSQL full-text
 search. Either way the index is derived data and PostgreSQL stays the system of record.
+
+An external index is written only after commit. A document change adds a row to `index_outbox` in the same transaction, so a rollback can never remove valid content from search, and a crash replays rather than loses. Each event carries a per-document revision: an older one, or a replay, is dropped. Failures retry with backoff up to 8 times, then go `dead`. Dead events are visible in `/knowledge/status` (`outbox`) and go back in the queue through `POST /knowledge/outbox/retry`. `documents.content_revision` against `indexed_revision` shows what is behind, and a periodic pass requeues anything left behind with nothing pending.
+
+A reindex notes the outbox position, copies from PostgreSQL, then copies again every document changed since. It holds outbox inserts only for the final check and the switch in the database. The old index is retired after that commit, and cleanup of an abandoned build is limited to the job that owned it.
 
 ## Durability
 

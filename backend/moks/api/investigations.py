@@ -11,11 +11,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import audit, conversations
 from ..auth.deps import get_auth, require
+from ..auth.revocation import CHECK_SECONDS as STREAM_RECHECK_SECONDS
+from ..auth.sessions import COOKIE, load
 from ..auth.ratelimit import limiter
 from ..auth.sessions import AuthContext, client_ip
 from ..config import get_settings
@@ -162,6 +164,9 @@ async def start_investigation(body: CreateIn, request: Request, ctx: AuthContext
     """conversation_id is never taken from a request body: callers have checked the person may post there."""
     s = get_settings()
     limiter.check(f"inv:{ctx.user.id}", s.rate_investigations_per_minute)
+    queued = (await db.execute(select(func.count()).select_from(Investigation).where(Investigation.status == "queued"))).scalar_one()
+    if queued >= s.investigation_queue_limit:
+        raise HTTPException(429, "Too many investigations are waiting; try again shortly", headers={"Retry-After": "30"})
     env, ns, why_env = await resolve_scope(db, ctx, body.question, body.environment, body.namespace)
     body = body.model_copy(update={"environment": env.name, "namespace": ns})
     # "*" (all namespaces) is matched literally: only bindings whose namespace pattern is "*" allow it.
@@ -284,7 +289,9 @@ async def cancel(inv_id: uuid.UUID, request: Request, ctx: AuthContext = Depends
 async def events(inv_id: uuid.UUID, request: Request, after: int = -1, ctx: AuthContext = Depends(get_auth),
                  db: AsyncSession = Depends(get_db, scope="function")) -> StreamingResponse:
     """Server-Sent Events. Resumable with Last-Event-ID; bounded to 10 minutes per connection."""
-    await _load_visible(request, db, ctx, inv_id)
+    inv, env = await _load_visible(request, db, ctx, inv_id)
+    env_name, namespace = env.name, inv.namespace
+    cookie = request.cookies.get(COOKIE)
     await db.commit()  # release the pooled connection; the stream uses short sessions
     last = request.headers.get("last-event-id")
     cursor = int(last) if last and last.lstrip("-").isdigit() else after
@@ -293,10 +300,19 @@ async def events(inv_id: uuid.UUID, request: Request, after: int = -1, ctx: Auth
         nonlocal cursor
         deadline = asyncio.get_running_loop().time() + 600
         idle = 0
+        checked = asyncio.get_running_loop().time()
         yield "retry: 2000\n\n"
         while asyncio.get_running_loop().time() < deadline:
             if await request.is_disconnected():
                 return
+            if asyncio.get_running_loop().time() - checked >= STREAM_RECHECK_SECONDS:
+                checked = asyncio.get_running_loop().time()
+                async with session_scope() as s:
+                    current = await load(s, cookie)  # the session and today's roles, not the ones at connect
+                    allowed = current is not None and current.principal.can(P.INVESTIGATION_READ, env_name, namespace)
+                if not allowed:
+                    yield "event: revoked\ndata: {}\n\n"
+                    return
             async with session_scope() as s:
                 rows = (await s.execute(select(InvestigationEvent).where(
                     InvestigationEvent.investigation_id == inv_id, InvestigationEvent.seq > cursor
@@ -313,7 +329,7 @@ async def events(inv_id: uuid.UUID, request: Request, after: int = -1, ctx: Auth
                 idle += 1
                 if idle % 30 == 0:
                     yield ": keep-alive\n\n"
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(min(0.5, STREAM_RECHECK_SECONDS))
             else:
                 idle = 0
         yield "event: timeout\ndata: {}\n\n"

@@ -92,6 +92,7 @@ async def _doc(sid, text="# Runbook\nrestart the thing"):
     async with session_scope() as db:
         src = await db.get(KnowledgeSource, sid)
         await service.index_document(db, src, f"{uuid.uuid4().hex}.md", text, revision=None, url=None)
+    await service.drain_outbox()
 
 
 async def _active():

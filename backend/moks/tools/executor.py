@@ -147,6 +147,8 @@ class ToolExecutor:
 
     async def run(self, tool: str, args: dict[str, Any] | None) -> ToolOutcome:
         args = args if isinstance(args, dict) else {}
+        if self.ctx.guard is not None:
+            await self.ctx.guard.check()  # raises AccessRevoked, which ends the whole investigation
         spec = REGISTRY.get(tool)
         if spec is None:
             return await self._deny(tool, args, f"unknown tool {tool!r}", "unknown_tool")

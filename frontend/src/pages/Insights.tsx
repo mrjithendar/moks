@@ -2,8 +2,9 @@ import { useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, apiForm, qs } from "../api";
 import { useAuth } from "../auth";
-import { Badge, type Env, ErrorBox, LineChart, PageHead, Stat, Time, useInterval, useLoad } from "../components";
+import { Badge, type Env, ErrorBox, LineChart, PageHead, Stat, Time, useInterval, useLoad, rowAction } from "../components";
 import { PlanForm } from "./Ops";
+import { useFeedback } from "../ui";
 
 // ---- Knowledge ----------------------------------------------------------------------------------
 
@@ -22,7 +23,7 @@ export function Knowledge() {
     <>
       <PageHead title="Runbooks & knowledge" sub={status.data ? `${status.data.backend} index ${status.data.index?.name ?? "(not built yet)"} · ${status.data.index?.model ?? ""} · ${status.data.chunks} passages` : ""} />
       <form className="card row" onSubmit={search}>
-        <input style={{ flex: 1 }} value={q} onChange={(e) => setQ(e.target.value)} placeholder="e.g. checkout 502 runbook, redis failover, rollback procedure" />
+        <input aria-label="Search knowledge" style={{ flex: 1 }} value={q} onChange={(e) => setQ(e.target.value)} placeholder="e.g. checkout 502 runbook, redis failover, rollback procedure" />
         <button disabled={q.length < 2}>Search</button>
       </form>
       <ErrorBox error={error} />
@@ -64,6 +65,7 @@ function SyncState({ s }: { s: any }) {
 }
 
 function KnowledgeSources({ onChange }: { onChange: () => void }) {
+  const { confirm: ask, toast } = useFeedback();
   const { can } = useAuth();
   const list = useLoad(() => api<any[]>("/knowledge/sources"), []);
   useInterval(() => { if (!list.loading && list.data?.some((s) => s.sync_state !== "idle")) list.reload(); }, 3000);
@@ -100,12 +102,12 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
   async function upload(id: string, file: File) {
     const form = new FormData();
     form.append("file", file);
-    try { const r = await apiForm(`/knowledge/sources/${id}/upload`, form); alert(r.status === "excluded" ? `Excluded: ${r.excluded_reason}` : `Indexed ${r.path}`); list.reload(); onChange(); }
+    try { const r = await apiForm(`/knowledge/sources/${id}/upload`, form); toast(r.status === "excluded" ? `Excluded: ${r.excluded_reason}` : `Indexed ${r.path}`); list.reload(); onChange(); }
     catch (err) { setError(err); }
   }
   return (
     <div className="card stack" style={{ marginTop: 14 }}>
-      <div className="row between"><h2>Sources</h2>{can("admin.llm") && <button className="ghost small" onClick={() => api("/knowledge/reindex", { method: "POST" }).then(() => alert("Reindex queued"))}>Rebuild index (embedding change)</button>}</div>
+      <div className="row between"><h2>Sources</h2>{can("admin.llm") && <button className="ghost small" onClick={() => api("/knowledge/reindex", { method: "POST" }).then(() => toast("Reindex queued"), (e) => toast(e.message, "bad"))}>Rebuild index (embedding change)</button>}</div>
       <table>
         <thead><tr><th>Source</th><th>Scope</th><th>Documents</th><th>Sync</th><th>Schedule</th><th /></tr></thead>
         <tbody>{list.data?.map((s) => (
@@ -126,7 +128,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
               {s.type === "upload" && <label className="btn small" style={{ cursor: "pointer" }}>Upload<input type="file" hidden accept=".md,.txt,.yaml,.yml,.json,.rst,.adoc,.sh,.py,.tf"
                 onChange={(e) => e.target.files?.[0] && upload(s.id, e.target.files[0])} /></label>}
               <button className="ghost small" onClick={() => startEdit(s)}>Edit</button>
-              <button className="ghost small" onClick={() => confirm(`Delete ${s.name} and remove its documents from search?`) && api(`/knowledge/sources/${s.id}`, { method: "DELETE" }).then(list.reload)}>Delete</button>
+              <button className="ghost small" onClick={async () => { if (await ask({ title: `Delete ${s.name}?`, body: "This removes its documents from search.", action: "Delete source", danger: true })) api(`/knowledge/sources/${s.id}`, { method: "DELETE" }).then(list.reload); }}>Delete</button>
             </td>
           </tr>
         ))}</tbody>
@@ -369,7 +371,7 @@ export function Evals() {
   return (
     <>
       <PageHead title="Evaluation" sub="Replay recorded incidents through the real orchestrator and score the reports">
-        <select value={mode} onChange={(e) => setMode(e.target.value)}><option value="rules">rules only</option><option value="llm">with the active LLM</option></select>
+        <select aria-label="Evaluation mode" value={mode} onChange={(e) => setMode(e.target.value)}><option value="rules">rules only</option><option value="llm">with the active LLM</option></select>
         {ds.data?.map((d) => <button key={d.name} onClick={() => api("/evals/runs", { method: "POST", body: { dataset: d.name, mode } }).then(() => setTimeout(runs.reload, 2000))}>Run {d.name} ({d.cases})</button>)}
         <button className="ghost" onClick={runs.reload}>Refresh</button>
       </PageHead>
@@ -418,7 +420,7 @@ export function Skills() {
       </div>
       <div className="grid" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(0, 3fr)", alignItems: "start" }}>
         <div className="card"><table><tbody>{rows.map((s: any) => (
-          <tr key={s.name} className="clickable" onClick={() => setOpen(s.name)}>
+          <tr key={s.name} className="clickable" {...rowAction(() => setOpen(s.name))}>
             <td><strong>{s.title}</strong> <Badge>{s.category}</Badge> <span className="small muted">v{s.version}</span> {s.source === "custom" && <Badge kind="info">custom</Badge>} {!s.enabled && <Badge kind="warn">off</Badge>}
               {s.detection_rules.length > 0 && <Badge kind="info">{s.detection_rules.length} detection</Badge>}
               <div className="small muted">{s.description}</div>

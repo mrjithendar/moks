@@ -20,6 +20,9 @@ COPY backend/ ./
 RUN pip install --prefix=/install --no-deps .
 
 FROM python:3.12-slim
+ARG GIT_COMMIT=dev
+LABEL org.opencontainers.image.revision=$GIT_COMMIT
+ENV MOKS_BUILD_COMMIT=$GIT_COMMIT
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     MOKS_STATIC_DIR=/app/static MOKS_CREDENTIALS_DIR=/var/run/moks-credentials
 RUN groupadd --gid 10001 moks && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin moks

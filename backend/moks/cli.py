@@ -1,6 +1,8 @@
 """moks command line.
 
   moks migrate                       apply database migrations (advisory-locked; safe from many pods)
+  moks db-grants                     create per-component database roles and apply their grants
+  moks wait-schema                   wait until the database schema is ready for this image
   moks seed FILE [--upsert]          create environments/connectors/LLM configs from YAML
   moks serve                         run the API (uvicorn)
   moks worker                        run the investigation worker
@@ -53,6 +55,64 @@ def migrate() -> None:
 
     asyncio.run(locked(lambda: command.upgrade(_alembic_config(), "head")))
     print("migrations applied")
+
+
+def db_grants() -> None:
+    """Create the per-component roles and apply their grants. Run by the migration owner."""
+    import asyncpg
+
+    from . import db_roles
+    from .config import get_settings
+
+    url = get_settings().database_url.replace("postgresql+asyncpg://", "postgresql://")
+
+    async def run():
+        conn = await asyncpg.connect(url)
+        try:
+            return await db_roles.apply(conn, await conn.fetchval("SELECT current_database()"))
+        finally:
+            await conn.close()
+
+    changed = asyncio.run(run())
+    print(f"grants applied; passwords set for: {', '.join(changed) or 'none'}")
+
+
+def wait_schema(timeout: int = 300) -> None:
+    """Runtime pods hold no schema rights. They wait until the database is at least what they need.
+    A revision this image does not know is newer, which expand/contract migrations allow."""
+    import time
+
+    import asyncpg
+    from alembic.script import ScriptDirectory
+
+    from .config import get_settings
+
+    script = ScriptDirectory.from_config(_alembic_config())
+    known, head = {r.revision for r in script.walk_revisions()}, script.get_current_head()
+    order = [r.revision for r in script.walk_revisions()]
+    url = get_settings().database_url.replace("postgresql+asyncpg://", "postgresql://")
+
+    async def current():
+        conn = await asyncpg.connect(url)
+        try:
+            return await conn.fetchval("SELECT version_num FROM alembic_version")
+        finally:
+            await conn.close()
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            at = asyncio.run(current())
+        except Exception as exc:
+            at, reason = None, type(exc).__name__
+        else:
+            reason = "no version yet"
+        if at and (at not in known or order.index(at) <= order.index(head)):
+            print(f"schema ready at {at}")
+            return
+        if time.monotonic() > deadline:
+            raise SystemExit(f"the schema did not reach {head} within {timeout}s (at {at or reason})")
+        time.sleep(3)
 
 
 async def _seed(path: str, upsert: bool) -> None:
@@ -254,7 +314,7 @@ async def _reindex() -> None:
         print(await service.reindex(db))
 
 
-async def _backup_run(dump: str) -> None:
+async def _backup_run(dump: str, manifest_path: str | None = None) -> None:
     from datetime import datetime, timezone
 
     from sqlalchemy import text
@@ -274,13 +334,18 @@ async def _backup_run(dump: str) -> None:
         if not bucket:
             raise backup.BackupError("MOKS_BACKUP_BUCKET is not set")
         key = backup.load_key()
+        if Path(dump + ".failed").exists():
+            raise backup.BackupError("pg_dump failed")
         async with session_scope() as db:
-            counts = await backup.table_counts(db)
             size = (await db.execute(text("SELECT pg_database_size(current_database())"))).scalar_one()
-            version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
+            if not manifest_path:  # read after the dump, so only good enough for manual runs
+                counts = await backup.table_counts(db)
+                version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
+        snapshot: dict[str, Any] = {"tables": counts, "migration": version, "counts_source": "live"} if not manifest_path else {**json.loads(Path(manifest_path).read_text()), "counts_source": "snapshot"}
+        counts = snapshot["tables"]
         retention = backup.Retention(int(env.get("MOKS_BACKUP_KEEP_HOURLY", 48)), int(env.get("MOKS_BACKUP_KEEP_DAILY", 30)), int(env.get("MOKS_BACKUP_KEEP_MONTHLY", 12)))
         store = backup.Store(bucket, env.get("MOKS_BACKUP_ENDPOINT"), env.get("MOKS_BACKUP_REGION"))
-        result = backup.publish(Path(dump), store, env.get("MOKS_BACKUP_PREFIX", "moks"), key, {"tables": counts, "database_bytes": size, "migration": version}, started, retention)
+        result = backup.publish(Path(dump), store, env.get("MOKS_BACKUP_PREFIX", "moks"), key, {**snapshot, "database_bytes": size}, started, retention)
     except Exception as exc:
         error = f"{type(exc).__name__}: {str(exc)[:500]}"
     async with session_scope() as db:
@@ -309,9 +374,31 @@ async def _backup_compare() -> None:
     """URLs come from the environment so passwords never appear in a process list."""
     from . import backup
 
-    result = backup.compare_counts(await _table_counts_at(os.environ["MOKS_COMPARE_SOURCE_URL"]), await _table_counts_at(os.environ["MOKS_COMPARE_TARGET_URL"]))
-    print(json.dumps(result, indent=1))
-    if not result["ok"]:
+    drift = backup.live_drift(await _table_counts_at(os.environ["MOKS_COMPARE_SOURCE_URL"]), await _table_counts_at(os.environ["MOKS_COMPARE_TARGET_URL"]))
+    print(json.dumps({"note": "drift from a live source is expected; `moks backup drill` proves integrity", "drift": drift}, indent=1))
+
+
+async def _backup_drill(key: str | None) -> None:
+    """URLs come from the environment. MOKS_DRILL_ADMIN_URL needs CREATE DATABASE on a server the
+    application is not using, or at least a maintenance database that is not the live one."""
+    import tempfile
+
+    from . import backup
+    from .config import get_settings
+
+    env = os.environ
+    store = backup.Store(env["MOKS_BACKUP_BUCKET"], env.get("MOKS_BACKUP_ENDPOINT"), env.get("MOKS_BACKUP_REGION"))
+    if key is None:
+        prefix = env.get("MOKS_BACKUP_PREFIX", "moks").strip("/")
+        found = sorted(k for k in store.keys(f"{prefix}/hourly/") if k.endswith(".dump.enc"))
+        if not found:
+            raise SystemExit("no backups found")
+        key = found[-1]
+    live = get_settings().database_url.rsplit("/", 1)[-1].split("?")[0]
+    with tempfile.TemporaryDirectory() as work:
+        report = await backup.restore_drill(store, key, backup.load_key(), env["MOKS_DRILL_ADMIN_URL"], live, Path(work))
+    print(json.dumps(report, indent=1, default=str))
+    if not report["ok"]:
         raise SystemExit(1)
 
 
@@ -338,6 +425,8 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="moks")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("migrate")
+    sub.add_parser("db-grants")
+    sub.add_parser("wait-schema")
     sp = sub.add_parser("seed")
     sp.add_argument("file")
     sp.add_argument("--upsert", action="store_true", help="overwrite existing rows with the file's values")
@@ -361,14 +450,21 @@ def main(argv: list[str] | None = None) -> None:
     bk = sub.add_parser("backup").add_subparsers(dest="backup_cmd", required=True)
     br = bk.add_parser("run", help="encrypt a pg_dump file, upload it, verify the copy and apply retention")
     br.add_argument("--dump", required=True)
+    br.add_argument("--manifest", help="the manifest written with the dump, from the same snapshot")
     bf = bk.add_parser("fetch", help="download and decrypt a backup (default: the newest)")
     bf.add_argument("--key")
     bf.add_argument("--out", required=True)
-    bk.add_parser("compare", help="compare row counts of MOKS_COMPARE_SOURCE_URL and MOKS_COMPARE_TARGET_URL")
+    bk.add_parser("compare", help="report drift between MOKS_COMPARE_SOURCE_URL and MOKS_COMPARE_TARGET_URL")
+    bd = bk.add_parser("drill", help="restore a backup into a new isolated database, prove it, drop it")
+    bd.add_argument("--key")
     a = p.parse_args(argv)
 
     if a.cmd == "migrate":
         migrate()
+    elif a.cmd == "db-grants":
+        db_grants()
+    elif a.cmd == "wait-schema":
+        wait_schema()
     elif a.cmd == "seed":
         if a.if_present and not Path(a.file).exists():
             print(f"{a.file} not present; nothing to seed")
@@ -397,7 +493,9 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_reindex())
     elif a.cmd == "backup":
         if a.backup_cmd == "run":
-            asyncio.run(_backup_run(a.dump))
+            asyncio.run(_backup_run(a.dump, a.manifest))
+        elif a.backup_cmd == "drill":
+            asyncio.run(_backup_drill(a.key))
         elif a.backup_cmd == "fetch":
             _backup_fetch(a.key, a.out)
         else:

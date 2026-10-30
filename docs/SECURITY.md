@@ -91,6 +91,18 @@ call, including calls planned by the LLM) and the worker, which re-loads the req
   stay in the provider adapter's request header.
 - See `tests/test_investigations.py::test_prompt_injection_cannot_widen_tools_or_scope`.
 
+## Revoking access during running work
+
+Roles are not trusted from when work started. Triggers maintain `users.auth_version` and `environments.policy_version`, so no write path can forget them. A running investigation compares them before every tool call, before every LLM request, and every 5 seconds. Open event streams recheck the session and role every 5 seconds, then send `revoked` and close.
+
+**Maximum delay:** 5 seconds for running work, and none for a new tool call or LLM request. Conversation history sent to a model leaves out turns the person can no longer read.
+
+Revocation cannot recall what has left: a prompt already sent to an LLM provider, or a query already at Prometheus, stays sent. A revoked investigation stores no partial report.
+
+## LLM budgets
+
+Every call, including embeddings, reserves its worst-case cost before it runs (`moks/llm/budget.py`), inside a lock per provider. The day is the UTC calendar day. A budget of 0 stops paid use; free models still run until any spend exists. Each provider also has `max_concurrency`, and `MOKS_LLM_USER_DAILY_BUDGET_USD` and `MOKS_LLM_INVESTIGATION_BUDGET_USD` add limits per person and per investigation. A call with an unknown outcome stays counted at its estimate for that day. `llm_usage` records estimated and actual cost.
+
 ## Secrets
 
 - Connector and LLM rows store **references**: `{"type":"env","name":"MOKS_CRED_..."}` (only that

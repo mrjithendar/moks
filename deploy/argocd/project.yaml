@@ -16,6 +16,8 @@ spec:
       namespace: moks-diagnostics      # diagnostic session namespace (chart-managed)
     - server: https://kubernetes.default.svc
       namespace: moks-lab              # executor RoleBinding; add every namespace listed in executor.namespaces
+    - server: https://kubernetes.default.svc
+      namespace: velero                # Roles for MOKS to use Velero, when velero.enabled is true
   clusterResourceWhitelist:
     - {group: "", kind: Namespace}
     - {group: rbac.authorization.k8s.io, kind: ClusterRole}
@@ -35,6 +37,7 @@ spec:
     - {group: "", kind: ResourceQuota}
     - {group: "", kind: LimitRange}
     - {group: batch, kind: CronJob}
+    - {group: batch, kind: Job}        # moks-migrate, when secrets.split is true
     - {group: rbac.authorization.k8s.io, kind: RoleBinding}
   # Secrets are deliberately absent: they are created out of band (deploy/secrets) and Argo CD
   # can neither create nor prune them.

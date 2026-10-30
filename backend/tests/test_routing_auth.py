@@ -142,3 +142,21 @@ def test_database_dependency_commits_before_the_response():
     root = pathlib.Path(__file__).resolve().parents[1] / "moks"
     offenders = [str(p) for p in root.rglob("*.py") if re.search(r"Depends\(get_db\)", p.read_text())]
     assert offenders == []
+
+
+async def test_health_reports_the_build_and_mixed_versions_are_detected(client):
+    from moks import versions
+    from moks.db import session_scope
+    from sqlalchemy import text
+    from tests.conftest import make_user
+
+    assert (await client.get("/moks/api/health")).json()["commit"] == "dev"
+    await make_user("ver@example.com", ["viewer"])
+    await login(client, "ver@example.com")
+    async with session_scope() as db:
+        await db.execute(text("DELETE FROM component_versions"))
+    await versions.report("worker")
+    assert (await client.get("/moks/api/system/versions")).json()["mixed"] is False
+    async with session_scope() as db:
+        await db.execute(text("INSERT INTO component_versions (instance, component, commit_sha, version) VALUES ('executor:old', 'executor', 'abc', '0.1.0')"))
+    assert (await client.get("/moks/api/system/versions")).json()["mixed"] is True

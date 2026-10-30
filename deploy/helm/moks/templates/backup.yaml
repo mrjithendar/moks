@@ -1,4 +1,13 @@
 {{- if and .Values.backup.enabled .Values.postgres.bundled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moks-backup-scripts
+  labels: {{- include "moks.labels" . | nindent 4 }}
+data:
+  consistent-dump.sql: |
+{{ .Files.Get "files/consistent-dump.sql" | indent 4 }}
+---
 # Off-cluster backups. The init container dumps with the PostgreSQL image; the main container uses
 # the MOKS image to encrypt, upload, verify the stored copy and apply retention. Credentials come
 # from the moks-backup Secret, created out of band.
@@ -24,6 +33,9 @@ spec:
         spec:
           restartPolicy: Never
           automountServiceAccountToken: false
+          {{- if .Values.secrets.split }}
+          serviceAccountName: moks-backup
+          {{- end }}
           enableServiceLinks: false
           {{- with .Values.imagePullSecrets }}
           imagePullSecrets: {{- toYaml . | nindent 12 }}
@@ -32,26 +44,36 @@ spec:
           initContainers:
             - name: dump
               image: {{ .Values.postgres.image }}
-              command: [sh, -c, "pg_dump -h moks-postgres -U moks -d moks --format=custom --compress=6 --file=/work/moks.dump"]
+              command: [sh, -c, 'psql -X -v manifest=/work/manifest.json -f /scripts/consistent-dump.sql && test ! -e /work/moks.dump.failed && test -s /work/moks.dump']
               env:
+                - {name: PGHOST, value: moks-postgres}
+                - {name: PGUSER, value: {{ if .Values.secrets.split }}moks_backup{{ else }}moks{{ end }}}
+                - {name: PGDATABASE, value: moks}
+                - {name: MOKS_DUMP_FILE, value: /work/moks.dump}
                 - name: PGPASSWORD
+                  {{- if .Values.secrets.split }}
+                  valueFrom: {secretKeyRef: {name: {{ .Values.backup.secret }}, key: PGPASSWORD}}
+                  {{- else }}
                   valueFrom: {secretKeyRef: {name: {{ .Values.postgres.passwordSecret }}, key: password}}
+                  {{- end }}
               securityContext:
                 runAsUser: {{ .Values.postgres.uid }}
                 runAsGroup: {{ .Values.postgres.uid }}
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
                 capabilities: {drop: [ALL]}
-              volumeMounts: [{name: work, mountPath: /work}]
+              volumeMounts: [{name: work, mountPath: /work}, {name: scripts, mountPath: /scripts, readOnly: true}]
               resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: "1", memory: 512Mi}}
           containers:
             - name: upload
               image: {{ include "moks.image" . }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}
-              args: [backup, run, --dump, /work/moks.dump]
+              args: [backup, run, --dump, /work/moks.dump, --manifest, /work/manifest.json]
               envFrom:
                 - configMapRef: {name: moks-config}
+                {{- if not .Values.secrets.split }}
                 - secretRef: {name: {{ .Values.existingSecret }}}
+                {{- end }}
                 - secretRef: {name: {{ .Values.backup.secret }}}
               env:
                 - {name: MOKS_BACKUP_BUCKET, value: {{ .Values.backup.bucket | quote }}}
@@ -70,6 +92,8 @@ spec:
               volumeMounts: [{name: work, mountPath: /work}, {name: tmp, mountPath: /tmp}]
               resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 500m, memory: 512Mi}}
           volumes:
+            - name: scripts
+              configMap: {name: moks-backup-scripts}
             - name: work
               emptyDir: {sizeLimit: {{ .Values.backup.workspace }}}
             - name: tmp

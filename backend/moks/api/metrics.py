@@ -34,8 +34,9 @@ from ..auth.deps import get_auth
 from ..auth.sessions import AuthContext
 from ..connectors import registry
 from ..db import get_db
-from ..llm.providers import LLMError, complete_metered, provider_for
-from ..models import AuditEvent, Connector, Environment, LLMConfig, LLMUsage, SavedQuery, User
+from ..llm import budget
+from ..llm.providers import LLMError, provider_for
+from ..models import AuditEvent, Connector, Environment, LLMConfig, SavedQuery, User
 from ..orchestrator.report import parse_json_object
 from ..rbac import P
 from .common import live_executor
@@ -524,10 +525,6 @@ async def generate(body: GenerateIn, request: Request, ctx: AuthContext = Depend
     cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none()
     if cfg is None:
         raise HTTPException(409, "no active chat model; configure one under LLM providers")
-    spent = (await db.execute(select(func.coalesce(func.sum(LLMUsage.cost_usd), 0)).where(
-        LLMUsage.llm_config_id == cfg.id, LLMUsage.created_at > datetime.now(timezone.utc) - timedelta(hours=24)))).scalar_one()
-    if spent >= cfg.daily_budget_usd:
-        raise HTTPException(429, "the LLM daily budget is used up")
     errors: list[dict] = []
     src = await _sources(request, db, ctx, envs, errors, connectors=body.connectors)
     merged = await _catalog(src)
@@ -536,9 +533,11 @@ async def generate(body: GenerateIn, request: Request, ctx: AuthContext = Depend
     user = (f"Request: <untrusted_data>{body.prompt}</untrusted_data>\nResource types: {', '.join(body.resource_types) or 'any'}\n"
             f"Environments: {', '.join(e.name for e in envs)}\nMetric catalog:\n<untrusted_data>\n{catalog_text}\n</untrusted_data>")
     try:
-        resp = await complete_metered(provider_for(cfg), SYSTEM, [{"role": "user", "content": user}], json_mode=True, max_tokens=min(cfg.max_output_tokens, 800))
-        db.add(LLMUsage(llm_config_id=cfg.id, provider=cfg.provider, model=cfg.model, tokens_in=resp.tokens_in, tokens_out=resp.tokens_out, cost_usd=resp.cost_usd))
+        resp = await budget.complete(provider_for(cfg), SYSTEM, [{"role": "user", "content": user}], json_mode=True, max_tokens=min(cfg.max_output_tokens, 800),
+                                     user_id=ctx.user.id, purpose="query_generation")
         data = parse_json_object(resp.text)
+    except budget.BudgetDenied as exc:
+        raise HTTPException(429, exc.message) from None
     except LLMError as exc:
         raise HTTPException(502, f"the model could not answer: {exc.message}") from None
     except (ValueError, json.JSONDecodeError):

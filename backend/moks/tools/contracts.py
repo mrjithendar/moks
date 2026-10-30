@@ -47,6 +47,7 @@ class ToolContext:
     time_to: datetime
     connectors: dict[str, Any]  # connector type -> (Connector row, instance)
     max_window: timedelta
+    guard: Any = None  # AccessGuard for long-running work; checked before every tool call
 
     def available(self, ctype: str) -> bool:
         return ctype in PSEUDO_CONNECTORS or ctype in self.connectors

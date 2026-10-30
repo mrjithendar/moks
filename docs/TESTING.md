@@ -178,3 +178,17 @@ helm lint deploy/helm/moks -f deploy/helm/moks/values-minikube.yaml
 - OIDC was tested only for its guards (state/nonce/PKCE code paths, open-redirect protection),
   not against a real IdP.
 - The demo lab has not been applied to mk4.
+
+## Failure-injection suites
+
+| File | Proves |
+|---|---|
+| `test_execution_fencing.py` | Lease expiry, worker pauses, database loss, stale checkpoints, late results, lease loss before recovery |
+| `test_db_grants.py` | Real plan and investigation flows under each database role, and refusals for everything else |
+| `test_helm_render.py` | What each component receives, for Minikube and EKS |
+| `test_job_classes.py` | A blocked reindex leaves detection on target; overload, fairness, shutdown |
+| `test_index_outbox.py` | Rollback after failure, duplicates, out-of-order events, changes during reindex, crashes |
+| `test_revocation.py` | Revocation during an investigation and an open stream |
+| `test_llm_budget.py` | Concurrent calls for the last of a budget, timeouts, retries, crashes |
+| `test_restore_drill.py` | Real `pg_dump` and `pg_restore`: missing table or rows, corruption, wrong key, clean restore |
+| `test_velero.py` | Cluster backups stay inside the plan path, and Secret values never surface |

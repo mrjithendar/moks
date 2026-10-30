@@ -20,6 +20,13 @@ serviceAccount:
     # IRSA role from deploy/iam/moks-role-policy.json (Bedrock, CloudWatch read). Or use EKS Pod Identity.
     eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/moks
 
+worker:
+  pools:
+    - {name: detection, classes: detection, capacity: "detection=4", replicas: 2}
+    - {name: interactive, classes: interactive, capacity: "", replicas: 2}
+    - {name: knowledge, classes: knowledge, capacity: "knowledge=2", replicas: 1}
+    - {name: maintenance, classes: maintenance, capacity: "maintenance=2", replicas: 1}
+
 rbac:
   clusterWide: false
   namespaces: [shop, payments, checkout]   # read access only where MOKS is meant to look

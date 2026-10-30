@@ -2,7 +2,7 @@ import { useMemo, useState, type FormEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, qs } from "../api";
 import { useAuth } from "../auth";
-import { Badge, EnvNsFilter, ErrorBox, LineChart, LogLines, PageHead, PartialErrors, type Multi, type Scope, SourceRef, Time, useInterval, useLoad, useScopes } from "../components";
+import { Badge, EnvNsFilter, ErrorBox, LineChart, LogLines, PageHead, PartialErrors, type Multi, type Scope, SourceRef, Time, useInterval, useLoad, useScopes, rowAction } from "../components";
 import { EvidenceData } from "./Investigate";
 import { PlanForm } from "./Ops";
 
@@ -153,7 +153,7 @@ function PodTable({ pods, onOpen }: { pods: any[]; onOpen: (p: any) => void }) {
     <table>
       <thead><tr><th>Environment</th><th>Namespace</th><th>Pod</th><th>Phase</th><th>Ready</th><th>Restarts</th><th>Problems</th><th>Node</th><th>Age</th></tr></thead>
       <tbody>{pods.map((p) => (
-        <tr key={p.environment + p.namespace + p.name} className="clickable" onClick={() => onOpen(p)}>
+        <tr key={p.environment + p.namespace + p.name} className="clickable" {...rowAction(() => onOpen(p))}>
           <td className="small">{p.environment}</td><td className="mono small">{p.namespace}</td>
           <td className="mono small">{p.name}</td>
           <td><Badge kind={p.phase === "Running" ? "ok" : p.phase === "Succeeded" ? "neutral" : "warn"}>{p.phase}</Badge></td>
@@ -316,7 +316,7 @@ export function Logs() {
       <form className="card filters" onSubmit={(e) => { e.preventDefault(); apply({}); }}>
         <EnvNsFilter scopes={scopes.data} env={f.environment} ns={f.namespace} onEnv={(e) => apply({ environment: e, namespace: "all" })} onNs={(n) => apply({ namespace: n })} />
         <label>Level
-          <select value={f.level} onChange={(e) => apply({ level: e.target.value })}><option value="">Any level</option>{LEVELS.map((l) => <option key={l}>{l}</option>)}</select>
+          <select aria-label="Log level" value={f.level} onChange={(e) => apply({ level: e.target.value })}><option value="">Any level</option>{LEVELS.map((l) => <option key={l}>{l}</option>)}</select>
         </label>
         <label>Pod<input value={f.pod} onChange={set("pod")} placeholder="checkout-*" /></label>
         <label>Container<input value={f.container} onChange={set("container")} /></label>
@@ -342,7 +342,7 @@ export function Logs() {
                 const lvl = levelOf(l);
                 const where = [l.environment, l.labels?.namespace, l.labels?.pod].filter(Boolean).join("/");
                 return (
-                  <div key={i} className={`line clickable ${lvl === "error" ? "err" : ""} ${open === i ? "open" : ""}`} onClick={() => setOpen(open === i ? null : i)}>
+                  <div key={i} className={`line clickable ${lvl === "error" ? "err" : ""} ${open === i ? "open" : ""}`} {...rowAction(() => setOpen(open === i ? null : i))}>
                     {l.ts && <span className="ts">{new Date(l.ts).toLocaleTimeString()}</span>}
                     <span className={`lvl ${lvl}`}>{lvl}</span><span className="ts">{where}</span>{l.line}
                     {open === i && <div className="small muted" style={{ marginTop: 4 }}>{l.ts && <div>{new Date(l.ts).toLocaleString()}</div>}{Object.entries(l.labels ?? {}).map(([k, v]) => <div key={k}>{k}={String(v)}</div>)}</div>}
@@ -378,7 +378,7 @@ function RawLogQL({ scopes }: { scopes?: Scope[] }) {
     <details className="card block" style={{ marginTop: 14 }}>
       <summary>Write LogQL</summary>
       <form className="stack" style={{ marginTop: 10 }} onSubmit={run}>
-        <textarea rows={2} className="mono" value={q} onChange={(e) => setQ(e.target.value)} placeholder='{namespace="default"} |= "error"' />
+        <textarea aria-label="LogQL query" rows={2} className="mono" value={q} onChange={(e) => setQ(e.target.value)} placeholder='{namespace="default"} |= "error"' />
         <div className="filters">
           <label>Environment<select value={target} onChange={(e) => setEnv(e.target.value)}>{scopes?.map((s) => <option key={s.environment} value={s.environment}>{s.display_name}</option>)}</select></label>
           <button disabled={!q || !target}>Run</button>

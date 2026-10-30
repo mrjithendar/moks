@@ -7,6 +7,9 @@ kind: ServiceAccount
 metadata:
   name: moks-executor
   labels: {{- include "moks.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.componentAnnotations.executor }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -67,6 +70,38 @@ roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: moks-exe
 subjects:
   - {kind: ServiceAccount, name: moks-executor, namespace: {{ $.Release.Namespace }}}
 {{- end }}
+{{- if .Values.velero.enabled }}
+---
+# Velero objects, plus create or overwrite on the Secrets MOKS itself writes. No get or list:
+# the executor can put a Secret there and can never read one back.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: moks-executor-velero
+  namespace: {{ .Values.velero.namespace }}
+  labels: {{- include "moks.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [velero.io]
+    resources: [backups, restores, schedules, backupstoragelocations]
+    verbs: [get, list, create, patch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [moks-r2-credentials, moks-r2-sse]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: moks-executor-velero
+  namespace: {{ .Values.velero.namespace }}
+  labels: {{- include "moks.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: moks-executor-velero}
+subjects:
+  - {kind: ServiceAccount, name: moks-executor, namespace: {{ .Release.Namespace }}}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -92,19 +127,19 @@ spec:
       {{- end }}
       {{- include "moks.podSecurity" . | nindent 6 }}
       terminationGracePeriodSeconds: 240     # let an in-flight action finish validating
-      {{- include "moks.migrateInit" . | nindent 6 }}
+      {{- include "moks.migrateInit" (dict "root" . "component" "executor") | nindent 6 }}
       containers:
         - name: executor
           image: {{ include "moks.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: [executor]
           ports: [{name: metrics, containerPort: 9464}]
-          {{- include "moks.env" . | nindent 10 }}
+          {{- include "moks.env" (dict "root" . "component" "executor") | nindent 10 }}
           env:
             - {name: MOKS_PROCESS_ROLE, value: executor}
           {{- include "moks.containerSecurity" . | nindent 10 }}
-          {{- include "moks.volumeMounts" . | nindent 10 }}
+          {{- include "moks.volumeMounts" (dict "root" . "component" "executor") | nindent 10 }}
           livenessProbe: {tcpSocket: {port: metrics}, periodSeconds: 20, failureThreshold: 3}
           resources: {{- toYaml .Values.executor.resources | nindent 12 }}
-      {{- include "moks.volumes" . | nindent 6 }}
+      {{- include "moks.volumes" (dict "root" . "component" "executor") | nindent 6 }}
 {{- end }}

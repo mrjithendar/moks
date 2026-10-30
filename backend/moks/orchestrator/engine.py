@@ -26,8 +26,10 @@ from .. import audit
 from ..config import get_settings
 from ..connectors import registry
 from ..db import session_scope
-from ..llm.providers import LLMError, complete_metered, provider_for
-from ..models import SkillPolicy, Environment, Investigation, InvestigationEvent, LLMConfig, LLMUsage, RoleBinding, User
+from ..auth.revocation import CHECK_SECONDS as WATCH_SECONDS, AccessGuard, AccessRevoked
+from ..llm import budget
+from ..llm.providers import LLMError, provider_for
+from ..models import SkillPolicy, Environment, Investigation, InvestigationEvent, LLMConfig, RoleBinding, User
 from ..observability import INVESTIGATION_DURATION, INVESTIGATIONS, INVESTIGATIONS_RUNNING
 from ..rbac import Binding, P, Principal
 from ..scope import ScopeError, effective_scope
@@ -71,6 +73,9 @@ async def emit(investigation_id: uuid.UUID, seq: int, type_: str, payload: dict[
 
 class Investigator:
     def __init__(self, investigation_id: uuid.UUID, worker_id: str, connectors_override: dict | None = None, use_llm: bool = True):
+        self.guard: AccessGuard | None = None
+        self.owner: uuid.UUID | None = None
+        self.revoked: str | None = None
         self.connectors_override = connectors_override  # evaluation runs supply fixture connectors
         self.use_llm = use_llm
         self.id = investigation_id
@@ -120,7 +125,7 @@ class Investigator:
                 mode = await self._investigate()
             status = "completed"
         except asyncio.CancelledError:
-            status, error = "cancelled", "cancelled by user"
+            status, error = "cancelled", self.revoked or "cancelled by user"
             uncancel = getattr(task, "uncancel", None)
             if uncancel:
                 uncancel()
@@ -128,6 +133,8 @@ class Investigator:
             status, error = "failed", f"time limit of {self.settings.max_duration_seconds}s reached"
         except ScopeError as exc:
             status, error = "failed", f"not permitted: {exc}"
+            if isinstance(exc, AccessRevoked):
+                self.revoked = error
         except Exception as exc:
             log.exception("investigation failed", extra={"event": "investigation_failed", "investigation_id": str(self.id)})
             status, error = "failed", f"internal error ({type(exc).__name__})"
@@ -137,15 +144,16 @@ class Investigator:
         if status != "completed":
             # Keep the partial evidence useful: write a rule-based report of what was collected.
             partial = rules_report("", self.findings, self.evidence, self.notes + [f"Investigation {status}: {error}"])
-            await self._finish(status, partial.model_dump() if self.evidence else None, error)
+            await self._finish(status, partial.model_dump() if self.evidence and not self.revoked else None, error)
             await self._emit("error" if status == "failed" else "cancelled", {"message": error})
         await self._emit("done", {"status": status})
         INVESTIGATIONS.labels(status, mode).inc()
         INVESTIGATION_DURATION.labels(mode).observe(time.monotonic() - start)
 
     async def _watch(self, task: asyncio.Task) -> None:
+        last_check = time.monotonic()
         while True:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(1.0 if WATCH_SECONDS >= 1 else WATCH_SECONDS)
             try:
                 async with session_scope() as db:
                     inv = await db.get(Investigation, self.id)
@@ -153,6 +161,14 @@ class Investigator:
                         task.cancel()
                         return
                     inv.heartbeat_at = datetime.now(timezone.utc)
+                if self.guard is not None and time.monotonic() - last_check >= WATCH_SECONDS:
+                    last_check = time.monotonic()
+                    await self.guard.check()
+            except AccessRevoked as exc:
+                self.revoked = f"stopped because access was revoked: {exc}"
+                log.warning("investigation stopped: access revoked", extra={"event": "investigation_revoked", "investigation_id": str(self.id)})
+                task.cancel()
+                return
             except Exception:  # transient DB errors must not kill the run
                 log.warning("heartbeat failed", extra={"event": "heartbeat_failed", "investigation_id": str(self.id)})
 
@@ -186,8 +202,10 @@ class Investigator:
                 connectors, conn_errors = await registry.for_environment(db, env.id)
             llm_cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none() if self.use_llm else None
             question, namespace, t_from, t_to = inv.question, inv.namespace, inv.time_from, inv.time_to
+            principal_id, environment_id = inv.created_by, inv.environment_id
+            self.owner = principal_id
             if inv.conversation_id:
-                self.history = await conversations.history(db, inv.conversation_id, inv.id)
+                self.history = await conversations.history(db, inv.conversation_id, inv.id, principal, env.name)
             self._window = (t_from, t_to)
             env_name = env.name
             max_window = timedelta(minutes=min(env.max_query_window_minutes, self.settings.max_query_window_minutes))
@@ -205,6 +223,8 @@ class Investigator:
         await self._emit("scope", {**scope_info, "mode": mode, "llm": f"{llm_cfg.provider}/{llm_cfg.model}" if llm_cfg else None})
 
         ctx = ToolContext(self.id, env, scope, principal, t_from, t_to, connectors, max_window)
+        self.guard = ctx.guard = AccessGuard(principal_id, environment_id, namespace, P.INVESTIGATION_RUN, ctx)
+        await self.guard.check()
 
         async with session_scope() as db:
             executor = ToolExecutor(db, ctx, next_ref=self._next_ref, timeout_seconds=min(45, self.settings.max_duration_seconds))
@@ -585,25 +605,19 @@ class Investigator:
     async def _check_budget(self, cfg: LLMConfig) -> None:
         if self.tokens_in + self.tokens_out >= self.settings.max_tokens_per_investigation:
             raise BudgetExceeded(f"token budget of {self.settings.max_tokens_per_investigation} for this investigation used")
-        async with session_scope() as db:
-            since = datetime.now(timezone.utc) - timedelta(days=1)
-            spent = (await db.execute(select(func.coalesce(func.sum(LLMUsage.cost_usd), 0))
-                                      .where(LLMUsage.llm_config_id == cfg.id, LLMUsage.created_at >= since))).scalar_one()
-        if Decimal(spent) >= Decimal(cfg.daily_budget_usd) and Decimal(cfg.daily_budget_usd) > 0:
-            raise BudgetExceeded(f"daily LLM budget of ${cfg.daily_budget_usd} for {cfg.name} reached")
 
     async def _llm(self, provider, cfg: LLMConfig, system: str, user: str, max_tokens: int) -> dict[str, Any]:
+        if self.guard is not None:
+            await self.guard.check()  # nothing more goes to the provider for someone who lost access
         await self._check_budget(cfg)
         messages = [{"role": "user", "content": user}]
         last_error: Exception | None = None
         for attempt in range(2):
-            resp = await complete_metered(provider, system, messages, json_mode=True, max_tokens=max_tokens)
+            resp = await budget.complete(provider, system, messages, json_mode=True, max_tokens=max_tokens, user_id=self.owner,
+                                         investigation_id=self.id, purpose="investigation")
             self.tokens_in += resp.tokens_in
             self.tokens_out += resp.tokens_out
             self.cost += resp.cost_usd
-            async with session_scope() as db:
-                db.add(LLMUsage(llm_config_id=cfg.id, investigation_id=self.id, provider=cfg.provider, model=cfg.model,
-                                tokens_in=resp.tokens_in, tokens_out=resp.tokens_out, cost_usd=resp.cost_usd))
             await self._emit("llm_usage", {"tokens_in": self.tokens_in, "tokens_out": self.tokens_out, "cost_usd": str(self.cost)})
             try:
                 return parse_json_object(resp.text)

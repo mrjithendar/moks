@@ -100,10 +100,9 @@ async def test_scope_change_reaches_opensearch_and_a_failure_saves_nothing(clien
     fail = {"on": False}
 
     def transport(req: httpx.Request) -> httpx.Response:
-        if "_update_by_query" in req.url.path:
-            if fail["on"]:
-                return httpx.Response(503, text="busy")
-            sent.append(json.loads(req.content))
+        if fail["on"]:
+            return httpx.Response(503, text="busy")
+        sent.append(req.url.path)
         return httpx.Response(200, json={})
 
     monkeypatch.setattr(service, "_opensearch", OpenSearchBackend("http://os:9200", transport=httpx.MockTransport(transport)))
@@ -117,12 +116,12 @@ async def test_scope_change_reaches_opensearch_and_a_failure_saves_nothing(clien
         db.add(Document(source_id=sid, path="a.md", content_hash="h", kind="doc", environment="*", namespace="*", status="active"))
     fail["on"] = True
     r = await client.put(f"/moks/api/knowledge/sources/{sid}", json={"scope_environment": "prod"}, headers=h)
-    assert r.status_code == 502 and "nothing was saved" in r.json()["detail"]
+    assert r.status_code == 200  # the outage does not block PostgreSQL, the authority for access checks
     async with session_scope() as db:
-        assert (await db.get(KnowledgeSource, sid)).scope_environment == "*"
-    fail["on"] = False
-    assert (await client.put(f"/moks/api/knowledge/sources/{sid}", json={"scope_environment": "prod"}, headers=h)).status_code == 200
-    assert sent[0]["script"]["params"] == {"e": "prod", "n": "*"}
+        assert (await db.get(KnowledgeSource, sid)).scope_environment == "prod"
+    await service.drain_outbox()
+    async with session_scope() as db:
+        assert (await service.stats(db))["outbox"]["pending"] >= 1  # kept for retry, and visible
     async with session_scope() as db:
         await db.execute(EmbeddingIndex.__table__.delete().where(EmbeddingIndex.backend == "opensearch"))
 
@@ -190,6 +189,16 @@ async def test_embedding_test_flags_a_size_mismatch_and_an_empty_answer(client, 
 
 
 async def test_a_reindex_waits_out_a_rate_limit_and_gives_up_eventually(monkeypatch):
+    from decimal import Decimal
+
+    from moks.models import LLMConfig
+
+    async with session_scope() as db:
+        cfg = LLMConfig(name=f"e-{uuid.uuid4().hex[:6]}", provider="openai", model="m", purpose="embedding", daily_budget_usd=Decimal("1"), is_active=False,
+                        input_price_per_mtok=Decimal("0"), output_price_per_mtok=Decimal("0"), max_concurrency=4)
+        db.add(cfg)
+        await db.flush()
+        db.expunge(cfg)
     monkeypatch.setattr(service, "EMBED_BACKOFF_SECONDS", 0)
 
     class Flaky:
@@ -200,7 +209,7 @@ async def test_a_reindex_waits_out_a_rate_limit_and_gives_up_eventually(monkeypa
             if Flaky.calls < 3:
                 raise LLMError("rate_limited", "429")
             return [[0.1]]
-    assert await service._embed_batch(Flaky(), ["x"], 5) == [[0.1]] and Flaky.calls == 3
+    assert await service._embed_batch(Flaky(), cfg, ["x"], 5) == [[0.1]] and Flaky.calls == 3
 
     class Always:
         calls = 0
@@ -209,7 +218,7 @@ async def test_a_reindex_waits_out_a_rate_limit_and_gives_up_eventually(monkeypa
             Always.calls += 1
             raise LLMError("rate_limited", "429")
     with pytest.raises(LLMError):
-        await service._embed_batch(Always(), ["x"], 3)
+        await service._embed_batch(Always(), cfg, ["x"], 3)
     assert Always.calls == 3
 
     class Auth:
@@ -219,7 +228,7 @@ async def test_a_reindex_waits_out_a_rate_limit_and_gives_up_eventually(monkeypa
             Auth.calls += 1
             raise LLMError("auth", "denied")
     with pytest.raises(LLMError):
-        await service._embed_batch(Auth(), ["x"], 5)
+        await service._embed_batch(Auth(), cfg, ["x"], 5)
     assert Auth.calls == 1  # only a rate limit is worth waiting for
 
 

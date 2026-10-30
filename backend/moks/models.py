@@ -31,6 +31,7 @@ def _uuid() -> uuid.UUID:
 class User(Base):
     __tablename__ = "users"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    auth_version: Mapped[int] = mapped_column(BigInteger, server_default="1", insert_default=1)  # triggers move this
     email: Mapped[str] = mapped_column(String(320), unique=True)
     display_name: Mapped[str] = mapped_column(String(200), default="")
     auth_provider: Mapped[str] = mapped_column(String(20))  # oidc | local | dev
@@ -70,6 +71,7 @@ class Session(Base):
 class Environment(Base):
     __tablename__ = "environments"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    policy_version: Mapped[int] = mapped_column(BigInteger, server_default="1", insert_default=1)  # a trigger moves this
     name: Mapped[str] = mapped_column(String(100), unique=True)
     display_name: Mapped[str] = mapped_column(String(200), default="")
     kind: Mapped[str] = mapped_column(String(20))  # minikube | eks
@@ -117,6 +119,7 @@ class LLMConfig(Base):
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=60)
     max_output_tokens: Mapped[int] = mapped_column(Integer, default=2000)
     daily_budget_usd: Mapped[Decimal] = mapped_column(Numeric(12, 4), default=Decimal("5"))
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=4)
     input_price_per_mtok: Mapped[Decimal] = mapped_column(Numeric(12, 4), default=Decimal("0"))
     output_price_per_mtok: Mapped[Decimal] = mapped_column(Numeric(12, 4), default=Decimal("0"))
     embedding_dimensions: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -134,7 +137,34 @@ class LLMUsage(Base):
     tokens_in: Mapped[int] = mapped_column(Integer, default=0)
     tokens_out: Mapped[int] = mapped_column(Integer, default=0)
     cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+    estimated_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)  # what was reserved for it
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    purpose: Mapped[str | None] = mapped_column(String(30), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ComponentVersion(Base):
+    __tablename__ = "component_versions"
+    instance: Mapped[str] = mapped_column(String(120), primary_key=True)
+    component: Mapped[str] = mapped_column(String(20))
+    commit_sha: Mapped[str] = mapped_column(String(64))
+    version: Mapped[str] = mapped_column(String(30))
+    seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LLMReservation(Base):
+    """Worst-case cost held for one call. See llm/budget.py."""
+    __tablename__ = "llm_reservations"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    llm_config_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    investigation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    purpose: Mapped[str] = mapped_column(String(30))
+    estimated_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    status: Mapped[str] = mapped_column(String(12), default="held")  # held | settled | released | uncertain
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Investigation(Base):
@@ -269,6 +299,7 @@ class Job(Base):
     __tablename__ = "jobs"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
     type: Mapped[str] = mapped_column(String(40))
+    job_class: Mapped[str] = mapped_column(String(20), default="maintenance")
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="queued")
     dedupe_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -328,6 +359,23 @@ class Document(Base):
     excluded_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    content_revision: Mapped[int] = mapped_column(BigInteger, default=0)  # moves with every change in PostgreSQL
+    indexed_revision: Mapped[int] = mapped_column(BigInteger, default=0)  # what the external index has
+
+
+class IndexOutbox(Base):
+    """A change the external search index still has to apply, committed with the change itself."""
+    __tablename__ = "index_outbox"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))  # no foreign key: outlives the document
+    revision: Mapped[int] = mapped_column(BigInteger)
+    op: Mapped[str] = mapped_column(String(10))  # upsert | delete
+    status: Mapped[str] = mapped_column(String(10), default="pending")  # pending | done | dead
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Chunk(Base):
@@ -354,6 +402,8 @@ class EmbeddingIndex(Base):
     cleanup_pending: Mapped[bool] = mapped_column(Boolean, default=False)  # physical index still to delete
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    build_watermark: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # outbox position when the build began
+    build_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # who owns this build
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

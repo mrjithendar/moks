@@ -1,21 +1,30 @@
+{{/* One Deployment with every class by default. worker.pools gives each class its own Deployment
+     so they scale separately (values-eks.yaml). */}}
+{{- $root := . -}}
+{{- $pools := .Values.worker.pools | default (list (dict "name" "" "classes" .Values.worker.classes "capacity" .Values.worker.capacity "replicas" .Values.worker.replicas)) -}}
+{{- range $i, $pool := $pools }}
+{{- if $i }}
+---
+{{- end }}
+{{- with $root }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: moks-worker
+  name: moks-worker{{ if $pool.name }}-{{ $pool.name }}{{ end }}
   labels: {{- include "moks.labels" . | nindent 4 }}
     app.kubernetes.io/component: worker
 spec:
-  replicas: {{ .Values.worker.replicas }}
+  replicas: {{ $pool.replicas }}
   revisionHistoryLimit: 5
   selector:
-    matchLabels: {app: moks, component: worker}
+    matchLabels: {app: moks, component: worker{{ if $pool.name }}, pool: {{ $pool.name }}{{ end }}}
   template:
     metadata:
-      labels: {app: moks, component: worker}
+      labels: {app: moks, component: worker{{ if $pool.name }}, pool: {{ $pool.name }}{{ end }}}
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
-      serviceAccountName: {{ .Values.serviceAccount.name }}
+      serviceAccountName: {{ include "moks.serviceAccount" (dict "root" . "component" "worker") }}
       enableServiceLinks: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
@@ -23,7 +32,7 @@ spec:
       {{- include "moks.podSecurity" . | nindent 6 }}
       # Lets a running investigation finish (bounded by maxDurationSeconds) on rollout.
       terminationGracePeriodSeconds: {{ add .Values.config.maxDurationSeconds 20 }}
-      {{- include "moks.migrateInit" . | nindent 6 }}
+      {{- include "moks.migrateInit" (dict "root" . "component" "worker") | nindent 6 }}
       containers:
         - name: worker
           image: {{ include "moks.image" . }}
@@ -31,9 +40,14 @@ spec:
           args: [worker]
           ports:
             - {name: metrics, containerPort: 9464}
-          {{- include "moks.env" . | nindent 10 }}
+          {{- include "moks.env" (dict "root" . "component" "worker") | nindent 10 }}
+          env:
+            - {name: MOKS_WORKER_CLASSES, value: {{ $pool.classes | quote }}}
+            - {name: MOKS_WORKER_CAPACITY, value: {{ $pool.capacity | quote }}}
           {{- include "moks.containerSecurity" . | nindent 10 }}
-          {{- include "moks.volumeMounts" . | nindent 10 }}
+          {{- include "moks.volumeMounts" (dict "root" . "component" "worker") | nindent 10 }}
           livenessProbe: {tcpSocket: {port: metrics}, periodSeconds: 20, failureThreshold: 3}
           resources: {{- toYaml .Values.worker.resources | nindent 12 }}
-      {{- include "moks.volumes" . | nindent 6 }}
+      {{- include "moks.volumes" (dict "root" . "component" "worker") | nindent 6 }}
+{{- end }}
+{{- end }}

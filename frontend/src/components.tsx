@@ -1,53 +1,9 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { NavLink } from "react-router-dom";
-import { api, qs } from "./api";
-import { useAuth } from "./auth";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
+import { api, ApiError, qs } from "./api";
 
-export function Layout({ children }: { children: ReactNode }) {
-  const { me, can, logout } = useAuth();
-  return (
-    <div className="shell">
-      <nav className="side" aria-label="Main">
-        <div className="brand">
-          <svg width="28" height="28" viewBox="0 0 32 32" aria-hidden>
-            <rect width="32" height="32" rx="7" fill="#16213a" />
-            <path d="M7 23V9l9 8 9-8v14" stroke="#38bdf8" strokeWidth="3" fill="none" strokeLinejoin="round" />
-          </svg>
-          <div>MOKS<small>Production Operations</small></div>
-        </div>
-        <NavLink to="/" end>Overview</NavLink>
-        {can("investigation.read") && <NavLink to="/investigate">Investigate</NavLink>}
-        {can("investigation.read") && <NavLink to="/investigations">Investigations</NavLink>}
-        {can("investigation.read") && <NavLink to="/incidents">Incidents</NavLink>}
-        {can("investigation.read") && <NavLink to="/detections">Detection rules</NavLink>}
-        {(can("action.request") || can("action.approve")) && <NavLink to="/actions">Approvals &amp; actions</NavLink>}
-        {can("action.request") && <NavLink to="/diagnostics">Diagnostics</NavLink>}
-        {can("investigation.read") && <NavLink to="/knowledge">Runbooks &amp; knowledge</NavLink>}
-        {can("investigation.read") && <NavLink to="/skills">SRE skills</NavLink>}
-        {can("finops.read") && <NavLink to="/finops">FinOps</NavLink>}
-        {can("explorer.read") && <>
-          <div className="group">Live</div>
-          <NavLink to="/explorer">Kubernetes explorer</NavLink>
-          <NavLink to="/metrics">Metrics</NavLink>
-          <NavLink to="/logs">Logs</NavLink>
-        </>}
-        {(can("audit.read") || can("admin.users")) && <div className="group">Administration</div>}
-        {can("audit.read") && <NavLink to="/audit">Audit log</NavLink>}
-        {can("admin.policies") && <NavLink to="/admin/environments">Environments</NavLink>}
-        {can("admin.connectors") && <NavLink to="/admin/connectors">Connectors</NavLink>}
-        {can("admin.llm") && <NavLink to="/admin/llm">LLM providers</NavLink>}
-        {can("admin.users") && <NavLink to="/admin/users">Users &amp; roles</NavLink>}
-        {can("admin.policies") && <NavLink to="/evals">Evaluation</NavLink>}
-        <div className="spacer" />
-        <div className="user">
-          <div title={me?.email}>{me?.display_name}</div>
-          <div className="small">{me?.roles.map((r) => `${r.role}@${r.environment}/${r.namespace}`).join(", ") || "no roles"}</div>
-          <button className="ghost small" style={{ marginTop: 8 }} onClick={logout}>Sign out</button>
-        </div>
-      </nav>
-      <main className="main">{children}</main>
-    </div>
-  );
+/** A table row that opens something. It stays a row for layout, and keyboards can reach it. */
+export function rowAction(fn: () => void) {
+  return { tabIndex: 0, role: "button", onClick: fn, onKeyDown: (e: ReactKeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fn(); } } };
 }
 
 export function PageHead({ title, sub, children }: { title: string; sub?: ReactNode; children?: ReactNode }) {
@@ -70,7 +26,8 @@ export function StatusBadge({ status }: { status: string }) {
 
 export function ErrorBox({ error }: { error: unknown }) {
   if (!error) return null;
-  return <div className="alert error">{error instanceof Error ? error.message : String(error)}</div>;
+  if (error instanceof ApiError && error.status === 403) return <div className="alert warn" role="alert"><strong>You don't have access to this.</strong> <span className="small">{error.message}</span></div>;
+  return <div className="alert error" role="alert">{error instanceof Error ? error.message : String(error)}</div>;
 }
 
 export function ago(iso?: string | null): string {
@@ -85,7 +42,7 @@ export function ago(iso?: string | null): string {
 
 export function Time({ iso }: { iso?: string | null }) {
   if (!iso) return <span className="muted">—</span>;
-  return <time dateTime={iso} title={new Date(iso).toLocaleString()}>{ago(iso)}</time>;
+  return <time dateTime={iso} title={new Date(iso).toLocaleString(undefined, { timeZoneName: "short" })}>{ago(iso)}</time>;
 }
 
 export function useLoad<T>(fn: () => Promise<T>, deps: unknown[]): { data: T | undefined; error: unknown; loading: boolean; reload: () => void } {
@@ -235,7 +192,7 @@ export function LineChart({ series, unit }: { series: Series[]; unit?: "bytes" |
           const x = x0 + ((e.clientX - r.left) / r.width * W - P.l) / (W - P.l - P.r) * (x1 - x0);
           setHover(x);
         }}>
-        {ticks.map((t, i) => <g key={i}><line x1={P.l} x2={W - P.r} y1={sy(t)} y2={sy(t)} stroke="#1e293b" /><text x={4} y={sy(t) + 3}>{fmt(t)}</text></g>)}
+        {ticks.map((t, i) => <g key={i}><line x1={P.l} x2={W - P.r} y1={sy(t)} y2={sy(t)} style={{ stroke: "var(--border)" }} /><text x={4} y={sy(t) + 3}>{fmt(t)}</text></g>)}
         <text x={P.l} y={H - 6}>{new Date(x0 * 1000).toLocaleTimeString()}</text>
         <text x={W - P.r - 60} y={H - 6}>{new Date(x1 * 1000).toLocaleTimeString()}</text>
         {pts.map((s, i) => {
@@ -248,7 +205,7 @@ export function LineChart({ series, unit }: { series: Series[]; unit?: "bytes" |
           }
           return <path key={i} d={d} fill="none" stroke={COLORS[i % COLORS.length]} strokeWidth={1.6} vectorEffect="non-scaling-stroke" />;
         })}
-        {hover !== null && <line x1={sx(hover)} x2={sx(hover)} y1={P.t} y2={H - P.b} stroke="#475569" strokeDasharray="3 3" />}
+        {hover !== null && <line x1={sx(hover)} x2={sx(hover)} y1={P.t} y2={H - P.b} style={{ stroke: "var(--muted)" }} strokeDasharray="3 3" />}
       </svg>
       <div className="legend">
         {pts.map((s, i) => {

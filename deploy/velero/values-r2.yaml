@@ -1,0 +1,18 @@
+# Velero for MOKS-managed backups to Cloudflare R2. Chart: vmware-tanzu/velero 12.2.2.
+# MOKS writes the storage location and its Secrets through a reviewed plan, so none are set here.
+# Install per cluster (docs/CLUSTER_BACKUPS.md). Nothing here has been applied.
+initContainers:
+  - name: velero-plugin-for-aws
+    image: velero/velero-plugin-for-aws:v1.14.4
+    volumeMounts:
+      - {name: plugins, mountPath: /target}
+credentials:
+  useSecret: false
+snapshotsEnabled: false
+backupsEnabled: true
+deployNodeAgent: true        # copies PersistentVolume contents; runs on every node with host access
+configuration:
+  backupStorageLocation: []
+  volumeSnapshotLocation: []
+  uploaderType: kopia
+  defaultVolumesToFsBackup: true

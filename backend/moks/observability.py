@@ -49,6 +49,14 @@ LLM_COST = Counter("moks_llm_cost_usd_total", "Estimated LLM cost in USD", ["pro
 RETRIEVAL_LATENCY = Histogram("moks_retrieval_latency_seconds", "RAG retrieval latency", ["backend"])
 INDEXING_DOCUMENTS = Gauge("moks_indexing_documents", "Indexed documents", ["source", "state"])
 ACTIONS = Counter("moks_actions_total", "Remediation actions", ["action", "outcome"])
+JOBS_QUEUED = Gauge("moks_jobs_queued", "Jobs waiting to run", ["job_class"])
+JOBS_OLDEST_AGE = Gauge("moks_jobs_oldest_age_seconds", "Age of the oldest job that is due", ["job_class"])
+JOBS_RUNNING = Gauge("moks_jobs_running", "Jobs running across workers", ["job_class"])
+JOB_DELAY = Histogram("moks_job_schedule_delay_seconds", "Time a due job waited to start", ["job_class"], buckets=(1, 5, 15, 30, 60, 120, 300, 900, 3600))
+JOB_RUNTIME = Histogram("moks_job_runtime_seconds", "Job duration", ["job_class", "type"], buckets=(1, 5, 15, 60, 300, 900, 3600, 14400))
+JOB_RETRIES = Counter("moks_job_retries_total", "Jobs queued again after a failure", ["type"])
+JOBS_ABANDONED = Counter("moks_jobs_abandoned_total", "Jobs whose worker stopped", ["type"])
+JOBS_REJECTED = Counter("moks_jobs_rejected_total", "Jobs refused because the queue is full", ["job_class"])
 APPROVALS = Counter("moks_approvals_total", "Approval decisions", ["decision"])
 
 

@@ -420,13 +420,18 @@ async def test_retries_stop_at_the_operations_limit_and_the_source_can_sync_agai
 async def test_killed_reindex_releases_its_build_slot():
     async with session_scope() as db:
         await db.execute(text("DELETE FROM embedding_indexes WHERE backend = 'crash-test'"))
-        db.add(EmbeddingIndex(backend="crash-test", model_key="x", index_name="i", status="building"))
-    await _running("knowledge_reindex", {})
+    jid = await _running("knowledge_reindex", {})
+    async with session_scope() as db:
+        db.add(EmbeddingIndex(backend="crash-test", model_key="x", index_name="mine", status="building", build_job_id=jid))
+        db.add(EmbeddingIndex(backend="crash-test-2", model_key="x", index_name="other", status="building", build_job_id=uuid.uuid4()))
     await jobs.reap_abandoned()
     async with session_scope() as db:
         row = (await db.execute(select(EmbeddingIndex).where(EmbeddingIndex.backend == "crash-test"))).scalar_one()
+        other = (await db.execute(select(EmbeddingIndex).where(EmbeddingIndex.backend == "crash-test-2"))).scalar_one()
         assert row.status == "failed" and row.cleanup_pending
+        assert other.status == "building" and not other.cleanup_pending  # someone else's build is left alone
         await db.delete(row)
+        await db.delete(other)
 
 
 async def test_a_live_lease_is_left_alone():

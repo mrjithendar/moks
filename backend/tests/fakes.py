@@ -63,6 +63,17 @@ class FakeKubernetes:
     def __init__(self, config: dict, credential_ref: dict | None = None):
         self.config = config
 
+    velero: dict[str, list[dict]] = {}
+
+    async def velero_list(self, plural):
+        return self.velero.get(plural, [])
+
+    async def velero_get(self, plural, name):
+        for item in self.velero.get(plural, []):
+            if item["metadata"]["name"] == name:
+                return item
+        raise ConnectorError("not_found", f"{plural}/{name}: not found")
+
     async def aclose(self):
         pass
 

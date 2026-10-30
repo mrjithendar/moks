@@ -29,7 +29,7 @@ for MOKS's Bedrock calls; that user has no key yet (step 8). Details are in
 mk4's `ecr-refresh` identity may pull the new repository.
 
 CI (`.github/workflows/ci.yml`) tests every push, then on `master` builds the arm64 image and
-pushes `moks:latest` (the only tag; the previous image stays in ECR untagged, for rollback). It
+pushes an image tagged with its commit, and tags in ECR are immutable. It
 never touches the cluster. Commit and push this repository (`github.com/mrjithendar/moks`) and
 wait for the `release` job, whose summary prints the commit and image digest.
 
@@ -59,17 +59,7 @@ It refuses to overwrite existing Secrets. Add provider credentials later as `MOK
 
 ## 4. Roll out a new image
 
-mk4 runs `moks:latest` with `imagePullPolicy: Always`. A new push does not change any manifest, so
-Argo CD does not redeploy; after each `release` job, restart the pods to pull it:
-
-```sh
-kubectl --context mk4 -n moks rollout restart deploy
-kubectl --context mk4 -n moks rollout status deploy --timeout=300s
-```
-
-To roll back, pin an older image: `scripts/set-image.sh sha256:<digest>` (list them with
-`aws ecr describe-images --repository-name moks`), commit and push. Set `image.digest` back to
-`""` to follow `:latest` again.
+CI tags each image with its commit and opens a pull request that pins its digest. Merging that pull request and syncing Argo CD by hand is the rollout, and reverting it is the rollback. See [RELEASES.md](RELEASES.md).
 
 ## 5. Argo CD project and application
 
@@ -365,9 +355,25 @@ A warning appears on **Overview** when no backup has succeeded for three hours. 
 `deploy/grafana/prometheus-scrape.yaml` and `deploy/grafana/moks-alerts.yaml` to the tools repository, and
 route them to a person. mk4 has no Alertmanager today.
 
-### Testing a restore
+### Restore drill
 
-A backup is not proven until a restore passes. Use a scratch database, never `moks`:
+A backup is not proven until a restore passes. `moks backup drill` proves the newest backup, or one named with `--key`:
+
+```sh
+MOKS_DRILL_ADMIN_URL=postgresql://<admin>@<host>/postgres MOKS_BACKUP_BUCKET=... MOKS_BACKUP_ENCRYPTION_KEY=... moks backup drill
+```
+
+It needs `pg_restore`, so run it where PostgreSQL client tools are installed. It verifies the checksum, decrypts (which authenticates every chunk), restores into a new `moks_restore_drill_*` database, compares row counts exactly with the manifest taken in the same snapshot as the dump, checks the schema version and application invariants, runs smoke checks including the audit chain, reports recovery time and recovery point, then drops that database. It refuses any other target, so it cannot touch the live database. Exit status is non-zero on any failure.
+
+Differences against a live database are expected and are not a verdict. `moks backup compare` reports them as drift, for information.
+
+**After a real restore,** external search indexes hold nothing that PostgreSQL does not. PostgreSQL stays the authority, so rebuild them with `moks reindex`, or **Rebuild index** under Knowledge. Until then, results are limited to what the index still has, and are still checked against the restored database.
+
+**Keys.** `MOKS_BACKUP_ENCRYPTION_KEY` is the only way to read a backup. Keep it outside the cluster, in a password manager with a second person or a sealed copy. `scripts/decrypt-backup.py` needs nothing else, so a backup is readable when MOKS itself is gone. Losing the key loses every backup, and nothing can recover it.
+
+### Testing a restore by hand
+
+Use a scratch database, never `moks`:
 
 ```sh
 kubectl --context mk4 -n moks exec statefulset/moks-postgres -- psql -U moks -d postgres -c 'CREATE DATABASE moks_restore_test'

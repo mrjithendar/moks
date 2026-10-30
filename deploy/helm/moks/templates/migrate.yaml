@@ -1,0 +1,36 @@
+{{- if .Values.secrets.split }}
+# The only workload holding the schema owner. The name follows the image, so a new release runs a
+# new Job and runtime pods (wait-schema) start once it has finished.
+{{- $image := include "moks.image" . }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: moks-migrate-{{ $image | sha256sum | trunc 10 }}
+  labels: {{- include "moks.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels: {app: moks, app.kubernetes.io/component: migrate}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: moks-migrate
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "moks.podSecurity" . | nindent 6 }}
+      containers:
+        - name: migrate
+          image: {{ $image }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c", "moks migrate && moks db-grants && moks seed /etc/moks/seed.yaml --if-present"]
+          {{- include "moks.env" (dict "root" . "component" "migrate") | nindent 10 }}
+          {{- include "moks.containerSecurity" . | nindent 10 }}
+          {{- include "moks.volumeMounts" (dict "root" . "component" "migrate") | nindent 10 }}
+          resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+      {{- include "moks.volumes" (dict "root" . "component" "migrate") | nindent 6 }}
+{{- end }}

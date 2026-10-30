@@ -87,6 +87,16 @@ class Settings(BaseSettings):
     database_volume_gib: int = 10  # capacity of the database volume, for the size alert
     diagnostics_namespace: str = "moks-diagnostics"
     velero_namespace: str = "velero"
+    build_commit: str = "dev"  # baked into the image at build time
+    llm_user_daily_budget_usd: float | None = None      # None: no per-person limit
+    llm_investigation_budget_usd: float | None = None   # None: no per-investigation limit
+    # Which job classes this worker runs, and how many of each at once. Investigations are the
+    # "interactive" class and use worker_concurrency.
+    worker_classes: str = "detection,interactive,knowledge,maintenance"
+    worker_capacity: str = "detection=2,knowledge=1,maintenance=1"
+    job_queue_limit: int = 500          # queued jobs per class; beyond this new work is refused
+    job_environment_limit: int = 2      # running jobs per environment within a class
+    investigation_queue_limit: int = 200
     own_namespace: str = "moks"  # never a restore target: restoring over MOKS would stop the restore
 
     # Alerts: shared secret for the Alertmanager / Grafana webhook (Authorization: Bearer ...)

@@ -4,7 +4,7 @@ image:
   repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
   # Pin a digest for releases (sha256:...); tag is used only when digest is empty.
   digest: ""
-  tag: latest
+  tag: ""               # a commit SHA for local installs; production pins digest
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
@@ -38,6 +38,16 @@ existingSecret: moks-secrets
 # Extra Secret mounted at /var/run/moks-credentials for file credential references (kubeconfigs).
 credentialsSecret: ""
 
+# One Secret, ServiceAccount and database role per component. Off by default so an upgrade never
+# changes who holds what by surprise: follow docs/SECRET_SPLIT.md before setting split to true.
+secrets:
+  split: false
+  api: moks-api-secrets
+  worker: moks-worker-secrets
+  executor: moks-executor-secrets
+  migrate: moks-migrate-secrets
+  credentials: {api: "", worker: "", executor: "", migrate: ""}   # file credentials, per component
+
 # Seeded at start-up (create-only; edits made in the admin UI are kept). See dev/seed.local.yaml.
 seed: {}
 
@@ -48,6 +58,10 @@ api:
     limits: {cpu: "1", memory: 512Mi}
 worker:
   replicas: 1
+  # Sized for mk4: everything in one pod, with capacity kept apart per class.
+  classes: "detection,interactive,knowledge,maintenance"
+  capacity: "detection=2,knowledge=1,maintenance=1"
+  pools: []                # [{name, classes, capacity, replicas}]: one Deployment each (values-eks.yaml)
   resources:
     requests: {cpu: 100m, memory: 192Mi}
     limits: {cpu: "1", memory: 512Mi}
@@ -56,6 +70,8 @@ serviceAccount:
   create: true
   name: moks
   annotations: {}          # EKS IRSA: eks.amazonaws.com/role-arn
+  # Once secrets.split is on, one identity each, so short-lived AWS roles can differ per component.
+  componentAnnotations: {api: {}, worker: {}, executor: {}, migrate: {}, backup: {}}
 
 # In-cluster Kubernetes connector permissions (read-only, no Secrets).
 rbac:
@@ -123,6 +139,11 @@ executor:
   resources:
     requests: {cpu: 50m, memory: 128Mi}
     limits: {cpu: 500m, memory: 384Mi}
+
+# Cluster backups through Velero (docs/CLUSTER_BACKUPS.md). Needs Velero installed in this cluster.
+velero:
+  enabled: false
+  namespace: velero
 
 # Disposable diagnostic session pods (no service account token, quota, egress-only network policy).
 diagnostics:

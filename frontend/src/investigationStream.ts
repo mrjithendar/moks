@@ -42,6 +42,7 @@ export function useInvestigationEvents(id: string | undefined, onRefresh: () => 
     const finish = () => { es.close(); setStream("ended"); };
     es.addEventListener("end", finish);
     es.addEventListener("timeout", finish);
+    es.addEventListener("revoked", () => { es.close(); setStream("failed"); }); // access changed: the server stopped sending
     es.onopen = () => setStream("live");
     es.onerror = () => setStream(es.readyState === EventSource.CLOSED ? "failed" : "reconnecting");
     return () => { active = false; es.close(); };

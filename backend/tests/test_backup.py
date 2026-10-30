@@ -158,7 +158,8 @@ def test_retention_keeps_everything_under_the_limit():
 
 def test_row_count_comparison():
     assert backup.compare_counts({"a": 5}, {"a": 5})["ok"]
-    assert backup.compare_counts({"a": 6}, {"a": 5})["ok"]  # a live source keeps moving
+    assert not backup.compare_counts({"a": 6}, {"a": 5})["ok"]  # compared with the same snapshot, so fewer rows is a failure
+    assert backup.live_drift({"a": 6}, {"a": 5}) == {"a": 1}  # against a live source this is only information
     assert not backup.compare_counts({"a": 5}, {"a": 6})["ok"]
     assert not backup.compare_counts({"a": 5, "b": 1}, {"a": 5})["ok"]
 

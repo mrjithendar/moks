@@ -14,6 +14,12 @@ from tests.fakes import FakeWriter
 from tests.test_action_safety import _approve_and_queue, _get, _plan, _setup, fakes  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+async def only_this_tests_plans():
+    async with session_scope() as db:
+        await db.execute(update(ActionPlan).where(ActionPlan.status.in_(("queued", "executing"))).values(status="cancelled", execution_token=None))
+
+
 async def _queued(client, prod=False):
     t = await _setup(prod=prod)
     h = await login(client, t[1])
@@ -151,7 +157,7 @@ async def test_no_mutation_when_ownership_is_gone_at_the_intent_checkpoint(clien
 
 
 async def test_lease_lost_during_execution_stops_validation_and_is_not_replayed(client, monkeypatch):
-    monkeypatch.setattr(ex, "LEASE_SECONDS", 0.09)
+    monkeypatch.setattr(ex, "LEASE_SECONDS", 0.3)
     monkeypatch.setattr(ex, "VALIDATION_TIMEOUT", 30)
     claim = await _claim(client)
     writer = FakeWriter("stuck")  # validation would otherwise wait 30 seconds
@@ -160,7 +166,7 @@ async def test_lease_lost_during_execution_stops_validation_and_is_not_replayed(
     while not writer.calls:
         await asyncio.sleep(0.005)
     await _lapse(claim.plan_id)
-    await asyncio.wait_for(run, 2)
+    await asyncio.wait_for(run, 5)
     assert (await _get(claim.plan_id)).status == "executing"  # the stale worker reported nothing
     assert await ex.reconcile_stale() == [claim.plan_id]
     plan = await _get(claim.plan_id)

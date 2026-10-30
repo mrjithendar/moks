@@ -33,7 +33,7 @@ from typing import Any, Callable, NamedTuple
 
 from sqlalchemy import func, select, text
 
-from .. import audit, velero
+from .. import audit, velero, versions
 from ..config import get_settings
 from ..connectors import registry
 from ..connectors.base import ConnectorError
@@ -632,6 +632,7 @@ async def run_executor(stop: asyncio.Event | None = None) -> None:
         raise RuntimeError("run the executor with MOKS_PROCESS_ROLE=executor")
     stop = stop or asyncio.Event()
     wid = worker_id()
+    reported = 0.0
     log.info("executor started", extra={"event": "executor_started"})
     while not stop.is_set():
         try:
@@ -639,6 +640,9 @@ async def run_executor(stop: asyncio.Event | None = None) -> None:
                 await db.execute(text("UPDATE action_plans SET status = 'expired' WHERE status IN ('pending','approved') AND expires_at < now()"))
                 await close_undecided_sessions(db)
             await reconcile_stale()
+            if time.monotonic() - reported > 60:
+                reported = time.monotonic()
+                await versions.report("executor")
             claim = await claim_plan(wid)
             if claim:
                 await execute_plan(claim)

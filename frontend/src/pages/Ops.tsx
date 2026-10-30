@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, API, qs } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, PageHead, ScopePicker, StatusBadge, Time, useLoad } from "../components";
+import { Badge, ErrorBox, PageHead, ScopePicker, StatusBadge, Time, useInterval, useLoad } from "../components";
 
 const SEV: Record<string, "bad" | "warn" | "info" | "neutral"> = { sev1: "bad", sev2: "bad", sev3: "warn", sev4: "neutral" };
 const PLAN: Record<string, "ok" | "warn" | "bad" | "info" | "neutral"> = {
@@ -33,7 +33,7 @@ export function Incidents() {
   return (
     <>
       <PageHead title="Incidents" sub="Incident workspaces: timeline, evidence, hypotheses, actions and validation">
-        <select value={status} onChange={(e) => setStatus(e.target.value)}><option value="">all</option>{["open", "mitigated", "resolved", "closed"].map((s) => <option key={s}>{s}</option>)}</select>
+        <select aria-label="Filter by status" value={status} onChange={(e) => setStatus(e.target.value)}><option value="">all</option>{["open", "mitigated", "resolved", "closed"].map((s) => <option key={s}>{s}</option>)}</select>
       </PageHead>
       <div className="card">
         <table>
@@ -101,7 +101,7 @@ export function IncidentView() {
       <PageHead title={d.title} sub={<span className="row small"><Badge kind={SEV[d.severity]}>{d.severity}</Badge><Badge>{d.status}</Badge><span className="mono">{d.environment}/{d.namespace}</span><span>source {d.source}</span><span>opened <Time iso={d.created_at} /></span></span>}>
         <a className="btn" href={`${API}/incidents/${id}/handover.md`} target="_blank" rel="noreferrer">Handover</a>
         <a className="btn" href={`${API}/incidents/${id}/report.md`} target="_blank" rel="noreferrer">Report (Markdown)</a>
-        {write && <select value={d.status} onChange={(e) => act(() => api(`/incidents/${id}`, { method: "PATCH", body: { status: e.target.value } }))}>
+        {write && <select aria-label="Incident status" value={d.status} onChange={(e) => act(() => api(`/incidents/${id}`, { method: "PATCH", body: { status: e.target.value } }))}>
           {["open", "mitigated", "resolved", "closed"].map((s) => <option key={s}>{s}</option>)}</select>}
         <Link className="btn" to={`/investigate?env=${d.environment}&ns=${d.namespace === "*" ? "" : d.namespace}&incident=${id}&q=${encodeURIComponent(d.title)}`}>Investigate</Link>
       </PageHead>
@@ -120,12 +120,12 @@ export function IncidentView() {
           <div className="card">
             <h2>Hypotheses</h2>
             <ul>{d.hypotheses.map((h: any, i: number) => <li key={i}><Badge kind={h.status === "verified" ? "ok" : h.status === "refuted" ? "neutral" : "warn"}>{h.status}</Badge> <Badge>{h.confidence}</Badge> {h.text}
-              {write && <select style={{ marginLeft: 6 }} value={h.status} onChange={(e) => act(() => api(`/incidents/${id}`, { method: "PATCH", body: { hypotheses: d.hypotheses.map((x: any, j: number) => j === i ? { ...x, status: e.target.value } : x) } }))}>
+              {write && <select aria-label="Hypothesis status" style={{ marginLeft: 6 }} value={h.status} onChange={(e) => act(() => api(`/incidents/${id}`, { method: "PATCH", body: { hypotheses: d.hypotheses.map((x: any, j: number) => j === i ? { ...x, status: e.target.value } : x) } }))}>
                 {["open", "supported", "refuted", "verified"].map((s) => <option key={s}>{s}</option>)}</select>}</li>)}</ul>
             {!d.hypotheses.length && <div className="muted small">No hypotheses yet.</div>}
             {write && <form className="row" onSubmit={(e) => { e.preventDefault(); act(() => api(`/incidents/${id}`, { method: "PATCH", body: { hypotheses: [...d.hypotheses, { ...hyp, status: "open" }] } })).then(() => setHyp({ text: "", confidence: "low" })); }}>
-              <input style={{ flex: 1 }} required value={hyp.text} onChange={(e) => setHyp({ ...hyp, text: e.target.value })} placeholder="Suspected cause" />
-              <select value={hyp.confidence} onChange={(e) => setHyp({ ...hyp, confidence: e.target.value })}><option>low</option><option>medium</option><option>high</option></select>
+              <input aria-label="Suspected cause" style={{ flex: 1 }} required value={hyp.text} onChange={(e) => setHyp({ ...hyp, text: e.target.value })} placeholder="Suspected cause" />
+              <select aria-label="Confidence" value={hyp.confidence} onChange={(e) => setHyp({ ...hyp, confidence: e.target.value })}><option>low</option><option>medium</option><option>high</option></select>
               <button className="small">Add</button></form>}
           </div>
           <div className="card">
@@ -157,8 +157,8 @@ export function IncidentView() {
         <div className="card">
           <h2>Timeline</h2>
           {write && <form className="stack" onSubmit={(e) => { e.preventDefault(); act(() => api(`/incidents/${id}/events`, { method: "POST", body: note })).then(() => setNote({ text: "", kind: "note" })); }}>
-            <textarea rows={2} required value={note.text} onChange={(e) => setNote({ ...note, text: e.target.value })} placeholder="Note, evidence, communication…" />
-            <div className="row"><select value={note.kind} onChange={(e) => setNote({ ...note, kind: e.target.value })}>{["note", "evidence", "validation", "communication"].map((k) => <option key={k}>{k}</option>)}</select><button className="small">Add</button></div>
+            <textarea aria-label="Timeline note" rows={2} required value={note.text} onChange={(e) => setNote({ ...note, text: e.target.value })} placeholder="Note, evidence, communication…" />
+            <div className="row"><select aria-label="Entry type" value={note.kind} onChange={(e) => setNote({ ...note, kind: e.target.value })}>{["note", "evidence", "validation", "communication"].map((k) => <option key={k}>{k}</option>)}</select><button className="small">Add</button></div>
           </form>}
           <ul className="timeline" style={{ marginTop: 10 }}>
             {[...d.timeline].reverse().map((e: any) => <li key={e.id}><span className="small muted">{new Date(e.ts).toLocaleTimeString()}</span>
@@ -207,11 +207,7 @@ export function PlanView() {
   const [outcome, setOutcome] = useState("not_applied");
   const [error, setError] = useState<unknown>();
   const p = plan.data;
-  useEffect(() => {
-    if (!p || !["queued", "executing"].includes(p.status)) return;
-    const t = setInterval(plan.reload, 2500);
-    return () => clearInterval(t);
-  }, [p, plan.reload]);
+  useInterval(plan.reload, 2500, !!p && ["queued", "executing"].includes(p.status));
   async function act(path: string, body?: any) {
     setError(null);
     try { await api(`/actions/plans/${id}/${path}`, { method: "POST", body }); plan.reload(); } catch (e) { setError(e); }
@@ -241,12 +237,12 @@ export function PlanView() {
             <dt>Requested by</dt><dd>{p.requested_by}</dd>
           </dl>
         </div>
-        <div className="stack">
+        <div className="stack plan-decision">
           <div className="card stack">
             <h2>Decision</h2>
             {p.approvals.map((a: any, i: number) => <div key={i} className="small"><Badge kind={a.decision === "approve" ? "ok" : "bad"}>{a.decision}</Badge> {a.approver} <Time iso={a.at} /> {a.comment && `— ${a.comment}`}</div>)}
             {p.status === "pending" && p.requires_approval && can("action.approve") && !mine && <>
-              <textarea rows={2} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Comment (optional)" />
+              <textarea aria-label="Comment" rows={2} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Comment (optional)" />
               <div className="row"><button onClick={() => act("approve", { plan_hash: p.plan_hash, comment })}>Approve this exact plan</button>
                 <button className="danger" onClick={() => act("reject", { plan_hash: p.plan_hash, comment })}>Reject</button></div>
             </>}
@@ -262,7 +258,7 @@ export function PlanView() {
                 <label>What happened<select value={outcome} onChange={(e) => setOutcome(e.target.value)}>
                   <option value="not_applied">The change was not applied</option><option value="applied">The change was applied</option><option value="reverted">It was reverted by hand</option>
                 </select></label>
-                <textarea rows={2} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="How you verified this (required)" />
+                <textarea rows={2} value={comment} onChange={(e) => setComment(e.target.value)} aria-label="How you verified this" placeholder="How you verified this (required)" />
                 <button disabled={!comment.trim()} onClick={() => act("reconcile", { outcome, comment })}>Record outcome</button>
               </> : <div>Someone with the Approver role must record the outcome.</div>}
             </div>}

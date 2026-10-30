@@ -23,7 +23,8 @@ from ..auth.sessions import AuthContext, client_ip, revoke_all_for_user
 from ..connectors import registry
 from ..connectors.base import describe_credential_ref
 from ..db import get_db
-from ..llm.providers import LLMError, complete_metered, provider_for
+from ..llm import budget
+from ..llm.providers import LLMError, provider_for
 from ..models import AuditEvent, Connector, Environment, LLMConfig, RoleBinding, User
 from ..rbac import ROLES, P
 
@@ -238,7 +239,7 @@ async def test_llm(lid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)
     extra: dict[str, Any] = {}
     try:
         if c.purpose == "embedding":
-            vectors = await provider_for(c).embed(["connection test"])
+            vectors = await budget.embed(provider_for(c), c, ["connection test"], user_id=ctx.user.id, purpose="connection_test")
             dims = len(vectors[0]) if vectors and vectors[0] else 0
             if not dims:
                 raise LLMError("bad_response", f"{c.provider}/{c.model} returned no embedding")
@@ -247,8 +248,9 @@ async def test_llm(lid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)
                 raise LLMError("bad_response", f"{c.provider}/{c.model} returned {dims} dimensions but {c.embedding_dimensions} are configured")
             ok, msg = True, f"{c.provider}/{c.model} returned a {dims}-dimension embedding"
         else:
-            resp = await complete_metered(provider_for(c), "Reply with the JSON object {\"ok\": true} and nothing else.",
-                                          [{"role": "user", "content": "connection test"}], json_mode=True, max_tokens=c.max_output_tokens)
+            resp = await budget.complete(provider_for(c), "Reply with the JSON object {\"ok\": true} and nothing else.",
+                                         [{"role": "user", "content": "connection test"}], json_mode=True, max_tokens=c.max_output_tokens,
+                                         user_id=ctx.user.id, purpose="connection_test")
             ok, msg = True, f"{c.provider}/{c.model} answered ({resp.tokens_in}+{resp.tokens_out} tokens): {resp.text[:80]}"
     except LLMError as exc:
         ok, msg = False, f"{exc.kind}: {exc.message}"

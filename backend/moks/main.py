@@ -18,16 +18,19 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import __version__
+from . import __version__, jobs, versions
 from .api import actions, admin, alerts, backups, conversations, detections, diagnostics, environments, evals, explorer, finops, incidents, investigations, knowledge, metrics, multi, skills
 from .auth import routes as auth_routes
+from .auth.deps import get_auth
+from .auth.sessions import AuthContext
 from .config import get_settings
 from .connectors import registry
-from .db import dispose, session_scope
+from .db import dispose, get_db, session_scope
 from .observability import HTTP_LATENCY, HTTP_REQUESTS, setup_logging, setup_tracing, start_metrics_server
 
 log = logging.getLogger("moks.api")
@@ -104,9 +107,17 @@ def create_app() -> FastAPI:
     for extra in (incidents, knowledge, finops, actions, diagnostics, alerts, evals, skills, multi, metrics, detections, conversations, backups):
         router.include_router(extra.router)
 
+    @app.exception_handler(jobs.QueueFull)
+    async def queue_full(_request, exc: jobs.QueueFull):
+        return JSONResponse({"detail": str(exc)}, status_code=429, headers={"Retry-After": "30"})
+
     @router.get("/health", tags=["health"])
     async def public_health() -> dict[str, str]:
-        return {"status": "ok", "version": __version__}
+        return {"status": "ok", **versions.build()}
+
+    @router.get("/system/versions", tags=["health"])
+    async def system_versions(ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+        return await versions.running(db)
 
     @router.api_route("/{rest:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)
     async def api_not_found(rest: str) -> None:

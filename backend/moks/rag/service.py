@@ -1,4 +1,11 @@
-"""Knowledge retrieval: indexing, versioned embedding indexes, hybrid search with access control."""
+"""Knowledge retrieval: indexing, versioned embedding indexes, hybrid search with access control.
+
+PostgreSQL is the authority for content and access. An external index (OpenSearch, Pinecone) is a
+derived copy, written only after the change has committed: a change adds a row to index_outbox in
+the same transaction, and drain_outbox applies it later. So a rollback can never remove valid
+content from search, and a crash replays rather than loses. Each event names a per-document
+revision, which makes replays harmless and lets an older event be recognised and dropped.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,15 +17,16 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
 from ..connectors.base import ConnectorError
 from ..db import session_scope
+from ..llm import budget
 from ..llm.providers import LLMError, provider_for
-from ..models import Chunk, Document, EmbeddingIndex, KnowledgeSource, LLMConfig
+from ..models import Chunk, Document, EmbeddingIndex, IndexOutbox, KnowledgeSource, LLMConfig
 from ..observability import RETRIEVAL_LATENCY
 from ..rbac import Principal
 from . import access
@@ -32,6 +40,9 @@ EMBED_BACKOFF_SECONDS = 5
 REINDEX_EMBED_TRIES = 7  # a reindex is the one place worth waiting out a provider's rate limit
 INDEX_LOCK = 7_203_114  # advisory lock: creating the first index
 BUILD_STALE = timedelta(minutes=30)
+OUTBOX_MAX_ATTEMPTS = 8
+OUTBOX_MAX_BACKOFF_SECONDS = 3600
+CATCHUP_PASSES = 20
 _opensearch: OpenSearchBackend | None = None
 _pinecone: PineconeBackend | None = None
 
@@ -77,7 +88,7 @@ async def active_index(db: AsyncSession) -> EmbeddingIndex | None:
 
 async def embedding_dimensions(cfg: LLMConfig) -> int:
     """The model's real output size. A configured size must agree: a vector mapping cannot change."""
-    vec = (await provider_for(cfg).embed(["dimension probe"]))[0]
+    vec = (await budget.embed(provider_for(cfg), cfg, ["dimension probe"], purpose="dimension_probe"))[0]
     if cfg.embedding_dimensions and cfg.embedding_dimensions != len(vec):
         raise ConnectorError("config", f"{cfg.name} is configured for {cfg.embedding_dimensions} dimensions but returns {len(vec)}")
     return len(vec)
@@ -110,15 +121,15 @@ async def ensure_index(db: AsyncSession) -> EmbeddingIndex:
     db.add(idx)
     await db.flush()
     idx.index_name = f"moks-chunks-{str(idx.id)[:8]}"
-    if external():
+    if external():  # idempotent, and an empty index left by a rollback holds nothing
         await external().ensure_index(idx.index_name, idx.dimensions)
     return idx
 
 
-async def _embed_batch(provider, texts: list[str], tries: int) -> list[list[float]]:
+async def _embed_batch(provider, cfg: LLMConfig, texts: list[str], tries: int) -> list[list[float]]:
     for attempt in range(tries):
         try:
-            return await provider.embed(texts)
+            return await budget.embed(provider, cfg, texts, purpose="indexing")
         except LLMError as exc:
             if exc.kind != "rate_limited" or attempt == tries - 1:
                 raise
@@ -135,7 +146,7 @@ async def _embed(db: AsyncSession, idx: EmbeddingIndex, texts: list[str], tries:
     provider = provider_for(cfg)
     out: list[list[float]] = []
     for i in range(0, len(texts), EMBED_BATCH):
-        out.extend(await _embed_batch(provider, texts[i:i + EMBED_BATCH], tries))
+        out.extend(await _embed_batch(provider, cfg, texts[i:i + EMBED_BATCH], tries))
     if any(len(v) != idx.dimensions for v in out):
         raise LLMError("bad_response", f"embedding size differs from the index's {idx.dimensions} dimensions; reindex after a model change")
     return out
@@ -156,7 +167,7 @@ async def index_document(db: AsyncSession, src: KnowledgeSource, path: str, raw:
     if doc and doc.content_hash == content_hash and doc.status == "active":
         return doc  # unchanged: incremental sync skips it
     if doc is None:
-        doc = Document(source_id=src.id, path=path, content_hash=content_hash)
+        doc = Document(source_id=src.id, path=path, content_hash=content_hash, content_revision=0, indexed_revision=0)
         db.add(doc)
     await _drop_chunks(db, doc)
     doc.content_hash, doc.revision, doc.url = content_hash, revision, url
@@ -170,6 +181,7 @@ async def index_document(db: AsyncSession, src: KnowledgeSource, path: str, raw:
     if reason:
         doc.status, doc.excluded_reason, doc.title = "excluded", reason, path.rsplit("/", 1)[-1]
         await db.flush()
+        await _record_change(db, doc, "delete")
         return doc
     text_clean = clean(raw)
     doc.status, doc.excluded_reason, doc.title = "active", None, extra.get("title") or title_of(path, text_clean)
@@ -179,35 +191,123 @@ async def index_document(db: AsyncSession, src: KnowledgeSource, path: str, raw:
               for i, p in enumerate(pieces)]
     db.add_all(chunks)
     await db.flush()
+    await _record_change(db, doc, "upsert")
+    if external():
+        return doc  # applied after commit by drain_outbox
     idx = await ensure_index(db)
-    rows = [_row(c, doc, src) for c in chunks]
+    await _write_postgres(db, idx, doc, src, chunks)
+    doc.indexed_at = datetime.now(timezone.utc)
+    return doc
+
+
+async def _write_postgres(db: AsyncSession, idx: EmbeddingIndex, doc: Document, src: KnowledgeSource, chunks: list[Chunk]) -> None:
     embeddings = None
     try:
         embeddings = await _embed(db, idx, [f"{c.heading}\n{c.text}" for c in chunks]) if chunks else None
     except LLMError as exc:
         log.warning("embedding failed; indexed keyword-only", extra={"event": "embedding_failed", "errorType": exc.kind})
+    await PostgresBackend(db).index_chunks(idx, [_row(c, doc, src) for c in chunks], embeddings)
+
+
+async def _record_change(db: AsyncSession, doc: Document, op: str) -> None:
+    """Part of the caller's transaction: the event exists exactly when the change does."""
+    doc.content_revision = (doc.content_revision or 0) + 1
     if external():
-        await external().index_chunks(idx.index_name, rows, embeddings)
+        db.add(IndexOutbox(document_id=doc.id, revision=doc.content_revision, op=op))
     else:
-        await PostgresBackend(db).index_chunks(idx, rows, embeddings)
-    doc.indexed_at = datetime.now(timezone.utc)
-    return doc
+        doc.indexed_revision = doc.content_revision  # the same database, so already consistent
+    await db.flush()
 
 
 async def _drop_chunks(db: AsyncSession, doc: Document) -> None:
-    if doc.id is None:
-        return
-    if external():
-        idx = await active_index(db)
-        if idx:
-            await external().delete_document(idx.index_name, doc.id)
-    await db.execute(delete(Chunk).where(Chunk.document_id == doc.id))
+    if doc.id is not None:
+        await db.execute(delete(Chunk).where(Chunk.document_id == doc.id))
 
 
 async def remove_document(db: AsyncSession, doc: Document) -> None:
-    """Deletion propagation: the document disappears from search immediately."""
+    """Search stops returning it at commit, because results are checked against PostgreSQL. The
+    external copy goes when the outbox event is applied."""
     await _drop_chunks(db, doc)
     doc.status, doc.updated_at = "deleted", datetime.now(timezone.utc)
+    await _record_change(db, doc, "delete")
+
+
+async def _write_document(db: AsyncSession, idx: EmbeddingIndex, document_id: uuid.UUID) -> None:
+    """Make one external index match PostgreSQL for one document. Replaying this is harmless."""
+    ext = external()
+    await ext.delete_document(idx.index_name, document_id)
+    row = (await db.execute(select(Document, KnowledgeSource).join(KnowledgeSource, KnowledgeSource.id == Document.source_id).where(Document.id == document_id))).first()
+    if row is None or row[0].status != "active":
+        return
+    doc, src = row
+    chunks = (await db.execute(select(Chunk).where(Chunk.document_id == doc.id).order_by(Chunk.ord))).scalars().all()
+    if not chunks:
+        return
+    embeddings = None
+    try:
+        embeddings = await _embed(db, idx, [f"{c.heading}\n{c.text}" for c in chunks])
+    except LLMError as exc:
+        log.warning("embedding failed; indexed keyword-only", extra={"event": "embedding_failed", "errorType": exc.kind})
+    await ext.index_chunks(idx.index_name, [_row(c, doc, src) for c in chunks], embeddings)
+
+
+async def _apply_event(db: AsyncSession, ev: IndexOutbox) -> str:
+    doc = await db.get(Document, ev.document_id)
+    now = (await db.execute(select(func.now()))).scalar_one()
+    if doc is not None and (ev.revision < doc.content_revision or ev.revision <= doc.indexed_revision):
+        ev.status, ev.processed_at, ev.error = "done", now, "superseded"  # newer content has its own event, or this is a replay
+        return "skipped"
+    try:
+        idx = await ensure_index(db)
+        await _write_document(db, idx, ev.document_id)
+    except Exception as exc:
+        ev.attempts += 1
+        ev.error = f"{type(exc).__name__}: {str(getattr(exc, 'message', exc))[:300]}"
+        if ev.attempts >= OUTBOX_MAX_ATTEMPTS:
+            ev.status, ev.processed_at = "dead", now
+            log.error("index event gave up", extra={"event": "index_outbox_dead", "errorType": type(exc).__name__})
+            return "dead"
+        ev.next_attempt_at = now + timedelta(seconds=min(30 * 2 ** (ev.attempts - 1), OUTBOX_MAX_BACKOFF_SECONDS))
+        return "retry"
+    ev.status, ev.processed_at, ev.error = "done", now, None
+    if doc is not None:
+        doc.indexed_revision, doc.indexed_at = ev.revision, now
+    return "applied"
+
+
+async def drain_outbox(limit: int = 100) -> dict[str, int]:
+    """Apply committed changes in order. Each event is its own transaction holding its row lock, so
+    workers never apply the same event twice at once, and a crash leaves it pending."""
+    counts = {"applied": 0, "skipped": 0, "retry": 0, "dead": 0}
+    if not external():
+        return counts
+    for _ in range(limit):
+        async with session_scope() as db:
+            ev = (await db.execute(select(IndexOutbox).where(IndexOutbox.status == "pending", IndexOutbox.next_attempt_at <= func.now())
+                                   .order_by(IndexOutbox.id).limit(1).with_for_update(skip_locked=True))).scalars().first()
+            if ev is None:
+                break
+            counts[await _apply_event(db, ev)] += 1
+    return counts
+
+
+async def reconcile_index() -> int:
+    """Finds documents PostgreSQL and the index disagree on with nothing pending to fix it, for
+    example after an event went dead and was then cleared, and queues them again."""
+    if not external():
+        return 0
+    async with session_scope() as db:
+        rows = (await db.execute(select(Document).where(Document.content_revision != Document.indexed_revision, ~select(IndexOutbox.id).where(
+            IndexOutbox.document_id == Document.id, IndexOutbox.status.in_(("pending", "dead"))).exists()).limit(500))).scalars().all()
+        for doc in rows:
+            await _record_change(db, doc, "upsert" if doc.status == "active" else "delete")
+        return len(rows)
+
+
+async def retry_dead() -> int:
+    async with session_scope() as db:
+        rows = (await db.execute(update(IndexOutbox).where(IndexOutbox.status == "dead").values(status="pending", attempts=0, next_attempt_at=func.now(), processed_at=None).returning(IndexOutbox.id))).all()
+        return len(rows)
 
 
 async def _index_batch(db: AsyncSession, new: EmbeddingIndex, batch: list) -> None:
@@ -226,10 +326,30 @@ async def _pending_rows(db: AsyncSession, done: set) -> list:
     return [r for r in rows if r[0].id not in done]
 
 
-async def reindex(db: AsyncSession) -> dict:
+async def _catch_up(db: AsyncSession, new: EmbeddingIndex, caught: int) -> int:
+    """Re-copy from PostgreSQL every document changed since `caught`, until a pass finds none and
+    the switch can happen with the outbox held still."""
+    for _ in range(CATCHUP_PASSES):
+        high = (await db.execute(select(func.coalesce(func.max(IndexOutbox.id), 0)))).scalar_one()
+        ids = (await db.execute(select(IndexOutbox.document_id).where(IndexOutbox.id > caught).distinct())).scalars().all()
+        if not ids:
+            return caught
+        for document_id in ids:
+            await _write_document(db, new, document_id)
+        caught = high
+        new.heartbeat_at = datetime.now(timezone.utc)
+        await db.commit()
+    raise ConnectorError("conflict", "changes kept arriving faster than the reindex could catch up; it will need another run")
+
+
+async def reindex(db: AsyncSession, job_id: uuid.UUID | None = None) -> dict:
     """Build a new index version beside the active one, then switch in one committed transaction.
     Search uses the old index until that commit. A failed build leaves the old index active. The
-    old physical index is deleted only after the switch has committed (cleanup_retired)."""
+    old physical index is deleted only after the switch has committed (cleanup_retired).
+
+    Changes during a build: the outbox position is noted first, the copy reads PostgreSQL, and every
+    document changed after that position is copied again. Inserts into the outbox are held only for
+    the moment of the final check and the switch, so nothing can slip between them."""
     cfg = await embedding_config(db)
     if backend_name() == "postgres" and cfg and not await PostgresBackend(db).has_vector():
         raise ConnectorError("config", "pgvector is not installed in this PostgreSQL; use the opensearch backend or a pgvector image")
@@ -239,7 +359,8 @@ async def reindex(db: AsyncSession) -> dict:
     await db.commit()
     dims = await embedding_dimensions(cfg) if cfg else None
     new = EmbeddingIndex(backend=backend_name(), llm_config_id=cfg.id if cfg else None, model_key=model_key(cfg),
-                         dimensions=dims, index_name="", status="building", heartbeat_at=datetime.now(timezone.utc))
+                         dimensions=dims, index_name="", status="building", heartbeat_at=datetime.now(timezone.utc), build_job_id=job_id,
+                         build_watermark=(await db.execute(select(func.coalesce(func.max(IndexOutbox.id), 0)))).scalar_one())
     db.add(new)
     try:
         await db.flush()
@@ -263,6 +384,14 @@ async def reindex(db: AsyncSession) -> dict:
                 done.update(r[0].id for r in batch)
                 new.heartbeat_at = datetime.now(timezone.utc)
                 await db.commit()
+        if external():
+            caught = new.build_watermark or 0
+            while True:
+                caught = await _catch_up(db, new, caught)
+                await db.execute(text("LOCK TABLE index_outbox IN EXCLUSIVE MODE"))  # held to the commit below
+                if (await db.execute(select(func.coalesce(func.max(IndexOutbox.id), 0)))).scalar_one() <= caught:
+                    break
+                await db.rollback()
     except Exception as exc:
         await db.rollback()
         new = await db.get(EmbeddingIndex, new_id)
@@ -321,7 +450,7 @@ async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8,
     cfg = await embedding_config(db)
     if idx and idx.dimensions and cfg and idx.llm_config_id == cfg.id and idx.model_key == model_key(cfg):
         try:
-            qv = (await provider_for(cfg).embed([query]))[0]
+            qv = (await budget.embed(provider_for(cfg), cfg, [query], user_id=uuid.UUID(principal.user_id), purpose="search", wait_seconds=2))[0]
             if external():
                 rankings.append(await external().vector(idx.index_name, qv, envs, nss, pool))
             elif await PostgresBackend(db).has_vector():
@@ -384,10 +513,8 @@ async def rescope_source(db: AsyncSession, src: KnowledgeSource, old: tuple[str,
         if (env, ns) != (d.environment, d.namespace):
             moved.append(d)
     await db.flush()
-    idx = await active_index(db)
-    if moved and idx is not None and external():
-        for d in moved:
-            await external().update_scope(idx.index_name, d.id, d.environment, d.namespace)
+    for d in moved:
+        await _record_change(db, d, "upsert" if d.status == "active" else "delete")
     return len(moved)
 
 
@@ -397,7 +524,10 @@ async def stats(db: AsyncSession) -> dict:
     idx = await active_index(db)
     cfg = await embedding_config(db)
     building = (await db.execute(select(EmbeddingIndex).where(EmbeddingIndex.backend == backend_name(), EmbeddingIndex.status == "building"))).scalars().first()
+    outbox = dict((await db.execute(text("SELECT status, count(*) FROM index_outbox WHERE status <> 'done' GROUP BY status"))).all())
+    stale = (await db.execute(select(func.count()).select_from(Document).where(Document.content_revision != Document.indexed_revision))).scalar_one()
     return {"backend": backend_name(), "documents": counts, "chunks": chunks,
+            "outbox": {"pending": outbox.get("pending", 0), "dead": outbox.get("dead", 0), "documents_behind": stale},
             "index": {"name": idx.index_name, "model": idx.model_key, "dimensions": idx.dimensions, "mode": "hybrid" if idx.dimensions else "keyword-only",
                       "note": idx.error, "reindex_needed": bool(cfg and idx.model_key != model_key(cfg))} if idx else None,
             "reindex_running": building is not None}

@@ -16,14 +16,14 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
-      serviceAccountName: {{ .Values.serviceAccount.name }}
+      serviceAccountName: {{ include "moks.serviceAccount" (dict "root" . "component" "api") }}
       enableServiceLinks: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- include "moks.podSecurity" . | nindent 6 }}
       terminationGracePeriodSeconds: 30
-      {{- include "moks.migrateInit" . | nindent 6 }}
+      {{- include "moks.migrateInit" (dict "root" . "component" "api") | nindent 6 }}
       containers:
         - name: api
           image: {{ include "moks.image" . }}
@@ -32,16 +32,16 @@ spec:
           ports:
             - {name: http, containerPort: 8080}
             - {name: metrics, containerPort: 9464}
-          {{- include "moks.env" . | nindent 10 }}
+          {{- include "moks.env" (dict "root" . "component" "api") | nindent 10 }}
           env:
             - {name: FORWARDED_ALLOW_IPS, value: "*"}  # only Traefik can reach :8080 (NetworkPolicy)
           {{- include "moks.containerSecurity" . | nindent 10 }}
-          {{- include "moks.volumeMounts" . | nindent 10 }}
+          {{- include "moks.volumeMounts" (dict "root" . "component" "api") | nindent 10 }}
           startupProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 3, failureThreshold: 40}
           livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 20, timeoutSeconds: 3, failureThreshold: 3}
           readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3}
           resources: {{- toYaml .Values.api.resources | nindent 12 }}
-      {{- include "moks.volumes" . | nindent 6 }}
+      {{- include "moks.volumes" (dict "root" . "component" "api") | nindent 6 }}
 ---
 apiVersion: v1
 kind: Service

@@ -1,7 +1,8 @@
 import { Fragment, useState, type FormEvent } from "react";
 import { api, qs } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, PageHead, Time, useLoad } from "../components";
+import { Badge, ErrorBox, PageHead, Time, useLoad, rowAction } from "../components";
+import { useFeedback } from "../ui";
 
 function useAction() {
   const [error, setError] = useState<unknown>();
@@ -201,6 +202,7 @@ export function Environments() {
 // ---- Connectors -------------------------------------------------------------------------------
 
 export function Connectors() {
+  const { confirm: ask } = useFeedback();
   const list = useLoad(() => api<any[]>("/admin/connectors"), []);
   const envs = useLoad(() => api<any[]>("/environments"), []);
   const [environment, setEnvironment] = useState("");
@@ -224,7 +226,7 @@ export function Connectors() {
     list.reload();
   }
   async function remove(id: string) {
-    if (confirm("Delete this connector?")) { await a.run(() => api(`/admin/connectors/${id}`, { method: "DELETE" })); list.reload(); }
+    if (await ask({ title: "Delete this connector?", body: "MOKS stops reading from this data source.", action: "Delete connector", danger: true })) { await a.run(() => api(`/admin/connectors/${id}`, { method: "DELETE" })); list.reload(); }
   }
   function edit(c: any) {
     setEditing(c.id);
@@ -283,6 +285,7 @@ const LLM_PROVIDERS: Record<string, { label: string; models: string[]; hint: str
 };
 
 export function LLMProviders() {
+  const { confirm: ask } = useFeedback();
   const list = useLoad(() => api<any[]>("/admin/llm"), []);
   const blank = { name: "", purpose: "chat", provider: "bedrock", model: "", endpoint: "", region: "us-east-1", credType: "none", credName: "",
     timeout_seconds: 60, max_output_tokens: 2000, daily_budget_usd: "5", input_price_per_mtok: "0", output_price_per_mtok: "0" };
@@ -321,7 +324,7 @@ export function LLMProviders() {
               <td className="row">
                 <button className="small" onClick={() => test(c.id)}>Test</button>
                 <button className="ghost small" onClick={async () => { await a.run(() => api(`/admin/llm/${c.id}/activate${qs({ active: !c.is_active })}`, { method: "POST" })); list.reload(); }}>{c.is_active ? "Deactivate" : "Activate"}</button>
-                {!c.is_active && <button className="ghost small" onClick={async () => { if (confirm(`Delete ${c.name}? Its usage history is kept.`)) { await a.run(() => api(`/admin/llm/${c.id}`, { method: "DELETE" })); list.reload(); } }}>Delete</button>}
+                {!c.is_active && <button className="ghost small" onClick={async () => { if (await ask({ title: `Delete ${c.name}?`, body: "Its usage history is kept.", action: "Delete provider", danger: true })) { await a.run(() => api(`/admin/llm/${c.id}`, { method: "DELETE" })); list.reload(); } }}>Delete</button>}
                 <button className="ghost small" onClick={() => { setEditing(c.id); setForm({ ...c, endpoint: c.endpoint ?? "", region: c.region ?? "us-east-1", credType: c.credential_ref?.type ?? "none", credName: c.credential_ref?.name ?? "" }); }}>Edit</button>
               </td>
             </tr>
@@ -394,9 +397,9 @@ export function Users() {
                 ))}{!u.bindings.length && <span className="muted">no access</span>}</td>
                 <td>
                   <div className="row">
-                    <select value={g.role} onChange={(e) => setGrant({ ...grant, [u.id]: { ...g, role: e.target.value } })}>{roles.data?.map((r) => <option key={r.role}>{r.role}</option>)}</select>
-                    <input style={{ width: 90 }} value={g.environment} onChange={(e) => setGrant({ ...grant, [u.id]: { ...g, environment: e.target.value } })} title="environment pattern" />
-                    <input style={{ width: 110 }} value={g.namespace} onChange={(e) => setGrant({ ...grant, [u.id]: { ...g, namespace: e.target.value } })} title="namespace pattern" />
+                    <select aria-label="Role" value={g.role} onChange={(e) => setGrant({ ...grant, [u.id]: { ...g, role: e.target.value } })}>{roles.data?.map((r) => <option key={r.role}>{r.role}</option>)}</select>
+                    <input aria-label="Environment" style={{ width: 90 }} value={g.environment} onChange={(e) => setGrant({ ...grant, [u.id]: { ...g, environment: e.target.value } })} title="environment pattern" />
+                    <input aria-label="Namespace" style={{ width: 110 }} value={g.namespace} onChange={(e) => setGrant({ ...grant, [u.id]: { ...g, namespace: e.target.value } })} title="namespace pattern" />
                     <button className="small" onClick={async () => { await a.run(() => api(`/admin/users/${u.id}/bindings`, { method: "POST", body: g })); list.reload(); }}>Grant</button>
                   </div>
                 </td>
@@ -493,7 +496,7 @@ export function Audit() {
           <thead><tr><th>#</th><th>Time</th><th>Actor</th><th>Action</th><th>Resource</th><th>Scope</th><th>Decision</th><th>Outcome</th></tr></thead>
           <tbody>{events.map((e) => (
             <Fragment key={e.id}>
-              <tr className="clickable" onClick={() => setOpen(open === e.id ? null : e.id)}>
+              <tr className="clickable" {...rowAction(() => setOpen(open === e.id ? null : e.id))}>
                 <td className="mono small">{e.chain_seq}</td><td className="small">{new Date(e.ts).toLocaleString()}</td>
                 <td className="small">{e.actor_email ?? "system"}</td><td className="mono small">{e.action}</td>
                 <td className="mono small">{[e.resource_type, e.resource_id].filter(Boolean).join(":")}</td>

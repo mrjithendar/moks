@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
+from .. import versions
 from ..config import get_settings
 from ..db import session_scope
 from .engine import Investigator, emit
@@ -71,33 +72,57 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
     s = get_settings()
     wid = worker_id()
     stop = stop or asyncio.Event()
+    jobs.draining.clear()
     running: set[asyncio.Task] = set()
-    job_tasks: set[asyncio.Task] = set()
+    pools: dict[str, set[asyncio.Task]] = {c: set() for c in jobs.capacity()}
+    sizes = jobs.capacity()
+    interactive = "interactive" in {c.strip() for c in s.worker_classes.split(",")}
     log.info("worker started", extra={"event": "worker_started"})
     tick = 0
     poll_every = max(1, int(s.alert_poll_seconds / max(s.worker_poll_seconds, 0.1)))
+    housekeeping: asyncio.Task | None = None
+
+    async def maintain(reap: bool, schedule: bool) -> None:
+        await versions.report("worker")
+        if reap:
+            await reap_stale()
+            await jobs.reap_abandoned()
+        if schedule:
+            await jobs.schedule_periodic()
+
+    async def index_changes() -> None:
+        from ..rag import service
+
+        await service.drain_outbox()
+        if tick % 600 == 0:
+            await service.reconcile_index()
+
+    outbox: asyncio.Task | None = None
     while not stop.is_set():
         try:
-            if tick % 30 == 0:
-                await reap_stale()
-                await jobs.reap_abandoned()
-            if tick % poll_every == 0:
-                await jobs.schedule_periodic()
-            if not job_tasks:  # one background job at a time per worker
-                jid = await jobs.claim(wid)
-                if jid:
+            # In its own task: a slow index cleanup must not hold back claiming.
+            if (tick % 30 == 0 or tick % poll_every == 0) and (housekeeping is None or housekeeping.done()):
+                housekeeping = asyncio.create_task(maintain(tick % 30 == 0, tick % poll_every == 0))
+            if "knowledge" in pools and (outbox is None or outbox.done()):  # not a job: a reindex must not hold up deletions
+                outbox = asyncio.create_task(index_changes())
+            for cls, tasks in pools.items():  # detection first; each class only ever uses its own slots
+                while len(tasks) < sizes[cls]:
+                    jid = await jobs.claim(wid, cls)
+                    if jid is None:
+                        break
                     jt = asyncio.create_task(jobs.run_one(jid))
-                    job_tasks.add(jt)
-                    jt.add_done_callback(job_tasks.discard)
-            await cancel_queued()
-            while len(running) < s.worker_concurrency:
-                iid = await claim(wid)
-                if iid is None:
-                    break
-                log.info("claimed investigation", extra={"event": "investigation_claimed", "investigation_id": str(iid)})
-                t = asyncio.create_task(Investigator(iid, wid).run())
-                running.add(t)
-                t.add_done_callback(running.discard)
+                    tasks.add(jt)
+                    jt.add_done_callback(tasks.discard)
+            if interactive:
+                await cancel_queued()
+                while len(running) < s.worker_concurrency:
+                    iid = await claim(wid)
+                    if iid is None:
+                        break
+                    log.info("claimed investigation", extra={"event": "investigation_claimed", "investigation_id": str(iid)})
+                    t = asyncio.create_task(Investigator(iid, wid).run())
+                    running.add(t)
+                    t.add_done_callback(running.discard)
         except Exception:
             log.exception("worker loop error", extra={"event": "worker_loop_error"})
         tick += 1
@@ -105,6 +130,15 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
             await asyncio.wait_for(stop.wait(), timeout=s.worker_poll_seconds)
         except asyncio.TimeoutError:
             pass
-    # Graceful shutdown: let running investigations finish within the termination grace period.
-    if running or job_tasks:
-        await asyncio.wait(running | job_tasks, timeout=max(5, s.max_duration_seconds))
+    # Graceful shutdown: long background work hands itself back at once, so a rollout never waits
+    # for a reindex. Detection and investigations finish within the termination grace period.
+    jobs.draining.set()
+    for t in (housekeeping, outbox):
+        if t is not None:
+            t.cancel()
+    for cls in ("knowledge", "maintenance"):
+        for t in list(pools.get(cls, ())):
+            t.cancel()
+    pending = running | {t for tasks in pools.values() for t in tasks}
+    if pending:
+        await asyncio.wait(pending, timeout=max(5, s.max_duration_seconds))

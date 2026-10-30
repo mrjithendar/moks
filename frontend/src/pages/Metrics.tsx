@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api, qs } from "../api";
-import { Badge, ErrorBox, LineChart, PageHead, type Scope, Time, useInterval, useLoad, useScopes } from "../components";
+import { Badge, ErrorBox, LineChart, PageHead, type Scope, Time, useInterval, useLoad, useScopes, rowAction } from "../components";
 
 interface Result {
   source: { environments: string[]; connector: string; language: string }; ok: boolean; error?: string; denied?: boolean; namespace?: string | null;
@@ -210,7 +210,7 @@ function Explore({ environments, connectors, scopes, sources, onQuery }: { envir
         <div className="card metric-list">
           <table>
             <tbody>{items.map((m: any) => (
-              <tr key={m.name} className={`clickable ${metric === m.name ? "selected" : ""}`} onClick={() => { setMetric(m.name); setFilters({}); }}>
+              <tr key={m.name} className={`clickable ${metric === m.name ? "selected" : ""}`} {...rowAction(() => { setMetric(m.name); setFilters({}); })}>
                 <td className="mono small">{m.name}<div className="muted">{[m.type, m.unit].filter(Boolean).join(" · ")}{m.environments.length > 1 ? ` · ${m.environments.length} environments` : ""}</div></td>
               </tr>
             ))}</tbody>
@@ -391,7 +391,7 @@ function CloudWatch({ envs, namespaces }: { envs: any[]; namespaces: Record<stri
       <ErrorBox error={list.error ?? r.error} />
       <div className="grid metrics-layout" style={{ marginTop: 14 }}>
         <div className="card metric-list"><table><tbody>{list.data?.items.map((m: any, i: number) => (
-          <tr key={i} className="clickable" onClick={() => setPick(m)}><td className="mono small">{m.metric}<div className="muted">{Object.entries(m.dimensions).map(([k, v]) => `${k}=${v}`).join(" ")}</div></td></tr>
+          <tr key={i} className="clickable" {...rowAction(() => setPick(m))}><td className="mono small">{m.metric}<div className="muted">{Object.entries(m.dimensions).map(([k, v]) => `${k}=${v}`).join(" ")}</div></td></tr>
         ))}</tbody></table>{list.data && !list.data.items.length && <div className="empty">No metrics found.</div>}</div>
         <div>{pick ? <Results data={r.data} loading={r.busy} /> : <div className="card empty">Pick a metric.</div>}</div>
       </div>

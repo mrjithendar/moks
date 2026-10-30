@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import struct
+import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,7 +33,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger("moks.backup")
@@ -195,13 +197,134 @@ async def table_counts(db: AsyncSession) -> dict[str, int]:
     return {t: int((await db.execute(text(f'SELECT count(*) FROM "{t}"'))).scalar_one()) for t in rows}
 
 
-def compare_counts(source: dict[str, int], restored: dict[str, int]) -> dict[str, Any]:
-    """A restore may lag a live source, but it must hold every table and never more rows."""
-    missing = sorted(set(source) - set(restored))
-    extra = sorted(set(restored) - set(source))
-    differ = {t: {"source": source[t], "restored": restored[t]} for t in sorted(set(source) & set(restored)) if source[t] != restored[t]}
-    bad = [t for t, v in differ.items() if v["restored"] > v["source"]]
-    return {"ok": not missing and not extra and not bad, "tables": len(source), "missing": missing, "extra": extra, "differ": differ, "more_than_source": bad}
+def compare_counts(expected: dict[str, int], restored: dict[str, int]) -> dict[str, Any]:
+    """Against the manifest of the same snapshot, so any difference at all is a failed restore."""
+    missing = sorted(set(expected) - set(restored))
+    extra = sorted(set(restored) - set(expected))
+    differ = {t: {"expected": expected[t], "restored": restored[t]} for t in sorted(set(expected) & set(restored)) if expected[t] != restored[t]}
+    return {"ok": not missing and not extra and not differ, "tables": len(expected), "missing": missing, "extra": extra, "differ": differ}
+
+
+def live_drift(source: dict[str, int], restored: dict[str, int]) -> dict[str, int]:
+    """How far the live database has moved since. Information only: it says nothing about integrity."""
+    return {t: source[t] - restored.get(t, 0) for t in sorted(source) if source[t] != restored.get(t, 0)}
+
+
+# Each counts rows that break a promise the application makes. All must be zero after a restore.
+INVARIANTS = {
+    "approvals_have_plans": "SELECT count(*) FROM approvals a LEFT JOIN action_plans p ON p.id = a.plan_id WHERE p.id IS NULL",
+    "plans_have_environments": "SELECT count(*) FROM action_plans p LEFT JOIN environments e ON e.id = p.environment_id WHERE e.id IS NULL",
+    "plans_have_requesters": "SELECT count(*) FROM action_plans p LEFT JOIN users u ON u.id = p.requested_by WHERE u.id IS NULL",
+    "approved_plans_have_approvals": """SELECT count(*) FROM action_plans p WHERE p.requires_approval AND p.status IN ('approved', 'succeeded', 'recovered')
+                                        AND NOT EXISTS (SELECT 1 FROM approvals a WHERE a.plan_id = p.id AND a.decision = 'approve')""",
+    "bindings_have_users": "SELECT count(*) FROM role_bindings b LEFT JOIN users u ON u.id = b.user_id WHERE u.id IS NULL",
+    "messages_have_conversations": "SELECT count(*) FROM conversation_messages m LEFT JOIN conversations c ON c.id = m.conversation_id WHERE c.id IS NULL",
+    "evidence_has_investigations": "SELECT count(*) FROM evidence e LEFT JOIN investigations i ON i.id = e.investigation_id WHERE i.id IS NULL",
+    "chunks_have_documents": "SELECT count(*) FROM chunks c LEFT JOIN documents d ON d.id = c.document_id WHERE d.id IS NULL",
+}
+
+
+async def check_invariants(db: AsyncSession) -> dict[str, int]:
+    return {name: n for name, sql in INVARIANTS.items() if (n := int((await db.execute(text(sql))).scalar_one()))}
+
+
+def assert_isolated(admin_url: str, live_database: str, scratch: str) -> None:
+    """A drill may only ever write to a database it created itself."""
+    if not scratch.startswith("moks_restore_drill_") or scratch == live_database:
+        raise BackupError(f"refusing to restore into {scratch}: drills use a new moks_restore_drill_ database")
+    if "/" in admin_url.replace("://", "").rstrip("/") and admin_url.rsplit("/", 1)[-1].split("?")[0] == live_database:
+        raise BackupError("the drill's admin connection must not point at the live database")
+
+
+async def _smoke(db: AsyncSession) -> dict[str, Any]:
+    """What the application does first: read accounts and configuration, and prove the audit chain."""
+    from . import audit
+    from .models import Environment, User
+    from .rag import service
+
+    users = (await db.execute(select(func.count()).select_from(User))).scalar_one()
+    environments = (await db.execute(select(func.count()).select_from(Environment))).scalar_one()
+    chain = await audit.verify_chain(db)
+    index = await service.stats(db)
+    return {"users": users, "environments": environments, "audit_chain_ok": chain["ok"], "audit_rows": chain.get("checked"), "documents": index["documents"]}
+
+
+async def restore_drill(store: Store, object_key: str, key: bytes, admin_url: str, live_database: str, workdir: Path, *, now: datetime | None = None) -> dict[str, Any]:
+    """Restores one backup into a new, isolated database, proves it, then drops that database.
+    Never touches the live database: it reads the bucket and creates a database of its own."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    now = now or datetime.now(timezone.utc)
+    scratch = f"moks_restore_drill_{os.urandom(4).hex()}"
+    assert_isolated(admin_url, live_database, scratch)
+    report: dict[str, Any] = {"object": object_key, "database": scratch, "ok": False, "failures": [], "seconds": {}}
+    fail = report["failures"].append
+    started = time.monotonic()
+
+    def lap(name: str, since: float) -> float:
+        at = time.monotonic()
+        report["seconds"][name] = round(at - since, 3)
+        return at
+
+    sealed, plain, meta = workdir / "drill.enc", workdir / "drill.dump", workdir / "drill.json"
+    t = started
+    store.download(object_key + ".json", meta)
+    manifest = json.loads(meta.read_text())
+    store.download(object_key, sealed)
+    if _sha256(sealed) != manifest.get("sha256"):
+        fail("checksum: the stored copy does not match its manifest")
+        return report
+    t = lap("download", t)
+    try:
+        with sealed.open("rb") as src, plain.open("wb") as dst:
+            decrypt_stream(src, dst, key)
+    except BackupError as exc:
+        fail(f"decryption: {exc}")
+        return report
+    t = lap("decrypt", t)
+    base = admin_url.rsplit("/", 1)[0]
+    import asyncpg
+
+    admin = await asyncpg.connect(admin_url)
+    await admin.execute(f'CREATE DATABASE "{scratch}"')
+    await admin.close()
+    try:
+        done = subprocess.run(["pg_restore", "--no-owner", "--no-privileges", "--exit-on-error", f"--dbname={base}/{scratch}", str(plain)], capture_output=True, text=True)
+        if done.returncode:
+            fail(f"restore: {done.stderr[:400]}")
+            return report
+        t = lap("restore", t)
+        engine = create_async_engine(f"{base.replace('postgresql://', 'postgresql+asyncpg://')}/{scratch}")
+        try:
+            async with async_sessionmaker(engine)() as db:
+                restored = await table_counts(db)
+                cmp = compare_counts(manifest.get("tables") or {}, restored)
+                report["counts"] = cmp
+                if not cmp["ok"]:
+                    fail(f"counts: missing {cmp['missing']}, extra {cmp['extra']}, different {sorted(cmp['differ'])}")
+                migration = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
+                report["migration"] = migration
+                if migration != manifest.get("migration"):
+                    fail(f"schema: restored {migration}, manifest says {manifest.get('migration')}")
+                broken = await check_invariants(db)
+                report["invariants"] = broken
+                if broken:
+                    fail(f"invariants: {broken}")
+                report["smoke"] = await _smoke(db)
+                if not report["smoke"]["audit_chain_ok"]:
+                    fail("smoke: the audit chain does not verify")
+        finally:
+            await engine.dispose()
+        lap("verify", t)
+    finally:
+        admin = await asyncpg.connect(admin_url)
+        await admin.execute(f'DROP DATABASE IF EXISTS "{scratch}" WITH (FORCE)')
+        await admin.close()
+    taken = manifest.get("snapshot_at") or manifest.get("taken_at")
+    report["recovery_point_seconds"] = round((now - datetime.fromisoformat(taken)).total_seconds()) if taken else None
+    report["recovery_time_seconds"] = round(time.monotonic() - started, 3)
+    report["ok"] = not report["failures"]
+    return report
 
 
 async def status(db: AsyncSession, interval_minutes: int = 60) -> dict[str, Any]:

@@ -226,6 +226,12 @@ async def documents(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CON
              "updated_at": d.updated_at.isoformat() if d.updated_at else None} for d in rows]
 
 
+@router.post("/outbox/retry")
+async def retry_outbox(ctx: AuthContext = Depends(needs(P.ADMIN_LLM))) -> dict:
+    """Index changes that ran out of attempts go back in the queue once the index is healthy."""
+    return {"requeued": await service.retry_dead()}
+
+
 @router.post("/reindex")
 async def reindex(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     jid = await jobs.enqueue("knowledge_reindex", {}, dedupe_key="knowledge_reindex", created_by=ctx.user.id)

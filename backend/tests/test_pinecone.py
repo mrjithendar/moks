@@ -207,7 +207,9 @@ async def _index(text, env="*", ns="*"):
         src = KnowledgeSource(name=f"pc-{uuid.uuid4().hex[:6]}", type="upload", config={}, scope_environment=env, scope_namespace=ns)
         db.add(src)
         await db.flush()
-        return await service.index_document(db, src, f"{uuid.uuid4().hex}.md", text, revision=None, url=None), src
+        doc = await service.index_document(db, src, f"{uuid.uuid4().hex}.md", text, revision=None, url=None)
+    await service.drain_outbox()
+    return doc, src
 
 
 async def test_indexing_and_hybrid_search_with_access_rechecked(live):
@@ -248,6 +250,7 @@ async def test_a_removed_document_leaves_pinecone(live):
     async with session_scope() as db:
         row = (await db.execute(select(Document).where(Document.id == doc.id))).scalar_one()
         await service.remove_document(db, row)
+    await service.drain_outbox()
     assert not live.vectors
 
 

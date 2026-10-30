@@ -2,7 +2,8 @@ name: moks
 
 # check   -> every push and pull request: backend tests against PostgreSQL, frontend typecheck/build,
 #            Helm lint/render
-# release -> default branch: build the arm64 image (mk4 nodes are arm64) and push moks:latest to ECR
+# release -> default branch: build the arm64 image once, tag it with the commit, then open a pull
+# request that pins its digest. Merging that pull request is the release; nothing mutable is used. to ECR
 #            (the only tag). CI never touches the cluster; restart the moks deployments to roll it out.
 
 on:
@@ -53,8 +54,10 @@ jobs:
       - name: Helm
         run: |
           helm lint deploy/helm/moks -f deploy/helm/moks/values-minikube.yaml
-          helm lint deploy/helm/moks -f deploy/helm/moks/values-eks.yaml
+          helm lint deploy/helm/moks -f deploy/helm/moks/values-eks.yaml --set image.tag=ci
           helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-minikube.yaml > /dev/null
+          helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-minikube.yaml --set secrets.split=true,backup.enabled=true,backup.bucket=ci,velero.enabled=true > /dev/null
+          helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-eks.yaml --set image.tag=ci,secrets.split=true > /dev/null
       - uses: hashicorp/setup-terraform@v4
       - name: Terraform
         working-directory: deploy/terraform
@@ -69,14 +72,14 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     permissions:
-      contents: read
-      id-token: write   # GitHub OIDC token for AWS; no stored access keys
+      contents: write        # the branch holding the digest pull request
+      pull-requests: write
+      id-token: write        # GitHub OIDC token for AWS; no stored access keys
     env:
       AWS_REGION: us-east-1
       REPOSITORY: moks
     steps:
       - uses: actions/checkout@v7
-        with: {persist-credentials: false}
       # Role moks-github-ci from deploy/terraform (output ci_role_arn), stored as the repository
       # variable AWS_ROLE_ARN. It can push to the moks ECR repository only, and only from master.
       - uses: aws-actions/configure-aws-credentials@v6
@@ -88,13 +91,30 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
       - name: Build, smoke-test and push
         run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
-          docker build --label org.opencontainers.image.revision=${{ github.sha }} -t "$IMAGE" .
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:${{ github.sha }}"
+          docker build --build-arg GIT_COMMIT=${{ github.sha }} -t "$IMAGE" .
           # The image must start and answer its probes without a database (readyz reports 503).
           docker run -d --name smoke -e MOKS_ENV=development -e MOKS_AUTH_MODE=local -p 8080:8080 "$IMAGE"
           for i in $(seq 1 30); do curl -fsS localhost:8080/healthz && break; sleep 1; done
           curl -fsS localhost:8080/moks/ | grep -q '<div id="root">'
-          curl -fsS localhost:8080/moks/api/health
+          curl -fsS localhost:8080/moks/api/health | grep -q '${{ github.sha }}'
           docker rm -f smoke
           docker push "$IMAGE"
-          echo "pushed $IMAGE (commit ${{ github.sha }}), $(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")" >> "$GITHUB_STEP_SUMMARY"
+          DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2)"
+          echo "DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          echo "pushed $IMAGE ($DIGEST)" >> "$GITHUB_STEP_SUMMARY"
+      # The same digest moves on through review: no rebuild, and no rollout until this is merged.
+      - name: Propose the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/set-image.sh "$DIGEST"
+          git diff --quiet && exit 0
+          BRANCH="release/${GITHUB_SHA::12}"
+          git config user.name moks-release
+          git config user.email moks-release@users.noreply.github.com
+          git switch -c "$BRANCH"
+          git commit -am "Release ${GITHUB_SHA::12}"
+          git push origin "$BRANCH"
+          gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" --title "Release ${GITHUB_SHA::12}" \
+            --body "Pins image $DIGEST built from ${{ github.sha }}. Merging this and syncing Argo CD is the rollout; see docs/RELEASES.md."

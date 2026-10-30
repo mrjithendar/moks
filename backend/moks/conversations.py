@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .rbac import P, Principal
 from .models import Conversation, ConversationMessage, ConversationParticipant, Investigation, User
 
 HISTORY_MESSAGES = 12
@@ -42,13 +43,17 @@ async def touch(db: AsyncSession, conversation_id: uuid.UUID) -> None:
     await db.execute(update(Conversation).where(Conversation.id == conversation_id).values(updated_at=datetime.now(timezone.utc)))
 
 
-async def history(db: AsyncSession, conversation_id: uuid.UUID, before: uuid.UUID) -> list[dict[str, str]]:
-    """What the model sees of the thread: the latest messages that have not been deleted."""
-    rows = (await db.execute(select(ConversationMessage, User.email).outerjoin(User, User.id == ConversationMessage.author_id)
+async def history(db: AsyncSession, conversation_id: uuid.UUID, before: uuid.UUID, principal: Principal | None = None, environment: str | None = None) -> list[dict[str, str]]:
+    """What the model sees of the thread: the latest messages that have not been deleted, and only
+    what the person asking may read now. A turn from a scope they have lost is left out."""
+    rows = (await db.execute(select(ConversationMessage, User.email, Investigation.namespace)
+                             .outerjoin(User, User.id == ConversationMessage.author_id)
+                             .outerjoin(Investigation, Investigation.id == ConversationMessage.investigation_id)
                              .where(ConversationMessage.conversation_id == conversation_id, ConversationMessage.deleted_at.is_(None),
                                     ConversationMessage.investigation_id.is_distinct_from(before))
                              .order_by(ConversationMessage.created_at.desc()).limit(HISTORY_MESSAGES))).all()
-    return [{"from": "MOKS" if m.role == "assistant" else (email or "unknown"), "text": m.content[:HISTORY_CHARS]} for m, email in reversed(rows)]
+    readable = [(m, email) for m, email, ns in rows if principal is None or ns is None or principal.can(P.INVESTIGATION_READ, environment, ns)]
+    return [{"from": "MOKS" if m.role == "assistant" else (email or "unknown"), "text": m.content[:HISTORY_CHARS]} for m, email in reversed(readable)]
 
 
 async def record_reply(db: AsyncSession, inv: Investigation, text: str) -> None:

@@ -1,9 +1,12 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, LineChart, LogLines, PageHead, SourceRef, StatusBadge, Time, fmtBytes, useInterval, useLoad } from "../components";
+import { Badge, ErrorBox, LineChart, LogLines, PageHead, SourceRef, StatusBadge, Time, fmtBytes, useLoad } from "../components";
 import { type Ev, useInvestigationEvents } from "../investigationStream";
+import { Markdown } from "../markdown";
+import { CopyButton, Dialog, useModal } from "../ui";
+import { proposalPlan } from "./Conversations";
 import { PlanForm } from "./Ops";
 
 const SUGGESTIONS = [
@@ -74,7 +77,7 @@ export function NewInvestigation() {
           )}
         </div>
         <div className="chat-input">
-          <textarea rows={3} required minLength={3} maxLength={2000} value={q} onChange={(e) => setQ(e.target.value)}
+          <textarea aria-label="Question" rows={3} required minLength={3} maxLength={2000} value={q} onChange={(e) => setQ(e.target.value)}
             placeholder="e.g. Why is checkout returning 502 errors?"
             onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) (e.currentTarget.form as HTMLFormElement).requestSubmit(); }} />
           <button disabled={busy || !can("investigation.run")}>{busy ? "Starting…" : "Investigate"}</button>
@@ -88,126 +91,6 @@ export function NewInvestigation() {
       <div className="small muted" style={{ marginTop: 10 }}>
         Investigations are read-only. Remediation runs only through an approved action plan. Evidence and tool calls are recorded in the audit log.
       </div>
-    </>
-  );
-}
-
-export function InvestigationList() {
-  const [deleted, setDeleted] = useState(false);
-  const list = useLoad(() => api<any[]>(`/conversations?deleted=${deleted}`), [deleted]);
-  return (
-    <>
-      <PageHead title="Investigations" sub="Conversations you are allowed to see. Anyone with access can join one.">
-        <label className="inline"><input type="checkbox" checked={deleted} onChange={(e) => setDeleted(e.target.checked)} /> Show deleted</label>
-        <Link className="btn" to="/investigate">New investigation</Link>
-      </PageHead>
-      <ErrorBox error={list.error} />
-      <div className="card">
-        <table>
-          <thead><tr><th>Conversation</th><th>Scope</th><th>Started by</th><th>People</th><th>Messages</th><th>Last activity</th></tr></thead>
-          <tbody>
-            {list.data?.map((c) => (
-              <tr key={c.id}>
-                <td><Link to={`/conversations/${c.id}`}>{c.title}</Link> {c.running && <Badge kind="info">running</Badge>}</td>
-                <td className="mono small">{c.environment}/{c.namespace}</td>
-                <td className="small">{c.owner}</td><td>{c.participants}</td><td>{c.messages}</td>
-                <td><Time iso={c.updated_at} /></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {list.data && !list.data.length && <div className="empty">{deleted ? "Nothing deleted." : "No conversations yet."}</div>}
-      </div>
-    </>
-  );
-}
-
-function Bubble({ m, conversation, onChange, children }: { m: any; conversation: string; onChange: () => void; children?: React.ReactNode }) {
-  const [error, setError] = useState<unknown>();
-  async function act(path: string, method: string) {
-    setError(null);
-    try { await api(`/conversations/${conversation}/messages/${m.id}${path}`, { method }); onChange(); } catch (e) { setError(e); }
-  }
-  return (
-    <div className={`bubble ${m.role}`}>
-      <div className="row between small muted">
-        <span>{m.author ?? "unknown"} · <Time iso={m.created_at} /></span>
-        <span className="row">
-          {m.can_delete && <button className="ghost small" onClick={() => confirm("Delete this message? It is hidden from everyone and from MOKS, and can be restored.") && act("", "DELETE")}>Delete</button>}
-          {m.can_restore && <button className="ghost small" onClick={() => act("/restore", "POST")}>Restore</button>}
-        </span>
-      </div>
-      {m.deleted ? <div className="small muted">Deleted by {m.deleted_by ?? "someone"}.</div> : <div className="bubble-text">{m.content}</div>}
-      <ErrorBox error={error} />
-      {!m.deleted && children}
-    </div>
-  );
-}
-
-export function ConversationView() {
-  const { id } = useParams();
-  const { can } = useAuth();
-  const nav = useNavigate();
-  const c = useLoad(() => api<any>(`/conversations/${id}`), [id]);
-  const [text, setText] = useState("");
-  const [note, setNote] = useState(false);
-  const [person, setPerson] = useState("");
-  const [open, setOpen] = useState<Record<string, boolean>>({});
-  const [error, setError] = useState<unknown>();
-  const [busy, setBusy] = useState(false);
-  useInterval(() => { if (!c.loading) c.reload(); }, 4000); // other people's messages arrive here
-  const d = c.data?.id === id ? c.data : undefined;
-  async function run(fn: () => Promise<any>) {
-    setError(null);
-    try { await fn(); c.reload(); return true; } catch (e) { setError(e); return false; }
-  }
-  async function send(e: FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    if (await run(() => api(`/conversations/${id}/messages`, { method: "POST", body: { content: text, ask: !note && d.can_ask } }))) setText("");
-    setBusy(false);
-  }
-  if (!d) return <ErrorBox error={c.error} />;
-  const answered = new Set(d.messages.filter((m: any) => m.role === "assistant").map((m: any) => m.investigation_id));
-  const lastAnswer = [...d.messages].reverse().find((m: any) => m.role === "assistant" && !m.deleted);
-  return (
-    <>
-      <PageHead title={d.title} sub={<span className="row small"><span className="mono">{d.environment}/{d.namespace}</span><span>started by {d.owner}</span>{d.running && <Badge kind="info">MOKS is working</Badge>}{d.deleted && <Badge kind="warn">deleted</Badge>}</span>}>
-        {d.can_manage && !d.deleted && <button className="ghost" onClick={async () => { if (confirm("Delete this whole conversation? It is hidden from everyone, and you can restore it from Show deleted.") && await run(() => api(`/conversations/${id}`, { method: "DELETE" }))) nav("/investigations"); }}>Delete conversation</button>}
-        {d.can_manage && d.deleted && <button onClick={() => run(() => api(`/conversations/${id}/restore`, { method: "POST" }))}>Restore conversation</button>}
-      </PageHead>
-      <ErrorBox error={error} />
-      <div className="card filters" style={{ marginBottom: 14 }}>
-        <div className="row small"><span className="muted">In this conversation:</span>{d.participants.map((p: any) => <Badge key={p.email} kind={p.owner ? "info" : "neutral"}>{p.email}</Badge>)}</div>
-        {!d.deleted && (d.is_participant || can("admin.policies")) && <form className="filters" style={{ marginLeft: "auto" }} onSubmit={async (e) => { e.preventDefault(); if (await run(() => api(`/conversations/${id}/participants`, { method: "POST", body: { email: person } }))) setPerson(""); }}>
-          <label>Add a person<input type="email" required value={person} onChange={(e) => setPerson(e.target.value)} placeholder="teammate@example.com" /></label>
-          <button className="ghost">Add</button>
-        </form>}
-      </div>
-      <div className="stack">
-        {d.messages.map((m: any) => {
-          const expanded = open[m.id] ?? m.id === lastAnswer?.id;
-          return (
-            <Bubble key={m.id} m={m} conversation={d.id} onChange={c.reload}>
-              {m.role === "assistant" && m.investigation_id && <>
-                <button className="ghost small" onClick={() => setOpen({ ...open, [m.id]: !expanded })}>{expanded ? "Hide report and evidence" : "Show report and evidence"}</button>
-                {expanded && <InvestigationView embeddedId={m.investigation_id} />}
-              </>}
-              {m.role === "user" && m.investigation_id && !answered.has(m.investigation_id) && !["completed", "failed", "cancelled"].includes(d.statuses[m.investigation_id]) && <InvestigationView embeddedId={m.investigation_id} />}
-            </Bubble>
-          );
-        })}
-      </div>
-      {!d.deleted && <form className="card stack" style={{ marginTop: 14 }} onSubmit={send}>
-        <div className="chat-input">
-          <textarea rows={2} required minLength={3} maxLength={2000} value={text} onChange={(e) => setText(e.target.value)} aria-label="Message"
-            placeholder={note || !d.can_ask ? "Write a note for the others" : "Ask a follow-up, for example: what did the previous container log before it crashed?"}
-            onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) (e.currentTarget.form as HTMLFormElement).requestSubmit(); }} />
-          <button disabled={busy}>{busy ? "Sending…" : note || !d.can_ask ? "Post" : "Ask MOKS"}</button>
-        </div>
-        {d.can_ask ? <label className="inline"><input type="checkbox" checked={note} onChange={(e) => setNote(e.target.checked)} /> Note only, don't ask MOKS</label>
-          : <div className="small muted">You can post notes here. Asking MOKS needs the Investigator role for this scope.</div>}
-      </form>}
     </>
   );
 }
@@ -279,9 +162,8 @@ function Relationships({ data, primary }: { data?: { nodes: any[]; edges: any[] 
   );
 }
 
-export function InvestigationView({ embeddedId }: { embeddedId?: string }) {
-  const params = useParams();
-  const id = embeddedId ?? params.id;
+export function InvestigationView() {
+  const { id } = useParams();
   const detail = useLoad(() => api<any>(`/investigations/${id}`), [id]);
   const [open, setOpen] = useState<string | null>(null);
   const [propose, setPropose] = useState<any>(null);
@@ -305,8 +187,7 @@ export function InvestigationView({ embeddedId }: { embeddedId?: string }) {
       <ErrorBox error={detail.error} />
       {inv && (
         <>
-          {embeddedId ? <div className="row small muted" style={{ margin: "8px 0" }}><Badge>{scopeEv?.mode === "llm" ? `LLM: ${scopeEv.llm}` : report?.generated_by === "rules" ? "rule-based" : inv.mode}</Badge><span>{inv.tool_calls} tool calls</span><StatusBadge status={inv.status} />
-            {!TERMINAL.has(inv.status) && <button className="danger small" onClick={cancel}>Cancel</button>}</div> : <PageHead title={inv.question} sub={
+          <PageHead title={inv.question} sub={
             <span className="row small">
               <span className="mono">{inv.environment}/{inv.namespace}</span>
               <span>window {new Date(inv.time_from).toLocaleTimeString()}–{new Date(inv.time_to).toLocaleTimeString()}</span>
@@ -319,16 +200,16 @@ export function InvestigationView({ embeddedId }: { embeddedId?: string }) {
             </span>
           }>
             {!TERMINAL.has(inv.status) && <button className="danger" onClick={cancel}>Cancel</button>}
-            <Link className="btn ghost" style={{ border: "1px solid var(--border)", color: "var(--text)", background: "transparent" }}
+            <Link className="btn ghost"
               to={`/investigate?env=${inv.environment}&ns=${inv.namespace}&q=${encodeURIComponent(inv.question)}`}>Re-run</Link>
             {inv.conversation_id && <Link className="btn" to={`/conversations/${inv.conversation_id}`}>Open conversation</Link>}
-          </PageHead>}
+          </PageHead>
           {inv.error && <div className="alert error" style={{ marginBottom: 12 }}>{inv.error}</div>}
-          <div className="grid" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(300px, 1fr)", alignItems: "start" }}>
+          <div className="grid inv-layout">
             <div className="stack">
               <Stages current={inv.stage} done={TERMINAL.has(inv.status)} />
               {inv.parent_id && <div className="small">Follow-up of <Link to={`/investigations/${inv.parent_id}`}>an earlier investigation</Link>.</div>}
-              {report ? <Report report={report} onCite={setOpen} onPropose={can("action.request") && inv.namespace !== "*" ? setPropose : undefined} /> : (
+              {report ? <Report report={report} evidence={evidence} onCite={setOpen} onPropose={can("action.request") && inv.namespace !== "*" ? setPropose : undefined} /> : (
                 <div className="card empty">{TERMINAL.has(inv.status) ? "No report was produced." : "Collecting evidence…"}</div>
               )}
               {report?.findings?.length > 0 && <Findings findings={report.findings} onCite={setOpen} />}
@@ -336,8 +217,8 @@ export function InvestigationView({ embeddedId }: { embeddedId?: string }) {
                 <table><tbody>{inv.actions.map((a: any) => <tr key={a.id}><td><Link to={`/actions/${a.id}`}>{a.action}</Link> <span className="mono small">{a.target}</span></td>
                   <td><Badge kind={a.status === "succeeded" ? "ok" : a.status === "reconciliation_required" ? "bad" : "neutral"}>{a.status}</Badge></td>
                   <td className="small">{a.validated ? "recovery validated" : "not validated"}</td></tr>)}</tbody></table></div>}
-              {!embeddedId && inv.follow_ups?.length > 0 && <div className="card"><h2>Follow-ups</h2>{inv.follow_ups.map((f: any) => <div key={f.id}><StatusBadge status={f.status} /> <Link to={`/investigations/${f.id}`}>{f.question}</Link></div>)}</div>}
-              {!embeddedId && TERMINAL.has(inv.status) && can("investigation.run") && <FollowUp id={inv.id} />}
+              {inv.follow_ups?.length > 0 && <div className="card"><h2>Follow-ups</h2>{inv.follow_ups.map((f: any) => <div key={f.id}><StatusBadge status={f.status} /> <Link to={`/investigations/${f.id}`}>{f.question}</Link></div>)}</div>}
+              {TERMINAL.has(inv.status) && can("investigation.run") && <FollowUp id={inv.id} />}
             </div>
             <div className="stack">
               {report && <Coverage report={report} />}
@@ -351,8 +232,8 @@ export function InvestigationView({ embeddedId }: { embeddedId?: string }) {
                 <table>
                   <tbody>
                     {evidence.map((e) => (
-                      <tr key={e.ref} className="clickable" onClick={() => setOpen(e.ref)}>
-                        <td className="mono small">{e.ref}</td>
+                      <tr key={e.ref}>
+                        <td className="mono small"><button type="button" className="cite" style={{ marginLeft: 0 }} onClick={() => setOpen(e.ref)}>{e.ref}</button></td>
                         <td><div className="mono small">{e.tool}</div><div className="small muted">{e.summary}</div></td>
                         <td>{e.ok ? <Badge kind="ok">ok</Badge> : <Badge kind="bad">failed</Badge>}<div className="small muted"><Time iso={e.collected_at} /></div></td>
                       </tr>
@@ -363,16 +244,9 @@ export function InvestigationView({ embeddedId }: { embeddedId?: string }) {
             </div>
           </div>
           {opened && <EvidenceDrawer e={opened} grafana={inv.grafana_url} onClose={() => setOpen(null)} />}
-          {propose && <div className="drawer" role="dialog" aria-label="Propose action"><div className="row between"><h2>Propose an action plan</h2>
-            <button className="ghost small" onClick={() => setPropose(null)}>Close</button></div>
+          {propose && <Dialog title="Propose an action plan" wide onClose={() => setPropose(null)}>
             <p className="small muted">Proposal from the report: {propose.action}</p>
-            <PlanForm env={inv.environment} ns={inv.namespace} initial={{ ...(propose.fromSkill ? { action: propose.action, target_kind: propose.target_kind ?? "Deployment",
-              params: propose.params ?? {} } : {}),
-              target_name: propose.fromSkill ? propose.target_name ?? "" : (propose.target || "").split("/").pop()?.split(" ")[0] ?? "",
-              reason: propose.fromSkill ? `${propose.note}\n\nFinding: ${propose.finding} (skill ${propose.skill}). From investigation: ${inv.question}` : `${propose.action}\n\nFrom investigation: ${inv.question}`,
-              investigation_id: inv.id, incident_id: inv.incident_id ?? undefined,
-              evidence: (report?.observed_facts ?? []).slice(0, 5).map((f: any) => ({ ref: f.evidence.join(","), summary: f.statement })) }}
-              onDone={(id) => nav(`/actions/${id}`)} /></div>}
+            <PlanForm env={inv.environment} ns={inv.namespace} initial={proposalPlan(inv, propose)} onDone={(id) => nav(`/actions/${id}`)} /></Dialog>}
         </>
       )}
     </>
@@ -385,25 +259,23 @@ function Cites({ refs, onCite }: { refs: string[]; onCite: (r: string) => void }
 
 const CONF: Record<string, "bad" | "warn" | "neutral"> = { high: "bad", medium: "warn", low: "neutral" };
 
-function Report({ report, onCite, onPropose }: { report: any; onCite: (r: string) => void; onPropose?: (r: any) => void }) {
+function Section({ title, count, open = true, children }: { title: string; count?: number; open?: boolean; children: React.ReactNode }) {
+  return <details className="rs" open={open}><summary>{title}{count !== undefined && <span className="count">{count}</span>}</summary>{children}</details>;
+}
+
+export function Report({ report, evidence = [], hideSummary, onCite, onPropose }: { report: any; evidence?: any[]; hideSummary?: boolean; onCite: (r: string) => void; onPropose?: (r: any) => void }) {
   return (
-    <div className="card">
-      <div className="row between">
-        <h2>Findings</h2>
-        <span className="small muted">{report.generated_by === "llm" ? "Written by the LLM from cited evidence" : "Rule-based report"}</span>
-      </div>
-      <p style={{ marginTop: 0 }}>{report.summary}</p>
-      <div className="report-section facts">
-        <h3>Observed facts</h3>
+    <div className="report">
+      {!hideSummary && <div className="rs static"><h3>Summary</h3><Markdown text={report.summary ?? ""} /><div className="small muted">{report.generated_by === "llm" ? "Written by the LLM from cited evidence" : "Rule-based report"}</div></div>}
+      {report.missing_evidence.length > 0 && <div className="rs missing"><strong>Missing evidence</strong><ul>{report.missing_evidence.map((m: string, i: number) => <li key={i}>{m}</li>)}</ul></div>}
+      <Section title="Observed facts" count={report.observed_facts.length}>
         {report.observed_facts.length ? <ul>{report.observed_facts.map((f: any, i: number) => <li key={i}>{f.statement}<Cites refs={f.evidence} onCite={onCite} /></li>)}</ul>
           : <div className="muted small">No facts with supporting evidence.</div>}
-      </div>
-      {report.verified_causes?.length > 0 && <div className="report-section facts">
-        <h3>Verified causes</h3>
+      </Section>
+      {report.verified_causes?.length > 0 && <Section title="Verified causes" count={report.verified_causes.length}>
         <ul>{report.verified_causes.map((c: any, i: number) => <li key={i}>{c.cause}<Cites refs={c.evidence} onCite={onCite} /><div className="small muted">Checked by a {c.check}.</div></li>)}</ul>
-      </div>}
-      <div className="report-section causes">
-        <h3>Suspected causes</h3>
+      </Section>}
+      <Section title="Suspected causes" count={report.suspected_causes.length}>
         {report.suspected_causes.length ? (
           <ul>{report.suspected_causes.map((c: any, i: number) => (
             <li key={i}><Badge kind={CONF[c.confidence]}>{c.confidence} confidence</Badge> {c.cause}<Cites refs={c.evidence} onCite={onCite} />
@@ -412,39 +284,30 @@ function Report({ report, onCite, onPropose }: { report: any; onCite: (r: string
               <div className="small muted">Suspected, not verified.</div></li>
           ))}</ul>
         ) : <div className="muted small">No cause suggested.</div>}
-      </div>
-      {report.missing_evidence.length > 0 && (
-        <div className="report-section missing"><h3>Missing evidence</h3><ul>{report.missing_evidence.map((m: string, i: number) => <li key={i}>{m}</li>)}</ul></div>
-      )}
-      {report.next_steps.length > 0 && (
-        <div className="report-section steps"><h3>Recommended next steps</h3><ul>{report.next_steps.map((m: string, i: number) => <li key={i}>{m}</li>)}</ul></div>
-      )}
-      {report.skills?.length > 0 && (
-        <div className="small" style={{ marginBottom: 12 }}>Skills applied: {report.skills.map((s: any) => (
-          <Link key={s.name} to="/skills" title={s.reasons.join("; ")}><Badge kind="info">{s.name}</Badge></Link>))}</div>
-      )}
-      {report.skill_actions?.length > 0 && (
-        <div className="report-section remediation">
-          <h3>Suggested actions (from skills)</h3>
-          <ul>{report.skill_actions.map((a: any, i: number) => (
-            <li key={i}><span className="mono">{a.action}</span>{a.target_name && <span className="mono small"> · {a.target_kind}/{a.target_name}</span>}
-              <span className="small muted"> — {a.note} (finding: {a.finding}; skill {a.skill})</span>
-              {onPropose && <button className="ghost small" style={{ marginLeft: 8 }} onClick={() => onPropose({ ...a, fromSkill: true })}>Propose as action plan</button>}</li>
-          ))}</ul>
-        </div>
-      )}
-      {report.proposed_remediation.length > 0 && (
-        <div className="report-section remediation">
-          <h3>Proposed remediation</h3>
-          <ul>{report.proposed_remediation.map((r: any, i: number) => (
-            <li key={i}><strong>{r.action}</strong>{r.target && <span className="mono small"> · {r.target}</span>}
-              {onPropose && <button className="ghost small" style={{ marginLeft: 8 }} onClick={() => onPropose(r)}>Propose as action plan</button>}
-              <div className="small muted">{[r.expected_impact && `Impact: ${r.expected_impact}`, r.risk && `Risk: ${r.risk}`, r.rollback && `Rollback: ${r.rollback}`].filter(Boolean).join(" · ")}</div>
-            </li>
-          ))}</ul>
-          <div className="small muted">Proposals only: nothing was changed. Turn one into a reviewed action plan to execute it (approval required in production).</div>
-        </div>
-      )}
+      </Section>
+      {evidence.length > 0 && <Section title="Supporting evidence" count={evidence.length} open={false}>
+        <ul>{evidence.slice(0, 40).map((e) => <li key={e.ref}><button type="button" className="cite" style={{ marginLeft: 0 }} onClick={() => onCite(e.ref)}>{e.ref}</button> <span className="small">{e.summary}</span></li>)}</ul>
+      </Section>}
+      {report.next_steps.length > 0 && <Section title="Recommended next steps" count={report.next_steps.length}>
+        <ul>{report.next_steps.map((m: string, i: number) => <li key={i}><Markdown text={m} /></li>)}</ul></Section>}
+      {report.skill_actions?.length > 0 && <Section title="Suggested actions from skills" count={report.skill_actions.length} open={false}>
+        <ul>{report.skill_actions.map((a: any, i: number) => (
+          <li key={i}><span className="mono">{a.action}</span>{a.target_name && <span className="mono small"> · {a.target_kind}/{a.target_name}</span>}
+            <span className="small muted"> — {a.note} (finding: {a.finding}; skill {a.skill})</span>
+            {onPropose && <button type="button" className="ghost small" style={{ marginLeft: 8 }} onClick={() => onPropose({ ...a, fromSkill: true })}>Propose as action plan</button>}</li>
+        ))}</ul>
+      </Section>}
+      {report.proposed_remediation.length > 0 && <Section title="Proposed remediation" count={report.proposed_remediation.length}>
+        <ul>{report.proposed_remediation.map((r: any, i: number) => (
+          <li key={i}><strong>{r.action}</strong>{r.target && <span className="mono small"> · {r.target}</span>}
+            {onPropose && <button type="button" className="ghost small" style={{ marginLeft: 8 }} onClick={() => onPropose(r)}>Propose as action plan</button>}
+            <div className="small muted">{[r.expected_impact && `Impact: ${r.expected_impact}`, r.risk && `Risk: ${r.risk}`, r.rollback && `Rollback: ${r.rollback}`].filter(Boolean).join(" · ")}</div>
+          </li>
+        ))}</ul>
+        <div className="small muted proposal-note">Proposals only: nothing was changed. Turn one into a reviewed action plan to execute it (approval required in production).</div>
+      </Section>}
+      {report.skills?.length > 0 && <div className="small" style={{ marginTop: 8 }}>Skills applied: {report.skills.map((s: any) => (
+        <Link key={s.name} to="/skills" title={s.reasons.join("; ")}><Badge kind="info">{s.name}</Badge></Link>))}</div>}
       {report.notes?.length > 0 && <details><summary className="small">Investigation notes ({report.notes.length})</summary><ul className="small">{report.notes.map((n: string, i: number) => <li key={i}>{n}</li>)}</ul></details>}
       {report.validation?.uncited_facts_dropped > 0 && <div className="small muted">{report.validation.uncited_facts_dropped} uncited statement(s) were removed by citation checks.</div>}
     </div>
@@ -470,7 +333,7 @@ function Findings({ findings, onCite }: { findings: any[]; onCite: (r: string) =
   );
 }
 
-function Timeline({ events }: { events: Ev[] }) {
+export function Timeline({ events }: { events: Ev[] }) {
   if (!events.length) return <div className="muted small">Waiting for the worker…</div>;
   return (
     <ul className="timeline">
@@ -493,25 +356,36 @@ function Timeline({ events }: { events: Ev[] }) {
   );
 }
 
-export function EvidenceDrawer({ e, onClose, grafana }: { e: any; onClose: () => void; grafana?: string | null }) {
-  useEffect(() => {
-    const h = (k: KeyboardEvent) => k.key === "Escape" && onClose();
-    window.addEventListener("keydown", h);
-    return () => window.removeEventListener("keydown", h);
-  }, [onClose]);
+export function EvidenceBody({ e, grafana }: { e: any; grafana?: string | null }) {
   return (
-    <div className="drawer" role="dialog" aria-label={`Evidence ${e.ref}`}>
-      <div className="row between"><h2>{e.ref} · <span className="mono">{e.tool}</span></h2><button className="ghost small" onClick={onClose}>Close</button></div>
+    <div className="stack">
+      <h2 style={{ margin: 0 }}>{e.ref} · <span className="mono">{e.tool}</span></h2>
       <dl className="kv">
         <dt>Summary</dt><dd>{e.summary}</dd>
-        <dt>Collected</dt><dd>{new Date(e.collected_at).toLocaleString()} ({e.duration_ms} ms)</dd>
-        <dt>Scope</dt><dd className="mono small">{e.scope.environment}/{e.scope.namespace ?? "cluster"} · {new Date(e.scope.from).toLocaleTimeString()}–{new Date(e.scope.to).toLocaleTimeString()}</dd>
+        <dt>Source</dt><dd className="mono small">{e.tool}</dd>
+        <dt>Collected</dt><dd>{new Date(e.collected_at).toLocaleString(undefined, { timeZoneName: "short" })} ({e.duration_ms} ms)</dd>
+        <dt>Environment</dt><dd className="mono small">{e.scope.environment}</dd>
+        <dt>Namespace</dt><dd className="mono small">{e.scope.namespace ?? "cluster"}</dd>
+        <dt>Window</dt><dd className="small">{new Date(e.scope.from).toLocaleTimeString()}–{new Date(e.scope.to).toLocaleTimeString()}</dd>
         <dt>Arguments</dt><dd className="mono small">{JSON.stringify(e.args)}</dd>
         {e.truncated && <><dt>Note</dt><dd>Result truncated to the size limit.</dd></>}
         {e.error && <><dt>Error</dt><dd className="mono small">{e.error}</dd></>}
       </dl>
-      <div style={{ margin: "10px 0" }}><SourceRef source={e.source} />{grafana && <a className="small" href={grafana} target="_blank" rel="noreferrer noopener">Open Grafana ↗</a>}</div>
+      <SourceRef source={e.source} />
+      {e.source?.query && <div><CopyButton text={e.source.query} label="Copy query" /></div>}
+      {grafana && <a className="small" href={grafana} target="_blank" rel="noreferrer noopener">Open Grafana ↗</a>}
       {e.ok && <EvidenceData tool={e.tool} data={e.data} />}
+    </div>
+  );
+}
+
+export function EvidenceDrawer({ e, onClose, grafana }: { e: any; onClose: () => void; grafana?: string | null }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useModal(ref, true, onClose);
+  return (
+    <div ref={ref} className="drawer" role="dialog" aria-modal="true" aria-label={`Evidence ${e.ref}`} tabIndex={-1}>
+      <div className="row end"><button type="button" className="ghost small" onClick={onClose}>Close</button></div>
+      <EvidenceBody e={e} grafana={grafana} />
     </div>
   );
 }
