@@ -37,6 +37,22 @@ variable "github_repository" {
   default     = "mrjithendar/moks"
 }
 
+variable "github_oidc_subject_prefix" {
+  description = <<-EOT
+    Start of the GitHub OIDC `sub` claim for this repository, without ":ref:...".
+    Repositories with immutable subjects (GitHub setting use_immutable_subject, the default here)
+    send "repo:<owner>@<owner-id>/<repo>@<repo-id>"; see
+    `gh api repos/<owner>/<repo>/actions/oidc/customization/sub` (field sub_claim_prefix).
+    Empty means the classic "repo:<owner>/<repo>".
+  EOT
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.github_oidc_subject_prefix == "" || can(regex("^repo:[A-Za-z0-9-]+(@[0-9]+)?/[A-Za-z0-9_.-]+(@[0-9]+)?$", var.github_oidc_subject_prefix))
+    error_message = "Use repo:<owner>[@<id>]/<repo>[@<id>] as shown by sub_claim_prefix."
+  }
+}
+
 variable "github_push_refs" {
   description = "Git refs allowed to assume the CI role (the release job runs only on the default branch)."
   type        = list(string)

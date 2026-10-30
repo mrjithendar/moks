@@ -7,7 +7,7 @@ This module creates everything MOKS needs in AWS account `881026659929` (us-east
 | ECR repository `moks` | Immutable tags, scan on push, AES-256. Lifecycle: untagged images expire after 1 day; the newest 30 commit images are kept. `force_delete = false` |
 | ECR repository policy (optional) | Pull access for listed principals (`ecr_pull_principal_arns`) |
 | IAM OIDC provider `token.actions.githubusercontent.com` | Lets GitHub Actions use short-lived credentials. It is account-wide; set `create_github_oidc_provider = false` if another stack manages it |
-| IAM role `moks-github-ci` | Assumable only by `repo:mrjithendar/moks:ref:refs/heads/master`; can push to `moks` only |
+| IAM role `moks-github-ci` | Assumable only by `master` of this repository, matched on GitHub's immutable subject `repo:mrjithendar@20453233/moks@1439332847:ref:refs/heads/master` (`github_oidc_subject_prefix`); can push to `moks` only |
 | IAM user `/moks/moks-mk4-runtime` | Identity for MOKS pods on mk4, created **without an access key** |
 | User policy `invoke-selected-bedrock-profile` | `bedrock:InvokeModel` (which also covers Converse) on one inference profile and its model through that profile only |
 | User policy `read-allowed-log-groups` | Phase 2 CloudWatch Logs Insights on listed log groups; off while `cloudwatch_log_group_arns = []` |
@@ -21,7 +21,7 @@ no secrets, because no access keys are created here.
 ```sh
 cd deploy/terraform
 terraform init
-terraform plan  -var-file=mk4.tfvars -out=moks.tfplan   # expect 7 to add on a fresh account
+terraform plan  -var-file=tfvars/mk4.tfvars -out=moks.tfplan   # expect 7 to add on a fresh account
 terraform apply moks.tfplan
 terraform output
 ```
@@ -59,3 +59,10 @@ more is needed. Otherwise, add its ARN to `ecr_pull_principal_arns` in `mk4.tfva
 - The S3 state bucket. Enable versioning on it (`aws s3api put-bucket-versioning --bucket jithendardharmapuri --versioning-configuration Status=Enabled`), since it holds the state of every stack.
 - The RoboShop repositories and roles (`roboshop-ai/infrastructure`).
 - EKS: use IRSA or Pod Identity with the policies in [../iam/](../iam/) instead of the runtime user.
+
+## Troubleshooting CI sign-in
+
+`Not authorized to perform sts:AssumeRoleWithWebIdentity` means the GitHub token's `sub` claim does
+not match the trust policy. Compare `gh api repos/mrjithendar/moks/actions/oidc/customization/sub`
+(field `sub_claim_prefix`) with `github_oidc_subject_prefix` in `tfvars/mk4.tfvars`. Workflows that
+use a GitHub environment send `:environment:<name>` instead of `:ref:...`.

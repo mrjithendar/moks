@@ -17,7 +17,7 @@ been run against the cluster yet; each step says what it changes.
 ```sh
 cd deploy/terraform
 terraform init
-terraform plan -var-file=mk4.tfvars -out=moks.tfplan     # ECR repo, GitHub OIDC + CI role, runtime IAM user
+terraform plan -var-file=tfvars/mk4.tfvars -out=moks.tfplan     # ECR repo, GitHub OIDC + CI role, runtime IAM user
 terraform apply moks.tfplan
 gh variable set AWS_ROLE_ARN --repo mrjithendar/moks --body "$(terraform output -raw ci_role_arn)"
 ```

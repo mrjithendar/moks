@@ -9,6 +9,10 @@ locals {
   github_oidc_provider_arn = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : "arn:${local.partition}:iam::${local.account_id}:oidc-provider/token.actions.githubusercontent.com"
 }
 
+locals {
+  github_subject_prefix = var.github_oidc_subject_prefix != "" ? var.github_oidc_subject_prefix : "repo:${var.github_repository}"
+}
+
 resource "aws_iam_role" "ci" {
   name                 = "moks-github-ci"
   description          = "GitHub Actions ${var.github_repository}: push images to ECR ${var.repository_name}"
@@ -23,7 +27,7 @@ resource "aws_iam_role" "ci" {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
           # Only the listed branches of this repository; pull requests and forks cannot assume it.
-          "token.actions.githubusercontent.com:sub" = [for ref in var.github_push_refs : "repo:${var.github_repository}:ref:${ref}"]
+          "token.actions.githubusercontent.com:sub" = [for ref in var.github_push_refs : "${local.github_subject_prefix}:ref:${ref}"]
         }
       }
     }]

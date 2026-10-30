@@ -3,8 +3,11 @@ aws_region            = "us-east-1"
 repository_name       = "moks"
 image_retention_count = 30
 
-github_repository           = "mrjithendar/moks"
-github_push_refs            = ["refs/heads/master"]
+github_repository = "mrjithendar/moks"
+github_push_refs  = ["refs/heads/master"]
+# The repository uses GitHub's immutable OIDC subject (owner and repo IDs survive renames and cannot
+# be claimed by a new repository that reuses the name). Source: gh api repos/mrjithendar/moks/actions/oidc/customization/sub
+github_oidc_subject_prefix  = "repo:mrjithendar@20453233/moks@1439332847"
 create_github_oidc_provider = true # none existed in the account on 2026-10-30
 
 # Principal behind mk4's ecr-refresh keys (roboshop-secrets), only if its own policy does not
