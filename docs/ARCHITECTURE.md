@@ -245,8 +245,12 @@ they still hold what MOKS applied.
 
 ## Metrics
 
-Environments sharing a Prometheus are queried once. Sources are evaluated separately and never added
-together. Raw PromQL needs `metrics.raw_query` for all namespaces, because it cannot be confined to
+A source is one connector seen with one level of access. Environments are served by one query only
+when the connector's full identity (endpoint, tenant, settings, credential) and the caller's effective
+scope match; a shared URL alone proves nothing. Every enabled connector is queried unless the caller
+picks some, and results name the connector. Catalogs are cached per source, so a scoped user is never
+served a wider user's list. Users without environment-wide access discover metrics only through series
+in their own namespaces. Sources are evaluated separately and never added together. Raw PromQL needs `metrics.raw_query` for all namespaces, because it cannot be confined to
 one. Explore builds the query itself and pins the namespace, so it works for scoped users. CloudWatch
 has its own query path and is labelled as such.
 
@@ -254,8 +258,27 @@ has its own query path and is labelled as such.
 
 Rules live in `SKILL.md` and are deterministic; an LLM plays no part. Each check ends as `firing`,
 `ok` or `unknown`. `unknown` changes nothing, so a telemetry outage neither opens nor resolves an
-incident. Incident identity is `sha256(rule, environment, resource)`, enforced by a partial unique
-index across workers. Rule schemas have no action field: an incident never authorizes a change.
+incident. A check also records what it read in full. Recovery is inferred only for resources in that
+coverage: a failed or truncated namespace, one outside this run's slice, or a capped result proves
+nothing. Namespaces rotate across runs, so every namespace is reached in environments with more than 40.
+
+Incident identity is `sha256(rule, environment, namespace, kind, resource)`, enforced by a partial
+unique index across workers. Pods resolve to their owning workload, so restarts update one incident.
+Rule schemas have no action field: an incident never authorizes a change.
+
+## Background jobs
+
+Jobs hold a renewable lease, and the worker reclaims any job whose lease lapses, so a killed worker
+cannot block a dedupe key. What happens next depends on the operation:
+
+| Job | Attempts | After a crash |
+|---|---|---|
+| `knowledge_sync` | 3 | Retried; it resumes from what it committed |
+| `knowledge_reindex` | 2 | Build marked failed, then retried beside the active index |
+| `alert_poll`, `detection_tick` | 1 | Dropped; the scheduler queues the next one |
+| `eval_run` | 1 | Marked failed; a person starts it again |
+
+A worker that loses its lease cancels its own run and cannot overwrite the new owner's result.
 
 ## Investigations
 

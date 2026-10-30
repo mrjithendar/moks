@@ -278,6 +278,7 @@ class Job(Base):
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -381,6 +382,7 @@ class DetectionRun(Base):
     last_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_status: Mapped[str] = mapped_column(String(20))
     last_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)  # next namespace in rotation
 
 
 class DetectionState(Base):

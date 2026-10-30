@@ -35,6 +35,10 @@ class ScaleP(Params):
     replicas: int = Field(ge=0, le=1000)
 
 
+class DeletePodP(Params):
+    pass
+
+
 class RollbackP(Params):
     to_revision: int = Field(ge=1)
 
@@ -224,6 +228,8 @@ CATALOG: dict[str, ActionDef] = {a.name: a for a in [
               "PUT apps/v1 Deployment (containers[].resources)"),
     ActionDef("apply_config_patch", "Apply a reviewed JSON merge patch", ("Deployment", "Service", "HorizontalPodAutoscaler"), ConfigPatchP, True,
               "PATCH (application/merge-patch+json, resourceVersion precondition)"),
+    ActionDef("delete_pod", "Delete a pod so its controller replaces it", ("Pod",), DeletePodP, False,
+              "DELETE v1 Pod (UID precondition; only pods managed by a controller)"),
     ActionDef("open_pull_request", "Open a draft pull request with a proposed change", ("Repository",), PullRequestP, True,
               "GitHub: create branch, commit file, open draft PR"),
 ]}
@@ -236,6 +242,8 @@ def needs_approval(action: ActionDef, env: Environment) -> bool:
 def check_policy(action: str, params: Params, env: Environment, pre: dict | None, target_kind: str | None = None) -> None:
     if action == "apply_config_patch":
         check_patch(target_kind or "", params.patch, env, {"spec": pre["spec"]} if pre and "spec" in pre else None)  # type: ignore[attr-defined]
+    if action == "delete_pod" and pre is not None and not pre.get("owner"):
+        raise ConnectorError("forbidden", "this pod has no controller, so nothing would replace it")
     if action == "scale_deployment":
         r = params.replicas  # type: ignore[attr-defined]
         if r == 0 and not env.allow_scale_to_zero:
@@ -301,6 +309,12 @@ def describe(action: str, params: Params, target: str, ns: str, pre: dict | None
                     ["selected Services still have ready endpoints"] if target.startswith("Service/") else
                     ["the autoscaler did not lose its ability to scale"])],
                 "rollback": recovery + "the previous values of the patched fields" + manual}
+    if action == "delete_pod":
+        owner = (pre or {}).get("owner")
+        return {"impact": f"{target} is deleted and {owner} creates a replacement. Requests it is serving may fail.",
+                "blast_radius": f"One pod of {owner} in {ns}.", "preconditions": [f"the pod is still the one reviewed (same UID) and still owned by {owner}"],
+                "validation": ["the reviewed pod is gone within the timeout", f"{owner} still has running pods"],
+                "rollback": "None: a deleted pod cannot be restored. Its controller replaces it."}
     if action == "open_pull_request":
         p2: PullRequestP = params  # type: ignore[assignment]
         return {"impact": f"A draft pull request to {p2.repository}@{p2.base} changing {p2.path}. Nothing is deployed.",

@@ -80,6 +80,7 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
         try:
             if tick % 30 == 0:
                 await reap_stale()
+                await jobs.reap_abandoned()
             if tick % poll_every == 0:
                 await jobs.schedule_periodic()
             if not job_tasks:  # one background job at a time per worker

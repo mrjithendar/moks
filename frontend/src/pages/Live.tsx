@@ -1,8 +1,10 @@
 import { useMemo, useState, type FormEvent } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { api, qs } from "../api";
+import { useAuth } from "../auth";
 import { Badge, EnvNsFilter, ErrorBox, LineChart, LogLines, PageHead, PartialErrors, type Multi, type Scope, SourceRef, Time, useInterval, useLoad, useScopes } from "../components";
 import { EvidenceData } from "./Investigate";
+import { PlanForm } from "./Ops";
 
 interface Result<T = any> { summary: string; data: T; source: any; truncated: boolean; collected_at: string; duration_ms: number }
 
@@ -14,9 +16,34 @@ const TABS = ["pods", "workloads", "services", "events", "ingresses", "nodes", "
 type Tab = (typeof TABS)[number];
 const PROBLEM_LABEL: Partial<Record<Tab, string>> = { pods: "problems only", events: "warnings only", services: "no endpoints", "config-audit": "high severity only", nodes: "not ready" };
 
+interface Manage { title: string; env: string; ns: string; initial: any }
+
+/** What can be proposed for a Deployment. Each option opens a reviewable action plan. */
+function deploymentActions(w: any): { label: string; action: string; params: any }[] {
+  return [
+    { label: "Rollout restart", action: "restart_deployment", params: {} },
+    { label: "Scale", action: "scale_deployment", params: { replicas: w.desired ?? 1 } },
+    { label: "Roll back", action: "rollback_deployment", params: { to_revision: Math.max(1, Number(w.revision ?? 2) - 1) } },
+    { label: "Change resources", action: "patch_resources", params: { container: "", requests: { cpu: "100m", memory: "128Mi" }, limits: { memory: "256Mi" } } },
+    { label: "Tune rollout settings", action: "apply_config_patch", params: { patch: { spec: { minReadySeconds: 0, revisionHistoryLimit: 10 } } } },
+  ];
+}
+
+function ManageDrawer({ m, onClose }: { m: Manage; onClose: () => void }) {
+  const nav = useNavigate();
+  return (
+    <div className="drawer" role="dialog" aria-label={m.title}>
+      <div className="row between"><h2>{m.title}</h2><button className="ghost small" onClick={onClose}>Close</button></div>
+      <p className="small muted">In {m.env}/{m.ns}. This creates an action plan: MOKS shows the impact and validation first, production plans need a second person's approval, and nothing changes until it is executed.</p>
+      <PlanForm env={m.env} ns={m.ns} initial={m.initial} onDone={(id) => nav(`/actions/${id}`)} />
+    </div>
+  );
+}
+
 export function Explorer() {
   const scopes = useScopes();
   const [tab, setTab] = useState<Tab>("pods");
+  const [filter, setFilter] = useState("");
   const [env, setEnv] = useState("all");
   const [ns, setNs] = useState("all");
   return (
@@ -24,13 +51,16 @@ export function Explorer() {
       <PageHead title="Kubernetes explorer" sub="Live, read-only view of every environment and namespace in your scope" />
       <div className="tabs">{TABS.map((t) => <button key={t} className={t === tab ? "active" : ""} onClick={() => setTab(t)}>{t}</button>)}</div>
       <ErrorBox error={scopes.error} />
-      <ExplorerTab key={tab} tab={tab} scopes={scopes.data} env={env} ns={ns} onEnv={setEnv} onNs={setNs} />
+      <ExplorerTab key={tab} tab={tab} scopes={scopes.data} env={env} ns={ns} onEnv={setEnv} onNs={setNs} initialText={filter} onShowPods={(name) => { setFilter(name); setTab("pods"); }} />
     </>
   );
 }
 
-function ExplorerTab({ tab, scopes, env, ns, onEnv, onNs }: { tab: Tab; scopes?: Scope[]; env: string; ns: string; onEnv: (e: string) => void; onNs: (n: string) => void }) {
-  const [text, setText] = useState("");
+function ExplorerTab({ tab, scopes, env, ns, onEnv, onNs, initialText, onShowPods }: { tab: Tab; scopes?: Scope[]; env: string; ns: string; onEnv: (e: string) => void; onNs: (n: string) => void; initialText: string; onShowPods: (name: string) => void }) {
+  const { can } = useAuth();
+  const canManage = can("action.request");
+  const [manage, setManage] = useState<Manage | null>(null);
+  const [text, setText] = useState(tab === "pods" ? initialText : "");
   const [only, setOnly] = useState(false);
   const [pod, setPod] = useState<any>(null);
   const r = useLoad(() => api<Multi>(`/multi/${tab}${qs({ environment: env, namespace: tab === "nodes" ? undefined : ns, warnings_only: tab === "events" ? false : undefined })}`), [tab, env, ns]);
@@ -58,8 +88,8 @@ function ExplorerTab({ tab, scopes, env, ns, onEnv, onNs }: { tab: Tab; scopes?:
           <PartialErrors errors={r.data.errors} />
           <div className="table-wrap">
             {tab === "pods" && <PodTable pods={rows} onOpen={setPod} />}
-            {tab === "workloads" && <Generic rows={rows} cols={[...scopeCols, "kind", "name", "ready", "desired", "revision", "images", "age"]} />}
-            {tab === "services" && <ServiceTable rows={rows} />}
+            {tab === "workloads" && <WorkloadTable rows={rows} canManage={canManage} onManage={setManage} onShowPods={onShowPods} />}
+            {tab === "services" && <ServiceTable rows={rows} canManage={canManage} onManage={setManage} />}
             {tab === "events" && <Generic rows={rows} cols={[...scopeCols, "type", "reason", "object", "message", "count", "lastSeen"]} />}
             {tab === "ingresses" && <Generic rows={rows} cols={[...scopeCols, "name", "host", "path", "service", "port"]} />}
             {tab === "nodes" && <Generic rows={rows} cols={["environment", "name", "ready", "pressure", "unschedulable", "taints", "allocatable", "kubelet"]} />}
@@ -67,8 +97,44 @@ function ExplorerTab({ tab, scopes, env, ns, onEnv, onNs }: { tab: Tab; scopes?:
           </div>
         </div>
       )}
-      {pod && <PodDrawer env={pod.environment} ns={pod.namespace} pod={pod.name} onClose={() => setPod(null)} />}
+      {pod && <PodDrawer env={pod.environment} ns={pod.namespace} pod={pod.name} owner={pod.owner} canManage={canManage} onManage={(m) => { setPod(null); setManage(m); }} onClose={() => setPod(null)} />}
+      {manage && <ManageDrawer m={manage} onClose={() => setManage(null)} />}
     </>
+  );
+}
+
+function ManageMenu({ label, options, onPick }: { label: string; options: { label: string; run: () => void }[]; onPick?: () => void }) {
+  return (
+    <select aria-label={`Manage ${label}`} className="manage" value="" onClick={(e) => e.stopPropagation()}
+      onChange={(e) => { options.find((o) => o.label === e.target.value)?.run(); onPick?.(); }}>
+      <option value="">Manage…</option>
+      {options.map((o) => <option key={o.label}>{o.label}</option>)}
+    </select>
+  );
+}
+
+function WorkloadTable({ rows, canManage, onManage, onShowPods }: { rows: any[]; canManage: boolean; onManage: (m: Manage) => void; onShowPods: (name: string) => void }) {
+  const nav = useNavigate();
+  if (!rows.length) return <div className="empty">Nothing here.</div>;
+  return (
+    <table>
+      <thead><tr><th>Environment</th><th>Namespace</th><th>Kind</th><th>Name</th><th>Ready</th><th>Revision</th><th>Images</th><th>Age</th><th /></tr></thead>
+      <tbody>{rows.map((w) => {
+        const ask = () => nav(`/investigate?env=${w.environment}&ns=${w.namespace}&q=${encodeURIComponent(`Why is ${w.kind} ${w.name} unhealthy?`)}`);
+        const options = [{ label: "View pods", run: () => onShowPods(w.name) }, { label: "Investigate", run: ask }];
+        if (canManage && w.kind === "Deployment") {
+          options.push(...deploymentActions(w).map((a) => ({ label: a.label, run: () => onManage({ title: `${a.label}: ${w.name}`, env: w.environment, ns: w.namespace, initial: { action: a.action, target_kind: "Deployment", target_name: w.name, params: a.params } }) })));
+        }
+        return (
+          <tr key={w.environment + w.namespace + w.kind + w.name}>
+            <td className="small">{w.environment}</td><td className="mono small">{w.namespace}</td><td className="small">{w.kind}</td><td className="mono small">{w.name}</td>
+            <td><Badge kind={(w.ready ?? 0) >= (w.desired ?? 0) ? "ok" : "warn"}>{w.ready ?? 0}/{w.desired ?? 0}</Badge></td>
+            <td className="small">{w.revision ?? "—"}</td><td className="small mono">{(w.images ?? []).join(", ")}</td><td className="small">{w.age}</td>
+            <td><ManageMenu label={w.name} options={options} /></td>
+          </tr>
+        );
+      })}</tbody>
+    </table>
   );
 }
 
@@ -121,10 +187,10 @@ function ConfigAudit({ rows, missing }: { rows: any[]; missing: any[] }) {
   );
 }
 
-function ServiceTable({ rows }: { rows: any[] }) {
+function ServiceTable({ rows, canManage, onManage }: { rows: any[]; canManage: boolean; onManage: (m: Manage) => void }) {
   return (
     <table>
-      <thead><tr><th>Environment</th><th>Namespace</th><th>Service</th><th>Selector</th><th>Ports</th><th>Ready endpoints</th><th>Matching pods</th></tr></thead>
+      <thead><tr><th>Environment</th><th>Namespace</th><th>Service</th><th>Selector</th><th>Ports</th><th>Ready endpoints</th><th>Matching pods</th><th /></tr></thead>
       <tbody>{rows.map((s) => (
         <tr key={s.environment + s.namespace + s.name}>
           <td className="small">{s.environment}</td><td className="mono small">{s.namespace}</td>
@@ -133,6 +199,10 @@ function ServiceTable({ rows }: { rows: any[] }) {
           <td className="small">{s.ports.map((p: any) => `${p.port}→${p.targetPort}`).join(", ")}</td>
           <td>{Object.keys(s.selector).length ? <Badge kind={s.endpoints.ready ? "ok" : "bad"}>{s.endpoints.ready}</Badge> : "—"}{s.endpoints.notReady > 0 && <Badge kind="warn">{s.endpoints.notReady} not ready</Badge>}</td>
           <td className="small">{s.matchingPodCount}{s.nearMissPods?.length > 0 && <div className="muted">near miss: {s.nearMissPods.map((n: any) => n.pod).join(", ")}</div>}</td>
+          <td>{canManage && <ManageMenu label={s.name} options={[{ label: "Edit selector", run: () => onManage({ title: `Edit selector: ${s.name}`, env: s.environment, ns: s.namespace,
+            initial: { action: "apply_config_patch", target_kind: "Service", target_name: s.name, params: { patch: { spec: { selector: s.selector } } } } }) },
+            { label: "Session affinity", run: () => onManage({ title: `Session affinity: ${s.name}`, env: s.environment, ns: s.namespace,
+              initial: { action: "apply_config_patch", target_kind: "Service", target_name: s.name, params: { patch: { spec: { sessionAffinity: "ClientIP" } } } } }) }]} />}</td>
         </tr>
       ))}</tbody>
     </table>
@@ -150,7 +220,8 @@ function Generic({ rows, cols }: { rows: any[]; cols: string[] }) {
   );
 }
 
-function PodDrawer({ env, ns, pod, onClose }: { env: string; ns: string; pod: string; onClose: () => void }) {
+function PodDrawer({ env, ns, pod, owner, canManage, onManage, onClose }: { env: string; ns: string; pod: string; owner?: string | null; canManage: boolean; onManage: (m: Manage) => void; onClose: () => void }) {
+  const deployment = owner?.startsWith("ReplicaSet/") ? owner.slice("ReplicaSet/".length).replace(/-[^-]+$/, "") : null;
   const [view, setView] = useState<"describe" | "logs" | "previous" | "resources">("describe");
   const r = useLoad<Result>(() => {
     if (view === "describe") return api(`/explore/${env}/pod${qs({ namespace: ns, pod })}`);
@@ -160,6 +231,10 @@ function PodDrawer({ env, ns, pod, onClose }: { env: string; ns: string; pod: st
   return (
     <div className="drawer" role="dialog" aria-label={pod}>
       <div className="row between"><h2 className="mono">{pod}</h2><button className="ghost small" onClick={onClose}>Close</button></div>
+      {canManage && owner && <div className="row" style={{ marginBottom: 10 }}>
+        <button className="ghost small" onClick={() => onManage({ title: `Delete pod: ${pod}`, env, ns, initial: { action: "delete_pod", target_kind: "Pod", target_name: pod, params: {} } })}>Delete pod (replaced by {owner})</button>
+        {deployment && <button className="ghost small" onClick={() => onManage({ title: `Rollout restart: ${deployment}`, env, ns, initial: { action: "restart_deployment", target_kind: "Deployment", target_name: deployment, params: {} } })}>Rollout restart {deployment}</button>}
+      </div>}
       <div className="tabs">{(["describe", "logs", "previous", "resources"] as const).map((v) => (
         <button key={v} className={v === view ? "active" : ""} onClick={() => setView(v)}>{v === "previous" ? "previous logs" : v}</button>
       ))}</div>

@@ -5,13 +5,18 @@ Everything runs through the ToolExecutor (RBAC, scope, bounds, redaction, audit)
 be confined to a namespace, so it stays limited to users with metrics.raw_query on all namespaces of
 an environment; scoped users use the Explore builder, which pins the namespace itself.
 
-Environments that share one Prometheus are queried once. Each source is evaluated on its own:
-results are never summed across sources, because separate servers are not one global PromQL
-evaluation and their metrics may be defined differently.
+A source is one connector seen with one level of access. Environments are served by a single query
+only when the connector's whole identity (endpoint, tenant, settings, credential) and the caller's
+effective scope in each environment are equal, because only then is the answer the same. A shared
+URL alone proves nothing: different tokens can see different tenants.
+
+Each source is evaluated on its own: results are never summed across sources, because separate
+servers are not one global PromQL evaluation and their metrics may be defined differently.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -27,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import audit
 from ..auth.deps import get_auth
 from ..auth.sessions import AuthContext
+from ..connectors import registry
 from ..db import get_db
 from ..llm.providers import LLMError, complete_metered, provider_for
 from ..models import AuditEvent, Connector, Environment, LLMConfig, LLMUsage, SavedQuery, User
@@ -107,14 +113,21 @@ TEMPLATES: list[dict[str, Any]] = [
 
 
 class Source:
-    """One backing Prometheus and the environments it serves."""
+    """One connector with one level of access, and the environments that share exactly that."""
 
-    def __init__(self, key: str, ex, env: str, connector: str):
+    def __init__(self, key: str, ex, env: str, connector: str, connector_id: str):
         self.key, self.ex, self.connector = key, ex, connector
-        self.environments = [env]
+        self.environments, self.connector_ids = [env], [connector_id]
 
     def identity(self) -> dict:
-        return {"environments": self.environments, "connector": self.connector, "language": "promql"}
+        return {"environments": self.environments, "connector": self.connector, "connector_ids": self.connector_ids, "language": "promql"}
+
+
+def _source_key(row: Connector, ex, ctx: AuthContext, env_name: str) -> str:
+    """Includes everything that changes the answer: same key means the same data for this caller."""
+    scope = ex.ctx.scope
+    return hashlib.sha256(json.dumps([registry.data_identity(row), sorted(scope.user_patterns), sorted(scope.env_allowed), sorted(scope.env_denied),
+                                      ctx.principal.can(P.METRICS_RAW_QUERY, env_name, "*"), str(ex.ctx.max_window)]).encode()).hexdigest()
 
 
 async def _environments(db: AsyncSession, ctx: AuthContext, wanted: str | None, perm: P = P.EXPLORER_READ) -> list[Environment]:
@@ -130,19 +143,31 @@ async def _environments(db: AsyncSession, ctx: AuthContext, wanted: str | None, 
     return [e for e in envs if e.name in allowed]
 
 
-async def _sources(request: Request, db: AsyncSession, ctx: AuthContext, envs: list[Environment], errors: list[dict], minutes: int | None = None) -> list[Source]:
+async def _sources(request: Request, db: AsyncSession, ctx: AuthContext, envs: list[Environment], errors: list[dict], minutes: int | None = None,
+                   connectors: list[str] | None = None) -> list[Source]:
+    """connectors: ids to restrict to; empty means every Prometheus connector in these environments."""
     by_key: dict[str, Source] = {}
+    wanted = set(connectors or [])
+    matched: set[str] = set()
     for e in envs:
-        ex = await live_executor(request, db, ctx, e.name, minutes, perm=P.EXPLORER_READ, audit_success=False)
-        entry = ex.ctx.connectors.get("prometheus")
-        if entry is None:
+        rows, build_errors = await registry.of_type(db, e.id, "prometheus")
+        errors.extend({"environment": e.name, "error": f"{name}: {msg}"} for name, msg in build_errors.items())
+        if not rows and not build_errors:
             errors.append({"environment": e.name, "error": "no Prometheus connector"})
-            continue
-        key = str((entry[0].config or {}).get("base_url") or entry[0].id)
-        if key in by_key:
-            by_key[key].environments.append(e.name)
-        else:
-            by_key[key] = Source(key, ex, e.name, entry[0].name)
+        for row, inst in rows:
+            if wanted and str(row.id) not in wanted:
+                continue
+            matched.add(str(row.id))
+            ex = await live_executor(request, db, ctx, e.name, minutes, perm=P.EXPLORER_READ, audit_success=False)
+            ex.ctx.connectors = {**ex.ctx.connectors, "prometheus": (row, inst)}
+            key = _source_key(row, ex, ctx, e.name)
+            if key in by_key:
+                by_key[key].environments.append(e.name)
+                by_key[key].connector_ids.append(str(row.id))
+            else:
+                by_key[key] = Source(key, ex, e.name, row.name, str(row.id))
+    if wanted - matched:
+        raise HTTPException(403, "you cannot read one of those data sources")  # same answer whether it exists or not
     return list(by_key.values())
 
 
@@ -173,19 +198,29 @@ def _note(results: list[dict]) -> str | None:
     return "Each source was queried separately. This is not one global PromQL evaluation, so values are shown per source and never added together." if len(results) > 1 else None
 
 
+async def _load_catalog(s: Source) -> None:
+    names = await asyncio.wait_for(s.ex.run("prom_metric_names", {}), SOURCE_TIMEOUT)
+    if not names.ok:
+        return
+    meta = await asyncio.wait_for(s.ex.run("prom_metric_metadata", {"names": names.data["names"]}), SOURCE_TIMEOUT)
+    _catalog_cache[s.key] = (time.monotonic(), {"names": names.data["names"], "metadata": meta.data["metadata"] if meta.ok else {}})
+
+
 async def _catalog(sources: list[Source]) -> dict[str, dict]:
-    """metric -> {type, unit, help, environments}, cached per source."""
+    """metric -> {type, unit, help, environments}. Cached per source, and a source's key carries
+    the caller's scope, so a scoped user can never be served a wider user's list."""
     merged: dict[str, dict] = {}
     stale = [s for s in sources if s.key not in _catalog_cache or time.monotonic() - _catalog_cache[s.key][0] > CATALOG_TTL]
-    names = dict(await _fan_out(stale, "prom_metric_names", {})) if stale else {}
-    meta = dict(await _fan_out(stale, "prom_metric_metadata", {})) if stale else {}
+    sem = asyncio.Semaphore(CONCURRENCY)
+
+    async def load(s: Source) -> None:
+        async with sem:
+            try:
+                await _load_catalog(s)
+            except asyncio.TimeoutError:
+                pass
+    await asyncio.gather(*[load(s) for s in stale])
     for s in sources:
-        if s in names:
-            out = names[s]
-            if out is None or not out.ok:
-                continue
-            m = meta.get(s)
-            _catalog_cache[s.key] = (time.monotonic(), {"names": out.data["names"], "metadata": m.data["metadata"] if m is not None and m.ok else {}})
         entry = _catalog_cache.get(s.key)
         if not entry:
             continue
@@ -193,6 +228,10 @@ async def _catalog(sources: list[Source]) -> dict[str, dict]:
             row = merged.setdefault(n, {"name": n, "environments": [], **entry[1]["metadata"].get(n, {})})
             row["environments"] = sorted({*row["environments"], *s.environments})
     return merged
+
+
+def _ids(connectors: str) -> list[str]:
+    return [c.strip() for c in connectors.split(",") if c.strip()]
 
 
 @router.get("/sources")
@@ -203,18 +242,18 @@ async def sources(request: Request, ctx: AuthContext = Depends(get_auth), db: As
     by_env: dict = {}
     for c in rows:
         if c.type in CAPABILITIES:
-            by_env.setdefault(c.environment_id, []).append({"name": c.name, "type": c.type, **CAPABILITIES[c.type], "last_test_ok": c.last_test_ok})
+            by_env.setdefault(c.environment_id, []).append({"id": str(c.id), "name": c.name, "type": c.type, **CAPABILITIES[c.type], "last_test_ok": c.last_test_ok})
     return {"environments": [{"environment": e.name, "display_name": e.display_name, "kind": e.kind, "data_sources": by_env.get(e.id, []),
                               "raw_query": ctx.principal.can(P.METRICS_RAW_QUERY, e.name, "*")} for e in envs],
             "resource_labels": RESOURCE_LABELS, "cloudwatch_namespaces": CW_NAMESPACES}
 
 
 @router.get("/catalog")
-async def catalog(request: Request, environments: str = "all", search: str = Query("", max_length=100), limit: int = Query(500, ge=1, le=5000),
+async def catalog(request: Request, environments: str = "all", connectors: str = "", search: str = Query("", max_length=100), limit: int = Query(500, ge=1, le=5000),
                   ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     envs = await _environments(db, ctx, environments)
     errors: list[dict] = []
-    src = await _sources(request, db, ctx, envs, errors)
+    src = await _sources(request, db, ctx, envs, errors, connectors=_ids(connectors))
     merged = await _catalog(src)
     needle = search.lower()
     items = sorted((m for m in merged.values() if needle in m["name"].lower()), key=lambda m: m["name"])
@@ -223,12 +262,12 @@ async def catalog(request: Request, environments: str = "all", search: str = Que
 
 
 @router.get("/labels")
-async def labels(request: Request, metric: str, environments: str = "all", namespace: str | None = None, label: str | None = None,
+async def labels(request: Request, metric: str, environments: str = "all", connectors: str = "", namespace: str | None = None, label: str | None = None,
                  ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Real label names of a metric, or the values of one label, merged across sources."""
     envs = await _environments(db, ctx, environments)
     errors: list[dict] = []
-    src = await _sources(request, db, ctx, envs, errors)
+    src = await _sources(request, db, ctx, envs, errors, connectors=_ids(connectors))
     args = {"metric": metric, **({"namespace": namespace} if namespace else {}), **({"label": label} if label else {})}
     found: set[str] = set()
     for s, out in await _fan_out(src, "prom_metric_labels", args):
@@ -240,11 +279,11 @@ async def labels(request: Request, metric: str, environments: str = "all", names
 
 
 @router.get("/templates")
-async def templates(request: Request, environments: str = "all", ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def templates(request: Request, environments: str = "all", connectors: str = "", ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Curated queries, marked runnable only where the metrics they need really exist."""
     envs = await _environments(db, ctx, environments)
     errors: list[dict] = []
-    src = await _sources(request, db, ctx, envs, errors)
+    src = await _sources(request, db, ctx, envs, errors, connectors=_ids(connectors))
     merged = await _catalog(src)
     out = []
     for t in TEMPLATES:
@@ -258,6 +297,7 @@ class QueryIn(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
     mode: Literal["instant", "range"] = "range"
     environments: str = "all"
+    connectors: list[str] = Field(default_factory=list, max_length=50)
     minutes: int = Field(60, ge=1, le=10080)
     step: int | None = Field(None, ge=5, le=3600)
 
@@ -284,7 +324,7 @@ async def query(body: QueryIn, request: Request, ctx: AuthContext = Depends(get_
     """Raw PromQL. The prom_query tool itself enforces metrics.raw_query and all-namespace scope."""
     envs = await _environments(db, ctx, body.environments)
     errors: list[dict] = []
-    src = await _sources(request, db, ctx, envs, errors, body.minutes)
+    src = await _sources(request, db, ctx, envs, errors, body.minutes, body.connectors)
     args = {"promql": body.query, "mode": body.mode, "minutes": body.minutes, **({"step": body.step} if body.step and body.mode == "range" else {})}
     results = [_result(s, o) for s, o in await _cancel_on_disconnect(request, _fan_out(src, "prom_query", args))]
     await audit.record(db, action="metrics.query", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="promql", decision="allow",
@@ -296,6 +336,7 @@ async def query(body: QueryIn, request: Request, ctx: AuthContext = Depends(get_
 class ExploreIn(BaseModel):
     metric: str = Field(max_length=200)
     environments: str = "all"
+    connectors: list[str] = Field(default_factory=list, max_length=50)
     namespaces: list[str] = Field(default_factory=list, max_length=10)
     labels: dict[str, str] = Field(default_factory=dict, max_length=10)
     aggregate: Literal["none", "sum", "avg", "max", "min", "count"] = "sum"
@@ -314,8 +355,8 @@ async def explore(body: ExploreIn, request: Request, ctx: AuthContext = Depends(
     """The builder: works for namespace-scoped users because the query pins the namespace."""
     envs = await _environments(db, ctx, body.environments)
     errors: list[dict] = []
-    src = await _sources(request, db, ctx, envs, errors, body.minutes)
-    base = body.model_dump(exclude={"environments", "namespaces"}, exclude_none=True)
+    src = await _sources(request, db, ctx, envs, errors, body.minutes, body.connectors)
+    base = body.model_dump(exclude={"environments", "namespaces", "connectors"}, exclude_none=True)
     results: list[dict] = []
 
     async def run(namespace: str | None):
@@ -456,6 +497,7 @@ async def delete_saved(sid: uuid.UUID, ctx: AuthContext = Depends(get_auth), db:
 class GenerateIn(BaseModel):
     prompt: str = Field(min_length=5, max_length=1000)
     environments: str = "all"
+    connectors: list[str] = Field(default_factory=list, max_length=50)
     resource_types: list[str] = Field(default_factory=list, max_length=10)
 
 
@@ -476,8 +518,8 @@ def _relevant(names: list[str], prompt: str) -> list[str]:
 async def generate(body: GenerateIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Drafts a query into the editor. It runs nothing: the engineer reviews it and presses Run,
     and /metrics/query applies the full policy then."""
-    envs = await _environments(db, ctx, body.environments)
-    if not any(ctx.principal.can(P.METRICS_RAW_QUERY, e.name, "*") for e in envs):
+    envs = [e for e in await _environments(db, ctx, body.environments) if ctx.principal.can(P.METRICS_RAW_QUERY, e.name, "*")]
+    if not envs:
         raise HTTPException(403, "query generation writes raw PromQL, which needs metrics.raw_query for all namespaces of an environment")
     cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none()
     if cfg is None:
@@ -487,7 +529,7 @@ async def generate(body: GenerateIn, request: Request, ctx: AuthContext = Depend
     if spent >= cfg.daily_budget_usd:
         raise HTTPException(429, "the LLM daily budget is used up")
     errors: list[dict] = []
-    src = await _sources(request, db, ctx, envs, errors)
+    src = await _sources(request, db, ctx, envs, errors, connectors=body.connectors)
     merged = await _catalog(src)
     names = _relevant(list(merged), body.prompt)
     catalog_text = "\n".join(f"{n} {merged[n].get('type', '')} {merged[n].get('unit', '')}".strip() for n in names)

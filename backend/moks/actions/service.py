@@ -119,6 +119,9 @@ async def create_plan(db: AsyncSession, principal: Principal, env: Environment, 
             else:
                 meta = await k8s[1].object_meta(namespace, target_kind, target_name)
                 pre = {"resourceVersion": meta["resourceVersion"], "uid": meta["uid"], "spec": meta["spec"]}
+                if target_kind == "Pod":  # a pod's resourceVersion moves with its status; the UID identifies it
+                    pre = {"uid": meta["uid"], "owner": meta.get("owner")}
+                    auto_recover = False
         check_policy(action, parsed, env, pre, target_kind)
         text = describe(action, parsed, f"{target_kind}/{target_name}", namespace, pre, history)
     except ConnectorError as exc:

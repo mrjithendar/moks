@@ -84,6 +84,26 @@ async def for_environment(db: AsyncSession, environment_id: uuid.UUID) -> tuple[
     return out, errors
 
 
+async def of_type(db: AsyncSession, environment_id: uuid.UUID, ctype: str) -> tuple[list[tuple[Connector, Any]], dict[str, str]]:
+    """Every enabled connector of a type, for features that address connectors individually."""
+    rows = (await db.execute(select(Connector).where(Connector.environment_id == environment_id, Connector.type == ctype, Connector.enabled.is_(True))
+                             .order_by(Connector.name))).scalars().all()
+    out: list[tuple[Connector, Any]] = []
+    errors: dict[str, str] = {}
+    for row in rows:
+        try:
+            out.append((row, await instance(row)))
+        except ConnectorError as exc:
+            errors[row.name] = exc.message
+    return out, errors
+
+
+def data_identity(row: Connector) -> str:
+    """Two connectors are the same source only if type, endpoint, tenant, every other setting and
+    the credential all match: one URL can serve different tenants to different tokens."""
+    return _fingerprint(row)
+
+
 async def test(row: Connector) -> tuple[bool, str]:
     try:
         inst = await instance(row)

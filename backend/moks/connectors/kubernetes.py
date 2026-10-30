@@ -302,11 +302,12 @@ class KubernetesConnector:
 
         api = await self._client()
         fns = {"Deployment": client.AppsV1Api(api).read_namespaced_deployment, "Service": client.CoreV1Api(api).read_namespaced_service,
-               "HorizontalPodAutoscaler": client.AutoscalingV2Api(api).read_namespaced_horizontal_pod_autoscaler}
+               "HorizontalPodAutoscaler": client.AutoscalingV2Api(api).read_namespaced_horizontal_pod_autoscaler, "Pod": client.CoreV1Api(api).read_namespaced_pod}
         if kind not in fns:
             raise ConnectorError("bad_request", f"unsupported kind {kind}")
         obj = api.sanitize_for_serialization(await self._call(f"get {kind} {namespace}/{name}", fns[kind], name, namespace))
         return {"kind": kind, "name": name, "resourceVersion": obj["metadata"].get("resourceVersion"), "uid": obj["metadata"].get("uid"), "spec": obj.get("spec", {}),
+                "owner": next((f"{o['kind']}/{o['name']}" for o in obj["metadata"].get("ownerReferences") or [] if o.get("controller")), None),
                 "generation": obj["metadata"].get("generation")}
 
     async def services(self, namespace: str) -> list[dict]:

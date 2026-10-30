@@ -83,6 +83,7 @@ async def k8s_triage(ctx: ToolContext, a: NamespaceArgs) -> ToolResult:
                f"{len(recent_events)} warning events in the window; {len(findings)} findings" + (" [pod list truncated]" if truncated else ""))
     return ToolResult(summary, {
         "findings": findings,
+        "pods_truncated": bool(truncated),
         "unhealthyPods": unhealthy[:40],
         "workloads": workloads,
         "services": [{k_: v for k_, v in s.items() if k_ != "podContainerPorts"} for s in services],
@@ -401,6 +402,13 @@ class MetricArgs(ToolArgs):
     minutes: int | None = Field(default=None, ge=5, le=10080)
 
 
+SCOPED_DISCOVERY_NAMESPACES = 20
+
+
+class MetricMetadataArgs(ToolArgs):
+    names: list[str] | None = Field(default=None, max_length=5000, description="limit to these metrics; required unless you may read all namespaces")
+
+
 class MetricLabelsArgs(ToolArgs):
     metric: str = Field(pattern=METRIC_NAME)
     namespace: str | None = Field(default=None, pattern=K8S_NAME, max_length=63)
@@ -425,18 +433,38 @@ async def prom_metric_labels(ctx: ToolContext, a: MetricLabelsArgs) -> ToolResul
     return ToolResult(f"{len(names)} labels on {a.metric}", {"labels": names}, {"api": "GET /api/v1/labels", "query": match})
 
 
-async def prom_metric_metadata(ctx: ToolContext, a: NoArgs) -> ToolResult:
+def _sees_all_metrics(ctx: ToolContext) -> bool:
+    return ctx.principal.can(P.METRICS_RAW_QUERY, ctx.environment.name, "*") and ctx.scope.cluster_wide
+
+
+async def prom_metric_metadata(ctx: ToolContext, a: MetricMetadataArgs) -> ToolResult:
+    if a.names is None and not _sees_all_metrics(ctx):
+        raise ScopeError("metadata for every metric needs metrics.raw_query for all namespaces; ask for the metrics you can read")
     data = await ctx.connector("prometheus").metadata()
+    if a.names is not None:
+        wanted = set(a.names)
+        data = {k: v for k, v in data.items() if k in wanted}
     return ToolResult(f"metadata for {len(data)} metrics", {"metadata": data}, {"api": "GET /api/v1/metadata"})
 
 
 async def prom_metric_names(ctx: ToolContext, a: MetricNamesArgs) -> ToolResult:
+    """All names for environment-wide users. Others see only names with series in a namespace they
+    may read, found through series discovery: the global list says what runs on the cluster."""
     prom = ctx.connector("prometheus")
     start, end = ctx.window(60)
-    names = await prom.label_values("__name__", None, start, end, limit=5000)
+    extra: dict = {}
+    if _sees_all_metrics(ctx):
+        names = await prom.label_values("__name__", None, start, end, limit=5000)
+    else:
+        permitted = ctx.scope.filter(await prom.label_values("namespace", None, start, end, limit=2000))
+        found: set[str] = set()
+        for ns in permitted[:SCOPED_DISCOVERY_NAMESPACES]:
+            found.update(await prom.label_values("__name__", f'{{namespace="{ns}"}}', start, end, limit=5000))
+        names = sorted(found)
+        extra = {"scoped": True, "namespaces_checked": permitted[:SCOPED_DISCOVERY_NAMESPACES], "namespaces_total": len(permitted)}
     if a.search:
         names = [n for n in names if a.search.lower() in n.lower()]
-    return ToolResult(f"{len(names)} metric names", {"names": names[:3000]}, {"api": "GET /api/v1/label/__name__/values"})
+    return ToolResult(f"{len(names)} metric names", {"names": names[:5000], **extra}, {"api": "GET /api/v1/label/__name__/values"})
 
 
 def build_promql(a: MetricArgs) -> str:
@@ -521,7 +549,7 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("loki_logs", "Recent logs across every permitted namespace (or one) with pod/container/level/text/trace/request filters.",
              "loki", LokiLogsArgs, loki_logs, namespace_arg=None),
     ToolSpec("prom_metric_labels", "Label names of a metric, or the values of one label, within your scope.", "prometheus", MetricLabelsArgs, prom_metric_labels, namespace_arg=None),
-    ToolSpec("prom_metric_metadata", "Type, unit and help text Prometheus has for its metrics.", "prometheus", NoArgs, prom_metric_metadata, namespace_arg=None),
+    ToolSpec("prom_metric_metadata", "Type, unit and help text Prometheus has for its metrics.", "prometheus", MetricMetadataArgs, prom_metric_metadata, namespace_arg=None),
     ToolSpec("prom_metric_names", "Catalog of metric names in Prometheus (optionally filtered).", "prometheus", MetricNamesArgs, prom_metric_names,
              namespace_arg=None),
     ToolSpec("prom_metric", "Chart one metric with label filters, aggregation and rate (query built safely; exact PromQL returned).",

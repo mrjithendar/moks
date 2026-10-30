@@ -224,6 +224,17 @@ restricts cluster resources, it already allows ClusterRole and ClusterRoleBindin
 A plan in **reconciliation_required** will not retry. Check the object, then record what happened on
 the plan's page (needs the Approver role).
 
+## Kubernetes explorer management
+
+**Workloads → Manage…** offers rollout restart, scale, roll back, change resources and rollout settings
+for Deployments. **Services → Manage…** edits the selector or session affinity. Opening a pod offers
+**Delete pod**, for pods a controller would replace, and a rollout restart of its Deployment.
+
+Each option creates an action plan, so the usual review applies: production plans need a second person,
+and nothing changes until it is executed. Execution only works in the namespaces listed in
+`executor.namespaces`, which on mk4 is `moks-lab`. Add a namespace there to manage it. StatefulSets and
+DaemonSets can be viewed and investigated but have no actions yet.
+
 ## Detection
 
 Detection is off by default. To turn it on:

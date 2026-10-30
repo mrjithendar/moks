@@ -29,6 +29,9 @@ rules:
   - apiGroups: [""]
     resources: [pods, events]
     verbs: [get, list]                             # rollout validation
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [delete]                                # delete_pod: controller-managed pods, UID precondition
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
     verbs: [get, list]

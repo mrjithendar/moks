@@ -12,27 +12,38 @@ const WINDOWS = [15, 30, 60, 180, 360, 720, 1440, 10080];
 const windowLabel = (m: number) => (m >= 1440 ? `last ${m / 1440} d` : m >= 60 ? `last ${m / 60} h` : `last ${m} min`);
 const REFRESH = [0, 15, 30, 60, 300];
 
-/** Searchable multi-select. Nothing selected means all the options. */
+/** Searchable multi-select dropdown. Nothing selected means all the options. */
 export function MultiSelect({ label, options, value, onChange, allLabel }: { label: string; options: { value: string; label?: string }[]; value: string[]; onChange: (v: string[]) => void; allLabel: string }) {
   const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const away = (e: MouseEvent) => { if (!box.current?.contains(e.target as Node)) setOpen(false); };
+    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", away);
+    document.addEventListener("keydown", esc);
+    return () => { document.removeEventListener("mousedown", away); document.removeEventListener("keydown", esc); };
+  }, [open]);
   const shown = options.filter((o) => (o.label ?? o.value).toLowerCase().includes(q.toLowerCase()));
-  const text = !value.length ? allLabel : value.length === 1 ? value[0] : `${value.length} selected`;
+  const name = (v: string) => options.find((o) => o.value === v)?.label ?? v;
+  const text = !value.length ? allLabel : value.length === 1 ? name(value[0]) : `${value.length} selected`;
   return (
-    <div className="ms">
+    <div className="ms" ref={box}>
       <span className="ms-label">{label}</span>
-      <details className="ms-box">
-        <summary aria-label={`${label}: ${text}`}>{text}</summary>
-        <div className="ms-menu">
-          {options.length > 6 && <input aria-label={`Search ${label}`} placeholder="Search…" value={q} onChange={(e) => setQ(e.target.value)} />}
-          {shown.slice(0, 200).map((o) => (
-            <label key={o.value} className="inline">
-              <input type="checkbox" checked={value.includes(o.value)} onChange={(e) => onChange(e.target.checked ? [...value, o.value] : value.filter((v) => v !== o.value))} /> {o.label ?? o.value}
-            </label>
-          ))}
-          {!shown.length && <div className="small muted">No matches.</div>}
-          {value.length > 0 && <button type="button" className="ghost small" onClick={() => onChange([])}>Clear</button>}
-        </div>
-      </details>
+      <button type="button" className="ms-button" aria-haspopup="listbox" aria-expanded={open} aria-label={`${label}: ${text}`} onClick={() => setOpen(!open)}>
+        <span>{text}</span><span aria-hidden>▾</span>
+      </button>
+      {open && <div className="ms-menu" role="listbox" aria-multiselectable aria-label={label}>
+        {options.length > 6 && <input autoFocus aria-label={`Search ${label}`} placeholder="Search…" value={q} onChange={(e) => setQ(e.target.value)} />}
+        <button type="button" role="option" aria-selected={!value.length} className={`ms-option ${!value.length ? "on" : ""}`} onClick={() => { onChange([]); setOpen(false); }}>{allLabel}</button>
+        {shown.slice(0, 200).map((o) => {
+          const on = value.includes(o.value);
+          return <button type="button" role="option" aria-selected={on} key={o.value} className={`ms-option ${on ? "on" : ""}`}
+            onClick={() => onChange(on ? value.filter((v) => v !== o.value) : [...value, o.value])}><span className="ms-check" aria-hidden>{on ? "✓" : ""}</span>{o.label ?? o.value}</button>;
+        })}
+        {!shown.length && <div className="small muted">No matches.</div>}
+      </div>}
     </div>
   );
 }
@@ -121,8 +132,12 @@ export function Metrics() {
   const [mode, setMode] = useState<"explore" | "query" | "cloudwatch">("explore");
   const [envs, setEnvs] = useState<string[]>([]);
   const [query, setQuery] = useState("");
+  const [picked, setPicked] = useState<string[]>([]);
   const options = (sources.data?.environments ?? []).map((e: any) => ({ value: e.environment, label: e.display_name }));
   const names = envs.length ? envs.join(",") : "all";
+  const dataSources = (sources.data?.environments ?? []).filter((e: any) => !envs.length || envs.includes(e.environment))
+    .flatMap((e: any) => e.data_sources.filter((d: any) => d.type === "prometheus").map((d: any) => ({ value: d.id, label: `${e.environment} · ${d.name}` })));
+  const connectors = picked.filter((id) => dataSources.some((d: any) => d.value === id));
   const raw = (sources.data?.environments ?? []).filter((e: any) => !envs.length || envs.includes(e.environment)).some((e: any) => e.raw_query);
   const cw = (sources.data?.environments ?? []).filter((e: any) => e.data_sources.some((d: any) => d.type === "cloudwatch"));
   return (
@@ -136,15 +151,16 @@ export function Metrics() {
       </div>
       {mode !== "cloudwatch" && <div className="card filters" style={{ marginBottom: 14 }}>
         <MultiSelect label="Environments" allLabel="All authorized environments" options={options} value={envs} onChange={setEnvs} />
+        {dataSources.length > 1 && <MultiSelect label="Data sources" allLabel="All data sources" options={dataSources} value={connectors} onChange={setPicked} />}
       </div>}
-      {mode === "explore" && <Explore environments={names} scopes={scopes.data} sources={sources.data} onQuery={(q) => { setQuery(q); setMode("query"); }} />}
-      {mode === "query" && <QueryEditor environments={names} query={query} onQuery={setQuery} canRaw={raw} />}
+      {mode === "explore" && <Explore environments={names} connectors={connectors} scopes={scopes.data} sources={sources.data} onQuery={(q) => { setQuery(q); setMode("query"); }} />}
+      {mode === "query" && <QueryEditor environments={names} connectors={connectors} query={query} onQuery={setQuery} canRaw={raw} />}
       {mode === "cloudwatch" && <CloudWatch envs={cw} namespaces={sources.data?.cloudwatch_namespaces ?? {}} />}
     </>
   );
 }
 
-function Explore({ environments, scopes, sources, onQuery }: { environments: string; scopes?: Scope[]; sources: any; onQuery: (q: string) => void }) {
+function Explore({ environments, connectors, scopes, sources, onQuery }: { environments: string; connectors: string[]; scopes?: Scope[]; sources: any; onQuery: (q: string) => void }) {
   const [search, setSearch] = useState("");
   const [metric, setMetric] = useState("");
   const [resource, setResource] = useState("");
@@ -152,9 +168,10 @@ function Explore({ environments, scopes, sources, onQuery }: { environments: str
   const [filters, setFilters] = useState<Record<string, string[]>>({});
   const [f, setF] = useState({ aggregate: "sum", by: [] as string[], rate: "", rate_window: "5m", rank: "", n: 10, instant: false, minutes: 60, step: "" });
   const [refresh, setRefresh] = useState(0);
-  const catalog = useLoad(() => api<any>(`/metrics/catalog${qs({ environments, limit: 5000 })}`), [environments]);
+  const ids = connectors.join(",");
+  const catalog = useLoad(() => api<any>(`/metrics/catalog${qs({ environments, connectors: ids, limit: 5000 })}`), [environments, ids]);
   const namespace1 = namespaces.length === 1 ? namespaces[0] : undefined;
-  const labels = useLoad(() => (metric ? api<any>(`/metrics/labels${qs({ metric, environments, namespace: namespace1 })}`) : Promise.resolve(null)), [metric, environments, namespace1]);
+  const labels = useLoad(() => (metric ? api<any>(`/metrics/labels${qs({ metric, environments, connectors: ids, namespace: namespace1 })}`) : Promise.resolve(null)), [metric, environments, ids, namespace1]);
   const allNamespaces = [...new Set((scopes ?? []).flatMap((s) => s.namespaces))].sort();
   const resourceLabels: string[] = sources?.resource_labels?.[resource] ?? [];
   const found: string[] = (labels.data?.labels ?? []).filter((l: string) => l !== "namespace");
@@ -167,12 +184,12 @@ function Explore({ environments, scopes, sources, onQuery }: { environments: str
   const info = (catalog.data?.items ?? []).find((m: any) => m.name === metric);
   const r = useRunner<any>("/metrics/explore");
   const body = () => ({
-    metric, environments, namespaces, aggregate: f.aggregate, by: f.by, rate: f.rate === "" ? undefined : f.rate === "true", rate_window: f.rate_window,
+    metric, environments, connectors, namespaces, aggregate: f.aggregate, by: f.by, rate: f.rate === "" ? undefined : f.rate === "true", rate_window: f.rate_window,
     instant: f.instant, minutes: f.minutes, step: f.step ? Number(f.step) : undefined,
     labels: Object.fromEntries(Object.entries(filters).filter(([, v]) => v.length).map(([k, v]) => [k, v.length === 1 ? v[0] : `~${v.map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")}`])),
     ...(f.rank ? { [f.rank]: f.n } : {}),
   });
-  useEffect(() => { if (metric) r.run(body()); }, [metric, environments, JSON.stringify(namespaces), JSON.stringify(filters), JSON.stringify(f)]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (metric) r.run(body()); }, [metric, environments, ids, JSON.stringify(namespaces), JSON.stringify(filters), JSON.stringify(f)]); // eslint-disable-line react-hooks/exhaustive-deps
   useInterval(() => { if (metric && !r.busy) r.run(body()); }, refresh * 1000, refresh > 0);
   const set = (k: keyof typeof f, v: any) => setF({ ...f, [k]: v });
   return (
@@ -208,7 +225,7 @@ function Explore({ environments, scopes, sources, onQuery }: { environments: str
                 <button type="button" className="ghost small" onClick={() => { const q = r.data?.results.find((x) => x.query)?.query; if (q) onQuery(q); }} disabled={!r.data}>Open in Query</button></div>
               {info?.help && <div className="small muted">{info.help}</div>}
               <div className="filters">
-                {relevant.slice(0, 8).map((l) => <LabelFilter key={l} metric={metric} label={l} environments={environments} namespace={namespace1} value={filters[l] ?? []} onChange={(v) => setFilters({ ...filters, [l]: v })} />)}
+                {relevant.slice(0, 8).map((l) => <LabelFilter key={l} metric={metric} label={l} environments={environments} connectors={ids} namespace={namespace1} value={filters[l] ?? []} onChange={(v) => setFilters({ ...filters, [l]: v })} />)}
               </div>
               {labels.data?.errors?.length > 0 && <div className="small muted">Label values need a single namespace for your access level.</div>}
               <div className="filters">
@@ -233,12 +250,12 @@ function Explore({ environments, scopes, sources, onQuery }: { environments: str
   );
 }
 
-function LabelFilter({ metric, label, environments, namespace, value, onChange }: { metric: string; label: string; environments: string; namespace?: string; value: string[]; onChange: (v: string[]) => void }) {
-  const v = useLoad(() => api<any>(`/metrics/labels${qs({ metric, environments, namespace, label })}`), [metric, label, environments, namespace]);
+function LabelFilter({ metric, label, environments, connectors, namespace, value, onChange }: { metric: string; label: string; environments: string; connectors: string; namespace?: string; value: string[]; onChange: (v: string[]) => void }) {
+  const v = useLoad(() => api<any>(`/metrics/labels${qs({ metric, environments, connectors, namespace, label })}`), [metric, label, environments, connectors, namespace]);
   return <MultiSelect label={label} allLabel="Any" options={(v.data?.values ?? []).map((x: string) => ({ value: x }))} value={value} onChange={onChange} />;
 }
 
-function QueryEditor({ environments, query, onQuery, canRaw }: { environments: string; query: string; onQuery: (q: string) => void; canRaw: boolean }) {
+function QueryEditor({ environments, connectors, query, onQuery, canRaw }: { environments: string; connectors: string[]; query: string; onQuery: (q: string) => void; canRaw: boolean }) {
   const [form, setForm] = useState({ mode: "range", minutes: 60, step: "" });
   const [prompt, setPrompt] = useState("");
   const [draft, setDraft] = useState<any>(null);
@@ -248,17 +265,18 @@ function QueryEditor({ environments, query, onQuery, canRaw }: { environments: s
   const [saveName, setSaveName] = useState("");
   const [shared, setShared] = useState(false);
   const r = useRunner<any>("/metrics/query");
-  const templates = useLoad(() => api<any>(`/metrics/templates${qs({ environments })}`), [environments]);
+  const ids = connectors.join(",");
+  const templates = useLoad(() => api<any>(`/metrics/templates${qs({ environments, connectors: ids })}`), [environments, ids]);
   const saved = useLoad(() => api<any>("/metrics/saved"), []);
   const history = useLoad(() => api<any>("/metrics/history"), [r.data]);
-  const catalog = useLoad(() => api<any>(`/metrics/catalog${qs({ environments, limit: 5000 })}`), [environments]);
+  const catalog = useLoad(() => api<any>(`/metrics/catalog${qs({ environments, connectors: ids, limit: 5000 })}`), [environments, ids]);
   const token = /[a-zA-Z_:][a-zA-Z0-9_:]*$/.exec(query)?.[0] ?? "";
   const suggestions = token.length >= 2 ? (catalog.data?.items ?? []).filter((m: any) => m.name.startsWith(token) && m.name !== token).slice(0, 8) : [];
   async function generate() {
     setGenerating(true);
     setGenError(null);
     try {
-      const d = await api<any>("/metrics/generate", { method: "POST", body: { prompt, environments } });
+      const d = await api<any>("/metrics/generate", { method: "POST", body: { prompt, environments, connectors } });
       setDraft(d);
       if (d.query) onQuery(d.query);
       setForm((x) => ({ ...x, minutes: WINDOWS.includes(d.suggested_minutes) ? d.suggested_minutes : x.minutes, step: d.suggested_step_seconds ? String(d.suggested_step_seconds) : x.step }));
@@ -270,7 +288,7 @@ function QueryEditor({ environments, query, onQuery, canRaw }: { environments: s
   }
   function run(e?: FormEvent) {
     e?.preventDefault();
-    r.run({ query, mode: form.mode, environments, minutes: form.minutes, step: form.step ? Number(form.step) : undefined });
+    r.run({ query, mode: form.mode, environments, connectors, minutes: form.minutes, step: form.step ? Number(form.step) : undefined });
   }
   const areas = [...new Set<string>((templates.data?.templates ?? []).map((t: any) => t.area))];
   return (

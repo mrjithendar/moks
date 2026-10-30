@@ -345,3 +345,45 @@ class FakeWriter:
     async def exec(self, ns, pod, argv, timeout=30, max_bytes=64000):
         self.calls.append(("exec", ns, pod, argv))
         return 0, "status=200 remote=10.0.0.1:80 total=0.01s\n"
+
+
+def _pods_for_writer() -> None:
+    OBJECTS[("shop", "Pod", "checkout-abc")] = {"metadata": {"uid": "uid-pod", "resourceVersion": "5", "ownerReferences": [{"kind": "ReplicaSet", "name": "checkout-7d9f", "controller": True}]}, "spec": {}}
+    OBJECTS[("shop", "Pod", "bare")] = {"metadata": {"uid": "uid-bare", "resourceVersion": "6"}, "spec": {}}
+
+
+_original_reset = reset_deployments
+
+
+def reset_deployments() -> None:  # noqa: F811
+    _original_reset()
+    _pods_for_writer()
+
+
+async def _object_meta(self, namespace, kind, name):
+    o = OBJECTS.get((namespace, kind, name))
+    if o is None:
+        raise ConnectorError("not_found", f"{kind} {namespace}/{name}: not found")
+    owner = next((f"{r['kind']}/{r['name']}" for r in o["metadata"].get("ownerReferences") or [] if r.get("controller")), None)
+    return {"kind": kind, "name": name, "resourceVersion": o["metadata"]["resourceVersion"], "uid": o["metadata"]["uid"], "spec": o["spec"], "owner": owner}
+
+
+FakeKubernetes.object_meta = _object_meta
+
+
+async def _delete_managed_pod(self, ns, name, uid):
+    self.calls.append(("delete_pod", ns, name, uid))
+    if self.mutate_error:
+        raise self.mutate_error
+    OBJECTS.pop((ns, "Pod", name), None)
+    return {"deleted": name, "uid": uid}
+
+
+async def _get_object(self, ns, kind, name, _real=FakeWriter.get_object):
+    if kind == "Pod" and (ns, kind, name) not in OBJECTS:
+        raise ConnectorError("not_found", "gone")
+    return await _real(self, ns, kind, name)
+
+
+FakeWriter.delete_managed_pod = _delete_managed_pod
+FakeWriter.get_object = _get_object

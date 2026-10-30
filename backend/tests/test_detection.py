@@ -86,7 +86,7 @@ async def test_duplicate_workers_cannot_open_two_incidents():
     env, r = await _env(), rule()
     await _apply(env, r, FIRING)
     await _apply(env, r, FIRING)
-    fp = detection.fingerprint(r.id, env, "pod/payments-1")
+    fp = detection.fingerprint(r.id, env, "shop", "pod", "pod/payments-1")
     async with session_scope() as db:
         e = await db.get(Environment, env)
         st = await db.get(DetectionState, fp)
@@ -114,7 +114,7 @@ async def test_partial_read_cannot_clear_what_it_did_not_see():
     await _apply(env, r, FIRING)
     await _apply(env, r, FIRING)
     for _ in range(5):
-        await _apply(env, r, Check("ok", partial=True))
+        await _apply(env, r, Check("ok", complete=False))
     assert (await _incidents(env))[0].status == "open"
 
 
@@ -197,7 +197,7 @@ async def test_live_finding_rule_evaluates_through_the_executor():
         e = await db.get(Environment, env)
         check = await detection.evaluate(db, e, r.spec)
     assert check.status == "firing" and any("payments" in s.resource for s in check.signals)
-    assert check.partial  # the fake lists kube-system but cannot read it
+    assert not check.complete and "shop" in check.covered  # the fake lists kube-system but cannot read it
 
 
 async def test_evaluate_without_connector_is_unknown_not_healthy():
@@ -215,7 +215,7 @@ async def test_tick_respects_the_interval_across_restarts(monkeypatch):
     env, r = await _env(), rule()
     calls = []
 
-    async def fake_eval(db, e, spec):
+    async def fake_eval(db, e, spec, principal=None, cursor=0):
         calls.append(spec.id)
         return CLEAR
     monkeypatch.setattr(detection, "all_rules", lambda: [r])

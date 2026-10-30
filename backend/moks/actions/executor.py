@@ -222,11 +222,45 @@ async def _recover(writer, kind: str, ns: str, name: str, uid: str, before: dict
     return ("recovered" if v["ok"] else "failed"), {"status": "applied", "output": out, "validation": v}
 
 
+async def _delete_pod(plan_id: uuid.UUID, writer, ns: str, name: str, pre: dict, timeout: int, result: dict) -> str:
+    obj = await writer.get_object(ns, "Pod", name)
+    if obj["metadata"].get("uid") != pre.get("uid"):
+        raise ConnectorError("conflict", f"pod {ns}/{name} is a different pod than the one reviewed")
+    if not any(o.get("controller") for o in obj["metadata"].get("ownerReferences") or []):
+        raise ConnectorError("forbidden", "this pod no longer has a controller")
+    await _checkpoint(plan_id, "intent", uid=pre["uid"], kind="Pod")
+    try:
+        out = await writer.delete_managed_pod(ns, name, pre["uid"])
+    except ConnectorError as exc:
+        if exc.kind not in UNCERTAIN:
+            await _checkpoint(plan_id, "not_applied", error=exc.message)
+        raise
+    await _checkpoint(plan_id, "applied")
+    result["steps"].append({"step": "execute", "output": out})
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            live = await writer.get_object(ns, "Pod", name)
+        except ConnectorError as exc:
+            if exc.kind != "not_found":
+                raise
+            live = None
+        if live is None or live["metadata"].get("uid") != pre["uid"]:
+            result["validation"] = {"ok": True, "gone": True}
+            return "succeeded"
+        if time.monotonic() > deadline:
+            result["validation"] = {"ok": False, "reason": f"the pod was still terminating after {timeout}s"}
+            return "failed"
+        await asyncio.sleep(POLL)
+
+
 async def _execute_object(plan_id: uuid.UUID, writer, snap: dict, identity: dict | None, timeout: int, result: dict) -> str:
     action, kind, ns, name, params = snap["action"], snap["target_kind"], snap["namespace"], snap["target_name"], snap["params"]
     pre = snap["pre_state"] or {}
     if identity and await writer.cluster_uid() != identity.get("cluster_uid"):
         raise ConnectorError("conflict", "the write target is not the cluster this plan was approved for")
+    if action == "delete_pod":
+        return await _delete_pod(plan_id, writer, ns, name, pre, timeout, result)
     obj = await writer.get_object(ns, kind, name)
     uid = obj["metadata"].get("uid")
     if pre.get("uid") and uid != pre["uid"]:

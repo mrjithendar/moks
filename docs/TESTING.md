@@ -73,6 +73,12 @@ Bugs this found and fixed: connector errors during fan-out collided on one datab
 unreadable namespace failed the whole FinOps report; the name field's validation pattern was invalid
 in current Chrome and was silently ignored.
 
+### Static review of bf00ffc (simulated connectors, not mk4)
+
+Regression tests are in `backend/tests/test_review_findings.py`. Against the old code 32 of 33 fail, some
+only because they use the new interfaces. Not run live: job leases against a really killed worker pod,
+and multiple Prometheus connectors or tenants against real servers.
+
 ### Enterprise upgrade (simulated connectors, not mk4)
 
 Backend suite 232 passed, 4 skipped. Frontend 10 passed. Helm lint and render clean for Minikube and EKS.

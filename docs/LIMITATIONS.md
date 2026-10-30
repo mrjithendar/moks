@@ -13,9 +13,9 @@
 
 ## Not built from the enterprise brief
 
-- **Metrics filters:** Explore filters by environment, namespace, resource type and the metric's real
-  labels. There are no account, region or cluster filters, and no separate data source picker;
-  CloudWatch has its own tab with basic discovery. Query budgets are constants in code, with no admin screen.
+- **Metrics filters:** Explore filters by environment, data source, namespace, resource type and the
+  metric's real labels. There are no account, region or cluster filters; CloudWatch has its own tab with
+  basic discovery. Scoped discovery checks up to 20 namespaces per source. Query budgets are constants in code, with no admin screen.
 - **Investigations:** no trace backend integration. Resumption means re-running or a follow-up, not
   continuing a stopped run. Grouped runs produce one investigation per environment, not one correlated report.
 - **Detection:** no Grafana alert source; Prometheus alerts, Kubernetes state, Loki and CloudWatch alarms only.

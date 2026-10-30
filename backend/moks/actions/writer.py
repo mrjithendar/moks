@@ -130,8 +130,17 @@ class KubernetesWriter:
         api = await self.read._client()
         fns = {"Deployment": client.AppsV1Api(api).read_namespaced_deployment, "ConfigMap": client.CoreV1Api(api).read_namespaced_config_map,
                "Service": client.CoreV1Api(api).read_namespaced_service,
-               "HorizontalPodAutoscaler": client.AutoscalingV2Api(api).read_namespaced_horizontal_pod_autoscaler}
+               "HorizontalPodAutoscaler": client.AutoscalingV2Api(api).read_namespaced_horizontal_pod_autoscaler,
+               "Pod": client.CoreV1Api(api).read_namespaced_pod}
         return api.sanitize_for_serialization(await self._call(f"get {kind} {ns}/{name}", fns[kind], name, ns))
+
+    async def delete_managed_pod(self, ns: str, name: str, uid: str) -> dict:
+        """The UID precondition makes the API server refuse if the name now belongs to another pod."""
+        from kubernetes_asyncio import client
+
+        core = await self.read.core()
+        await self._call(f"delete pod {ns}/{name}", core.delete_namespaced_pod, name, ns, body=client.V1DeleteOptions(preconditions=client.V1Preconditions(uid=uid)))
+        return {"deleted": name, "uid": uid}
 
     async def cluster_uid(self) -> str:
         return await self.read.cluster_uid()
