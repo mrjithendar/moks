@@ -70,7 +70,7 @@ class Provider:
         if r.status_code in (401, 403):
             raise LLMError("auth", f"{self.name} rejected the credentials (HTTP {r.status_code})")
         if r.status_code == 429:
-            raise LLMError("unavailable", f"{self.name} rate limited the request (HTTP 429)")
+            raise LLMError("rate_limited", f"{self.name} rate limited the request (HTTP 429)")
         if r.status_code >= 400:
             raise LLMError("unavailable" if r.status_code >= 500 else "bad_response",
                            f"{self.name} returned HTTP {r.status_code}: {r.text[:300]}")
@@ -84,7 +84,7 @@ class Provider:
         raise NotImplementedError
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        raise LLMError("config", f"embeddings are not implemented for {self.name} yet (Phase 2)")
+        raise LLMError("config", f"embeddings are not implemented for {self.name}")
 
 
 class OpenAIProvider(Provider):

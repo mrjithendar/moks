@@ -1,4 +1,4 @@
-"""Phase 2 and FinOps read-only tools: Grafana, CloudWatch, Git, knowledge search, cost."""
+"""Read-only tools: Grafana, CloudWatch, Git, knowledge search, cost."""
 from __future__ import annotations
 
 import re

@@ -204,6 +204,21 @@ The API's init container runs migration `0002` automatically. Take a backup firs
    and the model call fails with a credentials error. Set its input and output prices under
    **LLM providers** so FinOps can show cost as well as tokens.
 
+## Editing knowledge sources
+
+Use **Edit** on a source under **Runbooks & knowledge**, or `PUT /api/knowledge/sources/{id}`. Indexed
+documents are kept. Name, type and repository cannot change: create a new source for a different
+repository. A new scope applies at once, to the database and the search index. New include or exclude
+rules apply at the next sync, which removes files that no longer qualify. A token is named by its
+variable, and its value stays in `moks-secrets`.
+
+`partial` on a source means the sync finished but some files could not be read; the portal shows how
+many. They are retried at the next sync.
+
+**LLM providers → Test** makes a real call. For an embedding model it reports the provider, model and
+dimensions. After activating an embedding model, run a reindex to build the vector index: Gemini rate
+limits are waited out, and a failed build leaves the current index serving.
+
 ## Upgrading to safe execution
 
 Migrations `0004` to `0008` run automatically in the init containers. Take a backup first. They:

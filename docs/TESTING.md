@@ -87,6 +87,30 @@ went to reconciliation, the in-cluster connector gained an explicit write target
 read-only, and an explicit 360-minute schedule was kept. Chrome drove Metrics, saved queries, Detection
 dry run, Skills, Knowledge, Investigate and deep links with no console errors.
 
+## Live status (2026-10-30)
+
+Checks against mk4, read-only, running the image built from `bf00ffc` (migration `0008`).
+
+| Item | State | Evidence |
+|---|---|---|
+| Portal and health | Verified live | `/moks/`, `/moks/login`, `/moks/api/health` answer 200 through Traefik |
+| Audit chain | Verified live | `moks verify-audit`: ok, 270 records |
+| Investigations | Verified live, rule-based | 6 completed, with evidence and event rows. No LLM report: Bedrock has no keys |
+| Streaming | Not checked | Needs a signed-in session through the ingress |
+| Kubernetes, Prometheus, Loki tools | Verified live | `k8s_nodes` 4 nodes, `k8s_triage`, `prom_query`, `prom_alerts`, `loki_logs` |
+| Git | Verified live | `git_recent_commits`, and tree listing of all four repositories with `MOKS_CRED_GITHUB_TOKEN` |
+| Gemini embedding | Verified live | One real call from the worker pod: 3072 dimensions |
+| Keyword RAG | Verified live | Results for a signed-in scope, none for a user with no roles |
+| Vector search | Not verified | The live index is `keyword-only`; needs a reindex |
+| RAG scope filters | Fakes only | Every live document is scoped `*`, so a narrow scope has not been exercised |
+| Grafana | Blocked | `MOKS_CRED_GRAFANA_TOKEN` is not set |
+| CloudWatch, EKS, AWS cost | Blocked | No connector and no `AWS_ACCESS_KEY_ID` on mk4 |
+| Executor and diagnostics | Fakes only | No plan has reached a real API server |
+| Alerts, incidents, postmortems | Fakes only | No incidents exist on mk4 |
+
+Index coverage at the same time, as active documents against qualifying files: `roboshop-ai` 24 of 245,
+`tools` 71 of 118, `moks-docs` 29 of 66, `jithendar-com` 36 of 36.
+
 ## Coverage of the required areas
 
 | Area | Tests |

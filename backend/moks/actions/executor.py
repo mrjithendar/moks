@@ -438,6 +438,12 @@ async def _observe(plan_id, env_id, kind, ns, name, checkpoint, identity) -> Non
         plan.result = {**(plan.result or {}), "observed": observed}
 
 
+async def close_undecided_sessions(db) -> None:
+    """A session waits on its plan. If the plan will never run, the session must not stay "requested"."""
+    await db.execute(text("""UPDATE diagnostic_sessions s SET status = 'expired' FROM action_plans p
+                             WHERE s.plan_id = p.id AND s.status = 'requested' AND p.status IN ('expired', 'rejected', 'cancelled')"""))
+
+
 async def run_executor(stop: asyncio.Event | None = None) -> None:
     from ..diagnostics import service as diag
 
@@ -451,6 +457,7 @@ async def run_executor(stop: asyncio.Event | None = None) -> None:
         try:
             async with session_scope() as db:
                 await db.execute(text("UPDATE action_plans SET status = 'expired' WHERE status IN ('pending','approved') AND expires_at < now()"))
+                await close_undecided_sessions(db)
             await reconcile_stale()
             pid = await claim_plan(wid)
             if pid:

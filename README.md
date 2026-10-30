@@ -14,9 +14,10 @@ its evidence), **suspected causes with confidence**, **missing evidence**, **nex
 
 ## Status
 
-Phases 1–4 are implemented, plus FinOps and SRE skills (109 backend tests, lab evaluation 1.0,
-live read-only checks against mk4). Phase 1 runs on mk4; the rest rolls out with the next image
-and the steps in [operator guide §11](docs/OPERATOR_GUIDE.md).
+Phases 1–4 are implemented, plus FinOps and SRE skills. Not all of it has been proven against live
+services yet: [docs/LIMITATIONS.md](docs/LIMITATIONS.md) has the status of each phase and
+[docs/TESTING.md](docs/TESTING.md) the evidence. In particular, the executor has never run against a
+real API server.
 
 | | |
 |---|---|

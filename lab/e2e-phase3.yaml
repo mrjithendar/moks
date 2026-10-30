@@ -1,0 +1,41 @@
+# Throwaway workload for the first real executor test (Phase 3). Nothing else uses it.
+# Apply only with the owner's approval, and delete it afterwards:
+#   kubectl --context mk4 apply -f lab/e2e-phase3.yaml
+#   kubectl --context mk4 -n moks-lab delete deployment,service -l app=moks-e2e
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moks-e2e
+  namespace: moks-lab
+  labels: {app: moks-e2e}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector: {matchLabels: {app: moks-e2e}}
+  template:
+    metadata:
+      labels: {app: moks-e2e}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: web
+          image: nginxinc/nginx-unprivileged:1.31-alpine
+          ports: [{name: http, containerPort: 8080}]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 50m, memory: 32Mi}
+          readinessProbe: {httpGet: {path: /, port: http}, periodSeconds: 3}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {sizeLimit: 10Mi}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moks-e2e
+  namespace: moks-lab
+  labels: {app: moks-e2e}
+spec:
+  selector: {app: moks-e2e}
+  ports: [{port: 80, targetPort: http}]

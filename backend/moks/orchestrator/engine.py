@@ -1,7 +1,8 @@
 """The controlled investigation loop.
 
 question -> scope -> baseline evidence -> (LLM-planned or rule-based) follow-up evidence ->
-correlation -> hypotheses -> report. Remediation is proposed only; Phase 1 executes nothing.
+correlation -> hypotheses -> verification -> report. An investigation only proposes remediation;
+changes go through action plans (moks/actions).
 
 Bounds: tool calls, LLM rounds, wall time (MOKS_MAX_DURATION_SECONDS), query window,
 result size, tokens per investigation and the LLM configuration's daily budget. Cancellation

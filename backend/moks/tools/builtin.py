@@ -1,4 +1,4 @@
-"""Phase 1 read-only tools: Kubernetes, Prometheus, Loki."""
+"""Read-only tools: Kubernetes, Prometheus, Loki."""
 from __future__ import annotations
 
 import re

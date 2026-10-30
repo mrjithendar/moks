@@ -31,7 +31,7 @@ class Remediation(BaseModel):
     risk: str = Field(default="", max_length=600)
     rollback: str = Field(default="", max_length=600)
     requires_approval: bool = True
-    executable: bool = False  # no remediation executes in Phase 1
+    executable: bool = False  # a report never executes anything; action plans do
 
 
 class Report(BaseModel):

@@ -98,3 +98,19 @@ async def test_lab_evaluation_scores_rules_mode():
     rid = await runner.start("lab", "rules")
     out = await runner.execute(rid)
     assert out["cases"] == 6 and out["score"] == 1.0
+
+
+async def test_a_session_whose_plan_expired_does_not_stay_requested(client):
+    from sqlalchemy import update as sql_update
+
+    from moks.db import session_scope
+    from moks.models import ActionPlan, DiagnosticSession
+
+    name, op, _ = await _env()
+    h = await login(client, op)
+    s = (await client.post("/moks/api/diagnostics/sessions", json={"environment": name, "image": "python", "ttl_minutes": 15, "reason": "stuck session check"}, headers=h)).json()
+    async with session_scope() as db:
+        await db.execute(sql_update(ActionPlan).where(ActionPlan.id == uuid.UUID(s["plan"]["id"])).values(status="expired"))
+        await ex.close_undecided_sessions(db)
+    async with session_scope() as db:
+        assert (await db.get(DiagnosticSession, uuid.UUID(s["id"]))).status == "expired"

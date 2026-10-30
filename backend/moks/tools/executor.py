@@ -1,7 +1,7 @@
 """The single gate between investigations and live systems.
 
 For every call it: resolves the tool (unknown -> denied), refuses non-read-only/privileged
-tools (Phase 1 has no approval flow), validates arguments, re-checks application RBAC and
+tools (those go through action plans), validates arguments, re-checks application RBAC and
 infrastructure scope, enforces the time window and a per-call timeout, redacts and truncates
 the result, stores it as citable evidence and writes an audit record. Denials are recorded
 the same way. None of these checks depend on who asked: the UI, the API or the LLM planner.

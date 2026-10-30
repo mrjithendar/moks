@@ -191,7 +191,7 @@ async def update_llm(lid: uuid.UUID, body: LLMIn, ctx: AuthContext = Depends(nee
     if c is None:
         raise HTTPException(404, "Unknown LLM configuration")
     if c.purpose == "embedding" and c.is_active and (c.model != body.model or c.embedding_dimensions != body.embedding_dimensions):
-        raise HTTPException(409, "Changing the active embedding model requires a new configuration and a reindex (Phase 2)")
+        raise HTTPException(409, "Changing the active embedding model requires a new configuration and a reindex")
     for k, v in body.model_dump(exclude={"credential_ref"}).items():
         setattr(c, k, v)
     c.credential_ref = body.credential_ref.model_dump(exclude_none=True)
@@ -221,17 +221,26 @@ async def test_llm(lid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)
     c = await db.get(LLMConfig, lid)
     if c is None:
         raise HTTPException(404, "Unknown LLM configuration")
-    if c.purpose != "chat":
-        return {"ok": False, "message": "Embedding tests arrive with Phase 2 RAG"}
+    extra: dict[str, Any] = {}
     try:
-        resp = await complete_metered(provider_for(c), "Reply with the JSON object {\"ok\": true} and nothing else.",
-                                      [{"role": "user", "content": "connection test"}], json_mode=True, max_tokens=50)
-        ok, msg = True, f"{c.provider}/{c.model} answered ({resp.tokens_in}+{resp.tokens_out} tokens): {resp.text[:80]}"
+        if c.purpose == "embedding":
+            vectors = await provider_for(c).embed(["connection test"])
+            dims = len(vectors[0]) if vectors and vectors[0] else 0
+            if not dims:
+                raise LLMError("bad_response", f"{c.provider}/{c.model} returned no embedding")
+            extra = {"provider": c.provider, "model": c.model, "dimensions": dims}
+            if c.embedding_dimensions and c.embedding_dimensions != dims:
+                raise LLMError("bad_response", f"{c.provider}/{c.model} returned {dims} dimensions but {c.embedding_dimensions} are configured")
+            ok, msg = True, f"{c.provider}/{c.model} returned a {dims}-dimension embedding"
+        else:
+            resp = await complete_metered(provider_for(c), "Reply with the JSON object {\"ok\": true} and nothing else.",
+                                          [{"role": "user", "content": "connection test"}], json_mode=True, max_tokens=c.max_output_tokens)
+            ok, msg = True, f"{c.provider}/{c.model} answered ({resp.tokens_in}+{resp.tokens_out} tokens): {resp.text[:80]}"
     except LLMError as exc:
         ok, msg = False, f"{exc.kind}: {exc.message}"
     await audit.record(db, action="llm.test", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="llm_config",
-                       resource_id=str(c.id), outcome="success" if ok else "failure", details={"message": msg[:300]})
-    return {"ok": ok, "message": msg}
+                       resource_id=str(c.id), outcome="success" if ok else "failure", details={"message": msg[:300], **extra})
+    return {"ok": ok, "message": msg, **extra}
 
 
 # ---- users and role bindings ------------------------------------------------------------------

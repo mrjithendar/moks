@@ -172,6 +172,12 @@ class OpenSearchBackend:
         await self._req("POST", f"/{index_name}/_delete_by_query?refresh=true",
                         {"query": {"term": {"document_id": str(document_id)}}}, ok404=True)
 
+    async def update_scope(self, index_name: str, document_id: uuid.UUID, environment: str, namespace: str) -> None:
+        await self._req("POST", f"/{index_name}/_update_by_query?refresh=true&conflicts=proceed", {
+            "query": {"term": {"document_id": str(document_id)}},
+            "script": {"lang": "painless", "source": "ctx._source.environment = params.e; ctx._source.namespace = params.n",
+                       "params": {"e": environment, "n": namespace}}}, ok404=True)
+
     def _filter(self, envs, nss) -> list[dict]:
         f: list[dict] = []
         if envs is not None:

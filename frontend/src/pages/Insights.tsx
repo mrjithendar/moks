@@ -56,7 +56,8 @@ function SyncState({ s }: { s: any }) {
       {s.last_sync_status ? <Badge kind={kind}>{s.last_sync_status}</Badge> : <Badge>not synced yet</Badge>} {s.stale && <Badge kind="warn">stale</Badge>}
       {s.sync_state !== "idle" && <Badge kind="info">{s.sync_state}</Badge>}
       <div className="muted">last success <Time iso={s.last_success_at} /> · last attempt <Time iso={s.last_attempt_at} /></div>
-      {c && <div className="muted">+{c.added} added, {c.updated} updated, {c.deleted} deleted, {c.excluded} excluded, {c.failed ?? 0} failed</div>}
+      {c && <div className="muted">+{c.added} added, {c.updated} updated, {c.deleted} deleted, {c.excluded} excluded</div>}
+      {c?.failed > 0 && <div><Badge kind="warn">{c.failed} files failed</Badge></div>}
       {s.last_error && <div className="muted">{s.last_error}</div>}
     </>
   );
@@ -68,6 +69,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
   useInterval(() => { if (!list.loading && list.data?.some((s) => s.sync_state !== "idle")) list.reload(); }, 3000);
   const [f, setF] = useState({ name: "", type: "github", repository: "", include: "", scope_environment: "*", scope_namespace: "*", credType: "none", credName: "" });
   const [error, setError] = useState<unknown>();
+  const [editing, setEditing] = useState<any>(null);
   async function add(e: FormEvent) {
     e.preventDefault();
     setError(null);
@@ -78,6 +80,23 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
       list.reload(); onChange();
     } catch (err) { setError(err); }
   }
+  function startEdit(s: any) {
+    setEditing({ id: s.id, name: s.name, github: s.type === "github", repository: s.config?.repository, include: (s.config?.include ?? []).join(", "), exclude: (s.config?.exclude ?? []).join(", "),
+      scope_environment: s.scope_environment, scope_namespace: s.scope_namespace, owner: s.owner ?? "", service: s.service ?? "", enabled: s.enabled,
+      credType: s.credential_ref?.type === "env" ? "env" : "none", credName: s.credential_ref?.name ?? "" });
+  }
+  async function saveEdit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    const globs = (v: string) => v.split(/[\s,]+/).filter(Boolean);
+    try {
+      await api(`/knowledge/sources/${editing.id}`, { method: "PUT", body: { scope_environment: editing.scope_environment, scope_namespace: editing.scope_namespace,
+        owner: editing.owner || null, service: editing.service || null, enabled: editing.enabled,
+        ...(editing.github ? { include: globs(editing.include), exclude: globs(editing.exclude), credential_ref: editing.credType === "env" ? { type: "env", name: editing.credName } : { type: "none" } } : {}) } });
+      setEditing(null); list.reload(); onChange();
+    } catch (err) { setError(err); }
+  }
+  const ed = (k: string, v: unknown) => setEditing({ ...editing, [k]: v });
   async function upload(id: string, file: File) {
     const form = new FormData();
     form.append("file", file);
@@ -106,11 +125,30 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
               {s.syncable && <button className="small" disabled={s.sync_state !== "idle"} onClick={() => api(`/knowledge/sources/${s.id}/sync`, { method: "POST" }).then(list.reload)}>{s.sync_state === "idle" ? "Sync now" : s.sync_state === "running" ? "Syncing…" : "Queued…"}</button>}
               {s.type === "upload" && <label className="btn small" style={{ cursor: "pointer" }}>Upload<input type="file" hidden accept=".md,.txt,.yaml,.yml,.json,.rst,.adoc,.sh,.py,.tf"
                 onChange={(e) => e.target.files?.[0] && upload(s.id, e.target.files[0])} /></label>}
+              <button className="ghost small" onClick={() => startEdit(s)}>Edit</button>
               <button className="ghost small" onClick={() => confirm(`Delete ${s.name} and remove its documents from search?`) && api(`/knowledge/sources/${s.id}`, { method: "DELETE" }).then(list.reload)}>Delete</button>
             </td>
           </tr>
         ))}</tbody>
       </table>
+      {editing && <form className="stack" onSubmit={saveEdit} aria-label={`Edit ${editing.name}`}>
+        <h3>Edit {editing.name}{editing.repository ? ` (${editing.repository})` : ""}</h3>
+        <div className="row">
+          <label>Scope env<input value={editing.scope_environment} onChange={(e) => ed("scope_environment", e.target.value)} /></label>
+          <label>Scope namespace<input value={editing.scope_namespace} onChange={(e) => ed("scope_namespace", e.target.value)} /></label>
+          <label>Owner<input value={editing.owner} onChange={(e) => ed("owner", e.target.value)} /></label>
+          <label>Service<input value={editing.service} onChange={(e) => ed("service", e.target.value)} /></label>
+          <label className="inline"><input type="checkbox" checked={editing.enabled} onChange={(e) => ed("enabled", e.target.checked)} /> enabled</label>
+        </div>
+        {editing.github && <div className="row">
+          <label style={{ flex: 1 }}>Include globs<input value={editing.include} onChange={(e) => ed("include", e.target.value)} placeholder="default set" /></label>
+          <label style={{ flex: 1 }}>Exclude globs<input value={editing.exclude} onChange={(e) => ed("exclude", e.target.value)} /></label>
+          <label>Token<select value={editing.credType} onChange={(e) => ed("credType", e.target.value)}><option value="none">shared token, or none</option><option value="env">env variable</option></select></label>
+          {editing.credType === "env" && <label>Variable<input required pattern="MOKS_CRED_[A-Z0-9_]+" value={editing.credName} onChange={(e) => ed("credName", e.target.value)} placeholder="MOKS_CRED_GITHUB_TOKEN" /></label>}
+        </div>}
+        <div className="small muted">Indexed documents are kept. A new scope applies straight away; new include or exclude rules apply at the next sync, which removes files that no longer qualify. The value of a token is never entered here: this names the variable that holds it.</div>
+        <div className="row"><button>Save</button><button type="button" className="ghost" onClick={() => setEditing(null)}>Cancel</button></div>
+      </form>}
       <form className="stack" onSubmit={add}>
         <div className="row">
           <label>Name<input required pattern="[a-z0-9][a-z0-9\-]*" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></label>

@@ -83,7 +83,7 @@ class ToolSpec:
     handler: Handler
     read_only: bool = True
     # Privileged tools (exec, debug containers, scaling, restarts, package installs) are never
-    # offered to the LLM planner and need approval workflows (Phase 3).
+    # offered to the LLM planner and need an approved action plan.
     privileged: bool = False
     cluster_scoped: bool = False
     extra_permission: P | None = None

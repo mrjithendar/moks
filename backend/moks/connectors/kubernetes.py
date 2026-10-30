@@ -1,4 +1,4 @@
-"""Kubernetes connector (Minikube in Phase 1; EKS uses the same code with an exec/IRSA kubeconfig).
+"""Kubernetes connector for Minikube and EKS (in-cluster, kubeconfig or a short-lived EKS token).
 
 Read-only by construction: this class has no methods that create, patch or delete, and none
 that read Secrets. Its in-cluster ServiceAccount is bound to a ClusterRole without Secret

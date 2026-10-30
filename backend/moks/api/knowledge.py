@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,7 +14,7 @@ from .. import audit, jobs
 from ..auth.deps import get_auth, needs
 from ..auth.sessions import AuthContext
 from ..config import get_settings
-from ..connectors.base import ConnectorError
+from ..connectors.base import ConnectorError, describe_credential_ref
 from ..db import get_db
 from ..models import Document, Job, KnowledgeSource
 from ..rag import ingest, service
@@ -41,6 +41,26 @@ class SourceIn(BaseModel):
     enabled: bool = True
 
 
+class SourceUpdate(BaseModel):
+    """Name, type and repository cannot change: a different repository is a different source, and
+    its documents would all look deleted upstream."""
+    model_config = ConfigDict(extra="forbid")
+    ref: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_./-]{1,100}$")
+    include: list[str] | None = Field(default=None, max_length=50)
+    exclude: list[str] | None = Field(default=None, max_length=50)
+    services: dict[str, str] | None = Field(default=None, max_length=100)
+    sync_interval_minutes: int | None = Field(default=None, ge=0, le=43200)
+    scope_environment: str | None = Field(default=None, pattern=r"^[a-z0-9*?\-]{1,100}$")
+    scope_namespace: str | None = Field(default=None, pattern=r"^[a-z0-9*?\-]{1,63}$")
+    service: str | None = Field(default=None, max_length=100)
+    owner: str | None = Field(default=None, max_length=200)
+    credential_ref: CredentialRef | None = None
+    enabled: bool | None = None
+
+
+GITHUB_ONLY = {"ref", "include", "exclude", "services", "sync_interval_minutes", "credential_ref"}
+
+
 def source_out(s: KnowledgeSource, counts: dict | None = None, job: str | None = None) -> dict[str, Any]:
     stale_after = timedelta(minutes=s.sync_interval_minutes * 2) if s.sync_interval_minutes else None
     return {"sync_interval_minutes": s.sync_interval_minutes, "next_sync_at": s.next_sync_at.isoformat() if s.next_sync_at else None,
@@ -50,7 +70,8 @@ def source_out(s: KnowledgeSource, counts: dict | None = None, job: str | None =
             "syncable": s.type == "github", "id": str(s.id), "name": s.name, "type": s.type, "config": s.config, "scope_environment": s.scope_environment,
             "scope_namespace": s.scope_namespace, "service": s.service, "owner": s.owner, "enabled": s.enabled, "revision": s.revision,
             "last_sync_at": s.last_sync_at.isoformat() if s.last_sync_at else None, "last_sync_status": s.last_sync_status,
-            "last_error": s.last_error, "documents": counts or {}}
+            "last_error": s.last_error, "documents": counts or {}, "credential": describe_credential_ref(s.credential_ref),
+            "credential_ref": s.credential_ref}
 
 
 @router.get("/search")
@@ -97,6 +118,45 @@ async def create_source(body: SourceIn, ctx: AuthContext = Depends(needs(P.ADMIN
         await db.commit()
         await jobs.enqueue("knowledge_sync", {"source_id": str(src.id)}, dedupe_key=f"knowledge_sync:{src.id}", created_by=ctx.user.id)
     return source_out(src)
+
+
+@router.put("/sources/{sid}")
+async def update_source(sid: uuid.UUID, body: SourceUpdate, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    """Changes settings and keeps indexed documents. A sync then applies any new include or exclude
+    rules; changing a credential alone re-reads nothing."""
+    src = await db.get(KnowledgeSource, sid)
+    if src is None:
+        raise HTTPException(404, "Source not found")
+    changes = body.model_dump(exclude_unset=True)
+    if src.type != "github" and GITHUB_ONLY & set(changes):
+        raise HTTPException(422, f"{src.type} sources have no {', '.join(sorted(GITHUB_ONLY & set(changes)))}")
+    old_scope = (src.scope_environment, src.scope_namespace)
+    cfg = dict(src.config or {})
+    for key in ("ref", "include", "exclude", "services"):
+        if key in changes:
+            cfg[key] = changes[key]
+    src.config = cfg
+    for key in ("service", "owner"):  # null clears these
+        if key in changes:
+            setattr(src, key, changes[key])
+    for key in ("scope_environment", "scope_namespace", "enabled"):
+        if changes.get(key) is not None:
+            setattr(src, key, changes[key])
+    if changes.get("credential_ref") is not None:
+        src.credential_ref = body.credential_ref.model_dump(exclude_none=True)  # a reference: the value stays in the Secret
+    if changes.get("sync_interval_minutes") is not None:
+        src.sync_interval_minutes = changes["sync_interval_minutes"]
+        src.next_sync_at = datetime.now(timezone.utc) + timedelta(minutes=src.sync_interval_minutes) if src.sync_interval_minutes else None
+    moved = 0
+    if old_scope != (src.scope_environment, src.scope_namespace):
+        try:
+            moved = await service.rescope_source(db, src, old_scope)
+        except ConnectorError as exc:
+            raise HTTPException(502, f"could not update the search index, so nothing was saved: {exc.message}") from None
+    await audit.record(db, action="knowledge.source_update", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="knowledge_source",
+                       resource_id=str(src.id), decision="allow", details={"name": src.name, "changed": sorted(changes), "credential": describe_credential_ref(src.credential_ref), "documents_rescoped": moved})
+    counts = dict((await db.execute(select(Document.status, func.count()).where(Document.source_id == sid).group_by(Document.status))).all())
+    return source_out(src, counts)
 
 
 @router.post("/sources/{sid}/sync")

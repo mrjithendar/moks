@@ -1,6 +1,7 @@
 """Knowledge retrieval: indexing, versioned embedding indexes, hybrid search with access control."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -26,6 +27,8 @@ from .secrets import clean, exclusion_reason
 
 log = logging.getLogger("moks.rag")
 EMBED_BATCH = 32
+EMBED_BACKOFF_SECONDS = 5
+REINDEX_EMBED_TRIES = 7  # a reindex is the one place worth waiting out a provider's rate limit
 INDEX_LOCK = 7_203_114  # advisory lock: creating the first index
 BUILD_STALE = timedelta(minutes=30)
 _opensearch: OpenSearchBackend | None = None
@@ -96,7 +99,18 @@ async def ensure_index(db: AsyncSession) -> EmbeddingIndex:
     return idx
 
 
-async def _embed(db: AsyncSession, idx: EmbeddingIndex, texts: list[str]) -> list[list[float]] | None:
+async def _embed_batch(provider, texts: list[str], tries: int) -> list[list[float]]:
+    for attempt in range(tries):
+        try:
+            return await provider.embed(texts)
+        except LLMError as exc:
+            if exc.kind != "rate_limited" or attempt == tries - 1:
+                raise
+            await asyncio.sleep(EMBED_BACKOFF_SECONDS * 2 ** attempt)
+    raise LLMError("rate_limited", "embedding retries exhausted")
+
+
+async def _embed(db: AsyncSession, idx: EmbeddingIndex, texts: list[str], tries: int = 2) -> list[list[float]] | None:
     if not idx.llm_config_id or not idx.dimensions:
         return None  # keyword-only index: a vector field does not exist to write to
     cfg = await db.get(LLMConfig, idx.llm_config_id)
@@ -105,7 +119,7 @@ async def _embed(db: AsyncSession, idx: EmbeddingIndex, texts: list[str]) -> lis
     provider = provider_for(cfg)
     out: list[list[float]] = []
     for i in range(0, len(texts), EMBED_BATCH):
-        out.extend(await provider.embed(texts[i:i + EMBED_BATCH]))
+        out.extend(await _embed_batch(provider, texts[i:i + EMBED_BATCH], tries))
     if any(len(v) != idx.dimensions for v in out):
         raise LLMError("bad_response", f"embedding size differs from the index's {idx.dimensions} dimensions; reindex after a model change")
     return out
@@ -182,7 +196,7 @@ async def remove_document(db: AsyncSession, doc: Document) -> None:
 
 async def _index_batch(db: AsyncSession, new: EmbeddingIndex, batch: list) -> None:
     rows = [_row(c, d, src) for c, d, src in batch]
-    embs = await _embed(db, new, [f"{r['heading']}\n{r['text']}" for r in rows])
+    embs = await _embed(db, new, [f"{r['heading']}\n{r['text']}" for r in rows], tries=REINDEX_EMBED_TRIES)
     if backend_name() == "opensearch":
         await opensearch().index_chunks(new.index_name, rows, embs)
     else:
@@ -337,6 +351,28 @@ def _line_url(url: str | None, start: int | None, end: int | None) -> str | None
     if not url or "github" not in url or not start:
         return url
     return f"{url}#L{start}" + (f"-L{end}" if end and end != start else "")
+
+
+async def rescope_source(db: AsyncSession, src: KnowledgeSource, old: tuple[str, str]) -> int:
+    """After a source's scope changes, its documents must follow, or access filters would keep using
+    the old scope. Documents given their own scope at upload keep it. The index is updated too, since
+    it filters before PostgreSQL's authoritative check runs."""
+    docs = (await db.execute(select(Document).where(Document.source_id == src.id))).scalars().all()
+    moved = []
+    for d in docs:
+        env, ns = d.environment, d.namespace
+        if env == old[0]:
+            d.environment = src.scope_environment
+        if ns == old[1]:
+            d.namespace = src.scope_namespace
+        if (env, ns) != (d.environment, d.namespace):
+            moved.append(d)
+    await db.flush()
+    idx = await active_index(db)
+    if moved and idx is not None and backend_name() == "opensearch":
+        for d in moved:
+            await opensearch().update_scope(idx.index_name, d.id, d.environment, d.namespace)
+    return len(moved)
 
 
 async def stats(db: AsyncSession) -> dict:

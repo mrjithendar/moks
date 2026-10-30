@@ -4,12 +4,14 @@
 
 | Phase | Scope | State |
 |---|---|---|
-| 1 | Login + RBAC, `/moks` portal, Kubernetes/Prometheus/Loki, cited investigations, streaming, audit, Helm/Argo | Deployed on mk4 |
-| 2 | EKS (remote), CloudWatch, Grafana, Git connectors; RAG (Postgres/pgvector/OpenSearch); incident workspaces | Implemented and tested; not yet deployed |
-| 3 | Approvals, allowlisted remediation with pre/post validation and recovery, diagnostic sessions | Implemented and tested with fakes; executor never run against a cluster |
-| 4 | Alert-triggered investigations (webhook + poller) with dedup/cooldowns, incident reports and postmortems, evaluation datasets | Implemented and tested |
-| + | FinOps (AWS cost, anomalies, budgets, Kubernetes allocation and rightsizing, LLM spend) | Implemented; Kubernetes side verified live, AWS side stub-tested |
+| 1 | Login + RBAC, `/moks` portal, Kubernetes/Prometheus/Loki, cited investigations, streaming, audit, Helm/Argo | Verified live, except streaming through the ingress, which has not been checked |
+| 2 | EKS (remote), CloudWatch, Grafana, Git connectors; RAG (Postgres/pgvector/OpenSearch); incident workspaces | Git and keyword RAG verified live. Vector search, Grafana, CloudWatch and EKS are not: see below |
+| 3 | Approvals, allowlisted remediation with pre/post validation and recovery, diagnostic sessions | Tested with fakes only. No plan has run against a real API server |
+| 4 | Alert-triggered investigations (webhook + poller) with dedup/cooldowns, incident reports and postmortems, evaluation datasets | Tested with fakes. Not exercised on mk4 since the rewrite |
+| + | FinOps (AWS cost, anomalies, budgets, Kubernetes allocation and rightsizing, LLM spend) | Kubernetes allocation runs live but reports 0 until a price is set. AWS side tested with fakes only |
 | + | SRE skills (`SKILL.md`) | 50 built-in skills; custom skills via ConfigMap |
+
+See [TESTING.md](TESTING.md#live-status-2026-10-30) for the evidence behind each line.
 
 ## Not built from the enterprise brief
 
@@ -54,9 +56,9 @@
 ## Known limitations (Phase 1)
 
 **Integrations**
-- No LLM provider has been exercised against a real endpoint; only the OpenAI-compatible
-  protocol was tested, with a scripted server. Gemini/Bedrock/Ollama request formats follow
-  their public APIs as of this writing.
+- Gemini embeddings have been called live from a pod (`gemini-embedding-001`, 3072 dimensions). No
+  chat model has answered a live request: Bedrock has no AWS keys on mk4. OpenAI and Ollama were only
+  tested with a scripted server.
 - Token counts come from provider responses. Cost is an estimate from prices an admin
   configures; nothing is fetched from a pricing API.
 - Responses stream as structured progress events. The final report arrives whole, not

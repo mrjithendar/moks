@@ -32,8 +32,6 @@ CONNECTOR_TYPES: dict[str, Any] = {
     "cost_model": CostModelConnector,
 }
 
-PLANNED_TYPES: set[str] = set()
-
 _cache: dict[uuid.UUID, tuple[str, Any]] = {}
 _lock = asyncio.Lock()
 
@@ -45,8 +43,6 @@ def _fingerprint(row: Connector) -> str:
 def build(row: Connector) -> Any:
     cls = CONNECTOR_TYPES.get(row.type)
     if cls is None:
-        if row.type in PLANNED_TYPES:
-            raise ConnectorError("config", f"{row.type} connectors are planned for Phase 2 and not implemented yet")
         raise ConnectorError("config", f"unknown connector type {row.type!r}")
     return cls(row.config or {}, row.credential_ref)
 

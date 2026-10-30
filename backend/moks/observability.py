@@ -46,7 +46,6 @@ LLM_LATENCY = Histogram(
 )
 LLM_TOKENS = Counter("moks_llm_tokens_total", "LLM tokens", ["provider", "model", "direction"])
 LLM_COST = Counter("moks_llm_cost_usd_total", "Estimated LLM cost in USD", ["provider", "model"])
-# Phase 2/3 series are declared now so dashboards and alerts are stable.
 RETRIEVAL_LATENCY = Histogram("moks_retrieval_latency_seconds", "RAG retrieval latency", ["backend"])
 INDEXING_DOCUMENTS = Gauge("moks_indexing_documents", "Indexed documents", ["source", "state"])
 ACTIONS = Counter("moks_actions_total", "Remediation actions", ["action", "outcome"])

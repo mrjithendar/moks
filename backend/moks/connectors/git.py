@@ -1,7 +1,7 @@
 """Git connector with a provider adapter interface; GitHub is the first provider.
 
 Read operations (tree, file, commits, compare) serve investigations and RAG ingestion. The only
-write operation, opening a pull request, is used solely by the Phase 3 executor for an approved
+write operation, opening a pull request, is used solely by the executor for an approved
 `open_pull_request` action plan.
 """
 from __future__ import annotations
@@ -114,7 +114,7 @@ class GitHubProvider:
             url += f"#L{start_line}" + (f"-L{end_line}" if end_line and end_line != start_line else "")
         return url
 
-    # ---- the only write path (Phase 3 executor, approved plans only) -------------------------
+    # ---- the only write path (executor, approved plans only) -------------------------
 
     async def open_pull_request(self, repo: str, base: str, branch: str, path: str, content: str, message: str, title: str, body: str) -> dict:
         base_sha = (await self.http.get_json("ref", f"/repos/{repo}/git/ref/heads/{quote(base, safe='')}"))["object"]["sha"]
