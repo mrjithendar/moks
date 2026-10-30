@@ -74,11 +74,12 @@ postgres:
   fixVolumePermissions: true   # hostPath ignores fsGroup; chown the data dir to postgres (uid 70)
 
 rag:
-  backend: opensearch   # ~2.5 GiB; mk4 nodes have ~32 GiB. Use "postgres" for keyword-only without extra pods.
-  opensearch:
-    storage: 20Gi
-    nodeName: mk4-m02   # hostPath volume: keep OpenSearch on the node holding its data
-    fixVolumePermissions: true   # hostPath ignores fsGroup; chown the data dir to opensearch (uid 1000)
+  backend: pinecone
+  # backend: opensearch   # ~2.5 GiB; mk4 nodes have ~32 GiB. Use "postgres" for keyword-only without extra pods.
+  # opensearch:
+  #   storage: 20Gi
+  #   nodeName: mk4-m02   # hostPath volume: keep OpenSearch on the node holding its data
+  #   fixVolumePermissions: true   # hostPath ignores fsGroup; chown the data dir to opensearch (uid 1000)
 
 executor:
   enabled: true
