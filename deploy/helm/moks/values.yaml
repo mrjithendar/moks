@@ -79,6 +79,7 @@ postgres:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {cpu: "1", memory: 1Gi}
   passwordSecret: moks-postgres   # key: password
+  fixVolumePermissions: false     # true for storage that ignores fsGroup (minikube hostPath)
 
 # Phase 2 retrieval backend. Exactly one may be enabled; nothing uses it in Phase 1.
 rag:

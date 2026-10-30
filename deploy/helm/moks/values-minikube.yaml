@@ -51,6 +51,7 @@ postgres:
   bundled: true
   storage: 10Gi
   nodeName: mk4-m04     # hostPath PVs have no node affinity; keep the pod on the node holding the data
+  fixVolumePermissions: true   # hostPath ignores fsGroup; chown the data dir to postgres (uid 70)
 
 rag:
   backend: none         # Phase 2 sets opensearch (needs ~2.5 GiB) or pgvector

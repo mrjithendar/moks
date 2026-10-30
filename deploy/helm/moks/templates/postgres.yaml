@@ -23,6 +23,23 @@ spec:
       nodeSelector: {kubernetes.io/hostname: {{ . }}}
       {{- end }}
       securityContext: {runAsNonRoot: true, runAsUser: 70, runAsGroup: 70, fsGroup: 70, seccompProfile: {type: RuntimeDefault}}
+      {{- if .Values.postgres.fixVolumePermissions }}
+      # hostPath volumes (minikube) ignore fsGroup and arrive root-owned, so postgres (uid 70) cannot
+      # create PGDATA. Hand the volume to uid 70 once; root here, but only CHOWN/FOWNER.
+      initContainers:
+        - name: volume-permissions
+          image: {{ .Values.postgres.image }}
+          command: [sh, -c, "chown 70:70 /var/lib/postgresql/data && chmod 0700 /var/lib/postgresql/data"]
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL], add: [CHOWN, FOWNER]}
+          resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {cpu: 100m, memory: 64Mi}}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      {{- end }}
       containers:
         - name: postgres
           image: {{ .Values.postgres.image }}
