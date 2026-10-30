@@ -47,6 +47,8 @@ class FakePinecone:
             if name in self.indexes:
                 return httpx.Response(200, json=self._info(name))
             return httpx.Response(404, json={"error": "not found"})
+        if path.startswith("/vectors/") and "_values" not in next(iter(self.indexes.values()))["schema"]["fields"]:
+            return httpx.Response(400, json={"code": 3, "message": "This index has a document schema, so writes must go through the documents API."})
         if path == "/vectors/upsert":
             for v in body["vectors"]:
                 self.vectors[v["id"]] = v
@@ -93,7 +95,7 @@ async def test_creates_the_index_in_the_current_format_and_waits_until_ready():
     b = backend(fake)
     await b.ensure_index("moks-chunks-a", 3072)
     created = next(r for r in fake.requests if r[0] == "POST")[2]
-    assert created["schema"]["fields"]["embedding"] == {"type": "dense_vector", "dimension": 3072, "metric": "cosine"}
+    assert created["schema"]["fields"] == {"_values": {"type": "dense_vector", "dimension": 3072, "metric": "cosine"}}
     assert created["deployment"] == {"deployment_type": "managed", "cloud": "aws", "region": "us-east-1"}
     assert fake.headers["x-pinecone-api-version"] == "2026-07" and fake.headers["api-key"] == "test-key"
 

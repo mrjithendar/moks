@@ -267,8 +267,10 @@ class PineconeBackend:
         if not info:
             info = await self._req("POST", f"{self.CONTROL}/indexes", {
                 "name": name, "deployment": {"deployment_type": "managed", "cloud": self.cloud, "region": self.region},
-                "schema": {"fields": {"embedding": {"type": "dense_vector", "dimension": dims, "metric": "cosine"}}}})
-        found = (((info.get("schema") or {}).get("fields") or {}).get("embedding") or {}).get("dimension", dims)
+                # The reserved field _values makes a vector index. Any other name makes a document index,
+                # which refuses the /vectors endpoints used here.
+                "schema": {"fields": {"_values": {"type": "dense_vector", "dimension": dims, "metric": "cosine"}}}})
+        found = (((info.get("schema") or {}).get("fields") or {}).get("_values") or {}).get("dimension", dims)
         if found != dims:
             raise ConnectorError("config", f"Pinecone index {name} has vector dimension {found}, expected {dims}; run a reindex")
         for _ in range(int(self.READY_SECONDS / self.POLL_SECONDS)):
