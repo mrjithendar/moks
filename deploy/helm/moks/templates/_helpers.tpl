@@ -11,7 +11,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if .Values.image.digest -}}
 {{ .Values.image.repository }}@{{ .Values.image.digest }}
 {{- else -}}
-{{ .Values.image.repository }}:{{ .Values.image.tag }}
+{{ .Values.image.repository }}:{{ required "image.digest or image.tag is required (scripts/set-image.sh pins the digest)" .Values.image.tag }}
 {{- end -}}
 {{- end -}}
 

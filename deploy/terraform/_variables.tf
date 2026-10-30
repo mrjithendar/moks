@@ -10,7 +10,7 @@ variable "repository_name" {
 }
 
 variable "image_retention_count" {
-  description = "Commit-tagged images to keep. Older ones expire; keep enough to roll back."
+  description = "Superseded (untagged) images to keep for rollback by digest. Older ones expire."
   type        = number
   default     = 30
   validation {

@@ -29,9 +29,9 @@ for MOKS's Bedrock calls; that user has no key yet (step 8). Details are in
 mk4's `ecr-refresh` identity may pull the new repository.
 
 CI (`.github/workflows/ci.yml`) tests every push, then on `master` builds the arm64 image and
-pushes `moks:<commit-sha>`. It never touches the cluster. Commit and push this repository
-(`github.com/mrjithendar/moks`) and wait for the `release` job, whose summary prints the image
-digest.
+pushes `moks:latest` (the only tag; the previous image stays in ECR untagged, for rollback). It
+never touches the cluster. Commit and push this repository (`github.com/mrjithendar/moks`) and
+wait for the `release` job, whose summary prints the commit and image digest.
 
 ## 2. Namespace, pull secret and refresher
 
@@ -57,15 +57,19 @@ scripts/create-secrets.sh mk4      # moks-postgres + moks-secrets (database URL,
 It refuses to overwrite existing Secrets. Add provider credentials later as `MOKS_CRED_*` keys
 (see step 8).
 
-## 4. Pin the image and commit
+## 4. Roll out a new image
+
+mk4 runs `moks:latest` with `imagePullPolicy: Always`. A new push does not change any manifest, so
+Argo CD does not redeploy; after each `release` job, restart the pods to pull it:
 
 ```sh
-scripts/set-image.sh --latest      # writes image.digest into deploy/helm/moks/values-minikube.yaml
-git diff deploy/helm/moks/values-minikube.yaml   # review, then commit and push
+kubectl --context mk4 -n moks rollout restart deploy
+kubectl --context mk4 -n moks rollout status deploy --timeout=300s
 ```
 
-Argo CD deploys exactly the pinned digest. Repeat this step for every release; to roll back,
-pin an older digest.
+To roll back, pin an older image: `scripts/set-image.sh sha256:<digest>` (list them with
+`aws ecr describe-images --repository-name moks`), commit and push. Set `image.digest` back to
+`""` to follow `:latest` again.
 
 ## 5. Argo CD project and application
 
@@ -196,7 +200,7 @@ as jithendar.com does. On EKS, use RDS automated snapshots and point-in-time rec
 
 Migrations run in the API's init container under an advisory lock and are forward-only. Take a
 backup before upgrading across a migration. Roll back the application by pinning the previous
-digest (step 4). Roll back data by restoring the backup.
+image digest (step 4). Roll back data by restoring the backup.
 
 ## Troubleshooting
 

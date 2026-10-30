@@ -1,7 +1,8 @@
-# Immutable tags: CI pushes moks:<commit-sha> once and Argo CD deploys a pinned digest.
+# CI pushes only moks:latest, so the tag must be mutable. Each push leaves the previous image untagged;
+# the newest of those are kept so a rollback can still pin one by digest.
 resource "aws_ecr_repository" "moks" {
   name                 = var.repository_name
-  image_tag_mutability = "IMMUTABLE"
+  image_tag_mutability = "MUTABLE"
   force_delete         = false # never lose the images a rollback needs
 
   encryption_configuration {
@@ -19,14 +20,8 @@ resource "aws_ecr_lifecycle_policy" "moks" {
     rules = [
       {
         rulePriority = 1
-        description  = "Remove untagged layers left by failed or superseded pushes"
-        selection    = { tagStatus = "untagged", countType = "sinceImagePushed", countUnit = "days", countNumber = 1 }
-        action       = { type = "expire" }
-      },
-      {
-        rulePriority = 2
-        description  = "Keep the newest ${var.image_retention_count} commit images"
-        selection    = { tagStatus = "tagged", tagPatternList = ["*"], countType = "imageCountMoreThan", countNumber = var.image_retention_count }
+        description  = "Keep the newest ${var.image_retention_count} superseded images for rollback"
+        selection    = { tagStatus = "untagged", countType = "imageCountMoreThan", countNumber = var.image_retention_count }
         action       = { type = "expire" }
       },
     ]

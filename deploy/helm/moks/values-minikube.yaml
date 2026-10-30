@@ -1,8 +1,9 @@
 # mk4 (Hetzner, 4-node Minikube, arm64) behind Traefik at https://jithendar.com/moks
 image:
   repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
-  digest: ""            # scripts/set-image.sh pins sha256:... here; never deploy a mutable tag
-  tag: latest
+  digest: "sha256:4f31b7a6266d2d119ab768305aa231301f10ab0a02e8a1421851dfa6151fe04d"            # set only to roll back to an older image (scripts/set-image.sh sha256:...)
+  # tag: latest           # CI pushes only :latest; roll out with `kubectl -n moks rollout restart deploy`
+  pullPolicy: Always    # a restart must fetch the new :latest, not reuse the node's cached copy
 imagePullSecrets: [{name: ecr-pull}]   # refreshed by the ecr-refresh CronJob (tools repo); see docs/OPERATOR_GUIDE.md
 
 publicUrl: https://jithendar.com/moks

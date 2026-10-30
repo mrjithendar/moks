@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Pin the image digest in values-minikube.yaml (what Argo CD deploys). Commit the change afterwards.
-#   scripts/set-image.sh sha256:<digest>
-#   scripts/set-image.sh --latest          # look up the newest commit-tagged image in ECR
+# Roll back: pin an image digest in values-minikube.yaml instead of :latest. Commit the change afterwards;
+# set digest back to "" to follow :latest again.
+#   scripts/set-image.sh sha256:<digest>   # e.g. from: aws ecr describe-images --repository-name moks
+#   scripts/set-image.sh --latest          # pin whatever :latest is right now
 set -euo pipefail
 cd "$(dirname "$0")/.."
 FILE=deploy/helm/moks/values-minikube.yaml

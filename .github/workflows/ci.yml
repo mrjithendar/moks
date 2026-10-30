@@ -2,8 +2,8 @@ name: moks
 
 # check   -> every push and pull request: backend tests against PostgreSQL, frontend typecheck/build,
 #            Helm lint/render
-# release -> default branch: build the arm64 image (mk4 nodes are arm64) and push moks:<sha> to ECR.
-#            CI never touches the cluster; Argo CD deploys the digest pinned in values-minikube.yaml.
+# release -> default branch: build the arm64 image (mk4 nodes are arm64) and push moks:latest to ECR
+#            (the only tag). CI never touches the cluster; restart the moks deployments to roll it out.
 
 on:
   push:
@@ -88,13 +88,13 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
       - name: Build, smoke-test and push
         run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY"
-          docker build -t "$IMAGE:${{ github.sha }}" .
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
+          docker build --label org.opencontainers.image.revision=${{ github.sha }} -t "$IMAGE" .
           # The image must start and answer its probes without a database (readyz reports 503).
-          docker run -d --name smoke -e MOKS_ENV=development -e MOKS_AUTH_MODE=local -p 8080:8080 "$IMAGE:${{ github.sha }}"
+          docker run -d --name smoke -e MOKS_ENV=development -e MOKS_AUTH_MODE=local -p 8080:8080 "$IMAGE"
           for i in $(seq 1 30); do curl -fsS localhost:8080/healthz && break; sleep 1; done
           curl -fsS localhost:8080/moks/ | grep -q '<div id="root">'
           curl -fsS localhost:8080/moks/api/health
           docker rm -f smoke
-          docker push "$IMAGE:${{ github.sha }}"
-          echo "digest: $(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:${{ github.sha }}")" >> "$GITHUB_STEP_SUMMARY"
+          docker push "$IMAGE"
+          echo "pushed $IMAGE (commit ${{ github.sha }}), $(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")" >> "$GITHUB_STEP_SUMMARY"
