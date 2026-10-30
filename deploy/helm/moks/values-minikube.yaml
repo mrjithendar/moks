@@ -52,22 +52,7 @@ seed:
         # - type: aws_cost
         #   name: aws
         #   config: {cache_minutes: 60, max_requests_per_hour: 60}
-  # Chat model for investigations: the Bedrock inference profile the Terraform runtime user may call
-  # (deploy/terraform, bedrock_enabled). Needs AWS_ACCESS_KEY_ID/SECRET in moks-secrets
-  # (scripts/create-runtime-key.sh). Set input/output prices (USD per 1M tokens) from the Bedrock
-  # pricing page so FinOps shows LLM cost; 0 shows tokens only.
-  llm:
-    - name: bedrock-nova-lite
-      purpose: chat
-      provider: bedrock
-      model: us.amazon.nova-2-lite-v1:0
-      region: us-east-1
-      timeout_seconds: 60
-      max_output_tokens: 2000
-      daily_budget_usd: 5
-      input_price_per_mtok: 0
-      output_price_per_mtok: 0
-      is_active: true
+  # LLM providers are configured in the portal (Administration > LLM providers), not seeded here.
   knowledge_sources:
     - name: moks-docs
       type: github

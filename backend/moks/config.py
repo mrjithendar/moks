@@ -82,6 +82,7 @@ class Settings(BaseSettings):
     # Executor and diagnostics
     process_role: Literal["api", "worker", "executor"] = "api"
     sync_timezone: str = "UTC"  # shown beside knowledge sync schedules
+    database_volume_gib: int = 10  # capacity of the database volume, for the size alert
     diagnostics_namespace: str = "moks-diagnostics"
 
     # Alerts: shared secret for the Alertmanager / Grafana webhook (Authorization: Bearer ...)

@@ -2,7 +2,7 @@ import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useAuth } from "./auth";
 import { Layout } from "./components";
 import { Audit, Connectors, Environments, LLMProviders, Users } from "./pages/Admin";
-import { InvestigationList, InvestigationView, NewInvestigation } from "./pages/Investigate";
+import { ConversationView, InvestigationList, InvestigationView, NewInvestigation } from "./pages/Investigate";
 import { Evals, FinOps, Knowledge, Skills } from "./pages/Insights";
 import { Explorer, Logs } from "./pages/Live";
 import { Detections } from "./pages/Detections";
@@ -24,6 +24,7 @@ export default function App() {
         <Route path="/investigate" element={<NewInvestigation />} />
         <Route path="/investigations" element={<InvestigationList />} />
         <Route path="/investigations/:id" element={<InvestigationView />} />
+        <Route path="/conversations/:id" element={<ConversationView />} />
         <Route path="/explorer" element={<Explorer />} />
         <Route path="/metrics" element={<Metrics />} />
         <Route path="/logs" element={<Logs />} />

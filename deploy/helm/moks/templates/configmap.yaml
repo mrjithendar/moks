@@ -28,6 +28,7 @@ data:
   {{- end }}
   MOKS_DIAGNOSTICS_NAMESPACE: {{ .Values.diagnostics.namespace | quote }}
   MOKS_ALERT_POLL_SECONDS: {{ .Values.config.alertPollSeconds | quote }}
+  MOKS_DATABASE_VOLUME_GIB: {{ trimSuffix "Gi" .Values.postgres.storage | quote }}
   {{- if .Values.customSkills }}
   MOKS_SKILLS_DIR: /etc/moks-skills
   {{- end }}

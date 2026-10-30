@@ -10,9 +10,10 @@ interface Conn { id: string; type: string; name: string; enabled: boolean; last_
 interface EnvOverview { name: string; display_name: string; kind: string; is_production: boolean; active_investigations: number; connectors: Conn[]; grafana_url?: string | null }
 
 export default function Overview() {
-  const { me } = useAuth();
+  const { me, can } = useAuth();
   const ov = useLoad(() => api<{ environments: EnvOverview[] }>("/overview"), []);
   const recent = useLoad(() => api<any[]>("/investigations?limit=8"), []);
+  const backups = useLoad(() => (can("audit.read") ? api<any>("/admin/backups").catch(() => null) : Promise.resolve(null)), []);
   const [live, setLive] = useState(true);
   useInterval(() => {
     if (!ov.loading) ov.reload();
@@ -24,6 +25,12 @@ export default function Overview() {
         <label className="inline"><input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} /> Refresh every 5 s</label>
       </PageHead>
       <ErrorBox error={ov.error} />
+      {backups.data?.overdue && (
+        <div className="alert error" style={{ marginBottom: 14 }}>
+          {backups.data.last_success_at ? <>The last good database backup finished <Time iso={backups.data.last_success_at} />.</> : "No database backup has ever succeeded."}
+          {" "}Data written since then would be lost in a disaster.{backups.data.runs[0]?.error && ` Latest error: ${backups.data.runs[0].error}`}
+        </div>
+      )}
       {me && !me.roles.length && (
         <div className="alert info" style={{ marginBottom: 14 }}>
           You are signed in as {me.email} but have no roles yet. Ask a MOKS administrator to grant access.

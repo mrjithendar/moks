@@ -104,11 +104,9 @@ async def _seed(path: str, upsert: bool) -> None:
         for l in data.get("llm", []):
             row = (await db.execute(select(LLMConfig).where(LLMConfig.name == l["name"]))).scalar_one_or_none()
             if row is None:
-                if l.get("is_active"):
-                    for other in (await db.execute(select(LLMConfig).where(LLMConfig.purpose == l.get("purpose", "chat"), LLMConfig.is_active.is_(True)))).scalars():
-                        other.is_active = False
-                    await db.flush()
-                db.add(LLMConfig(**l))
+                # The seed runs on every pod start, so it must never override a choice made in the portal.
+                active = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == l.get("purpose", "chat"), LLMConfig.is_active.is_(True)))).scalars().first()
+                db.add(LLMConfig(**{**l, "is_active": bool(l.get("is_active")) and active is None}))
                 print(f"llm {l['name']}: created")
             elif upsert:
                 for k, v in l.items():
@@ -256,6 +254,86 @@ async def _reindex() -> None:
         print(await service.reindex(db))
 
 
+async def _backup_run(dump: str) -> None:
+    from datetime import datetime, timezone
+
+    from sqlalchemy import text
+
+    from . import backup
+    from .db import session_scope
+    from .models import BackupRun
+
+    started = datetime.now(timezone.utc)
+    env = os.environ
+    result: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    size = None
+    error = None
+    try:
+        bucket = env.get("MOKS_BACKUP_BUCKET")
+        if not bucket:
+            raise backup.BackupError("MOKS_BACKUP_BUCKET is not set")
+        key = backup.load_key()
+        async with session_scope() as db:
+            counts = await backup.table_counts(db)
+            size = (await db.execute(text("SELECT pg_database_size(current_database())"))).scalar_one()
+            version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
+        retention = backup.Retention(int(env.get("MOKS_BACKUP_KEEP_HOURLY", 48)), int(env.get("MOKS_BACKUP_KEEP_DAILY", 30)), int(env.get("MOKS_BACKUP_KEEP_MONTHLY", 12)))
+        store = backup.Store(bucket, env.get("MOKS_BACKUP_ENDPOINT"), env.get("MOKS_BACKUP_REGION"))
+        result = backup.publish(Path(dump), store, env.get("MOKS_BACKUP_PREFIX", "moks"), key, {"tables": counts, "database_bytes": size, "migration": version}, started, retention)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {str(exc)[:500]}"
+    async with session_scope() as db:
+        db.add(BackupRun(started_at=started, finished_at=datetime.now(timezone.utc), status="failed" if error else "success", object_key=result.get("key"),
+                         size_bytes=result.get("bytes"), sha256=result.get("sha256"), database_bytes=size, tables=counts or None, error=error))
+    if error:
+        print(f"backup failed: {error}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"backup ok: {result['key']} ({result['bytes']} bytes), {len(counts)} tables, {result['pruned']} old copies pruned")
+
+
+async def _table_counts_at(url: str) -> dict[str, int]:
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from . import backup
+
+    engine = create_async_engine(url)
+    try:
+        async with async_sessionmaker(engine)() as db:
+            return await backup.table_counts(db)
+    finally:
+        await engine.dispose()
+
+
+async def _backup_compare() -> None:
+    """URLs come from the environment so passwords never appear in a process list."""
+    from . import backup
+
+    result = backup.compare_counts(await _table_counts_at(os.environ["MOKS_COMPARE_SOURCE_URL"]), await _table_counts_at(os.environ["MOKS_COMPARE_TARGET_URL"]))
+    print(json.dumps(result, indent=1))
+    if not result["ok"]:
+        raise SystemExit(1)
+
+
+def _backup_fetch(key: str | None, out: str) -> None:
+    from . import backup
+
+    env = os.environ
+    store = backup.Store(env["MOKS_BACKUP_BUCKET"], env.get("MOKS_BACKUP_ENDPOINT"), env.get("MOKS_BACKUP_REGION"))
+    if key is None:
+        prefix = env.get("MOKS_BACKUP_PREFIX", "moks").strip("/")
+        found = sorted(k for k in store.keys(f"{prefix}/hourly/") if k.endswith(".dump.enc"))
+        if not found:
+            raise SystemExit("no backups found")
+        key = found[-1]
+    sealed = Path(out + ".enc")
+    store.download(key, sealed)
+    with sealed.open("rb") as src, open(out, "wb") as dst:
+        backup.decrypt_stream(src, dst, backup.load_key())
+    sealed.unlink()
+    print(f"{key} -> {out}")
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="moks")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -280,6 +358,13 @@ def main(argv: list[str] | None = None) -> None:
     ev.add_argument("dataset")
     ev.add_argument("--mode", choices=["rules", "llm"], default="rules")
     sub.add_parser("reindex")
+    bk = sub.add_parser("backup").add_subparsers(dest="backup_cmd", required=True)
+    br = bk.add_parser("run", help="encrypt a pg_dump file, upload it, verify the copy and apply retention")
+    br.add_argument("--dump", required=True)
+    bf = bk.add_parser("fetch", help="download and decrypt a backup (default: the newest)")
+    bf.add_argument("--key")
+    bf.add_argument("--out", required=True)
+    bk.add_parser("compare", help="compare row counts of MOKS_COMPARE_SOURCE_URL and MOKS_COMPARE_TARGET_URL")
     a = p.parse_args(argv)
 
     if a.cmd == "migrate":
@@ -310,6 +395,13 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_eval(a.dataset, a.mode))
     elif a.cmd == "reindex":
         asyncio.run(_reindex())
+    elif a.cmd == "backup":
+        if a.backup_cmd == "run":
+            asyncio.run(_backup_run(a.dump))
+        elif a.backup_cmd == "fetch":
+            _backup_fetch(a.key, a.out)
+        else:
+            asyncio.run(_backup_compare())
 
 
 if __name__ == "__main__":

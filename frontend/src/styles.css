@@ -164,3 +164,9 @@ select.manage { padding: 4px 6px; font-size: 12px; }
 .stages li { padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
 .stages li.done { color: #4ade80; border-color: #14532d; }
 .stages li.now { color: var(--accent); border-color: var(--accent); }
+
+/* Conversations */
+.bubble { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; background: var(--panel); }
+.bubble.user { border-left: 3px solid var(--accent); }
+.bubble.assistant { border-left: 3px solid #4ade80; }
+.bubble-text { white-space: pre-wrap; margin: 4px 0 6px; }

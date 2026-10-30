@@ -223,3 +223,84 @@ async def test_a_reindex_waits_out_a_rate_limit_and_gives_up_eventually(monkeypa
     assert Auth.calls == 1  # only a rate limit is worth waiting for
 
 
+
+
+async def _chat(name=None, active=False):
+    async with session_scope() as db:
+        c = LLMConfig(name=name or f"c-{uuid.uuid4().hex[:6]}", purpose="chat", provider="gemini", model="m", is_active=active)
+        db.add(c)
+        await db.flush()
+        return c.id
+
+
+async def _reset_active_chat():
+    async with session_scope() as db:
+        for c in (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalars():
+            c.is_active = False
+
+
+async def test_the_seed_never_replaces_the_active_model(tmp_path):
+    from moks.cli import _seed
+
+    await _reset_active_chat()
+    mine = await _chat(active=True)
+    name = f"seeded-{uuid.uuid4().hex[:6]}"
+    seed = tmp_path / "seed.yaml"
+    seed.write_text(f"llm:\n  - {{name: {name}, purpose: chat, provider: bedrock, model: x, is_active: true}}\n")
+    await _seed(str(seed), False)
+    async with session_scope() as db:
+        assert (await db.get(LLMConfig, mine)).is_active
+        seeded = (await db.execute(select(LLMConfig).where(LLMConfig.name == name))).scalar_one()
+        assert seeded.is_active is False
+    await _reset_active_chat()
+
+
+async def test_the_seed_still_activates_when_nothing_is_active(tmp_path):
+    from moks.cli import _seed
+
+    await _reset_active_chat()
+    name = f"first-{uuid.uuid4().hex[:6]}"
+    seed = tmp_path / "seed.yaml"
+    seed.write_text(f"llm:\n  - {{name: {name}, purpose: chat, provider: bedrock, model: x, is_active: true}}\n")
+    await _seed(str(seed), False)
+    async with session_scope() as db:
+        assert (await db.execute(select(LLMConfig).where(LLMConfig.name == name))).scalar_one().is_active
+    await _reset_active_chat()
+
+
+def test_mk4_seeds_no_llm_provider():
+    import yaml
+    from pathlib import Path
+
+    values = yaml.safe_load((Path(__file__).parents[2] / "deploy/helm/moks/values-minikube.yaml").read_text())
+    assert not values["seed"].get("llm")
+
+
+async def test_deleting_a_provider_keeps_usage_and_refuses_the_active_one(client):
+    from moks.models import LLMUsage
+
+    h, _ = await _admin(client)
+    await _reset_active_chat()
+    live = await _chat(active=True)
+    assert (await client.delete(f"/moks/api/admin/llm/{live}", headers=h)).status_code == 409
+    old = await _chat()
+    async with session_scope() as db:
+        usage = LLMUsage(llm_config_id=old, provider="gemini", model="m", tokens_in=5, tokens_out=5, cost_usd=0)
+        db.add(usage)
+        await db.flush()
+        uid = usage.id
+    assert (await client.delete(f"/moks/api/admin/llm/{old}", headers=h)).status_code == 200
+    async with session_scope() as db:
+        assert await db.get(LLMConfig, old) is None
+        kept = await db.get(LLMUsage, uid)
+        assert kept.model == "m" and kept.llm_config_id is None
+        assert (await db.execute(select(AuditEvent).where(AuditEvent.action == "llm.delete", AuditEvent.resource_id == str(old)))).scalar_one()
+    assert (await client.delete(f"/moks/api/admin/llm/{old}", headers=h)).status_code == 404
+    await _reset_active_chat()
+
+
+async def test_only_llm_admins_can_delete(client):
+    tag = uuid.uuid4().hex[:6]
+    await make_user(f"o-{tag}@example.com", ["operator:*:*"])
+    h = await login(client, f"o-{tag}@example.com")
+    assert (await client.delete(f"/moks/api/admin/llm/{await _chat()}", headers=h)).status_code == 403

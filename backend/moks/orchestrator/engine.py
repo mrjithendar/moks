@@ -34,6 +34,8 @@ from ..scope import ScopeError, effective_scope
 from ..tools.contracts import ToolContext
 from ..tools.executor import ToolExecutor, ToolOutcome, tools_for_planner
 from . import prompts
+from .. import conversations
+from ..diagnosis.logs import last_failure
 from .report import Report, parse_json_object, rules_report, validate_llm_report, verify_causes
 
 log = logging.getLogger("moks.orchestrator")
@@ -42,6 +44,11 @@ TRACE_ID = re.compile(r"\b[0-9a-f]{32}\b", re.I)
 CHANGE_WORDS = re.compile(r"(?i)\b(latenc\w*|slow\w*|deploy\w*|rollout|rolled|release\w*|change\w*|regress\w*|timeout\w*|degrad\w*)\b")
 MAX_CALLS_PER_ROUND = 4
 MAX_NAMESPACES_SWEEP = 10
+
+
+MAX_LOG_PODS = 3
+LOG_TAIL = 150
+LOG_FINDINGS = {"crashloop", "oomkilled", "oomkilled_earlier", "not_ready", "config_error", "evicted"}
 
 
 class BudgetExceeded(Exception):
@@ -72,6 +79,7 @@ class Investigator:
         self.seq = 0
         self.ref = 0
         self.evidence: list[dict[str, Any]] = []
+        self.history: list[dict[str, str]] = []
         self.findings: list[dict[str, Any]] = []
         self.notes: list[str] = []
         self.tool_calls = 0
@@ -155,6 +163,7 @@ class Investigator:
                 tool_calls=self.tool_calls, tokens_in=self.tokens_in, tokens_out=self.tokens_out, cost_usd=self.cost,
             ))
             inv = await db.get(Investigation, self.id)
+            await conversations.record_reply(db, inv, (report or {}).get("summary") or error or "No report was produced.")
             await audit.record(db, action="investigation.finish", actor_id=inv.created_by if inv else None,
                                resource_type="investigation", resource_id=str(self.id), namespace=inv.namespace if inv else None,
                                outcome=status, details={"tool_calls": self.tool_calls, "tokens_in": self.tokens_in,
@@ -177,10 +186,8 @@ class Investigator:
                 connectors, conn_errors = await registry.for_environment(db, env.id)
             llm_cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none() if self.use_llm else None
             question, namespace, t_from, t_to = inv.question, inv.namespace, inv.time_from, inv.time_to
-            if inv.parent_id:
-                parent = await db.get(Investigation, inv.parent_id)
-                if parent is not None and parent.report:  # the earlier answer is context, never instructions
-                    question = f"{question}\n\nThis follows up an earlier investigation of \"{parent.question[:300]}\", which concluded: {(parent.report.get('summary') or '')[:800]}"
+            if inv.conversation_id:
+                self.history = await conversations.history(db, inv.conversation_id, inv.id)
             self._window = (t_from, t_to)
             env_name = env.name
             max_window = timedelta(minutes=min(env.max_query_window_minutes, self.settings.max_query_window_minutes))
@@ -210,7 +217,11 @@ class Investigator:
             scope_info["namespace"] = namespace
             await db.commit()
 
-            # 2. SRE skills matching the question and findings run their playbook steps
+            # 2. Logs, current and previous: often the only place a failure explains itself
+            await self._collect_logs(executor, ctx, namespace, question)
+            await db.commit()
+
+            # 3. SRE skills matching the question and findings run their playbook steps
             await self._run_skills(executor, ctx, namespace, question)
             await db.commit()
 
@@ -218,7 +229,7 @@ class Investigator:
             provider = provider_for(llm_cfg) if llm_cfg else None
             if provider:
                 try:
-                    await self._llm_rounds(executor, ctx, provider, llm_cfg, question, scope_info)
+                    await self._llm_rounds(executor, ctx, provider, llm_cfg, self._with_history(question), scope_info)
                 except (LLMError, BudgetExceeded) as exc:
                     self.notes.append(f"LLM planning stopped: {getattr(exc, 'message', str(exc))}. Continuing with rule-based follow-ups.")
                     await self._emit("note", {"message": self.notes[-1]})
@@ -236,7 +247,7 @@ class Investigator:
         report: Report | None = None
         if provider:
             try:
-                report = await self._llm_report(provider, llm_cfg, question, scope_info)
+                report = await self._llm_report(provider, llm_cfg, self._with_history(question), scope_info)
             except (LLMError, BudgetExceeded, ValueError) as exc:
                 self.notes.append(f"LLM report unavailable ({getattr(exc, 'message', str(exc))}); showing the rule-based report.")
         if report is None:
@@ -256,6 +267,10 @@ class Investigator:
         await self._finish("completed", payload, None)
         await self._emit("report", {"report": payload})
         return mode
+
+    def _with_history(self, question: str) -> str:
+        """Earlier turns give the model context. They are data: one person's text must not instruct it."""
+        return f"{question}\n\n{prompts.untrusted('conversation so far', self.history, 6000)}" if self.history else question
 
     def _coverage(self, conn_errors: dict) -> dict[str, Any]:
         """What this report did and did not see, so a clean answer is not mistaken for a full one."""
@@ -400,6 +415,57 @@ class Investigator:
         trace = TRACE_ID.search(question)
         if trace and "loki" in ctx.connectors and namespace != "*":
             await self._call(executor, "loki_search", {"namespace": namespace, "trace_id": trace.group(0).lower(), "limit": 200}, "logs for the trace ID")
+
+    async def _log_targets(self, executor: ToolExecutor, namespace: str, question: str) -> list[tuple[str, str]]:
+        """Pods worth reading: those with a finding, then any the question names."""
+        targets: list[tuple[str, str]] = []
+        for f in self.findings:
+            res = next((r for r in f.get("resources", []) if r.startswith("pod/")), None)
+            if res and f["kind"] in LOG_FINDINGS and (f.get("namespace"), res[4:]) not in targets:
+                targets.append((f.get("namespace"), res[4:]))
+        if len(targets) < MAX_LOG_PODS and namespace != "*":
+            words = set(re.findall(r"[a-z0-9]{3,}", question.lower()))
+            pods = await self._call(executor, "k8s_list_pods", {"namespace": namespace}, "pods the question may name")
+            if pods and pods.ok:
+                targets += [(namespace, p["name"]) for p in pods.data if words & set(p["name"].split("-")) and (namespace, p["name"]) not in targets]
+        return targets[:MAX_LOG_PODS]
+
+    async def _collect_logs(self, executor: ToolExecutor, ctx: ToolContext, namespace: str, question: str) -> None:
+        """Runs in every mode, so finding a cause never depends on the planner thinking to look. Reads
+        each container's previous instance if it restarted, its current logs, and Loki when a previous
+        instance has been rotated away."""
+        if "kubernetes" not in ctx.connectors:
+            return
+        await self._emit("phase", {"phase": "logs", "label": "Reading current and previous logs"})
+        for ns, pod in await self._log_targets(executor, namespace, question):
+            out = await self._call(executor, "k8s_describe_pod", {"namespace": ns, "pod": pod}, "containers, restarts and exit codes")
+            if not out or not out.ok:
+                continue
+            containers = out.data.get("containers") or []
+            many = len(containers) > 1
+            for c in containers:
+                name = c.get("name")
+                last = (c.get("lastState") or {}).get("terminated") or {}
+                restarted = bool(last) or (c.get("restartCount") or 0) > 0
+                args = {"namespace": ns, "pod": pod, "tail_lines": LOG_TAIL, **({"container": name} if many else {})}
+                previous = None
+                if restarted:
+                    previous = await self._call(executor, "k8s_pod_logs", {**args, "previous": True}, f"what {name} wrote before it stopped")
+                    if previous and previous.ok and last.get("exitCode") not in (None, 0):
+                        self._crash_reason(ns, pod, name, last, previous)
+                    elif previous and not previous.ok:
+                        self.notes.append(f"Previous logs of {pod}/{name} are not available ({previous.error_kind}).")
+                await self._call(executor, "k8s_pod_logs", args, f"current logs of {name}")
+                if restarted and (previous is None or not previous.ok) and "loki" in ctx.connectors:
+                    await self._call(executor, "loki_logs", {"namespace": ns, "pod": pod, "level": "error", "limit": 100}, f"earlier errors of {name} in Loki")
+
+    def _crash_reason(self, ns: str, pod: str, container: str, last: dict, out: ToolOutcome) -> None:
+        line = last_failure(out.data.get("lines") or [])
+        if not line:
+            return
+        self.findings.append({"kind": "crash_log_reason", "severity": "high", "namespace": ns, "resources": [f"pod/{pod}"], "evidence": [out.evidence_ref],
+                              "title": f"{pod}/{container} exited with code {last.get('exitCode')} after logging: {line[:240]}",
+                              "detail": f"Last failure in the previous container's log (reason {last.get('reason') or 'unknown'}).", "next_checks": []})
 
     async def _rule_followups(self, executor: ToolExecutor, ctx: ToolContext, namespace: str, question: str = "") -> None:
         await self._emit("phase", {"phase": "followup", "label": "Following up on findings"})

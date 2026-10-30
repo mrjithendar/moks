@@ -321,6 +321,7 @@ export function LLMProviders() {
               <td className="row">
                 <button className="small" onClick={() => test(c.id)}>Test</button>
                 <button className="ghost small" onClick={async () => { await a.run(() => api(`/admin/llm/${c.id}/activate${qs({ active: !c.is_active })}`, { method: "POST" })); list.reload(); }}>{c.is_active ? "Deactivate" : "Activate"}</button>
+                {!c.is_active && <button className="ghost small" onClick={async () => { if (confirm(`Delete ${c.name}? Its usage history is kept.`)) { await a.run(() => api(`/admin/llm/${c.id}`, { method: "DELETE" })); list.reload(); } }}>Delete</button>}
                 <button className="ghost small" onClick={() => { setEditing(c.id); setForm({ ...c, endpoint: c.endpoint ?? "", region: c.region ?? "us-east-1", credType: c.credential_ref?.type ?? "none", credName: c.credential_ref?.name ?? "" }); }}>Edit</button>
               </td>
             </tr>

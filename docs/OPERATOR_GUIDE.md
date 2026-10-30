@@ -198,11 +198,19 @@ The API's init container runs migration `0002` automatically. Take a backup firs
    ([SKILLS.md](SKILLS.md)).
 8. **Evaluation:** **Evaluation → Run lab** (rules mode) should score 1.0. Run it again in LLM mode
    after configuring a provider, to compare.
-9. **LLM:** the mk4 seed adds an active Bedrock model (`us.amazon.nova-2-lite-v1:0`). Run
-   `scripts/create-runtime-key.sh` once so the pods have AWS keys, then restart `moks-api` and
-   `moks-worker`. Until then, investigations and **Analyze with AI** fall back to rule-based reports
-   and the model call fails with a credentials error. Set its input and output prices under
-   **LLM providers** so FinOps can show cost as well as tokens.
+9. **LLM:** configure providers under **LLM providers**. The mk4 seed adds none. Without an active chat
+   model, investigations and **Analyze with AI** use rule-based reports. Set input and output prices there
+   so FinOps can show cost as well as tokens. An inactive provider can be deleted; its usage history stays.
+
+## Investigation conversations
+
+Each investigation is a conversation. Every question starts a new turn with its own evidence, and MOKS sees
+the earlier messages as context. Anyone with access to the scope can open one. Replying with **Ask MOKS**
+needs `investigation.run` and runs with your own permissions. A person with read access can post notes once
+someone in the conversation adds them.
+
+Authors can delete their messages. The person who started a conversation, or an administrator, can delete
+any message or the whole conversation. Deleted items can be restored from **Show deleted** under Investigations.
 
 ## Editing knowledge sources
 
@@ -313,27 +321,77 @@ is password-less and **refuses to start** unless `MOKS_ENV=development`.
 
 ## Backup and restore
 
-What matters is PostgreSQL: users, roles, configuration, investigations, evidence and the audit
-log. Credentials live in Kubernetes Secrets, so back those up separately (or recreate them).
+PostgreSQL is the system of record: users, roles, configuration, investigations, evidence, FinOps
+history and the audit log. Credentials live in Kubernetes Secrets, so keep those separately too.
+
+**What protects the data on mk4 depends on the setup below being finished.** All four mk4 nodes are
+containers on one disk, so anything stored only in the cluster is lost with that disk.
+
+### Scheduled backups
+
+`backup.enabled` adds an hourly CronJob that dumps the database, encrypts it, uploads it, reads the stored
+copy back to prove it matches, and only then applies retention (48 hourly, 30 daily, 12 monthly). The
+bucket only ever holds ciphertext. Data written since the last run is not in any backup, so the most you
+can lose is about an hour.
+
+1. Create the bucket. For S3, set `backup_bucket_name` in Terraform (with `backup_object_lock_days` if you
+   want Object Lock, which can only be chosen at creation). For R2, create it and turn on versioning or
+   bucket locks there.
+2. Generate the encryption key and store it **outside the cluster** first. Without it no backup can be read:
+   `openssl rand -base64 32`
+3. Create the Secret, using `--from-env-file` or similar so values stay out of your shell history. Its keys
+   are `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `MOKS_BACKUP_ENCRYPTION_KEY`. Name it `moks-backup`.
+4. Set `backup.enabled`, `backup.bucket`, and for R2 `backup.endpoint` and `backup.region: auto`.
+5. Apply `deploy/argocd/project.yaml`, which now allows CronJobs, then sync.
+6. Run one by hand and check the stored copy:
+   `kubectl --context mk4 -n moks create job --from=cronjob/moks-backup first-backup`
+
+A warning appears on **Overview** when no backup has succeeded for three hours. For Prometheus alerts, add
+`deploy/grafana/prometheus-scrape.yaml` and `deploy/grafana/moks-alerts.yaml` to the tools repository, and
+route them to a person. mk4 has no Alertmanager today.
+
+### Testing a restore
+
+A backup is not proven until a restore passes. Use a scratch database, never `moks`:
 
 ```sh
-scripts/backup.sh mk4 ./backups            # pg_dump | gzip -> moks-<UTC>.sql.gz
+kubectl --context mk4 -n moks exec statefulset/moks-postgres -- psql -U moks -d postgres -c 'CREATE DATABASE moks_restore_test'
+# fetch and decrypt the newest backup, from a pod or machine holding the moks-backup values
+moks backup fetch --out /work/moks.dump
+pg_restore --no-owner -h moks-postgres -U moks -d moks_restore_test --exit-on-error /work/moks.dump
+MOKS_COMPARE_SOURCE_URL=... MOKS_COMPARE_TARGET_URL=... moks backup compare
+MOKS_DATABASE_URL=<scratch url> moks verify-audit
+kubectl --context mk4 -n moks exec statefulset/moks-postgres -- psql -U moks -d postgres -c 'DROP DATABASE moks_restore_test'
 ```
 
-Restore into an empty database, for example after recreating the PVC:
+`compare` fails if a table is missing or holds more rows than its source. A live source moves on, so a
+restore having fewer rows in busy tables is normal and listed under `differ`. Repeat this after any
+schema change and at least quarterly.
+
+### Recovery runbook
+
+Use this when the database is lost. Stop writers first, so nothing lands in a half-restored database.
 
 ```sh
-kubectl --context mk4 -n moks scale deploy/moks-api deploy/moks-worker --replicas=0
-kubectl --context mk4 -n moks exec -i statefulset/moks-postgres -- psql -U moks -d postgres \
-  -c 'DROP DATABASE IF EXISTS moks WITH (FORCE)' -c 'CREATE DATABASE moks OWNER moks'
-gunzip -c backups/moks-<UTC>.sql.gz | kubectl --context mk4 -n moks exec -i statefulset/moks-postgres -- psql -U moks -d moks -v ON_ERROR_STOP=1
-kubectl --context mk4 -n moks scale deploy/moks-api --replicas=2 && kubectl --context mk4 -n moks scale deploy/moks-worker --replicas=1
-kubectl --context mk4 -n moks exec deploy/moks-api -c api -- moks verify-audit
+kubectl --context mk4 -n moks scale deploy/moks-api deploy/moks-worker deploy/moks-executor --replicas=0
+kubectl --context mk4 -n moks patch cronjob moks-backup -p '{"spec":{"suspend":true}}'
+# recreate the database, keeping any surviving data aside rather than dropping it
+kubectl --context mk4 -n moks exec statefulset/moks-postgres -- psql -U moks -d postgres \
+  -c 'ALTER DATABASE moks RENAME TO moks_damaged' -c 'CREATE DATABASE moks OWNER moks'
+moks backup fetch --out moks.dump        # or scripts/decrypt-backup.py if MOKS is unavailable
+pg_restore --no-owner -h <postgres> -U moks -d moks --exit-on-error moks.dump
+MOKS_DATABASE_URL=<url> moks verify-audit
+kubectl --context mk4 -n moks scale deploy/moks-api --replicas=2
+kubectl --context mk4 -n moks scale deploy/moks-worker deploy/moks-executor --replicas=1
+kubectl --context mk4 -n moks patch cronjob moks-backup -p '{"spec":{"suspend":false}}'
 ```
 
-The dump includes the audit triggers. Rows are restored with their original hashes, so
-`verify-audit` should report `ok: true`. Schedule backups with a CronJob, or copy dumps to R2/S3
-as jithendar.com does. On EKS, use RDS automated snapshots and point-in-time recovery.
+If the whole host is gone, rebuild the cluster and recreate the Secrets first, including the encryption key
+from its off-cluster copy. Then run the steps above. Any work since the backup is gone: check the audit log
+for the last recorded time. On EKS, use RDS automated snapshots and point-in-time recovery instead.
+
+`scripts/backup.sh` still takes a one-off plain dump to your machine, which is useful before a migration.
+It is not encrypted, so delete it when you are done.
 
 ## Upgrades and rollback
 

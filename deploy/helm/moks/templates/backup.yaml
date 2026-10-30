@@ -1,0 +1,77 @@
+{{- if and .Values.backup.enabled .Values.postgres.bundled }}
+# Off-cluster backups. The init container dumps with the PostgreSQL image; the main container uses
+# the MOKS image to encrypt, upload, verify the stored copy and apply retention. Credentials come
+# from the moks-backup Secret, created out of band.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: moks-backup
+  labels: {{- include "moks.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1500
+      template:
+        metadata:
+          labels: {app: moks, app.kubernetes.io/component: backup}   # app=moks: the NetworkPolicy allows PostgreSQL and HTTPS
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          initContainers:
+            - name: dump
+              image: {{ .Values.postgres.image }}
+              command: [sh, -c, "pg_dump -h moks-postgres -U moks -d moks --format=custom --compress=6 --file=/work/moks.dump"]
+              env:
+                - name: PGPASSWORD
+                  valueFrom: {secretKeyRef: {name: {{ .Values.postgres.passwordSecret }}, key: password}}
+              securityContext:
+                runAsUser: {{ .Values.postgres.uid }}
+                runAsGroup: {{ .Values.postgres.uid }}
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              volumeMounts: [{name: work, mountPath: /work}]
+              resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: "1", memory: 512Mi}}
+          containers:
+            - name: upload
+              image: {{ include "moks.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args: [backup, run, --dump, /work/moks.dump]
+              envFrom:
+                - configMapRef: {name: moks-config}
+                - secretRef: {name: {{ .Values.existingSecret }}}
+                - secretRef: {name: {{ .Values.backup.secret }}}
+              env:
+                - {name: MOKS_BACKUP_BUCKET, value: {{ .Values.backup.bucket | quote }}}
+                - {name: MOKS_BACKUP_PREFIX, value: {{ .Values.backup.prefix | quote }}}
+                - {name: MOKS_BACKUP_ENDPOINT, value: {{ .Values.backup.endpoint | quote }}}
+                - {name: MOKS_BACKUP_REGION, value: {{ .Values.backup.region | quote }}}
+                - {name: MOKS_BACKUP_KEEP_HOURLY, value: {{ .Values.backup.retention.hourly | quote }}}
+                - {name: MOKS_BACKUP_KEEP_DAILY, value: {{ .Values.backup.retention.daily | quote }}}
+                - {name: MOKS_BACKUP_KEEP_MONTHLY, value: {{ .Values.backup.retention.monthly | quote }}}
+              securityContext:
+                runAsUser: 10001
+                runAsGroup: 10001
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              volumeMounts: [{name: work, mountPath: /work}, {name: tmp, mountPath: /tmp}]
+              resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 500m, memory: 512Mi}}
+          volumes:
+            - name: work
+              emptyDir: {sizeLimit: {{ .Values.backup.workspace }}}
+            - name: tmp
+              emptyDir: {sizeLimit: 64Mi}
+{{- end }}

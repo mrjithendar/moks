@@ -200,6 +200,20 @@ async def update_llm(lid: uuid.UUID, body: LLMIn, ctx: AuthContext = Depends(nee
     return llm_out(c)
 
 
+@router.delete("/llm/{lid}")
+async def delete_llm(lid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, str]:
+    """Usage history stays: each row keeps its provider, model and cost. Only the link to this config goes."""
+    c = await db.get(LLMConfig, lid)
+    if c is None:
+        raise HTTPException(404, "Unknown LLM configuration")
+    if c.is_active:
+        raise HTTPException(409, "Deactivate this provider before deleting it")
+    await audit.record(db, action="llm.delete", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="llm_config", resource_id=str(c.id),
+                       decision="allow", details={"name": c.name, "provider": c.provider, "model": c.model})
+    await db.delete(c)
+    return {"status": "deleted"}
+
+
 @router.post("/llm/{lid}/activate")
 async def activate_llm(lid: uuid.UUID, active: bool = True, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)),
                        db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
@@ -399,6 +413,13 @@ async def audit_facets(ctx: AuthContext = Depends(needs(P.AUDIT_READ)), db: Asyn
         rows[col] = [r[0] for r in (await db.execute(_text(
             f"SELECT DISTINCT {col} FROM (SELECT {col} FROM audit_events ORDER BY id DESC LIMIT 20000) t WHERE {col} IS NOT NULL ORDER BY 1 LIMIT 200"))).all()]
     return rows
+
+
+@router.get("/backups")
+async def backups(ctx: AuthContext = Depends(needs(P.AUDIT_READ)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    from .. import backup
+
+    return await backup.status(db)
 
 
 @router.get("/audit/verify")

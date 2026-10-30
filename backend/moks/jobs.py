@@ -20,7 +20,8 @@ from . import audit
 
 from .config import get_settings
 from .db import session_scope
-from .models import Environment, Job, KnowledgeSource
+from .models import BackupRun, Environment, Job, KnowledgeSource
+from .observability import BACKUP_LAST_RUN_OK, BACKUP_LAST_SUCCESS, DATABASE_SIZE, DATABASE_VOLUME
 
 log = logging.getLogger("moks.jobs")
 RATE_LIMIT_MIN_WAIT = 60
@@ -211,9 +212,27 @@ async def run_one(job_id: uuid.UUID) -> None:
             job.finished_at = datetime.now(timezone.utc)
 
 
+async def update_durability_metrics() -> None:
+    """Age is what the alert uses, so a job that never starts is caught as well as one that fails."""
+    s = get_settings()
+    async with session_scope() as db:
+        DATABASE_SIZE.set((await db.execute(text("SELECT pg_database_size(current_database())"))).scalar_one())
+        DATABASE_VOLUME.set(s.database_volume_gib * 1024**3)
+        latest = (await db.execute(select(BackupRun).order_by(BackupRun.started_at.desc()).limit(1))).scalars().first()
+        good = (await db.execute(select(BackupRun).where(BackupRun.status == "success").order_by(BackupRun.finished_at.desc()).limit(1))).scalars().first()
+    if latest is not None:
+        BACKUP_LAST_RUN_OK.set(1 if latest.status == "success" else 0)
+    if good is not None:
+        BACKUP_LAST_SUCCESS.set(good.finished_at.timestamp())
+
+
 async def schedule_periodic() -> None:
     """Idempotent: dedupe keys keep one pending job per target."""
     s = get_settings()
+    try:
+        await update_durability_metrics()
+    except Exception:
+        log.warning("durability metrics failed", extra={"event": "durability_metrics_failed"})
     async with session_scope() as db:
         envs = (await db.execute(select(Environment.id).where(Environment.auto_investigate.is_(True)))).scalars().all()
         watched = (await db.execute(select(Environment.id).where(Environment.detection_enabled.is_(True)))).scalars().all()

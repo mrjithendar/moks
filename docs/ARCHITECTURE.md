@@ -286,3 +286,19 @@ Causes have two tiers. **Verified** causes come only from detectors that observe
 (`service_selector_mismatch`, `oomkilled`, `image_pull`, `unschedulable`, `config_ref_missing`).
 Everything from an LLM stays **suspected**, whatever its confidence.
 
+## Conversations
+
+A conversation groups investigations as turns. Each turn is a normal investigation owned by the person who
+asked, so RBAC, scope and audit apply per turn. Earlier messages reach the model only as untrusted context.
+Each turn reads logs in every mode, before skills and before any LLM planning: previous logs for containers
+that restarted, current logs, and Loki when previous logs are gone. The last failure a crashed container wrote
+becomes a `crash_log_reason` finding, quoted verbatim.
+
+## Durability
+
+PostgreSQL is the only system of record. Everything else is rebuildable or a short-lived cache. On mk4 it
+runs on one volume on one disk, so the off-cluster backup is the only copy that survives losing that
+disk. Backups are encrypted before they leave the cluster, are read back before retention runs, and report
+through `backup_runs`, so an alert fires on the age of the last success: a job that never starts is caught
+as well as one that fails. There is no point-in-time recovery; see [LIMITATIONS.md](LIMITATIONS.md).
+

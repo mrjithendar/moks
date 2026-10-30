@@ -1,0 +1,35 @@
+# Add to the Prometheus rule files in the tools repository, after adding the scrape job in
+# prometheus-scrape.yaml. Without both, and a route to a person, these alerts notify no one; the
+# Overview page shows the same backup warning without them.
+groups:
+  - name: moks-durability
+    rules:
+      - alert: MoksBackupOverdue
+        expr: time() - moks_backup_last_success_timestamp_seconds > 10800
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: No successful MOKS backup for over 3 hours
+          description: Check the moks-backup CronJob. Data written since the last backup would be lost in a disaster.
+      - alert: MoksBackupNeverRan
+        expr: absent(moks_backup_last_success_timestamp_seconds)
+        for: 3h
+        labels: {severity: critical}
+        annotations: {summary: MOKS has no recorded successful backup}
+      - alert: MoksBackupFailed
+        expr: moks_backup_last_run_success == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: The latest MOKS backup run failed}
+      - alert: MoksDatabaseVolumeFilling
+        expr: moks_database_size_bytes / moks_database_volume_bytes > 0.7
+        for: 30m
+        labels: {severity: warning}
+        annotations: {summary: The MOKS database has used over 70% of its volume}
+      - alert: MoksDatabaseVolumeNearlyFull
+        expr: moks_database_size_bytes / moks_database_volume_bytes > 0.85
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: The MOKS database has used over 85% of its volume
+          description: PostgreSQL stops accepting writes when the volume fills, and this StorageClass cannot expand.

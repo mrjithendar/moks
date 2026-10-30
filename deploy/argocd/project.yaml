@@ -34,6 +34,7 @@ spec:
     - {group: rbac.authorization.k8s.io, kind: Role}
     - {group: "", kind: ResourceQuota}
     - {group: "", kind: LimitRange}
+    - {group: batch, kind: CronJob}
     - {group: rbac.authorization.k8s.io, kind: RoleBinding}
   # Secrets are deliberately absent: they are created out of band (deploy/secrets) and Argo CD
   # can neither create nor prune them.

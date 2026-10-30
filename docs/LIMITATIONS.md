@@ -25,6 +25,30 @@ See [TESTING.md](TESTING.md#live-status-2026-10-30) for the evidence behind each
   evaluation runner does not read them. Some skills reference metrics that vary by deployment.
 - **Argo CD:** no connector. Drift compares Git with the cluster.
 
+## Conversations and logs
+
+- **Delete is soft.** A deleted message or conversation is hidden from people and from MOKS and can be
+  restored, but stays in PostgreSQL and in backups. Evidence from a turn stays too. Text a person pasted by
+  mistake, such as a secret, is therefore not erased. Removing it needs a database action by an administrator.
+- **New messages appear within about 4 seconds:** the page polls. There are no notifications when someone
+  adds you or replies.
+- **Logs:** up to 3 pods are read per turn, with the last 150 lines of each container. A cause outside that
+  tail is missed. Previous logs exist only for the last restart; older ones are in Loki at best, and on mk4
+  Loki keeps only allowlisted JSON fields from listed namespaces.
+- **Verified from logs** means the process itself reported this failure just before exiting. It is the
+  stated reason, and the underlying cause can lie deeper.
+
+## Durability
+
+- **Single disk:** all four mk4 nodes are containers on one disk, and the PostgreSQL and OpenSearch volumes
+  have reclaim policy `Delete`. Until backups are running, a disk failure or `minikube delete` loses everything.
+- **No point-in-time recovery:** backups are logical dumps, so at most about an hour is lost once hourly
+  backups run. WAL archiving would narrow that to minutes, but needs a PostgreSQL restart, a custom image or
+  a shipping sidecar, and base backups.
+- **Vectors:** with the OpenSearch backend, embeddings exist only in OpenSearch. Chunk text is in PostgreSQL,
+  so the index can be rebuilt, but that means paying to embed everything again.
+- **Deletes are permanent:** deleting a knowledge source, connector or saved query removes its rows.
+
 ## Known limitations (Phases 2–4)
 
 - **Remediation** covers Deployments, Services and HPAs; StatefulSet/DaemonSet actions are not allowlisted.

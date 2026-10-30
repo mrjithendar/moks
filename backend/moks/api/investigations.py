@@ -14,13 +14,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import audit
+from .. import audit, conversations
 from ..auth.deps import get_auth, require
 from ..auth.ratelimit import limiter
 from ..auth.sessions import AuthContext, client_ip
 from ..config import get_settings
 from ..db import get_db, session_scope
-from ..models import Environment, Evidence, Investigation, InvestigationEvent, User
+from ..models import Conversation, ConversationMessage, Environment, Evidence, Investigation, InvestigationEvent, User
 from ..rbac import P
 from ..scope import ScopeError, effective_scope
 from .common import env_or_404, max_window
@@ -59,7 +59,7 @@ def serialize(inv: Investigation, env_name: str, user_email: str | None = None, 
         "cost_usd": str(inv.cost_usd), "error": inv.error,
         "summary": (inv.report or {}).get("summary") if inv.report else None,
         "incident_id": str(inv.incident_id) if inv.incident_id else None, "trigger": inv.trigger, "stage": inv.stage,
-        "group_id": str(inv.group_id) if inv.group_id else None,
+        "group_id": str(inv.group_id) if inv.group_id else None, "conversation_id": str(inv.conversation_id) if inv.conversation_id else None,
     }
     if full:
         out["report"] = inv.report
@@ -143,14 +143,23 @@ class FollowUpIn(BaseModel):
 @router.post("/investigations/{inv_id}/follow-up", status_code=201)
 async def follow_up(inv_id: uuid.UUID, body: FollowUpIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     parent, env = await _load_visible(request, db, ctx, inv_id)
-    minutes = max(1, int((parent.time_to - parent.time_from).total_seconds() // 60))
-    r = await create(CreateIn(question=body.question, environment=env.name, namespace=parent.namespace, minutes=minutes, incident_id=parent.incident_id), request, ctx, db)
+    minutes = max(5, int((parent.time_to - parent.time_from).total_seconds() // 60))
+    if parent.conversation_id is None:  # started by an alert or a detection rule
+        await conversations.start(db, parent)
+    await conversations.join(db, parent.conversation_id, ctx.user.id)
+    r = await start_investigation(CreateIn(question=body.question, environment=env.name, namespace=parent.namespace, minutes=minutes, incident_id=parent.incident_id),
+                                  request, ctx, db, parent.conversation_id)
     (await db.get(Investigation, uuid.UUID(r["id"]))).parent_id = parent.id
     return r
 
 
 @router.post("/investigations", status_code=201)
 async def create(body: CreateIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    return await start_investigation(body, request, ctx, db)
+
+
+async def start_investigation(body: CreateIn, request: Request, ctx: AuthContext, db: AsyncSession, conversation_id: uuid.UUID | None = None) -> dict[str, Any]:
+    """conversation_id is never taken from a request body: callers have checked the person may post there."""
     s = get_settings()
     limiter.check(f"inv:{ctx.user.id}", s.rate_investigations_per_minute)
     env, ns, why_env = await resolve_scope(db, ctx, body.question, body.environment, body.namespace)
@@ -193,6 +202,13 @@ async def create(body: CreateIn, request: Request, ctx: AuthContext = Depends(ge
                        decision="allow", details={"question_chars": len(body.question), "window_minutes": int(window.total_seconds() // 60)},
                        ip=client_ip(request))
     await db.flush()
+    if conversation_id:
+        inv.conversation_id = conversation_id
+        db.add(ConversationMessage(conversation_id=conversation_id, author_id=ctx.user.id, role="user", content=body.question, investigation_id=inv.id))
+        await conversations.touch(db, conversation_id)
+        await db.flush()
+    else:
+        await conversations.start(db, inv)
     return serialize(inv, env.name, ctx.user.email)
 
 
@@ -201,6 +217,9 @@ async def _load_visible(request: Request, db: AsyncSession, ctx: AuthContext, in
     if inv is None:
         raise HTTPException(404, "Investigation not found")
     env = await db.get(Environment, inv.environment_id)
+    conv = await db.get(Conversation, inv.conversation_id) if inv.conversation_id else None
+    if conv is not None and conv.deleted_at is not None and conv.created_by != ctx.user.id and not ctx.principal.can(P.ADMIN_POLICIES, "*", "*"):
+        raise HTTPException(404, "Investigation not found")
     # An all-namespace investigation may hold evidence from any namespace, so only principals
     # with namespace "*" may read it ("*" is matched literally by fnmatch).
     if not ctx.principal.can(P.INVESTIGATION_READ, env.name, inv.namespace):
@@ -212,7 +231,8 @@ async def _load_visible(request: Request, db: AsyncSession, ctx: AuthContext, in
 async def list_(request: Request, environment: str | None = None, limit: int = 50, ctx: AuthContext = Depends(get_auth),
                 db: AsyncSession = Depends(get_db, scope="function")) -> list[dict[str, Any]]:
     q = (select(Investigation, Environment.name, User.email).join(Environment, Environment.id == Investigation.environment_id)
-         .join(User, User.id == Investigation.created_by).order_by(Investigation.created_at.desc()).limit(min(max(limit, 1), 200) * 3))
+         .join(User, User.id == Investigation.created_by).outerjoin(Conversation, Conversation.id == Investigation.conversation_id)
+         .where(Conversation.deleted_at.is_(None)).order_by(Investigation.created_at.desc()).limit(min(max(limit, 1), 200) * 3))
     if environment:
         q = q.where(Environment.name == environment)
     out = []

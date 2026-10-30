@@ -114,3 +114,21 @@ variable "finops_enabled" {
   type        = bool
   default     = false
 }
+
+variable "backup_bucket_name" {
+  description = "S3 bucket for MOKS database backups. Empty creates nothing (use this when backups go to Cloudflare R2)."
+  type        = string
+  default     = ""
+}
+
+variable "backup_object_lock_days" {
+  description = "Days each backup version is locked against deletion. 0 disables Object Lock, which can only be enabled when the bucket is created."
+  type        = number
+  default     = 0
+}
+
+variable "backup_noncurrent_days" {
+  description = "Days a superseded or deleted backup version stays recoverable."
+  type        = number
+  default     = 90
+}

@@ -2,7 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, LineChart, LogLines, PageHead, SourceRef, StatusBadge, Time, fmtBytes, useLoad } from "../components";
+import { Badge, ErrorBox, LineChart, LogLines, PageHead, SourceRef, StatusBadge, Time, fmtBytes, useInterval, useLoad } from "../components";
 import { type Ev, useInvestigationEvents } from "../investigationStream";
 import { PlanForm } from "./Ops";
 
@@ -33,15 +33,15 @@ export function NewInvestigation() {
     try {
       if (everywhere) {
         const g = await api<{ investigations: { id: string }[] }>("/investigations/group", { method: "POST", body: { question: q, minutes: minutes ? Number(minutes) : undefined } });
-        nav(g.investigations.length === 1 ? `/investigations/${g.investigations[0].id}` : "/investigations");
+        nav(g.investigations.length === 1 ? `/conversations/${g.investigations[0].id}` : "/investigations");
         return;
       }
       // Scope comes from the question (or a deep link from the explorer); the backend resolves the rest.
-      const inv = await api<{ id: string }>("/investigations", {
+      const inv = await api<{ id: string; conversation_id: string }>("/investigations", {
         method: "POST", body: { question: q, environment: params.get("env") || undefined, namespace: params.get("ns") || undefined,
           minutes: minutes ? Number(minutes) : undefined, incident_id: params.get("incident") || undefined },
       });
-      nav(`/investigations/${inv.id}`);
+      nav(`/conversations/${inv.conversation_id}`);
     } catch (err) {
       setError(err);
       setBusy(false);
@@ -93,29 +93,121 @@ export function NewInvestigation() {
 }
 
 export function InvestigationList() {
-  const list = useLoad(() => api<any[]>("/investigations?limit=100"), []);
+  const [deleted, setDeleted] = useState(false);
+  const list = useLoad(() => api<any[]>(`/conversations?deleted=${deleted}`), [deleted]);
   return (
     <>
-      <PageHead title="Investigations" sub="Saved investigations you are allowed to see"><Link className="btn" to="/investigate">New investigation</Link></PageHead>
+      <PageHead title="Investigations" sub="Conversations you are allowed to see. Anyone with access can join one.">
+        <label className="inline"><input type="checkbox" checked={deleted} onChange={(e) => setDeleted(e.target.checked)} /> Show deleted</label>
+        <Link className="btn" to="/investigate">New investigation</Link>
+      </PageHead>
       <ErrorBox error={list.error} />
       <div className="card">
         <table>
-          <thead><tr><th>Question</th><th>Scope</th><th>Status</th><th>By</th><th>Tools</th><th>Created</th></tr></thead>
+          <thead><tr><th>Conversation</th><th>Scope</th><th>Started by</th><th>People</th><th>Messages</th><th>Last activity</th></tr></thead>
           <tbody>
-            {list.data?.map((i) => (
-              <tr key={i.id}>
-                <td><Link to={`/investigations/${i.id}`}>{i.question}</Link>{i.summary && <div className="small muted">{i.summary}</div>}</td>
-                <td className="mono small">{i.environment}/{i.namespace}</td>
-                <td><StatusBadge status={i.status} /></td>
-                <td className="small">{i.created_by}</td>
-                <td>{i.tool_calls}</td>
-                <td><Time iso={i.created_at} /></td>
+            {list.data?.map((c) => (
+              <tr key={c.id}>
+                <td><Link to={`/conversations/${c.id}`}>{c.title}</Link> {c.running && <Badge kind="info">running</Badge>}</td>
+                <td className="mono small">{c.environment}/{c.namespace}</td>
+                <td className="small">{c.owner}</td><td>{c.participants}</td><td>{c.messages}</td>
+                <td><Time iso={c.updated_at} /></td>
               </tr>
             ))}
           </tbody>
         </table>
-        {list.data && !list.data.length && <div className="empty">No investigations.</div>}
+        {list.data && !list.data.length && <div className="empty">{deleted ? "Nothing deleted." : "No conversations yet."}</div>}
       </div>
+    </>
+  );
+}
+
+function Bubble({ m, conversation, onChange, children }: { m: any; conversation: string; onChange: () => void; children?: React.ReactNode }) {
+  const [error, setError] = useState<unknown>();
+  async function act(path: string, method: string) {
+    setError(null);
+    try { await api(`/conversations/${conversation}/messages/${m.id}${path}`, { method }); onChange(); } catch (e) { setError(e); }
+  }
+  return (
+    <div className={`bubble ${m.role}`}>
+      <div className="row between small muted">
+        <span>{m.author ?? "unknown"} · <Time iso={m.created_at} /></span>
+        <span className="row">
+          {m.can_delete && <button className="ghost small" onClick={() => confirm("Delete this message? It is hidden from everyone and from MOKS, and can be restored.") && act("", "DELETE")}>Delete</button>}
+          {m.can_restore && <button className="ghost small" onClick={() => act("/restore", "POST")}>Restore</button>}
+        </span>
+      </div>
+      {m.deleted ? <div className="small muted">Deleted by {m.deleted_by ?? "someone"}.</div> : <div className="bubble-text">{m.content}</div>}
+      <ErrorBox error={error} />
+      {!m.deleted && children}
+    </div>
+  );
+}
+
+export function ConversationView() {
+  const { id } = useParams();
+  const { can } = useAuth();
+  const nav = useNavigate();
+  const c = useLoad(() => api<any>(`/conversations/${id}`), [id]);
+  const [text, setText] = useState("");
+  const [note, setNote] = useState(false);
+  const [person, setPerson] = useState("");
+  const [open, setOpen] = useState<Record<string, boolean>>({});
+  const [error, setError] = useState<unknown>();
+  const [busy, setBusy] = useState(false);
+  useInterval(() => { if (!c.loading) c.reload(); }, 4000); // other people's messages arrive here
+  const d = c.data?.id === id ? c.data : undefined;
+  async function run(fn: () => Promise<any>) {
+    setError(null);
+    try { await fn(); c.reload(); return true; } catch (e) { setError(e); return false; }
+  }
+  async function send(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    if (await run(() => api(`/conversations/${id}/messages`, { method: "POST", body: { content: text, ask: !note && d.can_ask } }))) setText("");
+    setBusy(false);
+  }
+  if (!d) return <ErrorBox error={c.error} />;
+  const answered = new Set(d.messages.filter((m: any) => m.role === "assistant").map((m: any) => m.investigation_id));
+  const lastAnswer = [...d.messages].reverse().find((m: any) => m.role === "assistant" && !m.deleted);
+  return (
+    <>
+      <PageHead title={d.title} sub={<span className="row small"><span className="mono">{d.environment}/{d.namespace}</span><span>started by {d.owner}</span>{d.running && <Badge kind="info">MOKS is working</Badge>}{d.deleted && <Badge kind="warn">deleted</Badge>}</span>}>
+        {d.can_manage && !d.deleted && <button className="ghost" onClick={async () => { if (confirm("Delete this whole conversation? It is hidden from everyone, and you can restore it from Show deleted.") && await run(() => api(`/conversations/${id}`, { method: "DELETE" }))) nav("/investigations"); }}>Delete conversation</button>}
+        {d.can_manage && d.deleted && <button onClick={() => run(() => api(`/conversations/${id}/restore`, { method: "POST" }))}>Restore conversation</button>}
+      </PageHead>
+      <ErrorBox error={error} />
+      <div className="card filters" style={{ marginBottom: 14 }}>
+        <div className="row small"><span className="muted">In this conversation:</span>{d.participants.map((p: any) => <Badge key={p.email} kind={p.owner ? "info" : "neutral"}>{p.email}</Badge>)}</div>
+        {!d.deleted && (d.is_participant || can("admin.policies")) && <form className="filters" style={{ marginLeft: "auto" }} onSubmit={async (e) => { e.preventDefault(); if (await run(() => api(`/conversations/${id}/participants`, { method: "POST", body: { email: person } }))) setPerson(""); }}>
+          <label>Add a person<input type="email" required value={person} onChange={(e) => setPerson(e.target.value)} placeholder="teammate@example.com" /></label>
+          <button className="ghost">Add</button>
+        </form>}
+      </div>
+      <div className="stack">
+        {d.messages.map((m: any) => {
+          const expanded = open[m.id] ?? m.id === lastAnswer?.id;
+          return (
+            <Bubble key={m.id} m={m} conversation={d.id} onChange={c.reload}>
+              {m.role === "assistant" && m.investigation_id && <>
+                <button className="ghost small" onClick={() => setOpen({ ...open, [m.id]: !expanded })}>{expanded ? "Hide report and evidence" : "Show report and evidence"}</button>
+                {expanded && <InvestigationView embeddedId={m.investigation_id} />}
+              </>}
+              {m.role === "user" && m.investigation_id && !answered.has(m.investigation_id) && !["completed", "failed", "cancelled"].includes(d.statuses[m.investigation_id]) && <InvestigationView embeddedId={m.investigation_id} />}
+            </Bubble>
+          );
+        })}
+      </div>
+      {!d.deleted && <form className="card stack" style={{ marginTop: 14 }} onSubmit={send}>
+        <div className="chat-input">
+          <textarea rows={2} required minLength={3} maxLength={2000} value={text} onChange={(e) => setText(e.target.value)} aria-label="Message"
+            placeholder={note || !d.can_ask ? "Write a note for the others" : "Ask a follow-up, for example: what did the previous container log before it crashed?"}
+            onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) (e.currentTarget.form as HTMLFormElement).requestSubmit(); }} />
+          <button disabled={busy}>{busy ? "Sending…" : note || !d.can_ask ? "Post" : "Ask MOKS"}</button>
+        </div>
+        {d.can_ask ? <label className="inline"><input type="checkbox" checked={note} onChange={(e) => setNote(e.target.checked)} /> Note only, don't ask MOKS</label>
+          : <div className="small muted">You can post notes here. Asking MOKS needs the Investigator role for this scope.</div>}
+      </form>}
     </>
   );
 }
@@ -140,9 +232,9 @@ function FollowUp({ id }: { id: string }) {
     e.preventDefault();
     setError(null);
     try {
-      const r = await api<{ id: string }>(`/investigations/${id}/follow-up`, { method: "POST", body: { question: q } });
+      const r = await api<{ conversation_id: string }>(`/investigations/${id}/follow-up`, { method: "POST", body: { question: q } });
       setQ("");
-      nav(`/investigations/${r.id}`);
+      nav(`/conversations/${r.conversation_id}`);
     } catch (err) {
       setError(err);
     }
@@ -187,8 +279,9 @@ function Relationships({ data, primary }: { data?: { nodes: any[]; edges: any[] 
   );
 }
 
-export function InvestigationView() {
-  const { id } = useParams();
+export function InvestigationView({ embeddedId }: { embeddedId?: string }) {
+  const params = useParams();
+  const id = embeddedId ?? params.id;
   const detail = useLoad(() => api<any>(`/investigations/${id}`), [id]);
   const [open, setOpen] = useState<string | null>(null);
   const [propose, setPropose] = useState<any>(null);
@@ -212,7 +305,8 @@ export function InvestigationView() {
       <ErrorBox error={detail.error} />
       {inv && (
         <>
-          <PageHead title={inv.question} sub={
+          {embeddedId ? <div className="row small muted" style={{ margin: "8px 0" }}><Badge>{scopeEv?.mode === "llm" ? `LLM: ${scopeEv.llm}` : report?.generated_by === "rules" ? "rule-based" : inv.mode}</Badge><span>{inv.tool_calls} tool calls</span><StatusBadge status={inv.status} />
+            {!TERMINAL.has(inv.status) && <button className="danger small" onClick={cancel}>Cancel</button>}</div> : <PageHead title={inv.question} sub={
             <span className="row small">
               <span className="mono">{inv.environment}/{inv.namespace}</span>
               <span>window {new Date(inv.time_from).toLocaleTimeString()}–{new Date(inv.time_to).toLocaleTimeString()}</span>
@@ -227,7 +321,8 @@ export function InvestigationView() {
             {!TERMINAL.has(inv.status) && <button className="danger" onClick={cancel}>Cancel</button>}
             <Link className="btn ghost" style={{ border: "1px solid var(--border)", color: "var(--text)", background: "transparent" }}
               to={`/investigate?env=${inv.environment}&ns=${inv.namespace}&q=${encodeURIComponent(inv.question)}`}>Re-run</Link>
-          </PageHead>
+            {inv.conversation_id && <Link className="btn" to={`/conversations/${inv.conversation_id}`}>Open conversation</Link>}
+          </PageHead>}
           {inv.error && <div className="alert error" style={{ marginBottom: 12 }}>{inv.error}</div>}
           <div className="grid" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(300px, 1fr)", alignItems: "start" }}>
             <div className="stack">
@@ -241,8 +336,8 @@ export function InvestigationView() {
                 <table><tbody>{inv.actions.map((a: any) => <tr key={a.id}><td><Link to={`/actions/${a.id}`}>{a.action}</Link> <span className="mono small">{a.target}</span></td>
                   <td><Badge kind={a.status === "succeeded" ? "ok" : a.status === "reconciliation_required" ? "bad" : "neutral"}>{a.status}</Badge></td>
                   <td className="small">{a.validated ? "recovery validated" : "not validated"}</td></tr>)}</tbody></table></div>}
-              {inv.follow_ups?.length > 0 && <div className="card"><h2>Follow-ups</h2>{inv.follow_ups.map((f: any) => <div key={f.id}><StatusBadge status={f.status} /> <Link to={`/investigations/${f.id}`}>{f.question}</Link></div>)}</div>}
-              {TERMINAL.has(inv.status) && can("investigation.run") && <FollowUp id={inv.id} />}
+              {!embeddedId && inv.follow_ups?.length > 0 && <div className="card"><h2>Follow-ups</h2>{inv.follow_ups.map((f: any) => <div key={f.id}><StatusBadge status={f.status} /> <Link to={`/investigations/${f.id}`}>{f.question}</Link></div>)}</div>}
+              {!embeddedId && TERMINAL.has(inv.status) && can("investigation.run") && <FollowUp id={inv.id} />}
             </div>
             <div className="stack">
               {report && <Coverage report={report} />}

@@ -94,7 +94,8 @@ async def test_investigation_runs_matching_skill_and_suggests_allowlisted_action
     rep = done.report
     assert "crashloop-triage" in [s["name"] for s in rep["skills"]]
     events = (await client.get(f"/moks/api/investigations/{inv['id']}/events")).text
-    assert "[crashloop-triage] output of the crashed container" in events  # skill step ran through the executor
+    assert "what app wrote before it stopped" in events  # logs are read before skills, which reuse that evidence
+    assert "[crashloop-triage] env, envFrom, probes" in events or "containers, restarts and exit codes" in events
     actions = {(a["action"], a["target_name"]) for a in rep["skill_actions"]}
     assert ("rollback_deployment", "payments") in actions
     assert all(a["action"] in ("rollback_deployment", "open_pull_request", "patch_resources", "apply_config_patch") for a in rep["skill_actions"])

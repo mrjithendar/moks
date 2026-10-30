@@ -52,6 +52,12 @@ ACTIONS = Counter("moks_actions_total", "Remediation actions", ["action", "outco
 APPROVALS = Counter("moks_approvals_total", "Approval decisions", ["decision"])
 
 
+BACKUP_LAST_SUCCESS = Gauge("moks_backup_last_success_timestamp_seconds", "When the last backup succeeded")
+BACKUP_LAST_RUN_OK = Gauge("moks_backup_last_run_success", "1 if the latest backup run succeeded, otherwise 0")
+DATABASE_SIZE = Gauge("moks_database_size_bytes", "Size of the MOKS database")
+DATABASE_VOLUME = Gauge("moks_database_volume_bytes", "Capacity of the database volume")
+
+
 def start_metrics_server(port: int) -> None:
     try:
         start_http_server(port)

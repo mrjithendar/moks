@@ -24,7 +24,7 @@ config:
   bootstrapAdmins: ""     # comma separated emails that become Administrator at first sign-in
   apiDocs: false
   logLevel: INFO
-  maxToolCalls: 16
+  maxToolCalls: 24
   maxDurationSeconds: 180
   maxQueryWindowMinutes: 360
   workerConcurrency: 2
@@ -83,6 +83,19 @@ postgres:
   passwordSecret: moks-postgres   # key: password
   uid: 70                         # 70 for postgres:*-alpine; 999 for Debian images such as pgvector/pgvector
   fixVolumePermissions: false     # true for storage that ignores fsGroup (minikube hostPath)
+
+# Encrypted, off-cluster backups of the bundled database. On EKS use RDS backups instead.
+# Needs the moks-backup Secret: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, MOKS_BACKUP_ENCRYPTION_KEY.
+backup:
+  enabled: false
+  schedule: "17 * * * *"    # hourly, so at most about an hour of data is lost
+  bucket: ""
+  prefix: moks/mk4
+  endpoint: ""              # empty for AWS S3; https://<account>.r2.cloudflarestorage.com for R2
+  region: ""                # us-east-1 for S3, auto for R2
+  secret: moks-backup
+  workspace: 2Gi            # scratch space for one dump; raise it as the database grows
+  retention: {hourly: 48, daily: 30, monthly: 12}
 
 # Retrieval (RAG) backend. Exactly one runs:
 #   postgres   - full-text search in the MOKS database (no extra pods; keyword-only)

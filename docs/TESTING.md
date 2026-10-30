@@ -87,6 +87,13 @@ went to reconciliation, the in-cluster connector gained an explicit write target
 read-only, and an explicit 360-minute schedule was kept. Chrome drove Metrics, saved queries, Detection
 dry run, Skills, Knowledge, Investigate and deep links with no console errors.
 
+## Backups
+
+`backend/tests/test_backup.py` covers encryption (tampering, truncation, wrong key), retention, promotion
+between tiers, a failed upload never pruning, overdue detection, and two real cycles with `pg_dump` and
+`pg_restore` against PostgreSQL 17. Row counts matched and the audit chain verified. The bucket is an
+in-memory stand-in: no backup has reached real storage and no restore has used mk4 data yet.
+
 ## Live status (2026-10-30)
 
 Checks against mk4, read-only, running the image built from `bf00ffc` (migration `0008`).
