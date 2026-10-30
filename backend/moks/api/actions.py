@@ -56,7 +56,7 @@ async def _out(db: AsyncSession, plan: ActionPlan) -> dict:
 @router.get("/catalog")
 async def catalog(ctx: AuthContext = Depends(get_auth)) -> list[dict]:
     return [{"action": a.name, "title": a.title, "target_kinds": a.target_kinds, "operation": a.operation,
-             "params": a.params.model_json_schema(), "approval_outside_production": a.approval_outside_production} for a in CATALOG.values()]
+             "params": a.params.model_json_schema(), "approval_outside_production": a.approval_outside_production} for a in CATALOG.values() if not a.cluster_wide]
 
 
 @router.post("/plans", status_code=201)

@@ -13,6 +13,7 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .. import velero
 from ..connectors.base import ConnectorError
 from ..models import Environment
 
@@ -75,6 +76,42 @@ class PullRequestP(Params):
     content: str = Field(max_length=200_000)
     title: str = Field(min_length=5, max_length=200)
     body: str = Field(default="", max_length=10_000)
+
+
+class NamespacesP(Params):
+    included_namespaces: list[str] = Field(min_length=1, max_length=100)
+    excluded_namespaces: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator("included_namespaces", "excluded_namespaces")
+    @classmethod
+    def _patterns(cls, v: list[str]) -> list[str]:
+        bad = [n for n in v if not velero.NS_PATTERN.match(n)]
+        if bad:
+            raise ValueError(f"invalid namespace pattern {bad[0]!r}")
+        return v
+
+
+class BackupP(NamespacesP):
+    include_volumes: bool = True
+    ttl_days: int = Field(default=velero.KEEP_DAYS, ge=1, le=velero.KEEP_DAYS)
+
+
+class ScheduleP(BackupP):
+    cron: str = Field(pattern=r"^[0-9*/,-]+( [0-9*/,-]+){4}$", max_length=60)
+    paused: bool = False
+
+
+class RestoreP(NamespacesP):
+    existing_resource_policy: Literal["none", "update"] = "none"
+    restore_volumes: bool = True
+    pre_restore_backup: bool = True
+
+
+class ConfigureP(Params):
+    store_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    endpoint: str = Field(max_length=200)
+    bucket: str = Field(max_length=63)
+    prefix: str = Field(max_length=300)
 
 
 # ---- Reviewed patches --------------------------------------------------------------------------
@@ -215,6 +252,7 @@ class ActionDef:
     params: type[Params]
     approval_outside_production: bool
     operation: str
+    cluster_wide: bool = False  # reaches every namespace, so only a binding on '*' may use it
 
 
 CATALOG: dict[str, ActionDef] = {a.name: a for a in [
@@ -232,6 +270,14 @@ CATALOG: dict[str, ActionDef] = {a.name: a for a in [
               "DELETE v1 Pod (UID precondition; only pods managed by a controller)"),
     ActionDef("open_pull_request", "Open a draft pull request with a proposed change", ("Repository",), PullRequestP, True,
               "GitHub: create branch, commit file, open draft PR"),
+    ActionDef("velero_configure", "Connect this cluster's Velero to Cloudflare R2", ("BackupStorageLocation",), ConfigureP, True,
+              "Write Velero's R2 Secrets (never read) and apply a BackupStorageLocation", cluster_wide=True),
+    ActionDef("velero_backup", "Back up this cluster to Cloudflare R2", ("Backup",), BackupP, False,
+              "CREATE velero.io/v1 Backup", cluster_wide=True),
+    ActionDef("velero_schedule", "Create or change a backup schedule", ("Schedule",), ScheduleP, True,
+              "CREATE or PATCH velero.io/v1 Schedule", cluster_wide=True),
+    ActionDef("velero_restore", "Restore this cluster from a backup", ("Restore",), RestoreP, True,
+              "CREATE velero.io/v1 Restore", cluster_wide=True),
 ]}
 
 
@@ -240,6 +286,8 @@ def needs_approval(action: ActionDef, env: Environment) -> bool:
 
 
 def check_policy(action: str, params: Params, env: Environment, pre: dict | None, target_kind: str | None = None) -> None:
+    if action in ("velero_backup", "velero_schedule", "velero_restore"):
+        velero.check_scope(env, params.included_namespaces, params.excluded_namespaces)  # type: ignore[attr-defined]
     if action == "apply_config_patch":
         check_patch(target_kind or "", params.patch, env, {"spec": pre["spec"]} if pre and "spec" in pre else None)  # type: ignore[attr-defined]
     if action == "delete_pod" and pre is not None and not pre.get("owner"):
@@ -261,6 +309,39 @@ def check_policy(action: str, params: Params, env: Environment, pre: dict | None
             raise ConnectorError("bad_request", "specify at least one request or limit")
 
 
+def _describe_velero(action: str, params: Params, target: str, pre: dict) -> dict[str, Any]:
+    if action == "velero_configure":
+        p: ConfigureP = params  # type: ignore[assignment]
+        return {"impact": f"Velero in this cluster stores backups in R2 bucket {p.bucket} under {p.prefix} ({p.endpoint}). "
+                          "The R2 keys, the encryption key and the volume repository password are written to Secrets in Velero's namespace.",
+                "blast_radius": "Velero's configuration only. No workload changes.",
+                "preconditions": ["the R2 settings are the ones shown here (fingerprint in the parameters)", "Velero is installed in this cluster"],
+                "validation": ["Velero reports the location Available within the timeout"],
+                "rollback": "Remove the location with kubectl. An existing volume repository password is never changed."}
+    p2: Any = params
+    scope = f"namespaces {', '.join(p2.included_namespaces)}, excluding {', '.join(p2.excluded_namespaces) or 'none'}"
+    if action in ("velero_backup", "velero_schedule"):
+        when = "One backup now" if action == "velero_backup" else f"Scheduled backups ({p2.cron})"
+        volumes = "with PersistentVolume data" if p2.include_volumes else "without PersistentVolume data"
+        return {"impact": f"{when} of {scope}, {volumes}, including Secret objects. Each is kept {p2.ttl_days} days, then Velero deletes it from R2.",
+                "blast_radius": "No workload changes. Volume copies add disk and network load on each node while they run.",
+                "preconditions": ["the R2 location is Available"], "validation": ["Velero accepts the object (it does not fail validation)"],
+                "rollback": "Delete the backup or schedule. A running backup stops at its next item."}
+    p3: RestoreP = params  # type: ignore[assignment]
+    overwrite = p3.existing_resource_policy == "update"
+    return {"impact": f"{target} is restored into {scope}, including Secret objects"
+                      + (" and PersistentVolume data" if p3.restore_volumes else "") + ". Objects that exist now are "
+                      + ("OVERWRITTEN with the backed-up version." if overwrite else "left unchanged; only missing objects are created."),
+            "blast_radius": "Every namespace listed. Restored workloads start as soon as they are created, and restored Secrets may hold old credentials."
+                            + (" Live changes made since the backup are lost." if overwrite else ""),
+            "preconditions": [f"the backup is still the reviewed one (UID {pre.get('uid')}, {pre.get('backup_phase')}, {pre.get('backup_errors')} errors)",
+                              "the R2 location is Available"]
+                             + (["a pre-restore backup of the same namespaces completes first, or the restore does not start"] if p3.pre_restore_backup else []),
+            "validation": ["Velero accepts the restore. It then runs on its own: follow it on the Backups page."],
+            "rollback": ("Restore the pre-restore backup. " if p3.pre_restore_backup else "No pre-restore backup was requested, so this cannot be undone from MOKS. ")
+                        + "Objects created by the restore are not removed automatically."}
+
+
 def describe(action: str, params: Params, target: str, ns: str, pre: dict | None, history: dict | None = None) -> dict[str, Any]:
     """Reviewable plan text: preconditions, validation, impact, blast radius, rollback."""
     replicas = (pre or {}).get("replicas")
@@ -271,6 +352,8 @@ def describe(action: str, params: Params, target: str, ns: str, pre: dict | None
                           "any Service selecting these pods keeps ready endpoints"]
     recovery = "If validation fails and the changed fields still hold what MOKS applied, MOKS restores "
     manual = ". If anyone changed those fields meanwhile, MOKS stops and asks for manual reconciliation."
+    if action.startswith("velero_"):
+        return _describe_velero(action, params, target, pre or {})
     if action == "restart_deployment":
         return {"impact": f"Pods of {target} are replaced one by one following its rolling-update strategy ({replicas} replicas).",
                 "blast_radius": f"{replicas} pod(s) of {target} in {ns}; brief capacity dip if maxUnavailable > 0.",

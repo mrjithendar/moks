@@ -19,7 +19,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import audit
+from .. import audit, velero
 from ..connectors import registry
 from ..connectors.base import ConnectorError
 from ..incidents import add_event
@@ -89,6 +89,8 @@ async def create_plan(db: AsyncSession, principal: Principal, env: Environment, 
         raise PlanError(400, f"{action!r} is not an allowlisted action ({', '.join(CATALOG)})")
     if target_kind not in spec.target_kinds:
         raise PlanError(400, f"{action} targets {', '.join(spec.target_kinds)}, not {target_kind}")
+    if spec.cluster_wide != (namespace == "-"):
+        raise PlanError(400, f"{action} is {'cluster-wide: its namespace must be -' if spec.cluster_wide else 'namespaced'}")
     _require(principal, P.ACTION_REQUEST, env, namespace)
     try:
         parsed = spec.params.model_validate(params)
@@ -110,7 +112,10 @@ async def create_plan(db: AsyncSession, principal: Principal, env: Environment, 
             if k8s is None:
                 raise PlanError(409, "no kubernetes connector in this environment")
             identity = {**write_target(k8s[0]), "cluster_uid": await k8s[1].cluster_uid()}
-            if target_kind == "Deployment":
+            if target_kind in velero.KINDS:
+                pre = await velero.preflight(k8s[1], action, target_name)
+                auto_recover = False
+            elif target_kind == "Deployment":
                 meta = await k8s[1].deployment_meta(namespace, target_name)
                 pre = {"resourceVersion": meta["resourceVersion"], "uid": meta["uid"], "generation": meta["generation"], "replicas": meta["replicas"],
                        "revision": meta["summary"].get("revision"), "images": meta["images"], "ready": meta["summary"].get("ready")}

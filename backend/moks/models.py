@@ -406,6 +406,23 @@ class BackupRun(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class BackupStore(Base):
+    """Cloudflare R2 settings. `credentials` holds references (env or file), never values."""
+    __tablename__ = "backup_stores"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(40), unique=True)
+    account_id: Mapped[str] = mapped_column(String(32))
+    bucket: Mapped[str] = mapped_column(String(63))
+    prefix: Mapped[str] = mapped_column(Text, default="clusters")
+    jurisdiction: Mapped[str] = mapped_column(String(10), default="default")
+    credentials: Mapped[dict] = mapped_column(JSONB, default=dict)
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    last_test_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_test_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    last_test_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class SkillPolicy(Base):
     __tablename__ = "skill_policies"
     name: Mapped[str] = mapped_column(String(120), primary_key=True)
@@ -502,6 +519,7 @@ class ActionPlan(Base):
     status: Mapped[str] = mapped_column(String(30), default="pending")
     hash_version: Mapped[int] = mapped_column(Integer, default=2)
     target_identity: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # connector, write target, cluster
+    execution_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # who owns this execution, see actions/executor.py
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     mutation_state: Mapped[str] = mapped_column(String(20), default="none")  # none | intent | applied | not_applied | unknown

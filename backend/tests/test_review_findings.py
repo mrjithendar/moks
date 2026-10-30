@@ -511,8 +511,9 @@ async def _run_plan(writer):
     async def factory(env, connector_id=None):
         return writer
     ex.writer_factory = factory
-    pid = await ex.claim_plan("t")
-    await ex.execute_plan(pid)
+    claim = await ex.claim_plan("t")
+    pid = claim.plan_id
+    await ex.execute_plan(claim)
     async with session_scope() as db:
         return await db.get(ActionPlan, pid)
 

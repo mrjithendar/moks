@@ -86,6 +86,8 @@ class Settings(BaseSettings):
     sync_timezone: str = "UTC"  # shown beside knowledge sync schedules
     database_volume_gib: int = 10  # capacity of the database volume, for the size alert
     diagnostics_namespace: str = "moks-diagnostics"
+    velero_namespace: str = "velero"
+    own_namespace: str = "moks"  # never a restore target: restoring over MOKS would stop the restore
 
     # Alerts: shared secret for the Alertmanager / Grafana webhook (Authorization: Bearer ...)
     alert_webhook_token: str = Field(default="", repr=False)

@@ -30,6 +30,7 @@ class P(StrEnum):
     ACTION_APPROVE = "action.approve"
     AUDIT_READ = "audit.read"
     FINOPS_READ = "finops.read"              # cost, allocation and rightsizing data
+    BACKUP_READ = "backup.read"              # cluster backup status (names and counts, no contents)
     INCIDENT_WRITE = "incident.write"        # create/update incidents and timelines
     ADMIN_USERS = "admin.users"
     ADMIN_CONNECTORS = "admin.connectors"
@@ -38,9 +39,9 @@ class P(StrEnum):
 
 
 _VIEWER = {P.OVERVIEW_READ, P.INVESTIGATION_READ}
-_INVESTIGATOR = _VIEWER | {P.INVESTIGATION_RUN, P.EXPLORER_READ, P.METRICS_RAW_QUERY, P.FINOPS_READ, P.INCIDENT_WRITE}
+_INVESTIGATOR = _VIEWER | {P.INVESTIGATION_RUN, P.EXPLORER_READ, P.METRICS_RAW_QUERY, P.FINOPS_READ, P.INCIDENT_WRITE, P.BACKUP_READ}
 _OPERATOR = _INVESTIGATOR | {P.ACTION_REQUEST, P.ACTION_EXECUTE}
-_APPROVER = _VIEWER | {P.ACTION_APPROVE, P.FINOPS_READ}
+_APPROVER = _VIEWER | {P.ACTION_APPROVE, P.FINOPS_READ, P.BACKUP_READ}
 _ADMIN = set(P)
 
 ROLES: dict[str, frozenset[P]] = {

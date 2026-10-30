@@ -68,9 +68,10 @@ async def _run(writer):
         return writer
 
     ex.writer_factory = factory
-    pid = await ex.claim_plan("test-exec")
-    assert pid
-    await ex.execute_plan(pid)
+    claim = await ex.claim_plan("test-exec")
+    assert claim
+    pid = claim.plan_id
+    await ex.execute_plan(claim)
     return await _get(pid)
 
 
@@ -311,9 +312,9 @@ async def _claimed(client, t):
     h = await login(client, t[1])
     plan = (await _plan(client, h, t[0])).json()
     await _approve_and_queue(client, t, plan)
-    pid = await ex.claim_plan("dead-executor")
-    assert pid
-    return pid
+    claim = await ex.claim_plan("dead-executor")
+    assert claim
+    return claim.plan_id
 
 
 async def _expire(pid, state):

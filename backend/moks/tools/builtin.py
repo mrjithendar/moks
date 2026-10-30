@@ -106,6 +106,17 @@ async def k8s_config_audit(ctx: ToolContext, a: NamespaceArgs) -> ToolResult:
                       {"api": f"GET pods and warning events in {a.namespace} (Secret/ConfigMap contents are not read)"})
 
 
+async def k8s_backup_status(ctx: ToolContext, a: NoArgs) -> ToolResult:
+    """Velero's own status objects. No backup contents and no Secret data are read."""
+    from .. import velero
+
+    s = await velero.status(ctx.connector("kubernetes"))
+    bad = [f["text"] for f in s["findings"] if f["severity"] == "bad"]
+    data = {**s, "backups": s["backups"][:20], "restores": s["restores"][:10]}
+    return ToolResult(f"{len(s['backups'])} backups, {len(s['schedules'])} schedules, {len(s['findings'])} findings" + (f": {bad[0]}" if bad else ""), data,
+                      {"api": "GET velero.io backups, restores, schedules, backupstoragelocations"})
+
+
 async def k8s_list_pods(ctx: ToolContext, a: ListPodsArgs) -> ToolResult:
     pods, truncated = await ctx.connector("kubernetes").list_pods(a.namespace, a.label_selector)
     if a.unhealthy_only:
@@ -524,6 +535,8 @@ async def loki_query(ctx: ToolContext, a: LokiQueryArgs) -> ToolResult:
 TOOLS: list[ToolSpec] = [
     ToolSpec("k8s_triage", "Namespace health check: pods, warning events, services/endpoints, workloads, ingresses, with automatic findings. Start here.",
              "kubernetes", NamespaceArgs, k8s_triage),
+    ToolSpec("k8s_backup_status", "Cluster backups: Velero location health, recent backups and restores with errors, schedules, and automatic findings. Contains no Secret data.",
+             "kubernetes", NoArgs, k8s_backup_status, cluster_scoped=True, namespace_arg=None),
     ToolSpec("k8s_list_pods", "List pods with status, readiness, restarts and problem reasons.", "kubernetes", ListPodsArgs, k8s_list_pods),
     ToolSpec("k8s_describe_pod", "Pod details: containers, images, resources, probes, state, last state, env names, events.", "kubernetes", PodArgs, k8s_describe_pod),
     ToolSpec("k8s_pod_logs", "Container logs (tail), optionally from the previous crashed instance.", "kubernetes", PodLogArgs, k8s_pod_logs),

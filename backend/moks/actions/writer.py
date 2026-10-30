@@ -12,6 +12,7 @@ import copy
 from datetime import datetime, timezone
 from typing import Any
 
+from .. import velero
 from ..config import get_settings
 from ..connectors.base import ConnectorError
 from ..connectors.kubernetes import KubernetesConnector, _api_error, summarize_pod, summarize_workload
@@ -41,6 +42,44 @@ class KubernetesWriter:
             if getattr(exc, "status", None) == 409:
                 raise ConnectorError("conflict", f"{what}: the resource changed since it was read (409 conflict)") from None
             raise _api_error(exc, what) from None
+
+    async def _custom(self):
+        return await self.read.custom()
+
+    async def velero_get(self, plural: str, name: str) -> dict:
+        return await self.read.velero_get(plural, name)
+
+    async def velero_create(self, plural: str, body: dict) -> dict:
+        custom = await self._custom()
+        return await self._call(f"create velero {plural}", custom.create_namespaced_custom_object, velero.GROUP, velero.VERSION, velero.namespace(), plural, body)
+
+    async def velero_apply(self, plural: str, name: str, body: dict) -> dict:
+        custom = await self._custom()
+        try:
+            return await self.velero_create(plural, body)
+        except ConnectorError as exc:
+            if exc.kind != "conflict":
+                raise
+        return await self._call(f"patch velero {plural}/{name}", custom.patch_namespaced_custom_object, velero.GROUP, velero.VERSION,
+                                velero.namespace(), plural, name, {"spec": body["spec"]}, _content_type=MERGE)
+
+    async def write_secret(self, name: str, data: dict[str, str], overwrite: bool) -> str:
+        """Create or overwrite, and nothing else: the role has no get or list on Secrets, and values
+        never appear in a result. An existing Secret is kept when overwrite is False."""
+        core = await self.read.core()
+        ns = velero.namespace()
+        body = {"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "data": data,
+                "metadata": {"name": name, "namespace": ns, "labels": {"app.kubernetes.io/managed-by": "moks"}}}
+        try:
+            await self._call(f"create secret {name}", core.create_namespaced_secret, ns, body)
+            return "created"
+        except ConnectorError as exc:
+            if exc.kind != "conflict":
+                raise
+        if not overwrite:
+            return "kept"
+        await self._call(f"update secret {name}", core.patch_namespaced_secret, name, ns, {"data": data}, _content_type=MERGE)
+        return "updated"
 
     async def deployment(self, ns: str, name: str) -> dict:
         apps = await self._apps()

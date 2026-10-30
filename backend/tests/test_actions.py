@@ -53,9 +53,10 @@ async def _run_executor(writer):
         return writer
 
     ex.writer_factory = factory
-    pid = await ex.claim_plan("test-exec")
-    assert pid
-    await ex.execute_plan(pid)
+    claim = await ex.claim_plan("test-exec")
+    assert claim
+    pid = claim.plan_id
+    await ex.execute_plan(claim)
     async with session_scope() as db:
         return await db.get(ActionPlan, pid)
 

@@ -8,6 +8,17 @@ reconciliation_required for a person, and is never retried.
 
 Recovery is conflict-aware. It touches only the fields MOKS changed, and only while they still hold
 what MOKS applied; if anyone changed them meanwhile, it stops and asks for reconciliation.
+
+Ownership. Every claim gets a unique token. A heartbeat, checkpoint or final result is written only
+while the row still holds that token in status executing, and the lease is judged by database time
+only. When a renewal is refused, or the database stays unreachable until the lease could have
+lapsed, the running work is cancelled and writes nothing more. Ownership is checked again right
+before each mutation and before recovery.
+
+The limit of this fence: a database lease cannot atomically fence a request to the Kubernetes API.
+A request sent just before the lease lapses can land after it. UID and resourceVersion preconditions
+limit that request to the exact object version that was reviewed, the durable intent checkpoint
+sends the plan to reconciliation_required, and nothing is ever replayed.
 """
 from __future__ import annotations
 
@@ -18,11 +29,11 @@ import socket
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
-from .. import audit
+from .. import audit, velero
 from ..config import get_settings
 from ..connectors import registry
 from ..connectors.base import ConnectorError
@@ -39,7 +50,17 @@ VALIDATION_TIMEOUT = 180
 POLL = 3.0
 LEASE_SECONDS = 90
 OBJECT_SETTLE_SECONDS = 30
+PRE_RESTORE_TIMEOUT = 900  # plans run one at a time, so a long wait would hold back urgent rollbacks
 UNCERTAIN = {"timeout", "unavailable"}  # the request may have reached the API server
+
+
+class LeaseLost(Exception):
+    """This process may no longer act on the plan. It must stop and write nothing."""
+
+
+class Claim(NamedTuple):
+    plan_id: uuid.UUID
+    token: uuid.UUID
 
 
 async def _default_writer(env: Environment, connector_id: str | None = None):
@@ -66,30 +87,90 @@ def worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}-executor"
 
 
-async def claim_plan(wid: str) -> uuid.UUID | None:
+async def claim_plan(wid: str) -> Claim | None:
     async with session_scope() as db:
         row = (await db.execute(text("""
             UPDATE action_plans SET status = 'executing', worker_id = :w, executed_at = now(), heartbeat_at = now(),
-                lease_expires_at = now() + make_interval(secs => :lease)
+                execution_token = gen_random_uuid(), lease_expires_at = now() + make_interval(secs => :lease)
             WHERE id = (SELECT id FROM action_plans WHERE status = 'queued' ORDER BY queued_at FOR UPDATE SKIP LOCKED LIMIT 1)
-            RETURNING id"""), {"w": wid, "lease": LEASE_SECONDS})).first()
-        return row[0] if row else None
+            RETURNING id, execution_token"""), {"w": wid, "lease": LEASE_SECONDS})).first()
+        return Claim(row[0], row[1]) if row else None
 
 
-async def _heartbeat(plan_id: uuid.UUID) -> None:
+class Fence:
+    """Proof of ownership for one execution. Local time only ever shortens how long it is trusted:
+    the clock starts before the renewal is sent, so a stalled process never overestimates its lease."""
+
+    OWNED = "id = :id AND status = 'executing' AND execution_token = :token AND lease_expires_at > now()"
+
+    def __init__(self, claim: Claim):
+        self.plan_id, self.token = claim
+        self.renewed_at = time.monotonic()
+        self.lost = False
+
+    @property
+    def lapsed(self) -> bool:
+        return time.monotonic() - self.renewed_at >= LEASE_SECONDS
+
+    async def renew(self) -> bool:
+        started = time.monotonic()
+        async with session_scope() as db:
+            row = (await db.execute(text(f"""UPDATE action_plans SET heartbeat_at = now(),
+                        lease_expires_at = GREATEST(lease_expires_at, now() + make_interval(secs => :lease))
+                     WHERE {self.OWNED} RETURNING id"""), {"lease": LEASE_SECONDS, "id": self.plan_id, "token": self.token})).first()
+        if row:
+            self.renewed_at = started
+        return row is not None
+
+    async def verify(self) -> None:
+        """Fail closed: not being able to prove ownership counts as not having it."""
+        if self.lost or self.lapsed:
+            self.lost = True
+            raise LeaseLost("the execution lease lapsed")
+        try:
+            async with session_scope() as db:
+                row = (await db.execute(text(f"SELECT 1 FROM action_plans WHERE {self.OWNED}"), {"id": self.plan_id, "token": self.token})).first()
+        except Exception as exc:
+            self.lost = True
+            raise LeaseLost(f"ownership could not be verified ({type(exc).__name__})") from None
+        if row is None:
+            self.lost = True
+            raise LeaseLost("this execution no longer owns the plan")
+
+    async def checkpoint(self, state: str, **values: Any) -> None:
+        """Committed before moving on: this row is what survives a crash. Refused without ownership."""
+        try:
+            async with session_scope() as db:
+                plan = (await db.execute(select(ActionPlan).where(ActionPlan.id == self.plan_id, ActionPlan.status == "executing", ActionPlan.execution_token == self.token,
+                                                                  ActionPlan.lease_expires_at > func.now()).with_for_update())).scalar_one_or_none()
+                if plan is not None:
+                    plan.mutation_state = state
+                    plan.checkpoint = {**(plan.checkpoint or {}), **values, "updated_at": datetime.now(timezone.utc).isoformat()}
+        except Exception as exc:
+            self.lost = True
+            raise LeaseLost(f"the checkpoint could not be recorded ({type(exc).__name__})") from None
+        if plan is None:
+            self.lost = True
+            raise LeaseLost("this execution no longer owns the plan")
+
+
+async def _heartbeat(fence: Fence, work: asyncio.Task) -> None:
+    """Renews the lease. A refusal stops the work at once. Database errors are retried only until
+    the lease could have lapsed, because after that another decision may already have been made."""
     while True:
         await asyncio.sleep(LEASE_SECONDS / 3)
-        async with session_scope() as db:
-            await db.execute(text("""UPDATE action_plans SET heartbeat_at = now(), lease_expires_at = now() + make_interval(secs => :lease)
-                                     WHERE id = :id AND status = 'executing'"""), {"lease": LEASE_SECONDS, "id": plan_id})
-
-
-async def _checkpoint(plan_id: uuid.UUID, state: str, **values: Any) -> None:
-    """Committed before moving on: this row is what survives a crash."""
-    async with session_scope() as db:
-        plan = await db.get(ActionPlan, plan_id)
-        plan.mutation_state = state
-        plan.checkpoint = {**(plan.checkpoint or {}), **values, "updated_at": datetime.now(timezone.utc).isoformat()}
+        try:
+            refused = not await asyncio.wait_for(fence.renew(), LEASE_SECONDS / 3)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("lease renewal failed", extra={"event": "action_lease_renewal_failed"})
+            refused = fence.lapsed
+        if refused:
+            fence.lost = True
+            log.error("execution lease lost, stopping", extra={"event": "action_lease_lost"})
+            work.cancel()
+            return
 
 
 async def validate_deployment(writer, ns: str, name: str, expect_replicas: int | None, timeout: int, baseline: dict[str, int] | None = None) -> dict:
@@ -199,7 +280,7 @@ async def _validate(writer, kind: str, ns: str, name: str, expected: dict, timeo
     return await validate_object(writer, ns, kind, name, expected, timeout, before_obj)
 
 
-async def _recover(writer, kind: str, ns: str, name: str, uid: str, before: dict, applied: dict, timeout: int, baseline: dict, before_obj: dict) -> tuple[str, dict]:
+async def _recover(fence: Fence, writer, kind: str, ns: str, name: str, uid: str, before: dict, applied: dict, timeout: int, baseline: dict, before_obj: dict) -> tuple[str, dict]:
     """Restore only what MOKS changed, and only if it still holds what MOKS applied."""
     live = await writer.get_object(ns, kind, name)
     if live["metadata"].get("uid") != uid:
@@ -215,6 +296,7 @@ async def _recover(writer, kind: str, ns: str, name: str, uid: str, before: dict
             node = node.setdefault(part, {})
         node[p[-1]] = before[".".join(p)]
     patch = paths_patch([list(p) for p in paths], live, wanted)
+    await fence.checkpoint("applied", recovery_intent=patch)  # proves ownership and survives a crash
     out = await writer.merge_patch(ns, kind, name, live["metadata"]["resourceVersion"], patch)
     expected = {p: before[".".join(p)] for p in paths if before[".".join(p)] is not None}
     replicas = before.get("spec.replicas") if kind == "Deployment" else None
@@ -222,20 +304,20 @@ async def _recover(writer, kind: str, ns: str, name: str, uid: str, before: dict
     return ("recovered" if v["ok"] else "failed"), {"status": "applied", "output": out, "validation": v}
 
 
-async def _delete_pod(plan_id: uuid.UUID, writer, ns: str, name: str, pre: dict, timeout: int, result: dict) -> str:
+async def _delete_pod(fence: Fence, writer, ns: str, name: str, pre: dict, timeout: int, result: dict) -> str:
     obj = await writer.get_object(ns, "Pod", name)
     if obj["metadata"].get("uid") != pre.get("uid"):
         raise ConnectorError("conflict", f"pod {ns}/{name} is a different pod than the one reviewed")
     if not any(o.get("controller") for o in obj["metadata"].get("ownerReferences") or []):
         raise ConnectorError("forbidden", "this pod no longer has a controller")
-    await _checkpoint(plan_id, "intent", uid=pre["uid"], kind="Pod")
+    await fence.checkpoint("intent", uid=pre["uid"], kind="Pod")
     try:
         out = await writer.delete_managed_pod(ns, name, pre["uid"])
     except ConnectorError as exc:
         if exc.kind not in UNCERTAIN:
-            await _checkpoint(plan_id, "not_applied", error=exc.message)
+            await fence.checkpoint("not_applied", error=exc.message)
         raise
-    await _checkpoint(plan_id, "applied")
+    await fence.checkpoint("applied")
     result["steps"].append({"step": "execute", "output": out})
     deadline = time.monotonic() + timeout
     while True:
@@ -254,13 +336,13 @@ async def _delete_pod(plan_id: uuid.UUID, writer, ns: str, name: str, pre: dict,
         await asyncio.sleep(POLL)
 
 
-async def _execute_object(plan_id: uuid.UUID, writer, snap: dict, identity: dict | None, timeout: int, result: dict) -> str:
+async def _execute_object(fence: Fence, writer, snap: dict, identity: dict | None, timeout: int, result: dict) -> str:
     action, kind, ns, name, params = snap["action"], snap["target_kind"], snap["namespace"], snap["target_name"], snap["params"]
     pre = snap["pre_state"] or {}
     if identity and await writer.cluster_uid() != identity.get("cluster_uid"):
         raise ConnectorError("conflict", "the write target is not the cluster this plan was approved for")
     if action == "delete_pod":
-        return await _delete_pod(plan_id, writer, ns, name, pre, timeout, result)
+        return await _delete_pod(fence, writer, ns, name, pre, timeout, result)
     obj = await writer.get_object(ns, kind, name)
     uid = obj["metadata"].get("uid")
     if pre.get("uid") and uid != pre["uid"]:
@@ -273,17 +355,17 @@ async def _execute_object(plan_id: uuid.UUID, writer, snap: dict, identity: dict
     paths = _touched(action, kind, params)
     before = {".".join(p): get_path(obj, p) for p in paths}
     baseline = {p["name"]: p.get("restarts") or 0 for p in await writer.pods_of(ns, name)} if kind == "Deployment" else {}
-    await _checkpoint(plan_id, "intent", uid=uid, kind=kind, before=before)
+    await fence.checkpoint("intent", uid=uid, kind=kind, before=before)
     try:
         out = await _mutate(writer, action, ns, name, kind, rv, params)
     except ConnectorError as exc:
         if exc.kind not in UNCERTAIN:
-            await _checkpoint(plan_id, "not_applied", error=exc.message)  # refused by the API server
+            await fence.checkpoint("not_applied", error=exc.message)  # refused by the API server
         raise
     result["steps"].append({"step": "execute", "output": out})
     after = await writer.get_object(ns, kind, name)
     applied = {".".join(p): get_path(after, p) for p in paths}
-    await _checkpoint(plan_id, "applied", applied=applied, restart_baseline=baseline)
+    await fence.checkpoint("applied", applied=applied, restart_baseline=baseline)
     expected = patch_leaves(kind, params["patch"]) if action == "apply_config_patch" else {("spec", "replicas"): params["replicas"]} if action == "scale_deployment" else {}
     expect_replicas = params["replicas"] if action == "scale_deployment" else None
     v = await _validate(writer, kind, ns, name, expected, timeout, expect_replicas, baseline, obj)
@@ -292,19 +374,145 @@ async def _execute_object(plan_id: uuid.UUID, writer, snap: dict, identity: dict
         return "succeeded"
     if not snap["auto_recover"]:
         return "failed"
-    status, rec = await _recover(writer, kind, ns, name, uid, before, applied, timeout, baseline, obj)
+    status, rec = await _recover(fence, writer, kind, ns, name, uid, before, applied, timeout, baseline, obj)
     result["recovery"] = rec
     return status
 
 
-async def execute_plan(plan_id: uuid.UUID) -> None:
+async def _velero_phase(writer, plural: str, name: str, timeout: int, wanted: set[str]) -> dict:
+    deadline = time.monotonic() + timeout
+    while True:
+        obj = await writer.velero_get(plural, name)
+        phase = (obj.get("status") or {}).get("phase")
+        if phase in wanted or time.monotonic() > deadline:
+            return obj
+        await asyncio.sleep(POLL)
+
+
+async def _velero_started(writer, plural: str, name: str, timeout: int) -> dict:
+    """Velero runs for hours. The plan only proves it was accepted; the Backups page follows the rest."""
+    obj = await _velero_phase(writer, plural, name, timeout, {"InProgress", "WaitingForPluginOperations", *velero.DONE})
+    phase = (obj.get("status") or {}).get("phase")
+    ok = phase not in (None, "New", "FailedValidation", "Failed")
+    return {"ok": ok, "phase": phase, "reason": None if ok else "; ".join((obj.get("status") or {}).get("validationErrors") or []) or f"Velero reports {phase or 'no phase'}"}
+
+
+async def _execute_velero(fence: Fence, writer, snap: dict, identity: dict | None, timeout: int, result: dict) -> str:
+    action, name, params, pre = snap["action"], snap["target_name"], snap["params"], snap["pre_state"] or {}
+    if identity and await writer.cluster_uid() != identity.get("cluster_uid"):
+        raise ConnectorError("conflict", "the write target is not the cluster this plan was approved for")
+    suffix = str(fence.plan_id)[:8]
+    if action == "velero_configure":
+        async with session_scope() as db:
+            store = await velero.get_store(db)
+        if store is None or velero.fingerprint(store) != params["store_fingerprint"]:
+            raise ConnectorError("conflict", "the R2 settings changed after this plan was made")
+        payloads = velero.secret_payloads(store)  # fails before anything is written
+        await fence.checkpoint("intent")
+        for secret, data, overwrite in payloads:
+            await fence.verify()
+            result["steps"].append({"step": "secret", "name": secret, "outcome": await writer.write_secret(secret, data, overwrite)})
+        await fence.verify()
+        await writer.velero_apply("backupstoragelocations", velero.LOCATION, velero.location_body(store, snap["env"].name))
+        await fence.checkpoint("applied")
+        obj = await _velero_phase(writer, "backupstoragelocations", velero.LOCATION, timeout, {"Available"})
+        phase = (obj.get("status") or {}).get("phase")
+        result["validation"] = {"ok": phase == "Available", "reason": None if phase == "Available" else f"location is {phase or 'not validated yet'}: {(obj.get('status') or {}).get('message') or 'no message'}"}
+        return "succeeded" if phase == "Available" else "failed"
+    if action == "velero_backup":
+        backup = f"moks-{suffix}"
+        await fence.checkpoint("intent")
+        await writer.velero_create("backups", velero.backup_body(backup, params))
+        await fence.checkpoint("applied", object=backup)
+        result["steps"].append({"step": "backup", "name": backup})
+        result["validation"] = await _velero_started(writer, "backups", backup, timeout)
+    elif action == "velero_schedule":
+        await fence.checkpoint("intent")
+        await writer.velero_apply("schedules", name, velero.schedule_body(name, params))
+        await fence.checkpoint("applied", object=name)
+        result["steps"].append({"step": "schedule", "name": name})
+        result["validation"] = {"ok": True, "reason": None}
+    else:
+        live = await writer.velero_get("backups", name)
+        if (live.get("metadata") or {}).get("uid") != pre.get("uid"):
+            raise ConnectorError("conflict", f"backup {name} is not the one reviewed")
+        if params.get("pre_restore_backup", True):
+            safety = f"pre-restore-{suffix}"
+            await fence.checkpoint("intent")
+            await writer.velero_create("backups", velero.backup_body(safety, {**params, "include_volumes": params.get("restore_volumes", True), "ttl_days": velero.KEEP_DAYS}))
+            await fence.checkpoint("applied", pre_restore_backup=safety)
+            obj = await _velero_phase(writer, "backups", safety, PRE_RESTORE_TIMEOUT, velero.DONE)
+            phase = (obj.get("status") or {}).get("phase")
+            result["steps"].append({"step": "pre_restore_backup", "name": safety, "phase": phase})
+            if phase != "Completed":
+                result["validation"] = {"ok": False, "reason": f"the pre-restore backup is {phase or 'not finished'}, so the restore did not start"}
+                return "failed"
+        restore = f"moks-{suffix}"
+        await fence.checkpoint("intent")
+        await writer.velero_create("restores", velero.restore_body(restore, name, params))
+        await fence.checkpoint("applied", object=restore)
+        result["steps"].append({"step": "restore", "name": restore})
+        result["validation"] = await _velero_started(writer, "restores", restore, timeout)
+    return "succeeded" if result["validation"]["ok"] else "failed"
+
+
+async def _perform(fence: Fence, snapshot: dict, identity: dict | None, env, timeout: int, result: dict) -> str:
+    plan_id = fence.plan_id
+    params, writer = snapshot["params"], None
+    try:
+        if snapshot["action"] == "diagnostic_session":
+            from types import SimpleNamespace
+
+            from ..diagnostics import service as diag
+
+            writer = await writer_factory(env)
+            await fence.checkpoint("intent")
+            out = await diag.start(SimpleNamespace(params=params), writer)
+            await fence.checkpoint("applied")
+            result["steps"].append({"step": "start_session", "output": out})
+            result["validation"] = {"ok": out["ok"], "reason": None if out["ok"] else f"session failed ({out['phase']})"}
+            return "succeeded" if out["ok"] else "failed"
+        if snapshot["action"] == "open_pull_request":
+            async with session_scope() as db:
+                conns, _ = await registry.for_environment(db, env.id)
+            git = conns.get("git")
+            if git is None:
+                raise ConnectorError("config", "no git connector")
+            git[1].check_repo(params["repository"])
+            branch = f"moks/{str(plan_id)[:8]}"
+            await fence.checkpoint("intent")
+            pr = await git[1].provider.open_pull_request(params["repository"], params.get("base", "main"), branch, params["path"],
+                                                        params["content"], f"MOKS: {params['title']}", params["title"],
+                                                        params.get("body", "") + f"\n\nProposed through MOKS action plan {plan_id}.")
+            await fence.checkpoint("applied")
+            result["steps"].append({"step": "execute", "pull_request": pr})
+            result["validation"] = {"ok": bool(pr.get("number")), "pull_request": pr.get("url")}
+            return "succeeded" if pr.get("number") else "failed"
+        writer = await writer_factory(env, (identity or {}).get("connector_id"))
+        run = _execute_velero if snapshot["action"] in velero.ACTIONS else _execute_object
+        return await run(fence, writer, snapshot, identity, timeout, result)
+    finally:
+        if writer is not None:
+            try:
+                await writer.aclose()
+            except Exception:
+                pass
+
+
+async def execute_plan(claim: Claim) -> None:
+    plan_id, token = claim
+    fence = Fence(claim)
     async with session_scope() as db:
         plan = await db.get(ActionPlan, plan_id)
         env = await db.get(Environment, plan.environment_id)
+        if plan.status != "executing" or plan.execution_token != token:
+            log.error("claim no longer valid", extra={"event": "action_claim_stale"})
+            return
         try:
             await verify_for_execution(db, plan, env)
         except PlanError as exc:
-            plan.status, plan.finished_at = "failed", datetime.now(timezone.utc)
+            plan.status, plan.finished_at, plan.execution_token = "failed", datetime.now(timezone.utc), None
+            plan.lease_expires_at = None
             plan.result = {"error": exc.message, "stage": "verification"}
             await audit.record(db, action="action.execute", actor_id=plan.executed_by, resource_type="action_plan", resource_id=str(plan.id),
                                environment=env.name, namespace=plan.namespace, decision="deny", outcome="denied", details={"reason": exc.message})
@@ -316,59 +524,31 @@ async def execute_plan(plan_id: uuid.UUID) -> None:
         env_snapshot = env
     result: dict[str, Any] = {"steps": []}
     status = "failed"
-    ns, name, params = snapshot["namespace"], snapshot["target_name"], snapshot["params"]
-    timeout = VALIDATION_TIMEOUT
-    writer = None
-    heartbeat = asyncio.create_task(_heartbeat(plan_id))
+    ns, name = snapshot["namespace"], snapshot["target_name"]
+    work = asyncio.create_task(_perform(fence, snapshot, identity, env_snapshot, VALIDATION_TIMEOUT, result))
+    heartbeat = asyncio.create_task(_heartbeat(fence, work))
     try:
-        if snapshot["action"] == "diagnostic_session":
-            from types import SimpleNamespace
-
-            from ..diagnostics import service as diag
-
-            writer = await writer_factory(env_snapshot)
-            await _checkpoint(plan_id, "intent")
-            out = await diag.start(SimpleNamespace(params=params), writer)
-            await _checkpoint(plan_id, "applied")
-            result["steps"].append({"step": "start_session", "output": out})
-            result["validation"] = {"ok": out["ok"], "reason": None if out["ok"] else f"session failed ({out['phase']})"}
-            status = "succeeded" if out["ok"] else "failed"
-        elif snapshot["action"] == "open_pull_request":
-            async with session_scope() as db:
-                conns, _ = await registry.for_environment(db, env_snapshot.id)
-            git = conns.get("git")
-            if git is None:
-                raise ConnectorError("config", "no git connector")
-            git[1].check_repo(params["repository"])
-            branch = f"moks/{str(plan_id)[:8]}"
-            await _checkpoint(plan_id, "intent")
-            pr = await git[1].provider.open_pull_request(params["repository"], params.get("base", "main"), branch, params["path"],
-                                                        params["content"], f"MOKS: {params['title']}", params["title"],
-                                                        params.get("body", "") + f"\n\nProposed through MOKS action plan {plan_id}.")
-            await _checkpoint(plan_id, "applied")
-            result["steps"].append({"step": "execute", "pull_request": pr})
-            result["validation"] = {"ok": bool(pr.get("number")), "pull_request": pr.get("url")}
-            status = "succeeded" if pr.get("number") else "failed"
-        else:
-            writer = await writer_factory(env_snapshot, (identity or {}).get("connector_id"))
-            status = await _execute_object(plan_id, writer, snapshot, identity, timeout, result)
+        status = await work
+    except asyncio.CancelledError:
+        if not fence.lost:
+            work.cancel()
+            raise
+    except LeaseLost:
+        pass
     except ConnectorError as exc:
         result["error"] = f"{exc.kind}: {exc.message}"
-        status = "failed"
     except Exception as exc:
         log.exception("execution error", extra={"event": "action_error"})
         result["error"] = f"internal error ({type(exc).__name__})"
-        status = "failed"
     finally:
         heartbeat.cancel()
-        if writer is not None:
-            try:
-                await writer.aclose()
-            except Exception:
-                pass
+    if fence.lost:  # reconcile_stale() decides the outcome from the durable checkpoint
+        ACTIONS.labels(snapshot["action"], "lease_lost").inc()
+        log.error("execution stopped without a result", extra={"event": "action_lease_lost"})
+        return
     async with session_scope() as db:
-        plan = await db.get(ActionPlan, plan_id)
-        if plan.status != "executing" or plan.worker_id != snapshot["worker_id"]:  # the lease was lost and this plan was already reconciled
+        plan = (await db.execute(select(ActionPlan).where(ActionPlan.id == plan_id).with_for_update())).scalar_one()
+        if plan.status != "executing" or plan.execution_token != token:  # the lease was lost and this plan was already reconciled
             log.error("late execution result ignored", extra={"event": "action_late_result"})
             plan.result = {**(plan.result or {}), "late_result": {"status": status, **result}}
             return
@@ -376,7 +556,7 @@ async def execute_plan(plan_id: uuid.UUID) -> None:
             status = "reconciliation_required"  # the mutation may have landed, or validation never finished
         ACTIONS.labels(snapshot["action"], status).inc()
         plan.status, plan.result, plan.finished_at = status, result, datetime.now(timezone.utc)
-        plan.lease_expires_at = None
+        plan.lease_expires_at, plan.execution_token = None, None
         await audit.record(db, action="action.execute", actor_id=plan.executed_by, resource_type="action_plan", resource_id=str(plan.id),
                            environment=env_snapshot.name, namespace=ns, decision="allow", outcome=status,
                            details={"action": snapshot["action"], "target": f"{snapshot['target_kind']}/{name}", "result": result})
@@ -390,15 +570,15 @@ async def execute_plan(plan_id: uuid.UUID) -> None:
 async def reconcile_stale() -> list[uuid.UUID]:
     """Plans whose executor stopped renewing its lease. Nothing is retried: a plan that never reached
     its mutation fails, and any other waits for a person, with the live values to compare against."""
-    now = datetime.now(timezone.utc)
     async with session_scope() as db:
+        now = (await db.execute(select(func.now()))).scalar_one()
         stale = (await db.execute(select(ActionPlan).where(ActionPlan.status == "executing").where(
-            (ActionPlan.lease_expires_at.is_(None)) | (ActionPlan.lease_expires_at < now)).with_for_update(skip_locked=True))).scalars().all()
+            (ActionPlan.lease_expires_at.is_(None)) | (ActionPlan.lease_expires_at <= now)).with_for_update(skip_locked=True))).scalars().all()
         for plan in stale:
             env = await db.get(Environment, plan.environment_id)
             attempted = plan.mutation_state != "none"
             plan.status = "reconciliation_required" if attempted else "failed"
-            plan.finished_at, plan.lease_expires_at = now, None
+            plan.finished_at, plan.lease_expires_at, plan.execution_token = now, None, None
             plan.result = {**(plan.result or {}), "error": "the executor stopped while this plan was running; " + (
                 "the change may or may not have been applied" if attempted else "no change was attempted"), "stage": "reconciliation"}
             ACTIONS.labels(plan.action, plan.status).inc()
@@ -459,9 +639,9 @@ async def run_executor(stop: asyncio.Event | None = None) -> None:
                 await db.execute(text("UPDATE action_plans SET status = 'expired' WHERE status IN ('pending','approved') AND expires_at < now()"))
                 await close_undecided_sessions(db)
             await reconcile_stale()
-            pid = await claim_plan(wid)
-            if pid:
-                await execute_plan(pid)
+            claim = await claim_plan(wid)
+            if claim:
+                await execute_plan(claim)
                 continue
             await diag.tick()
         except Exception:

@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from .. import velero
 from ..redaction import redact
 from .base import ConnectorError, resolve_credential_path
 
@@ -148,6 +149,22 @@ class KubernetesConnector:
         from kubernetes_asyncio import client
 
         return client.AppsV1Api(await self._client())
+
+    async def custom(self):
+        from kubernetes_asyncio import client
+
+        return client.CustomObjectsApi(await self._client())
+
+    # ---- Velero (its own objects only; these hold names and counts, never Secret data) ---
+
+    async def velero_list(self, plural: str) -> list[dict]:
+        custom = await self.custom()
+        items, _ = await self._list(f"list velero {plural}", custom.list_namespaced_custom_object, velero.GROUP, velero.VERSION, velero.namespace(), plural)
+        return items
+
+    async def velero_get(self, plural: str, name: str) -> dict:
+        custom = await self.custom()
+        return await self._call(f"get velero {plural}/{name}", custom.get_namespaced_custom_object, velero.GROUP, velero.VERSION, velero.namespace(), plural, name)
 
     # ---- Discovery ----------------------------------------------------------------------
 

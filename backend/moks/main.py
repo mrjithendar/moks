@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from sqlalchemy import text
 
 from . import __version__
-from .api import actions, admin, alerts, conversations, detections, diagnostics, environments, evals, explorer, finops, incidents, investigations, knowledge, metrics, multi, skills
+from .api import actions, admin, alerts, backups, conversations, detections, diagnostics, environments, evals, explorer, finops, incidents, investigations, knowledge, metrics, multi, skills
 from .auth import routes as auth_routes
 from .config import get_settings
 from .connectors import registry
@@ -101,7 +101,7 @@ def create_app() -> FastAPI:
     router.include_router(investigations.router)
     router.include_router(explorer.router)
     router.include_router(admin.router)
-    for extra in (incidents, knowledge, finops, actions, diagnostics, alerts, evals, skills, multi, metrics, detections, conversations):
+    for extra in (incidents, knowledge, finops, actions, diagnostics, alerts, evals, skills, multi, metrics, detections, conversations, backups):
         router.include_router(extra.router)
 
     @router.get("/health", tags=["health"])
