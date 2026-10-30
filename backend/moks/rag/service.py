@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -21,7 +22,7 @@ from ..models import Chunk, Document, EmbeddingIndex, KnowledgeSource, LLMConfig
 from ..observability import RETRIEVAL_LATENCY
 from ..rbac import Principal
 from . import access
-from .backends import OpenSearchBackend, PostgresBackend, rrf
+from .backends import OpenSearchBackend, PineconeBackend, PostgresBackend, rrf
 from .chunking import chunk, kind_of, title_of
 from .secrets import clean, exclusion_reason
 
@@ -32,6 +33,7 @@ REINDEX_EMBED_TRIES = 7  # a reindex is the one place worth waiting out a provid
 INDEX_LOCK = 7_203_114  # advisory lock: creating the first index
 BUILD_STALE = timedelta(minutes=30)
 _opensearch: OpenSearchBackend | None = None
+_pinecone: PineconeBackend | None = None
 
 
 def opensearch() -> OpenSearchBackend:
@@ -40,6 +42,20 @@ def opensearch() -> OpenSearchBackend:
         s = get_settings()
         _opensearch = OpenSearchBackend(s.opensearch_url, s.opensearch_username, s.opensearch_password, s.opensearch_verify_tls)
     return _opensearch
+
+
+def pinecone() -> PineconeBackend:
+    global _pinecone
+    if _pinecone is None:
+        s = get_settings()
+        _pinecone = PineconeBackend(os.environ.get("MOKS_CRED_PINECONE_API_KEY"), s.pinecone_cloud, s.pinecone_region)
+    return _pinecone
+
+
+def external(name: str | None = None):
+    """The index outside PostgreSQL, if any. Both kinds offer the same index lifecycle."""
+    name = name or backend_name()
+    return opensearch() if name == "opensearch" else pinecone() if name == "pinecone" else None
 
 
 def backend_name() -> str:
@@ -94,8 +110,8 @@ async def ensure_index(db: AsyncSession) -> EmbeddingIndex:
     db.add(idx)
     await db.flush()
     idx.index_name = f"moks-chunks-{str(idx.id)[:8]}"
-    if backend_name() == "opensearch":
-        await opensearch().ensure_index(idx.index_name, idx.dimensions)
+    if external():
+        await external().ensure_index(idx.index_name, idx.dimensions)
     return idx
 
 
@@ -170,8 +186,8 @@ async def index_document(db: AsyncSession, src: KnowledgeSource, path: str, raw:
         embeddings = await _embed(db, idx, [f"{c.heading}\n{c.text}" for c in chunks]) if chunks else None
     except LLMError as exc:
         log.warning("embedding failed; indexed keyword-only", extra={"event": "embedding_failed", "errorType": exc.kind})
-    if backend_name() == "opensearch":
-        await opensearch().index_chunks(idx.index_name, rows, embeddings)
+    if external():
+        await external().index_chunks(idx.index_name, rows, embeddings)
     else:
         await PostgresBackend(db).index_chunks(idx, rows, embeddings)
     doc.indexed_at = datetime.now(timezone.utc)
@@ -181,10 +197,10 @@ async def index_document(db: AsyncSession, src: KnowledgeSource, path: str, raw:
 async def _drop_chunks(db: AsyncSession, doc: Document) -> None:
     if doc.id is None:
         return
-    if backend_name() == "opensearch":
+    if external():
         idx = await active_index(db)
         if idx:
-            await opensearch().delete_document(idx.index_name, doc.id)
+            await external().delete_document(idx.index_name, doc.id)
     await db.execute(delete(Chunk).where(Chunk.document_id == doc.id))
 
 
@@ -197,8 +213,8 @@ async def remove_document(db: AsyncSession, doc: Document) -> None:
 async def _index_batch(db: AsyncSession, new: EmbeddingIndex, batch: list) -> None:
     rows = [_row(c, d, src) for c, d, src in batch]
     embs = await _embed(db, new, [f"{r['heading']}\n{r['text']}" for r in rows], tries=REINDEX_EMBED_TRIES)
-    if backend_name() == "opensearch":
-        await opensearch().index_chunks(new.index_name, rows, embs)
+    if external():
+        await external().index_chunks(new.index_name, rows, embs)
     else:
         await PostgresBackend(db).index_chunks(new, rows, embs)
 
@@ -235,8 +251,8 @@ async def reindex(db: AsyncSession) -> dict:
     new_id = new.id
     done: set = set()
     try:
-        if backend_name() == "opensearch":
-            await opensearch().ensure_index(new.index_name, new.dimensions)
+        if external():
+            await external().ensure_index(new.index_name, new.dimensions)
         while True:  # the second pass catches documents indexed while the first ran
             rows = await _pending_rows(db, done)
             if not rows:
@@ -273,8 +289,8 @@ async def cleanup_retired() -> int:
         done = 0
         for idx in rows:
             try:
-                if idx.backend == "opensearch" and idx.index_name:
-                    await opensearch().drop_index(idx.index_name)
+                if idx.backend in ("opensearch", "pinecone") and idx.index_name:
+                    await external(idx.backend).drop_index(idx.index_name)
                 elif idx.backend == "postgres" and await PostgresBackend(db).has_vector():
                     await db.execute(text("DELETE FROM chunk_embeddings WHERE index_id = :i"), {"i": idx.id})
             except ConnectorError as exc:
@@ -306,8 +322,8 @@ async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8,
     if idx and idx.dimensions and cfg and idx.llm_config_id == cfg.id and idx.model_key == model_key(cfg):
         try:
             qv = (await provider_for(cfg).embed([query]))[0]
-            if backend_name() == "opensearch":
-                rankings.append(await opensearch().vector(idx.index_name, qv, envs, nss, pool))
+            if external():
+                rankings.append(await external().vector(idx.index_name, qv, envs, nss, pool))
             elif await PostgresBackend(db).has_vector():
                 rankings.append(await PostgresBackend(db).vector(qv, idx.id, envs, nss, pool))
             mode = "hybrid"
@@ -369,9 +385,9 @@ async def rescope_source(db: AsyncSession, src: KnowledgeSource, old: tuple[str,
             moved.append(d)
     await db.flush()
     idx = await active_index(db)
-    if moved and idx is not None and backend_name() == "opensearch":
+    if moved and idx is not None and external():
         for d in moved:
-            await opensearch().update_scope(idx.index_name, d.id, d.environment, d.namespace)
+            await external().update_scope(idx.index_name, d.id, d.environment, d.namespace)
     return len(moved)
 
 

@@ -22,9 +22,13 @@ data:
   MOKS_MAX_QUERY_WINDOW_MINUTES: {{ .Values.config.maxQueryWindowMinutes | quote }}
   MOKS_WORKER_CONCURRENCY: {{ .Values.config.workerConcurrency | quote }}
   MOKS_COOKIE_SECURE: "true"
-  MOKS_RAG_BACKEND: {{ ternary "opensearch" "postgres" (eq .Values.rag.backend "opensearch") | quote }}
+  MOKS_RAG_BACKEND: {{ has .Values.rag.backend (list "opensearch" "pinecone") | ternary .Values.rag.backend "postgres" | quote }}
   {{- if eq .Values.rag.backend "opensearch" }}
   MOKS_OPENSEARCH_URL: "http://moks-opensearch:9200"
+  {{- end }}
+  {{- if eq .Values.rag.backend "pinecone" }}
+  MOKS_PINECONE_CLOUD: {{ .Values.rag.pinecone.cloud | quote }}
+  MOKS_PINECONE_REGION: {{ .Values.rag.pinecone.region | quote }}
   {{- end }}
   MOKS_DIAGNOSTICS_NAMESPACE: {{ .Values.diagnostics.namespace | quote }}
   MOKS_ALERT_POLL_SECONDS: {{ .Values.config.alertPollSeconds | quote }}

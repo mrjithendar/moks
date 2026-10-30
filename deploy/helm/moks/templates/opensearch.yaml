@@ -79,6 +79,6 @@ spec:
     - from: [{podSelector: {matchLabels: {app: moks}}}]
       ports: [{port: 9200, protocol: TCP}]
   egress: []
-{{- else if not (has .Values.rag.backend (list "postgres" "pgvector")) }}
-{{- fail "rag.backend must be postgres, pgvector or opensearch (only one backend at a time)" }}
+{{- else if not (has .Values.rag.backend (list "postgres" "pgvector" "pinecone")) }}
+{{- fail "rag.backend must be postgres, pgvector, opensearch or pinecone (only one backend at a time)" }}
 {{- end }}

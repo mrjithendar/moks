@@ -101,9 +101,12 @@ backup:
 #   postgres   - full-text search in the MOKS database (no extra pods; keyword-only)
 #   pgvector   - postgres + vectors: set postgres.image to pgvector/pgvector:0.8.7-pg17 and postgres.uid 999
 #                (fresh installs; moving an existing alpine database to the Debian image needs dump/restore)
+#   pinecone   - keyword search in the MOKS database, vectors in Pinecone (no extra pods). Needs
+#                MOKS_CRED_PINECONE_API_KEY in the Secret, an active embedding model and a reindex.
 #   opensearch - single-node OpenSearch (BM25 + k-NN), ~2.5 GiB memory, persistent volume
 rag:
   backend: postgres
+  pinecone: {cloud: aws, region: us-east-1}
   opensearch:
     image: opensearchproject/opensearch:3.9.0
     heapSize: 1g           # container limit = heap x 2

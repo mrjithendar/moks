@@ -202,6 +202,21 @@ The API's init container runs migration `0002` automatically. Take a backup firs
    model, investigations and **Analyze with AI** use rule-based reports. Set input and output prices there
    so FinOps can show cost as well as tokens. An inactive provider can be deleted; its usage history stays.
 
+## Using Pinecone for vectors
+
+Pinecone can hold the vectors instead of OpenSearch, with keyword search staying in PostgreSQL. It needs no
+pods, so `rag.backend: pinecone` frees about 2.5 GiB on mk4.
+
+1. Add `MOKS_CRED_PINECONE_API_KEY` to `moks-secrets`.
+2. Set `rag.backend: pinecone`, and `rag.pinecone.cloud` and `region` if not `aws` and `us-east-1`.
+3. Sync, then check an embedding model is active and passes **Test** under **LLM providers**.
+4. Run a reindex under **Runbooks & knowledge**. MOKS creates an index named `moks-chunks-<id>`, so the key
+   needs permission to create indexes. Until the reindex finishes, search is keyword-only.
+
+Pinecone receives vectors, document ids, and the environment and namespace each document is scoped to. It
+never receives chunk text. Access is still checked again in PostgreSQL before results are returned. To go
+back, set `rag.backend` to its old value; PostgreSQL still holds everything needed to rebuild.
+
 ## Investigation conversations
 
 Each investigation is a conversation. Every question starts a new turn with its own evidence, and MOKS sees

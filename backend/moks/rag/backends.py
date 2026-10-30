@@ -5,9 +5,12 @@ postgres   - full-text (websearch_to_tsquery, ts_rank_cd) and, when the pgvector
              installed and an embedding index is active, cosine k-NN; fused with RRF.
 opensearch - one index per embedding version (moks-chunks-<version>), BM25 multi_match plus
              knn_vector; fused client-side with RRF so no search pipeline plugin is required.
+pinecone   - vectors only, one index per embedding version. Keyword search stays in PostgreSQL, which
+             holds the text. Pinecone receives vectors, document ids and scope names, never chunk text.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -202,3 +205,114 @@ class OpenSearchBackend:
 
     async def drop_index(self, index_name: str) -> None:
         await self._req("DELETE", f"/{index_name}", ok404=True)
+
+
+class PineconeBackend:
+    """Pinecone REST API, pinned to one version. A derived copy: PostgreSQL can rebuild all of it."""
+
+    name = "pinecone"
+    API_VERSION = "2026-07"
+    CONTROL = "https://api.pinecone.io"
+    NAMESPACE = "moks"
+    UPSERT_BATCH = 25  # high-dimension vectors serialize to tens of KB each
+    READY_SECONDS = 120
+    POLL_SECONDS = 2.0
+    TRIES = 4
+
+    def __init__(self, api_key: str | None, cloud: str = "aws", region: str = "us-east-1", transport: httpx.AsyncBaseTransport | None = None):
+        if not api_key:
+            raise ConnectorError("config", "MOKS_CRED_PINECONE_API_KEY is required for the pinecone backend")
+        self.cloud, self.region = cloud, region
+        self.client = httpx.AsyncClient(timeout=30, transport=transport, headers={"Api-Key": api_key, "X-Pinecone-Api-Version": self.API_VERSION})
+        self._hosts: dict[str, str] = {}
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+    async def _req(self, method: str, url: str, body: Any = None, ok404: bool = False) -> dict:
+        for attempt in range(self.TRIES):
+            try:
+                r = await self.client.request(method, url, json=body)
+            except httpx.HTTPError as exc:
+                raise ConnectorError("unavailable", f"cannot reach Pinecone ({type(exc).__name__})", retryable=True) from None
+            if r.status_code != 429 or attempt == self.TRIES - 1:
+                break
+            await asyncio.sleep(2 ** attempt)
+        if r.status_code == 404 and ok404:
+            return {}
+        if r.status_code in (401, 403):
+            raise ConnectorError("auth", f"Pinecone rejected the credentials (HTTP {r.status_code})")
+        if r.status_code >= 400:
+            raise ConnectorError("unavailable" if r.status_code >= 500 or r.status_code == 429 else "bad_request", f"Pinecone {method}: {r.status_code} {r.text[:300]}")
+        return r.json() if r.content else {}
+
+    async def _describe(self, name: str) -> dict:
+        return await self._req("GET", f"{self.CONTROL}/indexes/{name}", ok404=True)
+
+    async def _host(self, name: str) -> str | None:
+        if name not in self._hosts:
+            info = await self._describe(name)
+            if not info.get("host"):
+                return None
+            self._hosts[name] = info["host"]
+        return self._hosts[name]
+
+    async def health(self) -> dict:
+        return await self._req("GET", f"{self.CONTROL}/indexes")
+
+    async def ensure_index(self, name: str, dims: int | None) -> None:
+        if not dims:
+            return  # keyword-only: nothing to store here
+        info = await self._describe(name)
+        if not info:
+            info = await self._req("POST", f"{self.CONTROL}/indexes", {
+                "name": name, "deployment": {"deployment_type": "managed", "cloud": self.cloud, "region": self.region},
+                "schema": {"fields": {"embedding": {"type": "dense_vector", "dimension": dims, "metric": "cosine"}}}})
+        found = (((info.get("schema") or {}).get("fields") or {}).get("embedding") or {}).get("dimension", dims)
+        if found != dims:
+            raise ConnectorError("config", f"Pinecone index {name} has vector dimension {found}, expected {dims}; run a reindex")
+        for _ in range(int(self.READY_SECONDS / self.POLL_SECONDS)):
+            if (info.get("status") or {}).get("ready"):
+                self._hosts[name] = info["host"]
+                return
+            await asyncio.sleep(self.POLL_SECONDS)
+            info = await self._describe(name)
+        raise ConnectorError("unavailable", f"Pinecone index {name} was not ready within {self.READY_SECONDS}s")
+
+    async def index_chunks(self, index_name: str, rows: list[dict], embeddings: list[list[float]] | None) -> None:
+        host = await self._host(index_name) if embeddings else None
+        if not host:
+            return
+        vectors = [{"id": r["chunk_id"], "values": v, "metadata": {"document_id": r["document_id"], "environment": r["environment"], "namespace": r["namespace"]}}
+                   for r, v in zip(rows, embeddings or [])]
+        for i in range(0, len(vectors), self.UPSERT_BATCH):
+            await self._req("POST", f"https://{host}/vectors/upsert", {"vectors": vectors[i:i + self.UPSERT_BATCH], "namespace": self.NAMESPACE})
+
+    async def delete_document(self, index_name: str, document_id: uuid.UUID) -> None:
+        host = await self._host(index_name)
+        if host:
+            await self._req("POST", f"https://{host}/vectors/delete", {"filter": {"document_id": {"$eq": str(document_id)}}, "namespace": self.NAMESPACE}, ok404=True)
+
+    async def update_scope(self, index_name: str, document_id: uuid.UUID, environment: str, namespace: str) -> None:
+        host = await self._host(index_name)
+        if host:
+            await self._req("POST", f"https://{host}/vectors/update", {"filter": {"document_id": {"$eq": str(document_id)}}, "namespace": self.NAMESPACE,
+                                                                       "setMetadata": {"environment": environment, "namespace": namespace}}, ok404=True)
+
+    async def vector(self, index_name: str, embedding: list[float], envs, nss, k: int) -> list[str]:
+        host = await self._host(index_name)
+        if not host:
+            return []
+        conditions = []
+        if envs is not None:
+            conditions.append({"environment": {"$in": ["*", *envs]}})
+        if nss is not None:
+            conditions.append({"namespace": {"$in": ["*", *nss]}})
+        body: dict[str, Any] = {"vector": embedding, "topK": k, "namespace": self.NAMESPACE, "includeMetadata": False, "includeValues": False}
+        if conditions:
+            body["filter"] = {"$and": conditions}
+        return [m["id"] for m in (await self._req("POST", f"https://{host}/query", body)).get("matches", [])]
+
+    async def drop_index(self, index_name: str) -> None:
+        await self._req("DELETE", f"{self.CONTROL}/indexes/{index_name}", ok404=True)
+        self._hosts.pop(index_name, None)

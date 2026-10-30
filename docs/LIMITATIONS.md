@@ -38,6 +38,12 @@ See [TESTING.md](TESTING.md#live-status-2026-10-30) for the evidence behind each
 - **Verified from logs** means the process itself reported this failure just before exiting. It is the
   stated reason, and the underlying cause can lie deeper.
 
+## Pinecone
+
+Tested against a stand-in for the `2026-07` API only: no real Pinecone call has been made. Each reindex needs
+a new index, and a reindex holds both until it finishes, so a plan limit on indexes can block it. Changing
+backends does not move vectors: run a reindex afterwards, which pays to embed everything again.
+
 ## Durability
 
 - **Single disk:** all four mk4 nodes are containers on one disk, and the PostgreSQL and OpenSearch volumes

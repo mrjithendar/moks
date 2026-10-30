@@ -72,7 +72,9 @@ class Settings(BaseSettings):
     rate_api_per_minute: int = 600
 
     # Retrieval: postgres (full-text, + pgvector when installed) or opensearch (BM25 + k-NN).
-    rag_backend: Literal["postgres", "opensearch"] = "postgres"
+    rag_backend: Literal["postgres", "opensearch", "pinecone"] = "postgres"
+    pinecone_cloud: str = "aws"
+    pinecone_region: str = "us-east-1"
     opensearch_url: str = ""
     opensearch_username: str = ""
     opensearch_password: str = Field(default="", repr=False)

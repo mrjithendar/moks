@@ -294,6 +294,12 @@ Each turn reads logs in every mode, before skills and before any LLM planning: p
 that restarted, current logs, and Loki when previous logs are gone. The last failure a crashed container wrote
 becomes a `crash_log_reason` finding, quoted verbatim.
 
+## Vector backends
+
+OpenSearch and Pinecone offer the same index lifecycle: versioned indexes, a build beside the active one, and
+cleanup after the switch commits. Pinecone holds vectors only, so its keyword half is PostgreSQL full-text
+search. Either way the index is derived data and PostgreSQL stays the system of record.
+
 ## Durability
 
 PostgreSQL is the only system of record. Everything else is rebuildable or a short-lived cache. On mk4 it
