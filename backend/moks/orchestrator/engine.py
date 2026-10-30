@@ -26,14 +26,14 @@ from ..config import get_settings
 from ..connectors import registry
 from ..db import session_scope
 from ..llm.providers import LLMError, complete_metered, provider_for
-from ..models import Environment, Investigation, InvestigationEvent, LLMConfig, LLMUsage, RoleBinding, User
+from ..models import SkillPolicy, Environment, Investigation, InvestigationEvent, LLMConfig, LLMUsage, RoleBinding, User
 from ..observability import INVESTIGATION_DURATION, INVESTIGATIONS, INVESTIGATIONS_RUNNING
 from ..rbac import Binding, P, Principal
 from ..scope import ScopeError, effective_scope
 from ..tools.contracts import ToolContext
 from ..tools.executor import ToolExecutor, ToolOutcome, tools_for_planner
 from . import prompts
-from .report import Report, parse_json_object, rules_report, validate_llm_report
+from .report import Report, parse_json_object, rules_report, validate_llm_report, verify_causes
 
 log = logging.getLogger("moks.orchestrator")
 
@@ -86,6 +86,9 @@ class Investigator:
     async def _emit(self, type_: str, payload: dict[str, Any]) -> None:
         self.seq += 1
         await emit(self.id, self.seq, type_, payload)
+        if type_ == "phase":
+            async with session_scope() as db:
+                await db.execute(update(Investigation).where(Investigation.id == self.id).values(stage=payload["phase"]))
 
     def _next_ref(self) -> str:
         self.ref += 1
@@ -173,6 +176,10 @@ class Investigator:
                 connectors, conn_errors = await registry.for_environment(db, env.id)
             llm_cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none() if self.use_llm else None
             question, namespace, t_from, t_to = inv.question, inv.namespace, inv.time_from, inv.time_to
+            if inv.parent_id:
+                parent = await db.get(Investigation, inv.parent_id)
+                if parent is not None and parent.report:  # the earlier answer is context, never instructions
+                    question = f"{question}\n\nThis follows up an earlier investigation of \"{parent.question[:300]}\", which concluded: {(parent.report.get('summary') or '')[:800]}"
             self._window = (t_from, t_to)
             env_name = env.name
             max_window = timedelta(minutes=min(env.max_query_window_minutes, self.settings.max_query_window_minutes))
@@ -195,6 +202,7 @@ class Investigator:
             executor = ToolExecutor(db, ctx, next_ref=self._next_ref, timeout_seconds=min(45, self.settings.max_duration_seconds))
 
             # 1. Baseline evidence (always, deterministic)
+            await self._emit("phase", {"phase": "triage", "label": "Triage: finding what is affected"})
             await self._emit("phase", {"phase": "evidence", "label": "Collecting baseline evidence"})
             await self._baseline(executor, ctx, namespace, question)
             namespace = self.focus_namespace or namespace
@@ -223,7 +231,7 @@ class Investigator:
         self._correlate()
 
         # 4. Hypotheses and report
-        await self._emit("phase", {"phase": "report", "label": "Writing findings"})
+        await self._emit("phase", {"phase": "hypotheses", "label": "Forming and checking hypotheses"})
         report: Report | None = None
         if provider:
             try:
@@ -233,14 +241,65 @@ class Investigator:
         if report is None:
             report = rules_report(question, self.findings, self.evidence, self.notes)
             mode = "deterministic" if not provider else "llm_fallback"
+        await self._emit("phase", {"phase": "verification", "label": "Verifying causes against direct evidence"})
+        verify_causes(report, self.findings)
+        await self._emit("phase", {"phase": "report", "label": "Writing findings"})
         payload = report.model_dump()
         payload["scope"] = scope_info
+        payload["coverage"] = self._coverage(conn_errors)
+        payload["relationships"] = self._relationships()
+        payload["primary_resource"] = self._primary_resource()
         payload["findings"] = self.findings
         payload["skills"] = [{"name": sk.name, "description": sk.meta.description, "reasons": why} for sk, _, why in self.skills]
         payload["skill_actions"] = self._skill_actions(namespace)
         await self._finish("completed", payload, None)
         await self._emit("report", {"report": payload})
         return mode
+
+    def _coverage(self, conn_errors: dict) -> dict[str, Any]:
+        """What this report did and did not see, so a clean answer is not mistaken for a full one."""
+        by_source: dict[str, dict[str, int]] = {}
+        for e in self.evidence:
+            row = by_source.setdefault(e["tool"].split("_")[0], {"ok": 0, "failed": 0})
+            row["ok" if e["ok"] else "failed"] += 1
+        return {"sources": by_source, "unavailable": conn_errors, "failed_tools": sorted({e["tool"] for e in self.evidence if not e["ok"]}),
+                "tool_calls": self.tool_calls, "tool_budget": self.settings.max_tool_calls, "budget_reached": self.tool_calls >= self.settings.max_tool_calls}
+
+    def _relationships(self) -> dict[str, list]:
+        """Observed ownership only: Service -> pods by selector, workload -> pods by ownerReference."""
+        nodes: dict[str, dict] = {}
+        edges: list[dict] = []
+        def pods(rows: list, ns: str | None) -> None:
+            for row in rows[:60]:
+                if row.get("owner"):
+                    pod, owner = f"Pod/{row['name']}", str(row["owner"])
+                    nodes[pod] = {"id": pod, "namespace": ns, "healthy": not row.get("problems")}
+                    nodes.setdefault(owner, {"id": owner, "namespace": ns})
+                    edges.append({"from": owner, "to": pod, "kind": "owns"})
+
+        def services(rows: list, ns: str | None) -> None:
+            for row in rows[:60]:
+                svc = f"Service/{row.get('name')}"
+                nodes[svc] = {"id": svc, "namespace": ns, "healthy": bool((row.get("endpoints") or {}).get("ready")) or not row.get("selector")}
+                for pod in (row.get("matchingPods") or [])[:10]:
+                    edges.append({"from": svc, "to": f"Pod/{pod}", "kind": "selects"})
+
+        for e in self.evidence:
+            if not e["ok"]:
+                continue
+            ns, data = e["args"].get("namespace"), e.get("data")
+            if e["tool"] == "k8s_list_pods" and isinstance(data, list):
+                pods(data, ns)
+            elif e["tool"] == "k8s_services" and isinstance(data, list):
+                services(data, ns)
+            elif e["tool"] == "k8s_triage" and isinstance(data, dict):
+                pods(data.get("unhealthyPods") or [], ns)
+                services(data.get("services") or [], ns)
+        return {"nodes": list(nodes.values())[:80], "edges": edges[:120]}
+
+    def _primary_resource(self) -> str | None:
+        ranked = sorted(self.findings, key=lambda f: {"high": 0, "medium": 1, "low": 2}.get(f.get("severity"), 3))
+        return next((f["resources"][0] for f in ranked if f.get("resources")), None)
 
     async def _call(self, executor: ToolExecutor, tool: str, args: dict[str, Any], purpose: str | None = None) -> ToolOutcome | None:
         key = tool + json.dumps(args, sort_keys=True)
@@ -387,7 +446,19 @@ class Investigator:
         from ..tools.builtin import REGISTRY
 
         kinds = {f["kind"] for f in self.findings}
-        self.skills = skill_lib.select(question, kinds)
+        async with session_scope() as db:
+            off = set((await db.execute(select(SkillPolicy.name).where(SkillPolicy.enabled.is_(False)))).scalars())
+        chosen = []
+        for entry in skill_lib.select(question, kinds):
+            sk = entry[0]
+            state = skill_lib.availability(sk, set(ctx.connectors), None)
+            if sk.name in off:
+                continue
+            if not state["available"]:
+                self.notes.append(f"Skill {sk.name} skipped: {'; '.join(state['reasons'])}.")
+                continue
+            chosen.append(entry)
+        self.skills = chosen
         if not self.skills:
             return
         await self._emit("skills", {"skills": [{"name": sk.name, "reasons": why} for sk, _, why in self.skills]})

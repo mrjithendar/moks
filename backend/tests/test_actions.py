@@ -28,7 +28,7 @@ def fakes(monkeypatch):
 
 async def _setup(client, prod=True):
     name = f"act-{uuid.uuid4().hex[:6]}"
-    env_id = await make_env(name, connectors=[{"type": "kubernetes", "name": "k8s", "config": {"mode": "in_cluster"}}])
+    env_id = await make_env(name, connectors=[{"type": "kubernetes", "name": "k8s", "config": {"mode": "in_cluster", "executor": {"mode": "in_cluster"}}}])
     async with session_scope() as db:
         from moks.models import Environment
 
@@ -49,7 +49,7 @@ async def _plan(client, h, env, action="scale_deployment", params=None, **kw):
 
 
 async def _run_executor(writer):
-    async def factory(env):
+    async def factory(env, connector_id=None):
         return writer
 
     ex.writer_factory = factory
@@ -100,7 +100,8 @@ async def test_validation_failure_triggers_automatic_recovery(client):
     done = await _run_executor(w)
     assert done.status == "recovered"
     assert "CrashLoopBackOff" in done.result["validation"]["reason"]
-    assert ("restore", "shop", "checkout", 2) in w.calls and done.result["recovery"]["validation"]["ok"]
+    assert done.result["recovery"]["status"] == "applied" and done.result["recovery"]["validation"]["ok"]
+    assert "annotations" not in DEPLOYMENTS[("shop", "checkout")]["template"]["metadata"]  # the pre-action template is back
 
 
 async def test_resource_changed_after_review_is_not_touched(client):
@@ -184,11 +185,3 @@ def test_writer_exists_only_in_the_executor_process():
 
     with pytest.raises(ConnectorError):
         KubernetesWriter({"mode": "in_cluster"})
-
-
-def test_inverse_merge_patch_restores_previous_values():
-    from moks.actions.catalog import inverse_merge_patch
-
-    original = {"spec": {"type": "ClusterIP", "ports": [{"port": 80}], "sessionAffinity": "None"}}
-    patch = {"spec": {"sessionAffinity": "ClientIP", "publishNotReadyAddresses": True}}
-    assert inverse_merge_patch(original, patch) == {"spec": {"sessionAffinity": "None", "publishNotReadyAddresses": None}}

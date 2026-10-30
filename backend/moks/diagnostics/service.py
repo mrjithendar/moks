@@ -84,7 +84,7 @@ async def request(db, principal: Principal, env: Environment, image_key: str, pa
                       validation=["pod reaches Running", "packages install successfully" if packages else "no packages requested"],
                       rollback="Terminate the session; the pod is deleted (also automatically at TTL).",
                       requires_approval=env.is_production or elevated, requested_by=uuid.UUID(principal.user_id),
-                      expires_at=now + timedelta(minutes=env.plan_ttl_minutes), status="pending", plan_hash="", auto_recover=False)
+                      expires_at=now + timedelta(minutes=env.plan_ttl_minutes), status="pending", plan_hash="", auto_recover=False, hash_version=2)
     db.add(plan)
     await db.flush()
     plan.plan_hash = compute_hash(plan, env.name)

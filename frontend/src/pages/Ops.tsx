@@ -6,7 +6,7 @@ import { Badge, ErrorBox, PageHead, ScopePicker, StatusBadge, Time, useLoad } fr
 
 const SEV: Record<string, "bad" | "warn" | "info" | "neutral"> = { sev1: "bad", sev2: "bad", sev3: "warn", sev4: "neutral" };
 const PLAN: Record<string, "ok" | "warn" | "bad" | "info" | "neutral"> = {
-  pending: "info", approved: "ok", queued: "info", executing: "info", succeeded: "ok", recovered: "warn", failed: "bad", rejected: "bad", expired: "neutral", cancelled: "neutral",
+  reconciliation_required: "bad", reconciled: "neutral", pending: "info", approved: "ok", queued: "info", executing: "info", succeeded: "ok", recovered: "warn", failed: "bad", rejected: "bad", expired: "neutral", cancelled: "neutral",
 };
 
 // ---- Incidents --------------------------------------------------------------------------------
@@ -99,6 +99,7 @@ export function IncidentView() {
   return (
     <>
       <PageHead title={d.title} sub={<span className="row small"><Badge kind={SEV[d.severity]}>{d.severity}</Badge><Badge>{d.status}</Badge><span className="mono">{d.environment}/{d.namespace}</span><span>source {d.source}</span><span>opened <Time iso={d.created_at} /></span></span>}>
+        <a className="btn" href={`${API}/incidents/${id}/handover.md`} target="_blank" rel="noreferrer">Handover</a>
         <a className="btn" href={`${API}/incidents/${id}/report.md`} target="_blank" rel="noreferrer">Report (Markdown)</a>
         {write && <select value={d.status} onChange={(e) => act(() => api(`/incidents/${id}`, { method: "PATCH", body: { status: e.target.value } }))}>
           {["open", "mitigated", "resolved", "closed"].map((s) => <option key={s}>{s}</option>)}</select>}
@@ -108,6 +109,14 @@ export function IncidentView() {
       <div className="grid" style={{ gridTemplateColumns: "minmax(0, 3fr) minmax(300px, 2fr)", alignItems: "start" }}>
         <div className="stack">
           {d.summary && <div className="card"><h2>Summary</h2><p style={{ margin: 0 }}>{d.summary}</p></div>}
+          {write && <div className="card filters"><label>Assigned to<input defaultValue={d.commander ?? ""} type="email" placeholder="engineer@example.com"
+            onBlur={(e) => { if (e.target.value !== (d.commander ?? "")) act(() => api(`/incidents/${id}`, { method: "PATCH", body: { commander: e.target.value } })); }} /></label>
+            <label>Severity<select value={d.severity} onChange={(e) => act(() => api(`/incidents/${id}`, { method: "PATCH", body: { severity: e.target.value } }))}>{["sev1", "sev2", "sev3", "sev4"].map((x) => <option key={x}>{x}</option>)}</select></label></div>}
+          {d.detection && <div className="card"><h2>Detection</h2>
+            <dl className="kv small"><dt>Rule</dt><dd className="mono">{d.detection.rule} (skill {d.detection.skill} v{d.detection.rule_version})</dd>
+              <dt>Resource</dt><dd className="mono">{d.detection.resource}</dd><dt>Observed</dt><dd>{new Date(d.detection.first_observed).toLocaleString()} to {new Date(d.detection.last_observed).toLocaleString()}, {d.detection.count} checks</dd>
+              <dt>Severity</dt><dd>{d.detection.severity_reason}</dd><dt>Owner</dt><dd>{d.detection.owner}</dd><dt>Runbook</dt><dd>{d.detection.runbook}</dd></dl>
+            <div className="small muted">An automatic incident authorizes no change. Remediation stays behind action plans and approvals.</div></div>}
           <div className="card">
             <h2>Hypotheses</h2>
             <ul>{d.hypotheses.map((h: any, i: number) => <li key={i}><Badge kind={h.status === "verified" ? "ok" : h.status === "refuted" ? "neutral" : "warn"}>{h.status}</Badge> <Badge>{h.confidence}</Badge> {h.text}
@@ -195,6 +204,7 @@ export function PlanView() {
   const { can, me } = useAuth();
   const plan = useLoad(() => api<any>(`/actions/plans/${id}`), [id]);
   const [comment, setComment] = useState("");
+  const [outcome, setOutcome] = useState("not_applied");
   const [error, setError] = useState<unknown>();
   const p = plan.data;
   useEffect(() => {
@@ -243,12 +253,25 @@ export function PlanView() {
             {mine && p.status === "pending" && p.requires_approval && <div className="small muted">Waiting for someone else to approve (you requested it).</div>}
             {can("action.execute") && (p.status === "approved" || (p.status === "pending" && !p.requires_approval)) &&
               <button onClick={() => act("execute", { plan_hash: p.plan_hash })}>Execute</button>}
+            {p.status === "reconciliation_required" && <div className="alert error small stack">
+              <strong>MOKS could not establish what happened, and will not retry.</strong>
+              <div>{p.result?.recovery?.reason ?? p.result?.error}</div>
+              {p.result?.observed && <div>Same object: {String(p.result.observed.same_object)}. Fields unchanged from before: {JSON.stringify(p.result.observed.unchanged_from_before)}</div>}
+              <div>Check the object yourself, then record the outcome.</div>
+              {can("action.approve") ? <>
+                <label>What happened<select value={outcome} onChange={(e) => setOutcome(e.target.value)}>
+                  <option value="not_applied">The change was not applied</option><option value="applied">The change was applied</option><option value="reverted">It was reverted by hand</option>
+                </select></label>
+                <textarea rows={2} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="How you verified this (required)" />
+                <button disabled={!comment.trim()} onClick={() => act("reconcile", { outcome, comment })}>Record outcome</button>
+              </> : <div>Someone with the Approver role must record the outcome.</div>}
+            </div>}
             {["pending", "approved", "queued"].includes(p.status) && (mine || can("action.approve")) && <button className="ghost" onClick={() => act("cancel")}>Cancel plan</button>}
           </div>
           {p.result && <div className="card"><h2>Result</h2>
             {p.result.validation && <div className="row" style={{ marginBottom: 8 }}><Badge kind={p.result.validation.ok ? "ok" : "bad"}>validation {p.result.validation.ok ? "passed" : "failed"}</Badge>
               {p.result.validation.reason && <span className="small">{p.result.validation.reason}</span>}</div>}
-            {p.result.recovery && <div className="alert warn small">Recovered: the pre-action state was restored ({p.result.recovery.validation?.ok ? "validated" : "recovery not validated"}).</div>}
+            {p.result.recovery?.status === "applied" && <div className="alert warn small">Recovery ran: the changed fields were restored ({p.result.recovery.validation?.ok ? "validated" : "recovery not validated"}).</div>}
             {p.result.error && <div className="alert error small">{p.result.error}</div>}
             <pre className="logbox">{JSON.stringify(p.result, null, 2)}</pre></div>}
         </div>

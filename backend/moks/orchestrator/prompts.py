@@ -38,7 +38,7 @@ Respond with one JSON object only, with exactly these keys:
 {
   "summary": "<= 3 sentences answering the question",
   "observed_facts": [{"statement": "...", "evidence": ["E1", ...]}],
-  "suspected_causes": [{"cause": "...", "confidence": "low|medium|high", "evidence": ["E2"], "reasoning": "<= 2 sentences"}],
+  "suspected_causes": [{"cause": "...", "confidence": "low|medium|high", "evidence": ["E2"], "contradicting": ["E3"], "reasoning": "<= 2 sentences"}],
   "missing_evidence": ["what is unknown and would confirm or refute a cause"],
   "next_steps": ["specific next checks or queries"],
   "proposed_remediation": [{"action": "...", "target": "<kind/name in namespace>", "expected_impact": "...", "risk": "...", "rollback": "..."}]

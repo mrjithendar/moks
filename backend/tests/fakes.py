@@ -57,6 +57,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
 class FakeKubernetes:
     type = "kubernetes"
     delay = 0.0
+    cluster = "cluster-a"
     calls: list[tuple] = []
 
     def __init__(self, config: dict, credential_ref: dict | None = None):
@@ -64,6 +65,15 @@ class FakeKubernetes:
 
     async def aclose(self):
         pass
+
+    async def cluster_uid(self):
+        return self.cluster
+
+    async def object_meta(self, namespace, kind, name):
+        o = OBJECTS.get((namespace, kind, name))
+        if o is None:
+            raise ConnectorError("not_found", f"{kind} {namespace}/{name}: not found")
+        return {"kind": kind, "name": name, "resourceVersion": o["metadata"]["resourceVersion"], "uid": o["metadata"]["uid"], "spec": o["spec"]}
 
     async def _maybe_delay(self):
         if FakeKubernetes.delay:
@@ -149,12 +159,19 @@ class FakeKubernetes:
 # ---- Phase 3 doubles --------------------------------------------------------------------------
 
 DEPLOYMENTS: dict[tuple[str, str], dict] = {}
+OBJECTS: dict[tuple[str, str, str], dict] = {}
 
 
 def reset_deployments() -> None:
     DEPLOYMENTS.clear()
     DEPLOYMENTS[("shop", "checkout")] = {"resourceVersion": "100", "generation": 3, "replicas": 2, "revision": "3",
                                          "template": {"metadata": {"labels": {"app": "checkout"}}, "spec": {"containers": [{"name": "app", "image": "example/app:3"}]}}}
+    OBJECTS.clear()
+    OBJECTS[("shop", "Service", "checkout")] = {"metadata": {"uid": "uid-svc", "resourceVersion": "7", "generation": 1},
+                                                "spec": {"type": "ClusterIP", "selector": {"app": "checkout-v2"}, "sessionAffinity": "None"}}
+    OBJECTS[("shop", "HorizontalPodAutoscaler", "checkout")] = {
+        "metadata": {"uid": "uid-hpa", "resourceVersion": "9", "generation": 1},
+        "spec": {"minReplicas": 2, "maxReplicas": 4}, "status": {"observedGeneration": 1, "conditions": [{"type": "AbleToScale", "status": "True"}]}}
 
 
 reset_deployments()
@@ -164,7 +181,7 @@ async def _deployment_meta(self, namespace, name):
     d = DEPLOYMENTS.get((namespace, name))
     if d is None:
         raise ConnectorError("not_found", f"deployment {namespace}/{name}: not found")
-    return {"name": name, "namespace": namespace, "resourceVersion": d["resourceVersion"], "generation": d["generation"],
+    return {"name": name, "namespace": namespace, "resourceVersion": d["resourceVersion"], "uid": d.get("uid", "uid-dep"), "generation": d["generation"],
             "annotations": d.get("annotations", {}), "labels": {}, "images": [c["image"] for c in d["template"]["spec"]["containers"]],
             "replicas": d["replicas"], "summary": {"revision": d["revision"], "ready": d["replicas"]}}
 
@@ -175,33 +192,38 @@ async def _rollout_history(self, namespace, deployment):
         {"revision": 2, "created": "2026-10-29T09:00:00Z", "images": ["example/app:2"]}]}
 
 
-async def _object_meta(self, namespace, kind, name):
-    return {"kind": kind, "name": name, "resourceVersion": "7", "spec": {"selector": {"app": "checkout"}}, "generation": 1}
-
-
 FakeKubernetes.deployment_meta = _deployment_meta
 FakeKubernetes.rollout_history = _rollout_history
-FakeKubernetes.object_meta = _object_meta
 
 
 class FakeWriter:
-    """In-memory executor writer. outcome: 'ok' | 'crashloop' (new pods fail) | 'stuck'."""
+    """In-memory executor writer. outcome: 'ok' | 'crashloop' (new pods fail) | 'stuck' | 'no_endpoints'."""
 
     instances: list["FakeWriter"] = []
 
-    def __init__(self, outcome: str = "ok"):
+    def __init__(self, outcome: str = "ok", cluster: str = "cluster-a"):
         self.outcome = outcome
+        self.cluster = cluster
         self.calls: list[tuple] = []
         self.restored = False
         self.pods: dict[str, str] = {}
+        self.pod_rows: list[dict] | None = None
+        self.mutate_error: ConnectorError | None = None
+        self.after_mutation = None  # simulates a person or controller acting during validation
         FakeWriter.instances.append(self)
 
     async def aclose(self):
         pass
 
+    async def cluster_uid(self):
+        return self.cluster
+
+    def _failing(self):
+        return self.outcome != "ok" and not self.restored and bool(self.calls)
+
     async def state(self, ns, name):
         d = DEPLOYMENTS[(ns, name)]
-        ready = d["replicas"] if (self.outcome == "ok" or self.restored or not self.calls) else 0
+        ready = 0 if self.outcome in ("crashloop", "stuck") and self._failing() else d["replicas"]
         return {"resourceVersion": d["resourceVersion"], "generation": d["generation"], "replicas": d["replicas"], "template": d["template"],
                 "revision": d["revision"], "summary": {"generation": d["generation"], "observedGeneration": d["generation"], "ready": ready,
                                                        "updated": ready, "available": ready}}
@@ -212,13 +234,26 @@ class FakeWriter:
         d["generation"] += 1
 
     def _guard(self, ns, name, rv):
+        if self.mutate_error:
+            raise self.mutate_error
         if DEPLOYMENTS[(ns, name)]["resourceVersion"] != rv:
             raise ConnectorError("conflict", "changed")
+
+    def _stamp(self, ns, name, value):
+        d = DEPLOYMENTS[(ns, name)]
+        d["template"] = {**d["template"], "metadata": {**d["template"]["metadata"], "annotations": {"moks": value}}}
+
+    def _after(self):
+        if self.after_mutation:
+            self.after_mutation()
+            self.after_mutation = None
 
     async def restart(self, ns, name, rv):
         self._guard(ns, name, rv)
         self.calls.append(("restart", ns, name))
+        self._stamp(ns, name, "restarted")
         self._bump(ns, name)
+        self._after()
         return {"restartedAt": "now"}
 
     async def scale(self, ns, name, rv, replicas):
@@ -226,38 +261,73 @@ class FakeWriter:
         self.calls.append(("scale", ns, name, replicas))
         DEPLOYMENTS[(ns, name)]["replicas"] = replicas
         self._bump(ns, name)
+        self._after()
         return {"replicas": replicas}
 
     async def rollback(self, ns, name, rv, to_revision):
         self._guard(ns, name, rv)
         self.calls.append(("rollback", ns, name, to_revision))
+        self._stamp(ns, name, f"revision-{to_revision}")
         self._bump(ns, name)
+        self._after()
         return {"rolled_back_to": to_revision}
 
     async def patch_resources(self, ns, name, rv, container, resources):
         self._guard(ns, name, rv)
         self.calls.append(("patch_resources", ns, name, container, resources))
+        self._stamp(ns, name, "resized")
         self._bump(ns, name)
+        self._after()
         return {"container": container}
 
     async def merge_patch(self, ns, kind, name, rv, patch):
+        from moks.actions.catalog import apply_merge_patch
+
+        if self.mutate_error:
+            raise self.mutate_error
         self.calls.append(("merge_patch", ns, kind, name, patch))
-        return {"resourceVersion": "8"}
+        if kind == "Deployment":
+            cur = await self.get_object(ns, kind, name)
+            if cur["metadata"]["resourceVersion"] != rv:
+                raise ConnectorError("conflict", "changed")
+            spec = apply_merge_patch(cur, patch)["spec"]
+            d = DEPLOYMENTS[(ns, name)]
+            recovering = "replicas" in patch.get("spec", {}) or "template" in patch.get("spec", {})
+            d["replicas"], d["template"] = spec["replicas"], spec["template"]
+            self.restored = self.restored or recovering
+            self._bump(ns, name)
+            return {"resourceVersion": d["resourceVersion"]}
+        obj = OBJECTS[(ns, kind, name)]
+        if obj["metadata"]["resourceVersion"] != rv:
+            raise ConnectorError("conflict", "changed")
+        new = apply_merge_patch(obj, patch)
+        new["metadata"]["resourceVersion"] = str(int(rv) + 1)
+        OBJECTS[(ns, kind, name)] = new
+        if len([c for c in self.calls if c[0] == "merge_patch"]) > 1:
+            self.restored = True
+        self._after()
+        return {"resourceVersion": new["metadata"]["resourceVersion"]}
 
     async def get_object(self, ns, kind, name):
-        return {"metadata": {"resourceVersion": "7"}, "spec": {"selector": {"app": "checkout"}}}
+        import copy
 
-    async def restore(self, ns, name, pre):
-        self.calls.append(("restore", ns, name, pre["replicas"]))
-        self.restored = True
-        DEPLOYMENTS[(ns, name)]["replicas"] = pre["replicas"]
-        self._bump(ns, name)
-        return {"replicas": pre["replicas"]}
+        if kind == "Deployment":
+            d = DEPLOYMENTS[(ns, name)]
+            return copy.deepcopy({"metadata": {"uid": d.get("uid", "uid-dep"), "resourceVersion": d["resourceVersion"], "generation": d["generation"]},
+                                  "spec": {"replicas": d["replicas"], "template": d["template"], "selector": {"matchLabels": {"app": "checkout"}}}})
+        return copy.deepcopy(OBJECTS[(ns, kind, name)])
+
+    async def services(self, ns):
+        ready = 0 if self.outcome == "no_endpoints" and self._failing() else 2
+        selector = (OBJECTS.get((ns, "Service", "checkout")) or {"spec": {}})["spec"].get("selector") or {"app": "checkout"}
+        return [{"name": "checkout", "selector": selector, "endpoints": {"ready": ready, "notReady": 0}}]
 
     async def pods_of(self, ns, name):
-        if self.outcome == "crashloop" and not self.restored and self.calls:
-            return [{"name": f"{name}-new", "phase": "Running", "problems": [{"state": "waiting", "reason": "CrashLoopBackOff"}]}]
-        return [{"name": f"{name}-a", "phase": "Running", "problems": []}]
+        if self.pod_rows is not None:
+            return self.pod_rows
+        if self.outcome == "crashloop" and self._failing():
+            return [{"name": f"{name}-new", "phase": "Running", "restarts": 0, "problems": [{"state": "waiting", "reason": "CrashLoopBackOff"}]}]
+        return [{"name": f"{name}-a", "phase": "Running", "restarts": 0, "problems": []}]
 
     # diagnostics
     async def create_pod(self, ns, manifest):

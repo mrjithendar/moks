@@ -58,7 +58,8 @@ def serialize(inv: Investigation, env_name: str, user_email: str | None = None, 
         "created_by": user_email, "tool_calls": inv.tool_calls, "tokens_in": inv.tokens_in, "tokens_out": inv.tokens_out,
         "cost_usd": str(inv.cost_usd), "error": inv.error,
         "summary": (inv.report or {}).get("summary") if inv.report else None,
-        "incident_id": str(inv.incident_id) if inv.incident_id else None, "trigger": inv.trigger,
+        "incident_id": str(inv.incident_id) if inv.incident_id else None, "trigger": inv.trigger, "stage": inv.stage,
+        "group_id": str(inv.group_id) if inv.group_id else None,
     }
     if full:
         out["report"] = inv.report
@@ -106,6 +107,46 @@ async def resolve_scope(db: AsyncSession, ctx: AuthContext, question: str, envir
     if len(concrete) == 1:
         return env, concrete[0], why_env
     raise HTTPException(422, f"Mention one of your namespaces ({', '.join(concrete[:10]) or 'none'}) in the question")
+
+
+class GroupIn(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+    environments: list[str] = Field(default_factory=list, max_length=20)  # empty: every environment you may investigate
+    minutes: int | None = Field(default=None, ge=1, le=10080)
+
+
+@router.post("/investigations/group", status_code=201)
+async def create_group(body: GroupIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """One question across environments: one investigation each, so evidence and permissions stay
+    per environment. Unauthorized environments are refused, not skipped."""
+    envs = [e for e in (await db.execute(select(Environment).where(~Environment.name.startswith("eval-")).order_by(Environment.name))).scalars()
+            if ctx.principal.namespace_patterns(P.INVESTIGATION_RUN, e.name)]
+    names = {e.name for e in envs}
+    if body.environments and not set(body.environments) <= names:
+        raise HTTPException(403, "you cannot investigate one of those environments")
+    chosen = [e for e in envs if not body.environments or e.name in body.environments]
+    if not chosen:
+        raise HTTPException(403, "You cannot run investigations in any environment")
+    group = uuid.uuid4()
+    out = []
+    for e in chosen[:10]:
+        r = await create(CreateIn(question=body.question, environment=e.name, minutes=body.minutes), request, ctx, db)
+        (await db.get(Investigation, uuid.UUID(r["id"]))).group_id = group
+        out.append(r)
+    return {"group_id": str(group), "investigations": out}
+
+
+class FollowUpIn(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+
+
+@router.post("/investigations/{inv_id}/follow-up", status_code=201)
+async def follow_up(inv_id: uuid.UUID, body: FollowUpIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    parent, env = await _load_visible(request, db, ctx, inv_id)
+    minutes = max(1, int((parent.time_to - parent.time_from).total_seconds() // 60))
+    r = await create(CreateIn(question=body.question, environment=env.name, namespace=parent.namespace, minutes=minutes, incident_id=parent.incident_id), request, ctx, db)
+    (await db.get(Investigation, uuid.UUID(r["id"]))).parent_id = parent.id
+    return r
 
 
 @router.post("/investigations", status_code=201)
@@ -195,6 +236,14 @@ async def get(inv_id: uuid.UUID, request: Request, ctx: AuthContext = Depends(ge
         "duration_ms": e.duration_ms, "collected_at": e.collected_at.isoformat(),
     } for e in sorted(ev, key=lambda e: int(e.ref[1:]))]
     out["grafana_url"] = env.grafana_url
+    from ..models import ActionPlan
+
+    plans = (await db.execute(select(ActionPlan).where(ActionPlan.investigation_id == inv.id).order_by(ActionPlan.created_at))).scalars().all()
+    out["actions"] = [{"id": str(p.id), "action": p.action, "target": f"{p.target_kind}/{p.target_name}", "status": p.status,
+                       "validated": bool((p.result or {}).get("validation", {}).get("ok")), "finished_at": p.finished_at.isoformat() if p.finished_at else None} for p in plans]
+    follow = (await db.execute(select(Investigation).where(Investigation.parent_id == inv.id).order_by(Investigation.created_at))).scalars().all()
+    out["follow_ups"] = [{"id": str(i.id), "question": i.question, "status": i.status} for i in follow if ctx.principal.can(P.INVESTIGATION_READ, env.name, i.namespace)]
+    out["parent_id"] = str(inv.parent_id) if inv.parent_id else None
     return out
 
 

@@ -190,6 +190,7 @@ class PromQueryArgs(ToolArgs):
     promql: str = Field(min_length=1, max_length=2000, description="PromQL expression")
     mode: Literal["instant", "range"] = "range"
     minutes: int | None = Field(default=None, ge=1, le=10080, description="look back this many minutes (bounded by the investigation window)")
+    step: int | None = Field(default=None, ge=5, le=3600, description="range step in seconds; default chosen from the window")
 
 
 class PodResourcesArgs(ToolArgs):
@@ -213,7 +214,7 @@ async def prom_query(ctx: ToolContext, a: PromQueryArgs) -> ToolResult:
     if a.mode == "instant":
         r = await prom.instant(a.promql, end)
     else:
-        step = auto_step(start, end)
+        step = a.step or auto_step(start, end)
         r = await prom.range(a.promql, start, end, step)
         r["step"] = step
     r["start"], r["end"] = start.isoformat(), end.isoformat()
@@ -392,13 +393,47 @@ class MetricArgs(ToolArgs):
     aggregate: Literal["none", "sum", "avg", "max", "min", "count"] = "sum"
     by: list[str] = Field(default_factory=list, max_length=5)
     rate: bool | None = Field(default=None, description="apply rate() over 5m; default: on for counters")
+    rate_window: str = Field(default="5m", pattern=r"^[0-9]{1,3}[smh]$")
+    topk: int | None = Field(default=None, ge=1, le=100)
+    bottomk: int | None = Field(default=None, ge=1, le=100)
+    instant: bool = False
+    step: int | None = Field(default=None, ge=5, le=3600)
     minutes: int | None = Field(default=None, ge=5, le=10080)
+
+
+class MetricLabelsArgs(ToolArgs):
+    metric: str = Field(pattern=METRIC_NAME)
+    namespace: str | None = Field(default=None, pattern=K8S_NAME, max_length=63)
+    label: str | None = Field(default=None, pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,100}$", description="values of this label; omit for label names")
+
+
+async def prom_metric_labels(ctx: ToolContext, a: MetricLabelsArgs) -> ToolResult:
+    """Real labels of a metric. Pinned to a namespace unless the user may read all of them, because
+    label values name workloads."""
+    env = ctx.environment.name
+    if a.namespace:
+        ctx.scope.require(a.namespace)
+    elif not (ctx.principal.can(P.METRICS_RAW_QUERY, env, "*") and ctx.scope.cluster_wide):
+        raise ScopeError("choose a namespace: label values across all namespaces need metrics.raw_query for all namespaces")
+    prom = ctx.connector("prometheus")
+    start, end = ctx.window(60)
+    match = a.metric + (f'{{namespace="{a.namespace}"}}' if a.namespace else "")
+    if a.label:
+        values = await prom.label_values(a.label, match, start, end, limit=200)
+        return ToolResult(f"{len(values)} values of {a.label}", {"label": a.label, "values": values}, {"api": "GET /api/v1/label/<label>/values", "query": match})
+    names = [n for n in await prom.label_names(match, start, end) if n != "__name__"]
+    return ToolResult(f"{len(names)} labels on {a.metric}", {"labels": names}, {"api": "GET /api/v1/labels", "query": match})
+
+
+async def prom_metric_metadata(ctx: ToolContext, a: NoArgs) -> ToolResult:
+    data = await ctx.connector("prometheus").metadata()
+    return ToolResult(f"metadata for {len(data)} metrics", {"metadata": data}, {"api": "GET /api/v1/metadata"})
 
 
 async def prom_metric_names(ctx: ToolContext, a: MetricNamesArgs) -> ToolResult:
     prom = ctx.connector("prometheus")
     start, end = ctx.window(60)
-    names = await prom.label_values("__name__", None, start, end)
+    names = await prom.label_values("__name__", None, start, end, limit=5000)
     if a.search:
         names = [n for n in names if a.search.lower() in n.lower()]
     return ToolResult(f"{len(names)} metric names", {"names": names[:3000]}, {"api": "GET /api/v1/label/__name__/values"})
@@ -416,10 +451,14 @@ def build_promql(a: MetricArgs) -> str:
         matchers.append(f'{k}{op}"{logql_escape(val)}"')
     sel = a.metric + ("{" + ", ".join(matchers) + "}" if matchers else "")
     counter = a.metric.endswith(("_total", "_count", "_sum", "_bucket"))
-    expr = f"rate({sel}[5m])" if (a.rate if a.rate is not None else counter) else sel
+    expr = f"rate({sel}[{a.rate_window}])" if (a.rate if a.rate is not None else counter) else sel
     by = [b for b in a.by if LABEL_NAME.match(b)]
     if a.aggregate != "none":
         expr = f"{a.aggregate}{' by (' + ', '.join(by) + ')' if by else ''} ({expr})"
+    if a.topk:
+        expr = f"topk({a.topk}, {expr})"
+    elif a.bottomk:
+        expr = f"bottomk({a.bottomk}, {expr})"
     return expr
 
 
@@ -433,8 +472,8 @@ async def prom_metric(ctx: ToolContext, a: MetricArgs) -> ToolResult:
     q = build_promql(a)
     prom = ctx.connector("prometheus")
     start, end = ctx.window(a.minutes)
-    step = auto_step(start, end)
-    r = await prom.range(q, start, end, step)
+    step = a.step or auto_step(start, end)
+    r = await prom.instant(q, end) if a.instant else await prom.range(q, start, end, step)
     r.update(step=step, start=start.isoformat(), end=end.isoformat())
     return ToolResult(f"{a.metric}: {len(r['series'])} series", r, _range_link(prom, q, int((end - start).total_seconds() // 60)))
 
@@ -481,6 +520,8 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("loki_search", "Search logs by namespace/pod/container, text, trace ID or request ID (builds LogQL).", "loki", LokiSearchArgs, loki_search),
     ToolSpec("loki_logs", "Recent logs across every permitted namespace (or one) with pod/container/level/text/trace/request filters.",
              "loki", LokiLogsArgs, loki_logs, namespace_arg=None),
+    ToolSpec("prom_metric_labels", "Label names of a metric, or the values of one label, within your scope.", "prometheus", MetricLabelsArgs, prom_metric_labels, namespace_arg=None),
+    ToolSpec("prom_metric_metadata", "Type, unit and help text Prometheus has for its metrics.", "prometheus", NoArgs, prom_metric_metadata, namespace_arg=None),
     ToolSpec("prom_metric_names", "Catalog of metric names in Prometheus (optionally filtered).", "prometheus", MetricNamesArgs, prom_metric_names,
              namespace_arg=None),
     ToolSpec("prom_metric", "Chart one metric with label filters, aggregation and rate (query built safely; exact PromQL returned).",

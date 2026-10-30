@@ -81,6 +81,7 @@ class Settings(BaseSettings):
 
     # Phase 3 executor / diagnostics
     process_role: Literal["api", "worker", "executor"] = "api"
+    sync_timezone: str = "UTC"  # shown beside knowledge sync schedules
     diagnostics_namespace: str = "moks-diagnostics"
 
     # Phase 4 alerts: shared secret for the Alertmanager / Grafana webhook (Authorization: Bearer ...)

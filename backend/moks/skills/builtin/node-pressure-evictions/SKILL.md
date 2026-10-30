@@ -12,6 +12,17 @@ steps:
     purpose: eviction messages naming the starved resource
   - tool: prom_targets
     purpose: kubelet/cAdvisor scrape health
+title: Node readiness and pressure
+owner: sre
+category: kubernetes
+version: '2'
+detection:
+- id: pod-evicted
+  kind: finding
+  finding: evicted
+  sustained_checks: 1
+  severity: sev3
+  title: Pods evicted
 ---
 # Node pressure and evictions
 

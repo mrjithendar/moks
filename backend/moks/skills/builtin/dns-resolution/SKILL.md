@@ -13,6 +13,10 @@ steps:
   - tool: k8s_events
     args: {namespace: "{namespace}", warnings_only: true}
     purpose: DNSConfigForming and related warnings
+title: DNS resolution
+owner: sre
+category: kubernetes
+version: '2'
 ---
 # DNS resolution
 

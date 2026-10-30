@@ -221,3 +221,45 @@ column when pgvector exists), `action_plans`, `approvals`, `diagnostic_sessions`
 `diagnostic_commands`, `alert_events`, `eval_runs`, plus environment policy columns
 (`auto_investigate`, cooldown, `max_replicas`, `allow_scale_to_zero`, `plan_ttl_minutes`) and the
 `automation@moks.system` principal.
+
+## Safe execution
+
+A plan binds to the connector, its write target and the cluster (`kube-system` UID), and to the
+object's UID. There is no default write target: a Kubernetes connector without `config.executor` is
+read-only, so a plan cannot land on the cluster hosting MOKS by accident.
+
+Immediately before acting, the executor re-checks the allowlist and parameters, current policy,
+approval requirements, the requester's and executor's permissions, the approver's permission, and
+the target's identity. It commits an `intent` checkpoint, mutates once, reads the result back and
+commits `applied`. A heartbeat renews a 90-second lease.
+
+```
+pending -> approved -> queued -> executing -> succeeded
+                                     |-> failed                     (definitely not applied, or validation failed)
+                                     |-> recovered                  (restored, and the restore validated)
+                                     '-> reconciliation_required -> reconciled   (a person records the outcome)
+```
+
+An uncertain outcome is never retried. Recovery restores only the fields MOKS changed, and only if
+they still hold what MOKS applied.
+
+## Metrics
+
+Environments sharing a Prometheus are queried once. Sources are evaluated separately and never added
+together. Raw PromQL needs `metrics.raw_query` for all namespaces, because it cannot be confined to
+one. Explore builds the query itself and pins the namespace, so it works for scoped users. CloudWatch
+has its own query path and is labelled as such.
+
+## Detection
+
+Rules live in `SKILL.md` and are deterministic; an LLM plays no part. Each check ends as `firing`,
+`ok` or `unknown`. `unknown` changes nothing, so a telemetry outage neither opens nor resolves an
+incident. Incident identity is `sha256(rule, environment, resource)`, enforced by a partial unique
+index across workers. Rule schemas have no action field: an incident never authorizes a change.
+
+## Investigations
+
+Causes have two tiers. **Verified** causes come only from detectors that observe the fault directly
+(`service_selector_mismatch`, `oomkilled`, `image_pull`, `unschedulable`, `config_ref_missing`).
+Everything from an LLM stays **suspected**, whatever its confidence.
+

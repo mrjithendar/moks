@@ -130,8 +130,17 @@ class OpenSearchBackend:
     async def health(self) -> dict:
         return await self._req("GET", "/_cluster/health")
 
+    async def vector_dimensions(self, name: str) -> int | None:
+        """Dimension of an existing index's vector field; None when it is keyword-only or absent."""
+        resp = await self._req("GET", f"/{name}/_mapping", ok404=True)
+        props = ((resp.get(name) or {}).get("mappings") or {}).get("properties") or {}
+        return (props.get("embedding") or {}).get("dimension")
+
     async def ensure_index(self, name: str, dims: int | None) -> None:
         if (await self.client.head(f"/{name}")).status_code == 200:
+            found = await self.vector_dimensions(name)
+            if found != dims:
+                raise ConnectorError("config", f"OpenSearch index {name} has vector dimension {found}, expected {dims}; run a reindex")
             return
         props: dict[str, Any] = {
             "chunk_id": {"type": "keyword"}, "document_id": {"type": "keyword"}, "environment": {"type": "keyword"},

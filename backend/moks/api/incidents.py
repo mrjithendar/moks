@@ -16,8 +16,8 @@ from ..auth.deps import get_auth, require
 from ..auth.sessions import AuthContext
 from ..config import get_settings
 from ..db import get_db
-from ..incidents import add_event, incident_detail, report_markdown
-from ..models import Environment, Incident, Investigation
+from ..incidents import add_event, incident_detail, report_markdown, handover_markdown
+from ..models import Environment, Incident, Investigation, User
 from ..rbac import P
 from .common import env_or_404
 
@@ -37,6 +37,7 @@ class UpdateIn(BaseModel):
     severity: Literal["sev1", "sev2", "sev3", "sev4"] | None = None
     summary: str | None = Field(default=None, max_length=5000)
     hypotheses: list[dict[str, Any]] | None = Field(default=None, max_length=30)
+    commander: str | None = Field(default=None, max_length=320)  # email; empty clears the assignment
 
 
 class NoteIn(BaseModel):
@@ -105,7 +106,13 @@ async def get(iid: uuid.UUID, request: Request, ctx: AuthContext = Depends(get_a
 @router.patch("/{iid}")
 async def update(iid: uuid.UUID, body: UpdateIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     inc, env = await _load(request, db, ctx, iid, write=True)
-    changes = body.model_dump(exclude_none=True)
+    changes = body.model_dump(exclude_none=True, exclude={"commander"})
+    if body.commander is not None:
+        user = (await db.execute(select(User).where(User.email == body.commander))).scalar_one_or_none() if body.commander else None
+        if body.commander and user is None:
+            raise HTTPException(422, "no such user")
+        inc.commander_id = user.id if user else None
+        await add_event(db, inc.id, "status", {"text": f"Assigned to {body.commander}" if body.commander else "Unassigned"}, ctx.user.id)
     if body.status and body.status != inc.status:
         await add_event(db, inc.id, "status", {"text": f"Status {inc.status} -> {body.status}", "status": body.status}, ctx.user.id)
         if body.status in ("resolved", "closed") and not inc.resolved_at:
@@ -148,6 +155,12 @@ async def link_investigation(iid: uuid.UUID, inv_id: uuid.UUID, request: Request
 async def report(iid: uuid.UUID, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> str:
     inc, _ = await _load(request, db, ctx, iid)
     return report_markdown(await incident_detail(db, inc))
+
+
+@router.get("/{iid}/handover.md", response_class=PlainTextResponse)
+async def handover(iid: uuid.UUID, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> str:
+    inc, _ = await _load(request, db, ctx, iid)
+    return await handover_markdown(db, inc)
 
 
 @router.put("/{iid}/postmortem")

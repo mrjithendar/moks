@@ -155,6 +155,16 @@ class CloudWatchConnector:
         except ConnectorError:
             pass
 
+    async def list_metrics(self, namespace: str | None, name: str | None) -> list[dict]:
+        kwargs: dict[str, Any] = {}
+        if namespace:
+            kwargs["Namespace"] = namespace
+        if name:
+            kwargs["MetricName"] = name
+        resp = await self._call("cloudwatch", "list_metrics", **kwargs)
+        return [{"namespace": m.get("Namespace"), "metric": m.get("MetricName"), "dimensions": {d["Name"]: d["Value"] for d in m.get("Dimensions") or []}}
+                for m in (resp.get("Metrics") or [])[:500]]
+
     async def metric(self, namespace: str, name: str, dimensions: dict[str, str], stat: str, start: datetime, end: datetime,
                      period: int | None = None) -> dict:
         if end - start > self.max_window:

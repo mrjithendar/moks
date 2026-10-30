@@ -1,7 +1,7 @@
 # Self-hosted GitHub Actions runners (not used)
 
 > **MOKS CI does not use self-hosted runners.** `.github/workflows/ci.yml` runs on GitHub-hosted
-> `ubuntu-24.04` (check) and `ubuntu-24.04-arm` (release), which are free for this public repository
+> `ubuntu-latest` (check) and `ubuntu-24.04-arm` (release), which are free for this public repository
 > and start clean for every job. The release job signs in to AWS with the Terraform-managed OIDC role
 > `moks-github-ci`; there are no stored keys.
 >

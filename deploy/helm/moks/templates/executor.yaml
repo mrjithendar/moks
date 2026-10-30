@@ -32,6 +32,27 @@ rules:
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
     verbs: [get, list]
+---
+# Reads the kube-system UID only, to prove it is writing to the cluster a plan was approved for.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: moks-executor-cluster-identity
+  labels: {{- include "moks.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    resourceNames: [kube-system]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: moks-executor-cluster-identity
+  labels: {{- include "moks.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: moks-executor-cluster-identity}
+subjects:
+  - {kind: ServiceAccount, name: moks-executor, namespace: {{ .Release.Namespace }}}
 {{- range .Values.executor.namespaces }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

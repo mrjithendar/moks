@@ -172,8 +172,8 @@ The API's init container runs migration `0002` automatically. Take a backup firs
 (`scripts/backup.sh mk4`).
 
 1. **Knowledge:** the seed creates the `moks-docs` GitHub source, and the worker syncs it within a
-   minute. Add sources under **Runbooks & knowledge** (GitHub repo or uploads). For private repos,
-   add a token: `kubectl -n moks patch secret moks-secrets --type merge -p '{"stringData":{"MOKS_CRED_GITHUB_TOKEN":"…"}}'`.
+   minute. Add sources under **Runbooks & knowledge** (GitHub repo or uploads). Add a token (needed for
+   private repos, and to avoid [rate limits](#github-rate-limits) on public ones): `kubectl -n moks patch secret moks-secrets --type merge -p '{"stringData":{"MOKS_CRED_GITHUB_TOKEN":"…"}}'`.
 2. **Grafana:** create a service account with the Viewer role in Grafana (Administration →
    Service accounts), add a token, then:
    `kubectl -n moks patch secret moks-secrets --type merge -p '{"stringData":{"MOKS_CRED_GRAFANA_TOKEN":"glsa_…"}}'`
@@ -203,6 +203,51 @@ The API's init container runs migration `0002` automatically. Take a backup firs
    `moks-worker`. Until then, investigations and **Analyze with AI** fall back to rule-based reports
    and the model call fails with a credentials error. Set its input and output prices under
    **LLM providers** so FinOps can show cost as well as tokens.
+
+## Upgrading to safe execution
+
+Migrations `0004` to `0008` run automatically in the init containers. Take a backup first. They:
+
+- expire plans still pending, approved or queued (their approvals did not cover the target identity);
+  create those again
+- send any plan caught mid-execution to reconciliation
+- give in-cluster connectors an explicit `config.executor`. Others stay read-only until you add one:
+
+```json
+{"mode": "eks", "cluster_name": "prod", "region": "us-east-1",
+ "executor": {"mode": "eks", "cluster_name": "prod", "region": "us-east-1"}}
+```
+
+The chart adds a small ClusterRole so the executor can read the `kube-system` UID. If the Argo project
+restricts cluster resources, it already allows ClusterRole and ClusterRoleBinding.
+
+A plan in **reconciliation_required** will not retry. Check the object, then record what happened on
+the plan's page (needs the Approver role).
+
+## Detection
+
+Detection is off by default. To turn it on:
+
+1. Open **Detection rules** and use **Dry run** on a rule. It runs with your access and writes nothing.
+2. Tick **run detection rules** on the environment.
+3. Add **maintenance windows** before planned work.
+
+Prometheus rules that need kube-state-metrics report `unknown` until it is installed. mk4 does not have it.
+
+Knowledge sources sync daily by default. Set `MOKS_SYNC_TIMEZONE` to label the schedule; the browser shows
+the next run in local time.
+
+## GitHub rate limits
+
+Without a token GitHub allows 60 requests an hour per IP, which a few repositories use up quickly.
+Set `MOKS_CRED_GITHUB_TOKEN` in `moks-secrets` and every GitHub source without its own credential
+uses it (5,000 requests an hour). A fine-grained token with read-only **Contents** access is enough.
+
+When GitHub rate limits a sync, by 429 or by 403, MOKS stops at once, shows the source as
+`rate_limited` and retries when GitHub says it may. Finished files are kept, so the retry resumes
+where it stopped. `partial` means the sync finished but some files could not be read; those are
+retried on the next sync. `git rejected the credentials (HTTP 403)` now means a real permission
+problem with the token.
 
 ## Using the portal
 

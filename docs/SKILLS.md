@@ -109,3 +109,29 @@ and approval.
 `tests/test_skills.py` covers loading, validation, selection and end-to-end execution. The lab
 evaluation (`moks eval lab`) runs every scenario with skills active. Add a dataset case to
 `backend/moks/evals/datasets/` for each new skill you write.
+
+## Versioned metadata and detection
+
+Skills also carry `title`, `owner`, `category`, `resource_types`, `requires`, `telemetry`, `queries`,
+`hypotheses`, `evidence_required`, `verification`, `recovery_validation`, `runbooks`, `evaluation` and
+`detection`. All are validated at load. A skill cannot grant permissions, and detection rules have no
+action field.
+
+```yaml
+detection:
+  - id: pod-crashloop
+    kind: finding            # finding | prometheus | prometheus_alert | loki | cloudwatch_alarm
+    finding: crashloop
+    interval_minutes: 5
+    lookback_minutes: 15
+    sustained_checks: 2      # consecutive checks before an incident opens
+    recovery_checks: 3       # consecutive clear checks before it counts as clear
+    severity: sev2
+    cooldown_minutes: 30     # returning inside this reopens the incident (flapping)
+    auto_investigate: true
+    auto_resolve: true
+    empty_means_ok: false    # no data is unknown unless the rule says otherwise
+```
+
+A skill that needs a connector an environment lacks is skipped, and the report and the Skills page say why.
+

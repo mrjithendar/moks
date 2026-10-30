@@ -9,7 +9,19 @@
 | 3 | Approvals, allowlisted remediation with pre/post validation and recovery, diagnostic sessions | Implemented and tested with fakes; executor never run against a cluster |
 | 4 | Alert-triggered investigations (webhook + poller) with dedup/cooldowns, incident reports and postmortems, evaluation datasets | Implemented and tested |
 | + | FinOps (AWS cost, anomalies, budgets, Kubernetes allocation and rightsizing, LLM spend) | Implemented; Kubernetes side verified live, AWS side stub-tested |
-| + | SRE skills (`SKILL.md`) | 14 built-in skills; custom skills via ConfigMap |
+| + | SRE skills (`SKILL.md`) | 50 built-in skills; custom skills via ConfigMap |
+
+## Not built from the enterprise brief
+
+- **Metrics filters:** Explore filters by environment, namespace, resource type and the metric's real
+  labels. There are no account, region or cluster filters, and no separate data source picker;
+  CloudWatch has its own tab with basic discovery. Query budgets are constants in code, with no admin screen.
+- **Investigations:** no trace backend integration. Resumption means re-running or a follow-up, not
+  continuing a stopped run. Grouped runs produce one investigation per environment, not one correlated report.
+- **Detection:** no Grafana alert source; Prometheus alerts, Kubernetes state, Loki and CloudWatch alarms only.
+- **Skills:** `evaluation` entries describe intended coverage. The cases are tests in `backend/tests`; the
+  evaluation runner does not read them. Some skills reference metrics that vary by deployment.
+- **Argo CD:** no connector. Drift compares Git with the cluster.
 
 ## Known limitations (Phases 2–4)
 
@@ -23,6 +35,8 @@
   300 KB per source.
 - **Alerts:** the poller reads Prometheus rule state only (no Alertmanager silences or inhibition).
   The automatic-investigation cap (6/hour/environment) is fixed in code.
+- **Executor:** the write path has only been tested with an in-memory writer. No plan has run against a
+  real API server.
 - **FinOps:** allocation covers current pods only; Cost Explorer lags up to 24 h and costs $0.01/request (cached and capped).
 - **Multi-environment views:** each environment queries at most 40 namespaces (the view says so
   when it stops), 6 at a time. Log results are merged and cut to the line limit, so a busy

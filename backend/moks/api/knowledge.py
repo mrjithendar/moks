@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -15,7 +16,7 @@ from ..auth.sessions import AuthContext
 from ..config import get_settings
 from ..connectors.base import ConnectorError
 from ..db import get_db
-from ..models import Document, KnowledgeSource
+from ..models import Document, Job, KnowledgeSource
 from ..rag import ingest, service
 from ..rbac import P
 from .admin import CredentialRef
@@ -31,7 +32,7 @@ class SourceIn(BaseModel):
     include: list[str] = Field(default_factory=list, max_length=50)
     exclude: list[str] = Field(default_factory=list, max_length=50)
     services: dict[str, str] = Field(default_factory=dict, max_length=100)
-    sync_interval_minutes: int = Field(default=360, ge=0, le=10080)
+    sync_interval_minutes: int = Field(default=1440, ge=0, le=43200)  # daily; 0 turns automatic sync off
     scope_environment: str = Field(default="*", pattern=r"^[a-z0-9*?\-]{1,100}$")
     scope_namespace: str = Field(default="*", pattern=r"^[a-z0-9*?\-]{1,63}$")
     service: str | None = Field(default=None, max_length=100)
@@ -40,8 +41,13 @@ class SourceIn(BaseModel):
     enabled: bool = True
 
 
-def source_out(s: KnowledgeSource, counts: dict | None = None) -> dict[str, Any]:
-    return {"id": str(s.id), "name": s.name, "type": s.type, "config": s.config, "scope_environment": s.scope_environment,
+def source_out(s: KnowledgeSource, counts: dict | None = None, job: str | None = None) -> dict[str, Any]:
+    stale_after = timedelta(minutes=s.sync_interval_minutes * 2) if s.sync_interval_minutes else None
+    return {"sync_interval_minutes": s.sync_interval_minutes, "next_sync_at": s.next_sync_at.isoformat() if s.next_sync_at else None,
+            "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None, "last_attempt_at": s.last_attempt_at.isoformat() if s.last_attempt_at else None,
+            "last_counts": s.last_counts, "sync_state": job or "idle", "timezone": get_settings().sync_timezone,
+            "stale": bool(s.type == "github" and stale_after and (not s.last_success_at or datetime.now(timezone.utc) - s.last_success_at > stale_after)),
+            "syncable": s.type == "github", "id": str(s.id), "name": s.name, "type": s.type, "config": s.config, "scope_environment": s.scope_environment,
             "scope_namespace": s.scope_namespace, "service": s.service, "owner": s.owner, "enabled": s.enabled, "revision": s.revision,
             "last_sync_at": s.last_sync_at.isoformat() if s.last_sync_at else None, "last_sync_status": s.last_sync_status,
             "last_error": s.last_error, "documents": counts or {}}
@@ -71,18 +77,18 @@ async def list_sources(ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db
     counts: dict[uuid.UUID, dict] = {}
     for sid, st, n in (await db.execute(select(Document.source_id, Document.status, func.count()).group_by(Document.source_id, Document.status))).all():
         counts.setdefault(sid, {})[st] = n
-    return [source_out(s, counts.get(s.id)) for s in rows]
+    running = dict((await db.execute(select(Job.dedupe_key, Job.status).where(Job.type == "knowledge_sync", Job.status.in_(["queued", "running"])))).all())
+    return [source_out(s, counts.get(s.id), running.get(f"knowledge_sync:{s.id}")) for s in rows]
 
 
 @router.post("/sources", status_code=201)
 async def create_source(body: SourceIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     if body.type == "github" and not body.repository:
         raise HTTPException(422, "github sources need a repository")
-    cfg = {"repository": body.repository, "ref": body.ref, "include": body.include, "exclude": body.exclude, "services": body.services,
-           "sync_interval_minutes": body.sync_interval_minutes} if body.type == "github" else {}
+    cfg = {"repository": body.repository, "ref": body.ref, "include": body.include, "exclude": body.exclude, "services": body.services} if body.type == "github" else {}
     src = KnowledgeSource(name=body.name, type=body.type, config=cfg, credential_ref=body.credential_ref.model_dump(exclude_none=True),
                           scope_environment=body.scope_environment, scope_namespace=body.scope_namespace, service=body.service,
-                          owner=body.owner, enabled=body.enabled)
+                          owner=body.owner, enabled=body.enabled, sync_interval_minutes=body.sync_interval_minutes if body.type == "github" else 0)
     db.add(src)
     await db.flush()
     await audit.record(db, action="knowledge.source_create", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="knowledge_source",
@@ -99,7 +105,25 @@ async def sync(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTO
     if src is None or src.type != "github":
         raise HTTPException(404, "GitHub source not found")
     jid = await jobs.enqueue("knowledge_sync", {"source_id": str(sid)}, dedupe_key=f"knowledge_sync:{sid}", created_by=ctx.user.id)
-    return {"queued": bool(jid)}
+    await audit.record(db, action="knowledge.sync_request", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="knowledge_source", resource_id=str(sid),
+                       decision="allow", outcome="queued" if jid else "already_running")
+    return {"queued": bool(jid), "already_running": not jid}
+
+
+class ScheduleIn(BaseModel):
+    sync_interval_minutes: int = Field(ge=0, le=43200)  # 0 turns automatic sync off
+
+
+@router.put("/sources/{sid}/schedule")
+async def schedule(sid: uuid.UUID, body: ScheduleIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    src = await db.get(KnowledgeSource, sid)
+    if src is None or src.type != "github":
+        raise HTTPException(404, "GitHub source not found")
+    src.sync_interval_minutes = body.sync_interval_minutes
+    src.next_sync_at = datetime.now(timezone.utc) + timedelta(minutes=body.sync_interval_minutes) if body.sync_interval_minutes else None
+    await audit.record(db, action="knowledge.schedule", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="knowledge_source", resource_id=str(sid),
+                       decision="allow", details=body.model_dump())
+    return source_out(src)
 
 
 @router.delete("/sources/{sid}")

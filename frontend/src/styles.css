@@ -142,3 +142,18 @@ details summary { cursor: pointer; color: var(--muted); }
 details.block > summary { cursor: pointer; color: var(--muted); }
 .table-wrap { overflow-x: auto; }
 .metric-list { max-height: 420px; overflow: auto; }
+
+/* Metrics workspace */
+.metrics-layout { grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); align-items: start; }
+@media (max-width: 1000px) { .metrics-layout { grid-template-columns: 1fr; } }
+tr.selected { background: #15233f; }
+.ms { display: flex; flex-direction: column; gap: 4px; min-width: 150px; position: relative; }
+.ms-label { font-size: 12px; color: var(--muted); }
+.ms-box summary { cursor: pointer; list-style: none; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 240px; }
+.ms-menu { position: absolute; z-index: 20; min-width: 220px; max-height: 280px; overflow: auto; background: #0d1526; border: 1px solid var(--border); border-radius: 8px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+
+/* Investigation stages */
+.stages { display: flex; flex-wrap: wrap; gap: 4px; list-style: none; padding: 0; margin: 0; font-size: 12px; }
+.stages li { padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+.stages li.done { color: #4ade80; border-color: #14532d; }
+.stages li.now { color: var(--accent); border-color: var(--accent); }

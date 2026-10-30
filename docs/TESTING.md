@@ -61,7 +61,7 @@ Defects found and fixed during this round:
 
 These ran the real backend and built frontend against PostgreSQL, with simulated Kubernetes,
 Prometheus and Loki connectors and two environments, one of them with a failing namespace. **They
-are not checks against mk4.** Results: 120 backend tests passed (4 skipped), 5 frontend tests passed,
+are not checks against mk4.** Results at that point: 120 backend tests passed (4 skipped), 5 frontend tests passed,
 Helm lint clean.
 
 Driven in the browser: Overview polling every 5 s, all Explorer tabs and pod drawer, Metrics catalog
@@ -72,6 +72,14 @@ environment or namespace.
 Bugs this found and fixed: connector errors during fan-out collided on one database session; one
 unreadable namespace failed the whole FinOps report; the name field's validation pattern was invalid
 in current Chrome and was silently ignored.
+
+### Enterprise upgrade (simulated connectors, not mk4)
+
+Backend suite 232 passed, 4 skipped. Frontend 10 passed. Helm lint and render clean for Minikube and EKS.
+A database with existing rows was upgraded from `0003` to `0008`: approved plans expired, a mid-flight plan
+went to reconciliation, the in-cluster connector gained an explicit write target, the EKS connector stayed
+read-only, and an explicit 360-minute schedule was kept. Chrome drove Metrics, saved queries, Detection
+dry run, Skills, Knowledge, Investigate and deep links with no console errors.
 
 ## Coverage of the required areas
 

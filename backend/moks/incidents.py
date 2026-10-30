@@ -35,6 +35,10 @@ async def incident_detail(db: AsyncSession, inc: Incident) -> dict[str, Any]:
         "namespace": inc.namespace, "summary": inc.summary, "hypotheses": inc.hypotheses, "source": inc.source,
         "created_by": actors.get(inc.created_by), "created_at": inc.created_at.isoformat(), "updated_at": inc.updated_at.isoformat(),
         "resolved_at": inc.resolved_at.isoformat() if inc.resolved_at else None,
+        "commander": (await db.get(User, inc.commander_id)).email if inc.commander_id else None,
+        "detection": {"rule": inc.rule_id, "rule_version": inc.rule_version, "skill": inc.skill, "resource": inc.resource, "owner": inc.owner_team, "severity_reason": inc.severity_reason,
+                      "runbook": inc.runbook, "count": inc.detection_count, "first_observed": inc.first_observed_at.isoformat() if inc.first_observed_at else None,
+                      "last_observed": inc.last_observed_at.isoformat() if inc.last_observed_at else None} if inc.rule_id else None,
         "postmortem": inc.postmortem, "postmortem_status": inc.postmortem_status,
         "timeline": [{"id": e.id, "ts": e.ts.isoformat(), "kind": e.kind, "actor": actors.get(e.actor_id), "payload": e.payload} for e in events],
         "investigations": [{"id": str(i.id), "question": i.question, "status": i.status, "namespace": i.namespace, "trigger": i.trigger,
@@ -85,3 +89,30 @@ def report_markdown(d: dict[str, Any]) -> str:
         text = p.get("text") or p.get("summary") or p.get("message") or p.get("status") or ", ".join(f"{k}={v}" for k, v in list(p.items())[:4])
         lines.append(f"- {e['ts']} · {e['kind']} · {e['actor'] or 'system'}: {text}")
     return "\n".join(lines) + "\n"
+
+
+async def handover_markdown(db: AsyncSession, inc: Incident) -> str:
+    """Facts, suspicions and verified causes stay in separate sections. Everything comes from
+    recorded evidence: nothing is summarized by an LLM here."""
+    d = await incident_detail(db, inc)
+    latest = (await db.execute(select(Investigation).where(Investigation.incident_id == inc.id, Investigation.report.is_not(None))
+                               .order_by(Investigation.created_at.desc()))).scalars().first()
+    report = (latest.report if latest else None) or {}
+    lines = [f"# Handover: {d['title']}", "", f"Severity {d['severity']}, status {d['status']}, environment {d['environment']}/{d['namespace']}.",
+             f"Assigned to: {d['commander'] or 'nobody'}.", ""]
+    if d["detection"]:
+        lines += [f"Detected by rule {d['detection']['rule']} (skill {d['detection']['skill']} v{d['detection']['rule_version']}) on {d['detection']['resource']}.",
+                  f"First seen {d['detection']['first_observed']}, last seen {d['detection']['last_observed']}.", ""]
+
+    def section(title: str, rows: list[str], empty: str) -> None:
+        lines.extend([f"## {title}", *([f"- {r}" for r in rows] or [empty]), ""])
+
+    section("Observed facts", [f["statement"] for f in report.get("observed_facts", [])][:10], "None recorded.")
+    section("Verified causes", [c["cause"] for c in report.get("verified_causes", [])], "None verified.")
+    section("Suspected causes (not verified)", [f"{c['cause']} ({c['confidence']} confidence)" for c in report.get("suspected_causes", [])], "None.")
+    section("Missing evidence", report.get("missing_evidence", []), "None listed.")
+    plans = (await db.execute(select(ActionPlan).where(ActionPlan.incident_id == inc.id).order_by(ActionPlan.created_at))).scalars().all()
+    section("Executed actions", [f"{p.action} on {p.target_kind}/{p.target_name}: {p.status}" for p in plans if p.executed_by], "None.")
+    section("Validated recovery", [f"{p.action} on {p.target_kind}/{p.target_name}" for p in plans if p.status == "succeeded" and (p.result or {}).get("validation", {}).get("ok")], "Not validated.")
+    section("Next steps", report.get("next_steps", []), "None listed.")
+    return "\n".join(lines)

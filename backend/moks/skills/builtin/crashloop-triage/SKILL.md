@@ -33,6 +33,22 @@ remediation:
   - when: crashloop
     action: open_pull_request
     note: If the logs show an invalid configuration value, fix it in Git (manifest/ConfigMap) rather than live.
+title: CrashLoopBackOff
+owner: sre
+category: kubernetes
+version: '2'
+detection:
+- id: pod-crashloop
+  kind: finding
+  finding: crashloop
+  sustained_checks: 2
+  severity: sev2
+  auto_investigate: true
+  auto_resolve: true
+  title: Pod crash-looping
+evaluation:
+- fixture: crashloop-config
+  expect: the lab's expected finding
 ---
 # CrashLoopBackOff triage
 

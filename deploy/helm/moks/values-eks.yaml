@@ -36,7 +36,7 @@ seed:
       connectors:
         - type: kubernetes
           name: in-cluster
-          config: {mode: in_cluster}
+          config: {mode: in_cluster, executor: {mode: in_cluster}}
 
 ingress:
   className: alb

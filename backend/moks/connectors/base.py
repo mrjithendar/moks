@@ -18,14 +18,16 @@ CREDENTIALS_DIR = Path(os.environ.get("MOKS_CREDENTIALS_DIR", "/var/run/moks-cre
 class ConnectorError(Exception):
     """A connector failure with a user-presentable message.
 
-    kind: config | auth | unavailable | timeout | bad_request | not_found | too_large | forbidden
+    kind: config | auth | unavailable | timeout | bad_request | not_found | too_large | forbidden | rate_limited
+    retry_after: seconds the upstream asked us to wait (rate_limited only).
     """
 
-    def __init__(self, kind: str, message: str, *, retryable: bool = False):
+    def __init__(self, kind: str, message: str, *, retryable: bool = False, retry_after: float | None = None):
         super().__init__(message)
         self.kind = kind
         self.message = message
         self.retryable = retryable
+        self.retry_after = retry_after
 
     def __str__(self) -> str:
         return f"{self.kind}: {self.message}"
@@ -88,6 +90,25 @@ class HttpLimits:
     max_response_bytes: int = 8_000_000
 
 
+def _is_rate_limit(status: int, headers: httpx.Headers, text: str) -> bool:
+    """GitHub also answers 403 for primary and secondary rate limits."""
+    if status == 429:
+        return True
+    lowered = text.lower()
+    return status == 403 and (headers.get("x-ratelimit-remaining") == "0" or "retry-after" in headers or "rate limit" in lowered or "abuse" in lowered)
+
+
+def _retry_after(headers: httpx.Headers) -> float:
+    value = headers.get("retry-after", "")
+    if value.isdigit():
+        wait = float(value)
+    elif (headers.get("x-ratelimit-reset") or "").isdigit():
+        wait = float(headers["x-ratelimit-reset"]) - time.time() + 1
+    else:
+        wait = 60.0  # GitHub: wait at least a minute when no header says otherwise
+    return min(max(wait, 1.0), 3600.0)
+
+
 class BoundedHttp:
     """httpx wrapper: per-call timeout, bounded retries for idempotent requests, response size cap,
     and connector metrics. One instance per connector configuration."""
@@ -138,17 +159,21 @@ class BoundedHttp:
                     body.extend(chunk)
                     if len(body) > self.limits.max_response_bytes:
                         raise ConnectorError("too_large", f"response exceeded {self.limits.max_response_bytes} bytes; narrow the query")
-                status = resp.status_code
+                status, headers = resp.status_code, resp.headers
         except httpx.TimeoutException:
             raise ConnectorError("timeout", f"{self.connector_type} did not answer within {self.limits.timeout_seconds:.0f}s", retryable=True) from None
         except httpx.TransportError as exc:
             raise ConnectorError("unavailable", f"cannot reach {self.connector_type} at {self.client.base_url} ({type(exc).__name__})", retryable=True) from None
         text = body.decode("utf-8", "replace")
+        if _is_rate_limit(status, headers, text):
+            # Never retried here: repeating a rate-limited request is what extends the block.
+            wait = _retry_after(headers)
+            raise ConnectorError("rate_limited", f"{self.connector_type} rate limit reached (HTTP {status}); retry in about {wait:.0f}s", retry_after=wait)
         if status in (401, 403):
             raise ConnectorError("auth" if status == 401 else "forbidden", f"{self.connector_type} rejected the credentials (HTTP {status})")
         if status == 404:
             raise ConnectorError("not_found", f"{self.connector_type} endpoint not found (HTTP 404); check the base URL/path prefix")
-        if status == 429 or status >= 500:
+        if status >= 500:
             raise ConnectorError("unavailable", f"{self.connector_type} returned HTTP {status}: {_short(text)}", retryable=True)
         if status >= 400:
             raise ConnectorError("bad_request", f"{self.connector_type} rejected the request (HTTP {status}): {_short(text)}")

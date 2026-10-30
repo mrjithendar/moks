@@ -23,6 +23,18 @@ remediation:
     action: rollback_deployment
     target: "Deployment/{deployment}"
     note: Roll back to the last revision whose image pulled successfully while the reference is fixed.
+title: Image pull failures
+owner: sre
+category: kubernetes
+version: '2'
+detection:
+- id: pod-image-pull
+  kind: finding
+  finding: image_pull
+  sustained_checks: 2
+  severity: sev3
+  auto_resolve: true
+  title: Image cannot be pulled
 ---
 # Image pull failures
 

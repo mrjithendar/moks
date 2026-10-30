@@ -275,6 +275,12 @@ class KubernetesConnector:
         revisions.sort(key=lambda r: r["revision"], reverse=True)
         return {"deployment": summarize_workload("Deployment", dep), "revisions": revisions[:15]}
 
+    async def cluster_uid(self) -> str:
+        """UID of kube-system: stable for a cluster's lifetime and unique across clusters."""
+        core = await self.core()
+        ns = await self._call("get namespace kube-system", core.read_namespace, "kube-system")
+        return ns.metadata.uid
+
     async def deployment_meta(self, namespace: str, name: str) -> dict:
         apps = await self.apps()
         api = await self._client()
@@ -282,7 +288,7 @@ class KubernetesConnector:
         tmpl = dep.get("spec", {}).get("template", {})
         return {
             "name": name, "namespace": namespace,
-            "resourceVersion": dep["metadata"].get("resourceVersion"), "generation": dep["metadata"].get("generation"),
+            "resourceVersion": dep["metadata"].get("resourceVersion"), "uid": dep["metadata"].get("uid"), "generation": dep["metadata"].get("generation"),
             "annotations": {**(dep["metadata"].get("annotations") or {}), **((tmpl.get("metadata") or {}).get("annotations") or {})},
             "labels": dep["metadata"].get("labels") or {},
             "images": [c.get("image") for c in tmpl.get("spec", {}).get("containers", [])],
@@ -300,7 +306,7 @@ class KubernetesConnector:
         if kind not in fns:
             raise ConnectorError("bad_request", f"unsupported kind {kind}")
         obj = api.sanitize_for_serialization(await self._call(f"get {kind} {namespace}/{name}", fns[kind], name, namespace))
-        return {"kind": kind, "name": name, "resourceVersion": obj["metadata"].get("resourceVersion"), "spec": obj.get("spec", {}),
+        return {"kind": kind, "name": name, "resourceVersion": obj["metadata"].get("resourceVersion"), "uid": obj["metadata"].get("uid"), "spec": obj.get("spec", {}),
                 "generation": obj["metadata"].get("generation")}
 
     async def services(self, namespace: str) -> list[dict]:

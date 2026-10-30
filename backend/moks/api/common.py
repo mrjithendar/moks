@@ -50,7 +50,7 @@ def outcome_response(out) -> dict[str, Any]:
     if out.denied:
         raise HTTPException(403, out.error)
     if not out.ok:
-        status = {"invalid_args": 422, "not_found": 404, "config": 409, "timeout": 504}.get(out.error_kind or "", 502)
+        status = {"invalid_args": 422, "not_found": 404, "config": 409, "timeout": 504, "rate_limited": 429}.get(out.error_kind or "", 502)
         raise HTTPException(status, out.summary)
     return {"summary": out.summary, "data": out.data, "source": out.source, "truncated": out.truncated,
             "collected_at": out.collected_at, "duration_ms": out.duration_ms}

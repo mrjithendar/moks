@@ -81,6 +81,7 @@ class Environment(Base):
     grafana_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     auto_investigate: Mapped[bool] = mapped_column(Boolean, default=False)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    detection_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     alert_cooldown_minutes: Mapped[int] = mapped_column(Integer, default=30)
     max_replicas: Mapped[int] = mapped_column(Integer, default=10)
     allow_scale_to_zero: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -151,6 +152,9 @@ class Investigation(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     mode: Mapped[str] = mapped_column(String(20), default="llm")  # llm | deterministic
     incident_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("incidents.id", ondelete="SET NULL"), nullable=True)
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # follow-up question
+    group_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # one question, several environments
+    stage: Mapped[str] = mapped_column(String(20), default="queued")
     trigger: Mapped[str] = mapped_column(String(20), default="user")  # user | alert | eval
     tool_calls: Mapped[int] = mapped_column(Integer, default=0)
     tokens_in: Mapped[int] = mapped_column(Integer, default=0)
@@ -205,7 +209,7 @@ class AuditEvent(Base):
     environment: Mapped[str | None] = mapped_column(String(100), nullable=True)
     namespace: Mapped[str | None] = mapped_column(String(253), nullable=True)
     decision: Mapped[str] = mapped_column(String(10), default="n/a")  # allow | deny | n/a
-    outcome: Mapped[str] = mapped_column(String(20), default="success")
+    outcome: Mapped[str] = mapped_column(String(30), default="success")
     details: Mapped[dict] = mapped_column(JSONB, default=dict)
     ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -238,6 +242,16 @@ class Incident(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rule_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    rule_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    skill: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    resource: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    first_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    detection_count: Mapped[int] = mapped_column(Integer, default=0)
+    owner_team: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    severity_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    runbook: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class IncidentEvent(Base):
@@ -285,6 +299,11 @@ class KnowledgeSource(Base):
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sync_interval_minutes: Mapped[int] = mapped_column(Integer, default=1440)  # 0 turns automatic sync off
+    next_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_counts: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -330,8 +349,80 @@ class EmbeddingIndex(Base):
     index_name: Mapped[str] = mapped_column(String(200))
     status: Mapped[str] = mapped_column(String(20), default="building")
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    cleanup_pending: Mapped[bool] = mapped_column(Boolean, default=False)  # physical index still to delete
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SkillPolicy(Base):
+    __tablename__ = "skill_policies"
+    name: Mapped[str] = mapped_column(String(120), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DetectionPolicy(Base):
+    __tablename__ = "detection_policies"
+    rule_id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    environments: Mapped[list] = mapped_column(JSONB, default=list)  # empty: all with detection enabled
+    overrides: Mapped[dict] = mapped_column(JSONB, default=dict)
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DetectionRun(Base):
+    __tablename__ = "detection_runs"
+    rule_id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id", ondelete="CASCADE"), primary_key=True)
+    last_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_status: Mapped[str] = mapped_column(String(20))
+    last_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DetectionState(Base):
+    __tablename__ = "detection_states"
+    fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    rule_id: Mapped[str] = mapped_column(String(120))
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id", ondelete="CASCADE"))
+    resource: Mapped[str] = mapped_column(String(300))
+    namespace: Mapped[str | None] = mapped_column(String(253), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending | firing | suppressed | cleared
+    consecutive: Mapped[int] = mapped_column(Integer, default=0)
+    clear_checks: Mapped[int] = mapped_column(Integer, default=0)
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    incident_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("incidents.id", ondelete="SET NULL"), nullable=True)
+
+
+class MaintenanceWindow(Base):
+    __tablename__ = "maintenance_windows"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id", ondelete="CASCADE"))
+    namespace: Mapped[str] = mapped_column(String(253), default="*")
+    rule_id: Mapped[str] = mapped_column(String(120), default="*")
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reason: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SavedQuery(Base):
+    __tablename__ = "saved_queries"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")
+    language: Mapped[str] = mapped_column(String(20), default="promql")
+    query: Mapped[str] = mapped_column(Text)
+    environments: Mapped[list] = mapped_column(JSONB, default=list)  # empty: all the reader may query
+    shared: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ActionPlan(Base):
@@ -357,7 +448,13 @@ class ActionPlan(Base):
     requires_approval: Mapped[bool] = mapped_column(Boolean, default=True)
     plan_hash: Mapped[str] = mapped_column(String(64))
     requested_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
-    status: Mapped[str] = mapped_column(String(20), default="pending")
+    status: Mapped[str] = mapped_column(String(30), default="pending")
+    hash_version: Mapped[int] = mapped_column(Integer, default=2)
+    target_identity: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # connector, write target, cluster
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    mutation_state: Mapped[str] = mapped_column(String(20), default="none")  # none | intent | applied | not_applied | unknown
+    checkpoint: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     executed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

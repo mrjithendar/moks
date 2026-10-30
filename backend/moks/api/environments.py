@@ -37,13 +37,14 @@ class EnvIn(BaseModel):
     max_replicas: int = Field(default=10, ge=1, le=1000)
     allow_scale_to_zero: bool = False
     plan_ttl_minutes: int = Field(default=60, ge=5, le=1440)
+    detection_enabled: bool = False
 
 
 def env_out(e: Environment) -> dict[str, Any]:
     return {"id": str(e.id), "name": e.name, "display_name": e.display_name or e.name, "kind": e.kind,
             "is_production": e.is_production, "allowed_namespaces": e.allowed_namespaces, "denied_namespaces": e.denied_namespaces,
             "max_query_window_minutes": e.max_query_window_minutes, "grafana_url": e.grafana_url,
-            "auto_investigate": e.auto_investigate, "is_default": e.is_default, "alert_cooldown_minutes": e.alert_cooldown_minutes, "max_replicas": e.max_replicas,
+            "auto_investigate": e.auto_investigate, "detection_enabled": e.detection_enabled, "is_default": e.is_default, "alert_cooldown_minutes": e.alert_cooldown_minutes, "max_replicas": e.max_replicas,
             "allow_scale_to_zero": e.allow_scale_to_zero, "plan_ttl_minutes": e.plan_ttl_minutes}
 
 

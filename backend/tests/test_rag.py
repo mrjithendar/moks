@@ -2,13 +2,17 @@
 chunking, OpenSearch contract, prompt injection inside retrieved documents."""
 import base64
 import json
+import time
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 import pytest
+from sqlalchemy import text
 
+from moks import jobs
 from moks.db import session_scope
-from moks.models import KnowledgeSource
+from moks.models import Job, KnowledgeSource
 from moks.rag import ingest, service
 from moks.rag.chunking import chunk
 from moks.rbac import Binding, Principal
@@ -149,6 +153,150 @@ async def test_github_sync_is_incremental_and_propagates_deletions(monkeypatch):
     assert (await _search(viewer, f"alpaca{tag}"))["results"] == []
     assert (await _search(viewer, f"buffalo{tag}"))["results"]
     assert (await _search(viewer, f"bison{tag}"))["results"] == []
+
+
+class LimitedGitHub(FakeGitHub):
+    """Rate limits every blob read after the first `allowed`, in the way GitHub answers."""
+
+    def __init__(self, files, allowed, response):
+        super().__init__(files)
+        self.allowed, self.response, self.blocked = allowed, response, 0
+
+    def __call__(self, req):
+        if "/git/blobs/" in req.url.path and self.blob_reads >= self.allowed:
+            self.blocked += 1
+            return self.response()
+        return super().__call__(req)
+
+
+def _use(monkeypatch, gh):
+    import moks.connectors.git as gitmod
+
+    real = gitmod.GitHubProvider.__init__
+    monkeypatch.setattr(gitmod.GitHubProvider, "__init__", lambda self, config, cred, transport=None: real(self, config, cred, httpx.MockTransport(gh)))
+
+
+UNAUTHENTICATED_LIMIT = lambda: httpx.Response(403, headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(time.time()) + 600)},  # noqa: E731
+                                               json={"message": "API rate limit exceeded"})
+ABUSE_LIMIT = lambda: httpx.Response(429, headers={"retry-after": "120"}, json={"message": "You have triggered an abuse detection mechanism."})  # noqa: E731
+
+
+@pytest.mark.parametrize("response,wait", [(UNAUTHENTICATED_LIMIT, 600), (ABUSE_LIMIT, 120)])
+async def test_rate_limit_stops_the_sync_requeues_and_resumes(monkeypatch, response, wait):
+    tag = uuid.uuid4().hex[:6]
+    gh = LimitedGitHub({f"docs/{i}.md": f"# {i}\nfile{i}{tag}" for i in range(6)}, 2, response)
+    sid = await _source("lim", type_="github", config={"repository": "acme/ops"})
+    _use(monkeypatch, gh)
+    job_id = await jobs.enqueue("knowledge_sync", {"source_id": str(sid)})
+    async with session_scope() as db:
+        await db.execute(text("UPDATE jobs SET attempts = 1, status = 'running' WHERE id = :i"), {"i": job_id})
+    await jobs.run_one(job_id)
+    assert gh.blocked == 1  # no retries, and no attempt at the remaining files
+    async with session_scope() as db:
+        job, src = await db.get(Job, job_id), await db.get(KnowledgeSource, sid)
+        assert job.status == "queued" and job.attempts == 0 and src.last_sync_status == "rate_limited"
+        assert wait - 5 <= (job.run_after - datetime.now(timezone.utc)).total_seconds() <= wait + 5
+        assert "rate limit" in src.last_error and "credentials" not in src.last_error
+    gh.allowed = 100
+    async with session_scope() as db:
+        r = await ingest.sync_github(db, await db.get(KnowledgeSource, sid))
+    assert r["added"] == 4 and r["unchanged"] == 2 and gh.blob_reads == 6  # resumed, nothing re-fetched
+
+
+async def test_real_403_is_still_a_credential_error_and_a_skipped_file_is_not_ok(monkeypatch):
+    gh = LimitedGitHub({"docs/a.md": "# A", "docs/b.md": "# B"}, 1, lambda: httpx.Response(403, json={"message": "Resource not accessible"}))
+    sid = await _source("deny", type_="github", config={"repository": "acme/ops"})
+    _use(monkeypatch, gh)
+    async with session_scope() as db:
+        r = await ingest.sync_github(db, await db.get(KnowledgeSource, sid))
+    assert r["failed"] == 1 and gh.blocked == 1
+    async with session_scope() as db:
+        src = await db.get(KnowledgeSource, sid)
+        assert src.last_sync_status == "partial" and src.revision is None
+
+
+async def _synced(monkeypatch, gh):
+    sid = await _source("del", type_="github", config={"repository": "acme/ops"})
+    _use(monkeypatch, gh)
+    async with session_scope() as db:
+        await ingest.sync_github(db, await db.get(KnowledgeSource, sid))
+    return sid
+
+
+async def _sync_again(sid):
+    async with session_scope() as db:
+        return await ingest.sync_github(db, await db.get(KnowledgeSource, sid))
+
+
+async def test_empty_listing_never_wipes_indexed_documents(monkeypatch):
+    gh = FakeGitHub({"docs/a.md": "# A", "docs/b.md": "# B"})
+    sid = await _synced(monkeypatch, gh)
+    gh.files.clear()
+    r = await _sync_again(sid)
+    assert r["deleted"] == 0 and r["deletions_skipped"]
+    async with session_scope() as db:
+        assert (await db.get(KnowledgeSource, sid)).last_sync_status == "partial"
+
+
+async def test_failed_listing_deletes_nothing(monkeypatch):
+    gh = FakeGitHub({"docs/a.md": "# A"})
+    sid = await _synced(monkeypatch, gh)
+    gh.down = True
+    real = gh.__class__.__call__
+    monkeypatch.setattr(FakeGitHub, "__call__", lambda self, req: httpx.Response(503) if "/git/trees/" in req.url.path else real(self, req))
+    with pytest.raises(Exception):
+        await _sync_again(sid)
+    async with session_scope() as db:
+        from sqlalchemy import select
+
+        from moks.models import Document
+
+        docs = (await db.execute(select(Document).where(Document.source_id == sid))).scalars().all()
+    assert [d.status for d in docs] == ["active"]
+
+
+async def test_files_past_the_cap_are_not_treated_as_deleted(monkeypatch):
+    gh = FakeGitHub({f"docs/{i}.md": f"# {i}" for i in range(4)})
+    sid = await _synced(monkeypatch, gh)
+    monkeypatch.setattr(ingest, "MAX_FILES", 2)
+    r = await _sync_again(sid)
+    assert r["deleted"] == 0 and r["deletions_skipped"]
+
+
+async def test_new_source_syncs_now_and_then_daily_and_duplicates_are_refused(client, monkeypatch):
+    tag = uuid.uuid4().hex[:6]
+    await make_user(f"k-{tag}@example.com", ["admin"])
+    h = await login(client, f"k-{tag}@example.com")
+    s = (await client.post("/moks/api/knowledge/sources", json={"name": f"daily-{tag}", "type": "github", "repository": "acme/ops"}, headers=h)).json()
+    assert s["sync_interval_minutes"] == 1440 and s["syncable"]
+    r = (await client.post(f"/moks/api/knowledge/sources/{s['id']}/sync", headers=h)).json()
+    assert r == {"queued": False, "already_running": True}  # the first sync is already queued
+    row = next(x for x in (await client.get("/moks/api/knowledge/sources")).json() if x["id"] == s["id"])
+    assert row["sync_state"] == "queued" and row["timezone"] == "UTC" and row["stale"]
+    u = (await client.post("/moks/api/knowledge/sources", json={"name": f"up-{tag}", "type": "upload"}, headers=h)).json()
+    assert u["syncable"] is False and u["sync_interval_minutes"] == 0
+    assert (await client.post(f"/moks/api/knowledge/sources/{u['id']}/sync", headers=h)).status_code == 404
+    off = (await client.put(f"/moks/api/knowledge/sources/{s['id']}/schedule", json={"sync_interval_minutes": 0}, headers=h)).json()
+    assert off["next_sync_at"] is None
+
+
+async def test_scheduler_queues_a_due_source_once(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import select
+
+    from moks import jobs
+    from moks.models import Job
+
+    sid = await _source("due", type_="github", config={"repository": "acme/ops"})
+    async with session_scope() as db:
+        src = await db.get(KnowledgeSource, sid)
+        src.sync_interval_minutes, src.next_sync_at = 1440, datetime.now(timezone.utc) - timedelta(minutes=1)
+    await jobs.schedule_periodic()
+    await jobs.schedule_periodic()  # a second replica
+    async with session_scope() as db:
+        rows = (await db.execute(select(Job).where(Job.dedupe_key == f"knowledge_sync:{sid}"))).scalars().all()
+    assert len(rows) == 1
 
 
 def test_chunking_follows_structure():

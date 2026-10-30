@@ -35,6 +35,21 @@ remediation:
     action: patch_resources
     target: "Deployment/{deployment}"
     note: Raise the memory limit to observed peak + headroom (see finops_rightsizing), or fix a leak if usage grows without bound.
+title: OOMKilled workloads
+owner: sre
+category: kubernetes
+version: '2'
+detection:
+- id: pod-oomkilled
+  kind: finding
+  finding: oomkilled
+  sustained_checks: 1
+  severity: sev2
+  auto_investigate: true
+  title: Container OOMKilled
+evaluation:
+- fixture: oomkilled
+  expect: the lab's expected finding
 ---
 # OOMKilled triage
 

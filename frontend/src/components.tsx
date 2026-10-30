@@ -19,6 +19,7 @@ export function Layout({ children }: { children: ReactNode }) {
         {can("investigation.read") && <NavLink to="/investigate">Investigate</NavLink>}
         {can("investigation.read") && <NavLink to="/investigations">Investigations</NavLink>}
         {can("investigation.read") && <NavLink to="/incidents">Incidents</NavLink>}
+        {can("investigation.read") && <NavLink to="/detections">Detection rules</NavLink>}
         {(can("action.request") || can("action.approve")) && <NavLink to="/actions">Approvals &amp; actions</NavLink>}
         {can("action.request") && <NavLink to="/diagnostics">Diagnostics</NavLink>}
         {can("investigation.read") && <NavLink to="/knowledge">Runbooks &amp; knowledge</NavLink>}

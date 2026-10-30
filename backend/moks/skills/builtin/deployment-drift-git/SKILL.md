@@ -13,6 +13,10 @@ steps:
     limit: 2
     args: {namespace: "{namespace}", deployment: "{deployment}"}
     purpose: what changed between revisions
+title: Deployment drift
+owner: sre
+category: devops
+version: '2'
 ---
 # Deployment drift against Git
 

@@ -18,6 +18,18 @@ steps:
     limit: 1
     args: {namespace: "{namespace}", pod: "{pod}", tail_lines: 120}
     purpose: application view of its health
+title: Readiness and liveness probes
+owner: sre
+category: application
+version: '2'
+detection:
+- id: pod-not-ready
+  kind: finding
+  finding: not_ready
+  sustained_checks: 4
+  severity: sev3
+  auto_resolve: true
+  title: Pod not Ready
 ---
 # Readiness failures
 

@@ -34,10 +34,10 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 log = logging.getLogger("moks.skills")
 BUILTIN = Path(__file__).parent / "builtin"
@@ -70,6 +70,62 @@ class Triggers(BaseModel):
     findings: list[str] = Field(default_factory=list)
 
 
+class DetectionSpec(BaseModel):
+    """A deterministic rule. Rules read evidence; they cannot name an action, so an incident never
+    authorizes a change: remediation stays behind action plans and approvals."""
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,80}$")
+    kind: Literal["finding", "prometheus", "prometheus_alert", "loki", "cloudwatch_alarm"]
+    finding: str | None = Field(default=None, pattern=r"^[a-z_]+$")   # kind finding
+    query: str | None = Field(default=None, max_length=2000)          # prometheus: PromQL; loki: text; alert kinds: name regex
+    resource_label: list[str] = Field(default_factory=list, max_length=4)
+    operator: Literal[">", ">=", "<", "<=", "==", "!="] = ">"
+    threshold: float = 0
+    enabled: bool = True
+    environments: list[str] = Field(default_factory=lambda: ["*"])
+    namespaces: list[str] = Field(default_factory=lambda: ["*"])
+    interval_minutes: int = Field(default=5, ge=1, le=1440)
+    lookback_minutes: int = Field(default=15, ge=1, le=1440)
+    sustained_checks: int = Field(default=2, ge=1, le=20)
+    recovery_checks: int = Field(default=3, ge=1, le=50)
+    severity: Literal["sev1", "sev2", "sev3", "sev4"] = "sev3"
+    min_evidence: int = Field(default=1, ge=1, le=20)
+    cooldown_minutes: int = Field(default=30, ge=0, le=1440)
+    owner: str | None = Field(default=None, max_length=120)
+    auto_investigate: bool = False
+    auto_resolve: bool = False
+    empty_means_ok: bool = False  # no results proves health only when the rule says so
+    title: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def _shape(self) -> "DetectionSpec":
+        if self.kind == "finding" and not self.finding:
+            raise ValueError(f"{self.id}: a finding rule needs finding")
+        if self.kind != "finding" and not self.query:
+            raise ValueError(f"{self.id}: a {self.kind} rule needs query")
+        return self
+
+
+class QueryTemplate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    language: Literal["promql", "logql", "cloudwatch"]
+    query: str = Field(max_length=2000)
+    purpose: str = Field(default="", max_length=200)
+
+
+class Hypothesis(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    statement: str = Field(max_length=300)
+    supports: str = Field(default="", max_length=300)
+    refutes: str = Field(default="", max_length=300)
+
+
+class EvalCase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fixture: str = Field(max_length=200)
+    expect: str = Field(max_length=200)
+
+
 class SkillMeta(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,60}$")
@@ -78,6 +134,27 @@ class SkillMeta(BaseModel):
     steps: list[StepSpec] = Field(default_factory=list, max_length=12)
     remediation: list[RemediationSpec] = Field(default_factory=list, max_length=8)
     version: str = "1"
+    title: str | None = Field(default=None, max_length=120)
+    owner: str = Field(default="sre", max_length=120)
+    category: Literal["kubernetes", "application", "aws", "devops", "support", "finops"] = "kubernetes"
+    resource_types: list[str] = Field(default_factory=list, max_length=12)
+    requires: list[str] = Field(default_factory=list, max_length=6)   # connectors, beyond those its steps need
+    telemetry: list[str] = Field(default_factory=list, max_length=12)  # metrics that must exist
+    detection: list[DetectionSpec] = Field(default_factory=list, max_length=6)
+    queries: dict[str, QueryTemplate] = Field(default_factory=dict, max_length=12)
+    hypotheses: list[Hypothesis] = Field(default_factory=list, max_length=8)
+    evidence_required: list[str] = Field(default_factory=list, max_length=10)
+    verification: list[str] = Field(default_factory=list, max_length=8)
+    recovery_validation: list[str] = Field(default_factory=list, max_length=8)
+    runbooks: list[str] = Field(default_factory=list, max_length=8)
+    evaluation: list[EvalCase] = Field(default_factory=list, max_length=8)
+
+    def needs(self) -> set[str]:
+        from ..tools.builtin import REGISTRY
+        from ..tools.contracts import PSEUDO_CONNECTORS
+
+        tools = {REGISTRY[s.tool].connector_type for s in self.steps}
+        return {c for c in (tools | set(self.requires)) if c not in PSEUDO_CONNECTORS}
 
     @field_validator("steps")
     @classmethod
@@ -143,6 +220,14 @@ def parse(text: str, path: str, source: str) -> Skill:
         raise ValueError("guidance body longer than 12,000 characters")
     kws = [re.compile(rf"(?i)\b{re.escape(k)}\w*") for k in meta.triggers.keywords]
     return Skill(meta, body, path, source, kws)
+
+
+def availability(sk: "Skill", connectors: set[str], metrics: set[str] | None) -> dict[str, Any]:
+    """Whether a skill can work in an environment, and if not, why. metrics None: not known."""
+    missing = sorted(sk.meta.needs() - connectors)
+    gaps = sorted(set(sk.meta.telemetry) - metrics) if metrics is not None else []
+    reasons = [f"needs the {c} connector" for c in missing] + [f"needs metric {m}" for m in gaps]
+    return {"available": not reasons, "reasons": reasons}
 
 
 def load(extra_dir: str | None = None) -> SkillLibrary:

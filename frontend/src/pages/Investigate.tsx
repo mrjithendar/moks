@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api, API } from "../api";
+import { api } from "../api";
 import { useAuth } from "../auth";
 import { Badge, ErrorBox, LineChart, LogLines, PageHead, SourceRef, StatusBadge, Time, fmtBytes, useLoad } from "../components";
+import { type Ev, useInvestigationEvents } from "../investigationStream";
 import { PlanForm } from "./Ops";
 
 const SUGGESTIONS = [
@@ -22,6 +23,7 @@ export function NewInvestigation() {
   const [minutes, setMinutes] = useState<string>("");
   const [error, setError] = useState<unknown>();
   const [busy, setBusy] = useState(false);
+  const [everywhere, setEverywhere] = useState(false);
   const config = useLoad(() => api<{ llm: { provider: string; model: string } | null; skills: string[] }>("/investigate/config"), []);
 
   async function submit(e: FormEvent) {
@@ -29,6 +31,11 @@ export function NewInvestigation() {
     setBusy(true);
     setError(null);
     try {
+      if (everywhere) {
+        const g = await api<{ investigations: { id: string }[] }>("/investigations/group", { method: "POST", body: { question: q, minutes: minutes ? Number(minutes) : undefined } });
+        nav(g.investigations.length === 1 ? `/investigations/${g.investigations[0].id}` : "/investigations");
+        return;
+      }
       // Scope comes from the question (or a deep link from the explorer); the backend resolves the rest.
       const inv = await api<{ id: string }>("/investigations", {
         method: "POST", body: { question: q, environment: params.get("env") || undefined, namespace: params.get("ns") || undefined,
@@ -72,6 +79,7 @@ export function NewInvestigation() {
             onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) (e.currentTarget.form as HTMLFormElement).requestSubmit(); }} />
           <button disabled={busy || !can("investigation.run")}>{busy ? "Starting…" : "Investigate"}</button>
         </div>
+        {!params.get("env") && <label className="inline"><input type="checkbox" checked={everywhere} onChange={(e) => setEverywhere(e.target.checked)} /> Check all my environments (one investigation each)</label>}
         <div className="suggestions">
           {SUGGESTIONS.map((s) => <button type="button" key={s} onClick={() => setQ(s)}>{s}</button>)}
         </div>
@@ -112,46 +120,88 @@ export function InvestigationList() {
   );
 }
 
-interface Ev { type: string; seq: number; at: string; [k: string]: any }
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+const STAGES: [string, string][] = [["triage", "Triage"], ["evidence", "Evidence"], ["correlation", "Correlation"], ["hypotheses", "Hypotheses"], ["verification", "Verification"], ["report", "Report"]];
+
+function Stages({ current, done }: { current?: string; done: boolean }) {
+  const reached = STAGES.findIndex(([k]) => k === (current === "skill" || current === "followup" ? "evidence" : current));
+  return (
+    <ol className="stages" aria-label="Investigation stages">
+      {STAGES.map(([k, label], i) => <li key={k} className={done || i < reached ? "done" : i === reached ? "now" : ""} aria-current={i === reached && !done ? "step" : undefined}>{label}</li>)}
+    </ol>
+  );
+}
+
+function FollowUp({ id }: { id: string }) {
+  const nav = useNavigate();
+  const [q, setQ] = useState("");
+  const [error, setError] = useState<unknown>();
+  async function ask(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    try {
+      const r = await api<{ id: string }>(`/investigations/${id}/follow-up`, { method: "POST", body: { question: q } });
+      setQ("");
+      nav(`/investigations/${r.id}`);
+    } catch (err) {
+      setError(err);
+    }
+  }
+  return (
+    <form className="card stack" onSubmit={ask}>
+      <h2>Ask a follow-up</h2>
+      <div className="filters"><label style={{ flex: 1 }}>Question<input value={q} minLength={3} maxLength={2000} onChange={(e) => setQ(e.target.value)} placeholder="Same scope and time window as this investigation" /></label><button disabled={q.length < 3}>Ask</button></div>
+      <ErrorBox error={error} />
+    </form>
+  );
+}
+
+function Coverage({ report }: { report: any }) {
+  const c = report.coverage;
+  if (!c) return null;
+  return (
+    <div className="card">
+      <h2>What this report saw</h2>
+      <div className="row small">{Object.entries(c.sources as Record<string, any>).map(([k, v]) => <Badge key={k} kind={v.failed ? "warn" : "ok"}>{k}: {v.ok} ok{v.failed ? `, ${v.failed} failed` : ""}</Badge>)}</div>
+      {Object.entries(c.unavailable ?? {}).map(([k, v]) => <div key={k} className="alert warn small" style={{ marginTop: 6 }}>{k}: {String(v)}</div>)}
+      {c.budget_reached && <div className="alert warn small" style={{ marginTop: 6 }}>The tool budget of {c.tool_budget} calls ran out, so evidence may be incomplete.</div>}
+      <div className="small muted" style={{ marginTop: 6 }}>{c.tool_calls} of {c.tool_budget} tool calls used.</div>
+    </div>
+  );
+}
+
+function Relationships({ data, primary }: { data?: { nodes: any[]; edges: any[] }; primary?: string | null }) {
+  if (!data?.nodes.length) return null;
+  const roots = data.nodes.filter((n) => !n.id.startsWith("Pod/"));
+  return (
+    <div className="card">
+      <h2>Observed resources</h2>
+      {primary && <div className="small" style={{ marginBottom: 6 }}>Primary: <span className="mono">{primary}</span></div>}
+      <ul className="small">{roots.slice(0, 20).map((n) => {
+        const kids = data.edges.filter((e) => e.from === n.id);
+        return <li key={n.id}><span className="mono">{n.id}</span> {n.healthy === false && <Badge kind="bad">unhealthy</Badge>}
+          {kids.length > 0 && <div className="muted mono">{kids.slice(0, 5).map((e) => `${e.kind} ${e.to.replace("Pod/", "")}`).join(", ")}{kids.length > 5 ? ` +${kids.length - 5}` : ""}</div>}</li>;
+      })}</ul>
+      <div className="small muted">From ownerReferences and selectors seen in this investigation.</div>
+    </div>
+  );
+}
 
 export function InvestigationView() {
   const { id } = useParams();
   const detail = useLoad(() => api<any>(`/investigations/${id}`), [id]);
-  const [events, setEvents] = useState<Ev[]>([]);
   const [open, setOpen] = useState<string | null>(null);
-  const [live, setLive] = useState(false);
   const [propose, setPropose] = useState<any>(null);
   const nav = useNavigate();
   const { can } = useAuth();
-  const reloadRef = useRef(detail.reload);
-  reloadRef.current = detail.reload;
-
-  useEffect(() => {
-    if (!id) return;
-    // Server-Sent Events: progress for running investigations, and the full replay for finished ones.
-    const es = new EventSource(`${API}/investigations/${id}/events`);
-    setLive(true);
-    const seen = new Set<number>();
-    const onMsg = (m: MessageEvent) => {
-      const ev: Ev = JSON.parse(m.data);
-      if (seen.has(ev.seq)) return;
-      seen.add(ev.seq);
-      setEvents((xs) => [...xs, ev]);
-      if (["tool_result", "report", "done"].includes(ev.type)) reloadRef.current();
-    };
-    for (const t of ["queued", "scope", "phase", "skills", "tool_call", "tool_result", "llm_usage", "note", "report", "error", "cancelled", "done"]) es.addEventListener(t, onMsg);
-    es.addEventListener("end", () => { es.close(); setLive(false); });
-    es.addEventListener("timeout", () => { es.close(); setLive(false); });
-    es.onerror = () => { if (es.readyState === EventSource.CLOSED) setLive(false); };
-    return () => { es.close(); setLive(false); };
-  }, [id]);
+  const { events, stream } = useInvestigationEvents(id, detail.reload);
+  useEffect(() => { setOpen(null); setPropose(null); }, [id]);
 
   async function cancel() {
     await api(`/investigations/${id}/cancel`, { method: "POST" });
   }
 
-  const inv = detail.data;
+  const inv = detail.data?.id === id ? detail.data : undefined; // never show the previous route's data
   const evidence: any[] = inv?.evidence ?? [];
   const report = inv?.report;
   const scopeEv = events.find((e) => e.type === "scope");
@@ -167,7 +217,7 @@ export function InvestigationView() {
               <span className="mono">{inv.environment}/{inv.namespace}</span>
               <span>window {new Date(inv.time_from).toLocaleTimeString()}–{new Date(inv.time_to).toLocaleTimeString()}</span>
               <StatusBadge status={inv.status} />
-              {live && !TERMINAL.has(inv.status) && <Badge kind="info">live</Badge>}
+              {!TERMINAL.has(inv.status) && <Badge kind={stream === "live" ? "info" : stream === "failed" ? "bad" : "warn"}>{stream === "live" ? "live" : stream === "failed" ? "updates stopped" : stream === "ended" ? "updates ended" : stream}</Badge>}
               <Badge>{scopeEv?.mode === "llm" ? `LLM: ${scopeEv.llm}` : report?.generated_by === "rules" ? "rule-based" : inv.mode}</Badge>
               <span>{inv.tool_calls} tool calls</span>
               {inv.tokens_in > 0 && <span>{inv.tokens_in + inv.tokens_out} tokens · ${Number(inv.cost_usd).toFixed(4)}</span>}
@@ -181,12 +231,22 @@ export function InvestigationView() {
           {inv.error && <div className="alert error" style={{ marginBottom: 12 }}>{inv.error}</div>}
           <div className="grid" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(300px, 1fr)", alignItems: "start" }}>
             <div className="stack">
+              <Stages current={inv.stage} done={TERMINAL.has(inv.status)} />
+              {inv.parent_id && <div className="small">Follow-up of <Link to={`/investigations/${inv.parent_id}`}>an earlier investigation</Link>.</div>}
               {report ? <Report report={report} onCite={setOpen} onPropose={can("action.request") && inv.namespace !== "*" ? setPropose : undefined} /> : (
                 <div className="card empty">{TERMINAL.has(inv.status) ? "No report was produced." : "Collecting evidence…"}</div>
               )}
               {report?.findings?.length > 0 && <Findings findings={report.findings} onCite={setOpen} />}
+              {inv.actions?.length > 0 && <div className="card"><h2>Executed actions and validated recovery</h2>
+                <table><tbody>{inv.actions.map((a: any) => <tr key={a.id}><td><Link to={`/actions/${a.id}`}>{a.action}</Link> <span className="mono small">{a.target}</span></td>
+                  <td><Badge kind={a.status === "succeeded" ? "ok" : a.status === "reconciliation_required" ? "bad" : "neutral"}>{a.status}</Badge></td>
+                  <td className="small">{a.validated ? "recovery validated" : "not validated"}</td></tr>)}</tbody></table></div>}
+              {inv.follow_ups?.length > 0 && <div className="card"><h2>Follow-ups</h2>{inv.follow_ups.map((f: any) => <div key={f.id}><StatusBadge status={f.status} /> <Link to={`/investigations/${f.id}`}>{f.question}</Link></div>)}</div>}
+              {TERMINAL.has(inv.status) && can("investigation.run") && <FollowUp id={inv.id} />}
             </div>
             <div className="stack">
+              {report && <Coverage report={report} />}
+              {report && <Relationships data={report.relationships} primary={report.primary_resource} />}
               <div className="card">
                 <h2>Progress</h2>
                 <Timeline events={events} />
@@ -243,13 +303,18 @@ function Report({ report, onCite, onPropose }: { report: any; onCite: (r: string
         {report.observed_facts.length ? <ul>{report.observed_facts.map((f: any, i: number) => <li key={i}>{f.statement}<Cites refs={f.evidence} onCite={onCite} /></li>)}</ul>
           : <div className="muted small">No facts with supporting evidence.</div>}
       </div>
+      {report.verified_causes?.length > 0 && <div className="report-section facts">
+        <h3>Verified causes</h3>
+        <ul>{report.verified_causes.map((c: any, i: number) => <li key={i}>{c.cause}<Cites refs={c.evidence} onCite={onCite} /><div className="small muted">Checked by a {c.check}.</div></li>)}</ul>
+      </div>}
       <div className="report-section causes">
         <h3>Suspected causes</h3>
         {report.suspected_causes.length ? (
           <ul>{report.suspected_causes.map((c: any, i: number) => (
             <li key={i}><Badge kind={CONF[c.confidence]}>{c.confidence} confidence</Badge> {c.cause}<Cites refs={c.evidence} onCite={onCite} />
+              {c.contradicting?.length > 0 && <div className="small muted">Evidence against this: <Cites refs={c.contradicting} onCite={onCite} /></div>}
               {c.reasoning && <div className="small muted">{c.reasoning}</div>}
-              {!c.verified && <div className="small muted">Not verified.</div>}</li>
+              <div className="small muted">Suspected, not verified.</div></li>
           ))}</ul>
         ) : <div className="muted small">No cause suggested.</div>}
       </div>

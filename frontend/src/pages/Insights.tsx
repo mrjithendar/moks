@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, apiForm, qs } from "../api";
 import { useAuth } from "../auth";
-import { Badge, type Env, ErrorBox, LineChart, PageHead, Stat, Time, useLoad } from "../components";
+import { Badge, type Env, ErrorBox, LineChart, PageHead, Stat, Time, useInterval, useLoad } from "../components";
 import { PlanForm } from "./Ops";
 
 // ---- Knowledge ----------------------------------------------------------------------------------
@@ -46,9 +46,26 @@ export function Knowledge() {
   );
 }
 
+const SCHEDULES: [number, string][] = [[0, "Off"], [60, "Hourly"], [360, "Every 6 hours"], [1440, "Daily"], [10080, "Weekly"]];
+
+function SyncState({ s }: { s: any }) {
+  const kind = !s.last_sync_status ? "neutral" : s.last_sync_status === "ok" ? "ok" : s.last_sync_status === "error" ? "bad" : "warn";
+  const c = s.last_counts;
+  return (
+    <>
+      {s.last_sync_status ? <Badge kind={kind}>{s.last_sync_status}</Badge> : <Badge>not synced yet</Badge>} {s.stale && <Badge kind="warn">stale</Badge>}
+      {s.sync_state !== "idle" && <Badge kind="info">{s.sync_state}</Badge>}
+      <div className="muted">last success <Time iso={s.last_success_at} /> · last attempt <Time iso={s.last_attempt_at} /></div>
+      {c && <div className="muted">+{c.added} added, {c.updated} updated, {c.deleted} deleted, {c.excluded} excluded, {c.failed ?? 0} failed</div>}
+      {s.last_error && <div className="muted">{s.last_error}</div>}
+    </>
+  );
+}
+
 function KnowledgeSources({ onChange }: { onChange: () => void }) {
   const { can } = useAuth();
   const list = useLoad(() => api<any[]>("/knowledge/sources"), []);
+  useInterval(() => { if (!list.loading && list.data?.some((s) => s.sync_state !== "idle")) list.reload(); }, 3000);
   const [f, setF] = useState({ name: "", type: "github", repository: "", include: "", scope_environment: "*", scope_namespace: "*", credType: "none", credName: "" });
   const [error, setError] = useState<unknown>();
   async function add(e: FormEvent) {
@@ -71,16 +88,22 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
     <div className="card stack" style={{ marginTop: 14 }}>
       <div className="row between"><h2>Sources</h2>{can("admin.llm") && <button className="ghost small" onClick={() => api("/knowledge/reindex", { method: "POST" }).then(() => alert("Reindex queued"))}>Rebuild index (embedding change)</button>}</div>
       <table>
-        <thead><tr><th>Source</th><th>Scope</th><th>Documents</th><th>Last sync</th><th /></tr></thead>
+        <thead><tr><th>Source</th><th>Scope</th><th>Documents</th><th>Sync</th><th>Schedule</th><th /></tr></thead>
         <tbody>{list.data?.map((s) => (
           <tr key={s.id}>
             <td>{s.name} <Badge>{s.type}</Badge><div className="small mono muted">{s.config?.repository}{s.revision ? ` @ ${s.revision.slice(0, 8)}` : ""}</div></td>
             <td className="mono small">{s.scope_environment}/{s.scope_namespace}</td>
             <td className="small">{Object.entries(s.documents).map(([k, v]) => `${v} ${k}`).join(", ") || "—"}</td>
-            <td className="small">{s.last_sync_status && <Badge kind={s.last_sync_status === "ok" ? "ok" : "bad"}>{s.last_sync_status}</Badge>} <Time iso={s.last_sync_at} />
-              {s.last_error && <div className="muted">{s.last_error}</div>}</td>
+            <td className="small">{s.syncable ? <SyncState s={s} /> : <span className="muted">Managed by uploads</span>}</td>
+            <td className="small">{s.syncable ? <>
+              <select aria-label={`Schedule for ${s.name}`} value={s.sync_interval_minutes} onChange={(e) => api(`/knowledge/sources/${s.id}/schedule`, { method: "PUT", body: { sync_interval_minutes: Number(e.target.value) } }).then(list.reload)}>
+                {!SCHEDULES.some(([m]) => m === s.sync_interval_minutes) && <option value={s.sync_interval_minutes}>every {s.sync_interval_minutes} min</option>}
+                {SCHEDULES.map(([m, l]) => <option key={m} value={m}>{l}</option>)}
+              </select>
+              {s.next_sync_at && <div className="muted">next {new Date(s.next_sync_at).toLocaleString()} ({Intl.DateTimeFormat().resolvedOptions().timeZone})</div>}
+            </> : "—"}</td>
             <td className="row">
-              {s.type === "github" && <button className="small" onClick={() => api(`/knowledge/sources/${s.id}/sync`, { method: "POST" }).then(() => setTimeout(list.reload, 1500))}>Sync</button>}
+              {s.syncable && <button className="small" disabled={s.sync_state !== "idle"} onClick={() => api(`/knowledge/sources/${s.id}/sync`, { method: "POST" }).then(list.reload)}>{s.sync_state === "idle" ? "Sync now" : s.sync_state === "running" ? "Syncing…" : "Queued…"}</button>}
               {s.type === "upload" && <label className="btn small" style={{ cursor: "pointer" }}>Upload<input type="file" hidden accept=".md,.txt,.yaml,.yml,.json,.rst,.adoc,.sh,.py,.tf"
                 onChange={(e) => e.target.files?.[0] && upload(s.id, e.target.files[0])} /></label>}
               <button className="ghost small" onClick={() => confirm(`Delete ${s.name} and remove its documents from search?`) && api(`/knowledge/sources/${s.id}`, { method: "DELETE" }).then(list.reload)}>Delete</button>
@@ -327,38 +350,58 @@ export function Evals() {
 
 // ---- SRE skills -------------------------------------------------------------------------------
 
+const CATEGORIES = ["kubernetes", "application", "aws", "devops", "support", "finops"];
+
 export function Skills() {
   const { can } = useAuth();
   const list = useLoad(() => api<any>("/skills"), []);
   const [open, setOpen] = useState<string | null>(null);
+  const [category, setCategory] = useState("");
+  const [text, setText] = useState("");
   const detail = useLoad(() => (open ? api<any>(`/skills/${open}`) : Promise.resolve(null)), [open]);
+  const rows = (list.data?.skills ?? []).filter((s: any) => (!category || s.category === category) && JSON.stringify([s.name, s.title, s.description]).toLowerCase().includes(text.toLowerCase()));
+  const d = detail.data;
+  const blocked = (s: any) => Object.entries(s.availability as Record<string, any>).filter(([, v]) => !v.available);
+  async function toggle(s: any) {
+    await api(`/skills/${s.name}/policy`, { method: "PUT", body: { enabled: !s.enabled } });
+    list.reload();
+    detail.reload();
+  }
   return (
     <>
-      <PageHead title="SRE skills" sub="Playbooks from SKILL.md files. MOKS selects them from the question and detector findings, runs their read-only steps and follows their guidance.">
+      <PageHead title="SRE skills" sub="Versioned playbooks from SKILL.md files. MOKS picks them from the question and findings, runs their read-only steps and follows their guidance.">
         {can("admin.policies") && <button className="ghost" onClick={() => api("/skills/reload", { method: "POST" }).then(list.reload)}>Reload</button>}
       </PageHead>
       {list.data?.errors?.length > 0 && <div className="alert error" style={{ marginBottom: 12 }}>{list.data.errors.map((e: any) => <div key={e.path} className="small">{e.path}: {e.error}</div>)}</div>}
+      <div className="card filters" style={{ marginBottom: 14 }}>
+        <label>Category<select value={category} onChange={(e) => setCategory(e.target.value)}><option value="">All</option>{CATEGORIES.map((c) => <option key={c}>{c}</option>)}</select></label>
+        <label>Search<input value={text} onChange={(e) => setText(e.target.value)} /></label>
+        <span className="small muted">{rows.length} skills</span>
+      </div>
       <div className="grid" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(0, 3fr)", alignItems: "start" }}>
-        <div className="card">
-          <table><tbody>{list.data?.skills.map((s: any) => (
-            <tr key={s.name} className="clickable" onClick={() => setOpen(s.name)}>
-              <td><strong className="mono">{s.name}</strong> {s.source === "custom" && <Badge kind="info">custom</Badge>}<div className="small muted">{s.description}</div>
-                <div className="small">{s.triggers.findings.map((f: string) => <Badge key={f} kind="warn">{f}</Badge>)} {s.tools.map((t: string) => <Badge key={t}>{t}</Badge>)}</div></td>
-            </tr>
-          ))}</tbody></table>
-        </div>
-        <div className="card">
-          {!detail.data ? <div className="empty">Select a skill.</div> : <>
-            <h2 className="mono">{detail.data.name}</h2>
-            <p className="muted">{detail.data.description}</p>
-            <h3>Triggers</h3><div className="small">keywords: {detail.data.triggers.keywords.join(", ") || "—"} · findings: {detail.data.triggers.findings.join(", ") || "—"}</div>
-            <h3 style={{ marginTop: 12 }}>Steps (read-only, policy-checked)</h3>
-            <ol className="small">{detail.data.steps.map((s: any, i: number) => <li key={i}><span className="mono">{s.tool}</span> {s.for_each && <Badge>{s.for_each} ×{s.limit}</Badge>} {s.purpose && <span className="muted">— {s.purpose}</span>}
-              <div className="mono muted">{JSON.stringify(s.args)}</div></li>)}</ol>
-            {detail.data.remediation.length > 0 && <><h3>Remediation hints</h3><ul className="small">{detail.data.remediation.map((r: any, i: number) => <li key={i}>
-              when <Badge kind="warn">{r.when}</Badge> → <span className="mono">{r.action}</span> {r.target} <span className="muted">{r.note}</span></li>)}</ul></>}
-            <h3>Guidance</h3><pre className="logbox">{detail.data.body}</pre>
-            <div className="small muted">{detail.data.path}</div>
+        <div className="card"><table><tbody>{rows.map((s: any) => (
+          <tr key={s.name} className="clickable" onClick={() => setOpen(s.name)}>
+            <td><strong>{s.title}</strong> <Badge>{s.category}</Badge> <span className="small muted">v{s.version}</span> {s.source === "custom" && <Badge kind="info">custom</Badge>} {!s.enabled && <Badge kind="warn">off</Badge>}
+              {s.detection_rules.length > 0 && <Badge kind="info">{s.detection_rules.length} detection</Badge>}
+              <div className="small muted">{s.description}</div>
+              {blocked(s).length > 0 && <div className="small muted">Unavailable in {blocked(s).map(([e]) => e).join(", ")}: {(blocked(s)[0][1] as any).reasons.join("; ")}</div>}</td>
+          </tr>
+        ))}</tbody></table></div>
+        <div className="card stack">
+          {!d ? <div className="empty">Select a skill.</div> : <>
+            <div className="row between"><h2>{d.title} <span className="small muted">v{d.version} · {d.owner}</span></h2>
+              {can("admin.policies") && <button className="ghost small" onClick={() => toggle(d)}>{d.enabled ? "Turn off" : "Turn on"}</button>}</div>
+            <p className="muted" style={{ margin: 0 }}>{d.description}</p>
+            <div className="small">Needs: {d.needs.join(", ") || "nothing beyond MOKS"}{d.telemetry.length > 0 && <> · metrics {d.telemetry.join(", ")}</>}</div>
+            <div className="row small">{Object.entries(d.availability as Record<string, any>).map(([e, v]) => <Badge key={e} kind={v.available ? "ok" : "neutral"}>{e}: {v.available ? "available" : v.reasons[0]}</Badge>)}</div>
+            <h3>Triggers</h3><div className="small">keywords: {d.triggers.keywords.join(", ") || "—"} · findings: {d.triggers.findings.join(", ") || "—"}</div>
+            {d.steps.length > 0 && <><h3>Steps (read-only, policy-checked)</h3>
+              <ol className="small">{d.steps.map((s: any, i: number) => <li key={i}><span className="mono">{s.tool}</span> {s.for_each && <Badge>{s.for_each}</Badge>} {s.purpose}</li>)}</ol></>}
+            {d.detection.length > 0 && <><h3>Detection rules</h3><ul className="small">{d.detection.map((r: any) => <li key={r.id}><span className="mono">{r.id}</span> {r.kind} · {r.severity} · every {r.interval_minutes} min, {r.sustained_checks} checks to open</li>)}</ul></>}
+            {d.hypotheses.length > 0 && <><h3>Hypotheses</h3><ul className="small">{d.hypotheses.map((h: any, i: number) => <li key={i}>{h.statement} <span className="muted">Supported by: {h.supports || "—"} Refuted by: {h.refutes || "—"}</span></li>)}</ul></>}
+            {d.recovery_validation.length > 0 && <><h3>Recovery validation</h3><ul className="small">{d.recovery_validation.map((x: string, i: number) => <li key={i}>{x}</li>)}</ul></>}
+            {d.remediation.length > 0 && <><h3>Remediation hints</h3><ul className="small">{d.remediation.map((r: any, i: number) => <li key={i}>when <Badge kind="warn">{r.when}</Badge> → <span className="mono">{r.action}</span> {r.target} <span className="muted">{r.note}</span></li>)}</ul></>}
+            <h3>Guidance</h3><pre className="logbox">{d.body}</pre>
           </>}
         </div>
       </div>

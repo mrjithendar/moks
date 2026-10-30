@@ -17,6 +17,13 @@ steps:
   - tool: kb_search
     args: {query: "latency {question}"}
     purpose: known dependencies and SLOs
+title: Latency regression
+owner: sre
+category: application
+version: '2'
+evaluation:
+- fixture: dependency-latency
+  expect: the lab's expected finding
 ---
 # Latency regression
 

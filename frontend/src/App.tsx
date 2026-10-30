@@ -4,7 +4,9 @@ import { Layout } from "./components";
 import { Audit, Connectors, Environments, LLMProviders, Users } from "./pages/Admin";
 import { InvestigationList, InvestigationView, NewInvestigation } from "./pages/Investigate";
 import { Evals, FinOps, Knowledge, Skills } from "./pages/Insights";
-import { Explorer, Logs, Metrics } from "./pages/Live";
+import { Explorer, Logs } from "./pages/Live";
+import { Detections } from "./pages/Detections";
+import { Metrics } from "./pages/Metrics";
 import { Actions, DiagnosticView, Diagnostics, IncidentView, Incidents, PlanView } from "./pages/Ops";
 import Login from "./pages/Login";
 import Overview from "./pages/Overview";
@@ -25,6 +27,7 @@ export default function App() {
         <Route path="/explorer" element={<Explorer />} />
         <Route path="/metrics" element={<Metrics />} />
         <Route path="/logs" element={<Logs />} />
+        <Route path="/detections" element={<Detections />} />
         <Route path="/incidents" element={<Incidents />} />
         <Route path="/incidents/:id" element={<IncidentView />} />
         <Route path="/actions" element={<Actions />} />

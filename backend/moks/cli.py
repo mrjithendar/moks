@@ -100,7 +100,7 @@ async def _seed(path: str, upsert: bool) -> None:
 
         for e in data.get("environments", []):
             env = (await db.execute(select(Environment).where(Environment.name == e["name"]))).scalar_one()
-            await sync_automation_binding(db, env.name, env.auto_investigate)
+            await sync_automation_binding(db, env.name, env.auto_investigate or env.detection_enabled)
         for l in data.get("llm", []):
             row = (await db.execute(select(LLMConfig).where(LLMConfig.name == l["name"]))).scalar_one_or_none()
             if row is None:

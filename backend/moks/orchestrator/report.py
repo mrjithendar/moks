@@ -20,7 +20,8 @@ class Cause(BaseModel):
     confidence: Literal["low", "medium", "high"] = "low"
     evidence: list[str] = Field(default_factory=list)
     reasoning: str = Field(default="", max_length=1200)
-    verified: bool = False  # Phase 3 verification sets this; never the model
+    verified: bool = False  # set only by verify_causes; never by the model
+    contradicting: list[str] = Field(default_factory=list)  # evidence refs against this cause
 
 
 class Remediation(BaseModel):
@@ -43,6 +44,7 @@ class Report(BaseModel):
     generated_by: Literal["llm", "rules"] = "rules"
     notes: list[str] = Field(default_factory=list)
     validation: dict[str, Any] = Field(default_factory=dict)
+    verified_causes: list[dict[str, Any]] = Field(default_factory=list)
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -86,6 +88,7 @@ def validate_llm_report(raw: dict[str, Any], valid_refs: set[str], notes: list[s
     for c in rep.suspected_causes:
         c.verified = False
         c.evidence = [r for r in c.evidence if REF.match(r) and r in valid_refs]
+        c.contradicting = [r for r in c.contradicting if REF.match(r) and r in valid_refs]
         if not c.evidence and c.confidence != "low":
             c.confidence = "low"
             downgraded += 1
@@ -98,6 +101,21 @@ def validate_llm_report(raw: dict[str, Any], valid_refs: set[str], notes: list[s
         rep.summary += " (Unverified: no change has been made or validated.)"
     rep.validation = {"uncited_facts_dropped": dropped, "causes_downgraded": downgraded, "valid_refs": sorted(valid_refs, key=lambda r: int(r[1:]))}
     return rep
+
+
+# Findings where the detector reads the fault itself, not a symptom of it. A selector that matches
+# no pods IS the broken selector; a crashloop is a symptom whose cause is still open.
+SELF_EVIDENT = {"service_selector_mismatch", "oomkilled", "image_pull", "unschedulable", "config_ref_missing"}
+
+
+def verify_causes(report: Report, findings: list[dict]) -> None:
+    """Verified means a deterministic check observed the fault directly. Model confidence never
+    counts: however sure the LLM is, its causes stay suspected."""
+    for c in report.suspected_causes:
+        c.verified = False
+    report.verified_causes = [{"cause": f["title"], "detail": f.get("detail", ""), "evidence": f.get("evidence", []),
+                               "check": f"deterministic detector: {f['kind']}", "resources": f.get("resources", [])}
+                              for f in findings if f.get("kind") in SELF_EVIDENT and f.get("evidence")]
 
 
 def _scope_text(args: dict[str, Any]) -> str:

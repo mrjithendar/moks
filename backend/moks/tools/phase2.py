@@ -104,6 +104,16 @@ async def cw_metric(ctx: ToolContext, a: CwMetricArgs) -> ToolResult:
                       {"query": f"{a.namespace} {a.metric} {a.dimensions} {a.stat} period={r['period']}s"})
 
 
+class CwListArgs(ToolArgs):
+    namespace: str | None = Field(default=None, pattern=r"^[A-Za-z0-9/_.:-]{1,255}$")
+    metric: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.:-]{1,255}$")
+
+
+async def cw_metrics_list(ctx: ToolContext, a: CwListArgs) -> ToolResult:
+    rows = await ctx.connector("cloudwatch").list_metrics(a.namespace, a.metric)
+    return ToolResult(f"{len(rows)} CloudWatch metrics", rows, {"api": "cloudwatch:ListMetrics"})
+
+
 async def cw_alarms(ctx: ToolContext, a: AlarmArgs) -> ToolResult:
     rows = await ctx.connector("cloudwatch").alarms(a.state)
     return ToolResult(f"{len(rows)} CloudWatch alarms in state {a.state or 'any'}", rows, {"api": "cloudwatch:DescribeAlarms"})
@@ -390,6 +400,7 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("cw_log_groups", "CloudWatch log groups this environment may query.", "cloudwatch", LogGroupArgs, cw_log_groups, cluster_scoped=True, namespace_arg=None),
     ToolSpec("cw_logs_query", "Run a bounded CloudWatch Logs Insights query on allowed log groups.", "cloudwatch", InsightsArgs, cw_logs_query, cluster_scoped=True, namespace_arg=None),
     ToolSpec("cw_metric", "One CloudWatch metric over the window.", "cloudwatch", CwMetricArgs, cw_metric, cluster_scoped=True, namespace_arg=None),
+    ToolSpec("cw_metrics_list", "Discover CloudWatch metrics and their dimensions.", "cloudwatch", CwListArgs, cw_metrics_list, cluster_scoped=True, namespace_arg=None),
     ToolSpec("cw_alarms", "CloudWatch alarms by state.", "cloudwatch", AlarmArgs, cw_alarms, cluster_scoped=True, namespace_arg=None),
     ToolSpec("git_recent_commits", "Recent commits in an allowed repository, optionally for one path.", "git", CommitsArgs, git_recent_commits, cluster_scoped=True, namespace_arg=None),
     ToolSpec("git_read_file", "Read one file (manifest, config, runbook) from an allowed repository; secrets are never read.", "git", ReadFileArgs, git_read_file, cluster_scoped=True, namespace_arg=None),

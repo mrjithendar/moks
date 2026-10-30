@@ -66,12 +66,25 @@ class PrometheusConnector:
         }, method="POST")
         return {"resultType": data.get("resultType"), "series": _shape(data), "warnings": warnings}
 
-    async def label_values(self, label: str, match: str | None, start: datetime, end: datetime) -> list[str]:
+    async def label_names(self, match: str | None, start: datetime, end: datetime) -> list[str]:
+        params: list[tuple[str, Any]] = [("start", start.timestamp()), ("end", end.timestamp())]
+        if match:
+            params.append(("match[]", match))
+        data, _ = await self._api("labels", "/api/v1/labels", params)
+        return sorted(data)[:200]
+
+    async def metadata(self) -> dict[str, dict[str, str]]:
+        """metric -> {type, unit, help}; not every Prometheus or exporter provides it."""
+        data, _ = await self._api("metadata", "/api/v1/metadata", {"limit_per_metric": 1})
+        return {name: {"type": m[0].get("type", ""), "unit": m[0].get("unit", ""), "help": (m[0].get("help") or "")[:300]}
+                for name, m in (data or {}).items() if m}
+
+    async def label_values(self, label: str, match: str | None, start: datetime, end: datetime, limit: int = 500) -> list[str]:
         params: list[tuple[str, Any]] = [("start", start.timestamp()), ("end", end.timestamp())]
         if match:
             params.append(("match[]", match))
         data, _ = await self._api("label_values", f"/api/v1/label/{label}/values", params)
-        return sorted(data)[:500]
+        return sorted(data)[:limit]
 
     async def targets(self) -> list[dict[str, Any]]:
         data, _ = await self._api("targets", "/api/v1/targets", {"state": "active"})

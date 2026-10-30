@@ -126,6 +126,20 @@ async def execute(pid: uuid.UUID, body: DecisionIn, ctx: AuthContext = Depends(g
     return await _out(db, plan)
 
 
+class ReconcileIn(BaseModel):
+    outcome: str
+    comment: str = Field(max_length=2000)
+
+
+@router.post("/plans/{pid}/reconcile")
+async def reconcile(pid: uuid.UUID, body: ReconcileIn, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    try:
+        plan = await service.reconcile(db, ctx.principal, pid, body.outcome, body.comment)
+    except service.PlanError as exc:
+        raise _err(exc) from None
+    return await _out(db, plan)
+
+
 @router.post("/plans/{pid}/cancel")
 async def cancel(pid: uuid.UUID, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     try:

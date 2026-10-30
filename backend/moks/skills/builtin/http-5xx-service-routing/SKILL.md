@@ -28,6 +28,29 @@ remediation:
   - when: service_no_ready_endpoints
     action: rollback_deployment
     note: If pods became unready after a rollout, roll back; otherwise fix readiness first.
+title: Missing Service endpoints
+owner: sre
+category: kubernetes
+version: '2'
+detection:
+- id: service-selector-mismatch
+  kind: finding
+  finding: service_selector_mismatch
+  sustained_checks: 2
+  severity: sev2
+  auto_investigate: true
+  auto_resolve: true
+  title: Service selects no pods
+- id: service-no-endpoints
+  kind: finding
+  finding: service_no_ready_endpoints
+  sustained_checks: 2
+  severity: sev2
+  auto_resolve: true
+  title: Service has no ready endpoints
+evaluation:
+- fixture: broken-selector
+  expect: the lab's expected finding
 ---
 # 5xx routing triage
 

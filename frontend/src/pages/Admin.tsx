@@ -34,9 +34,9 @@ const ROLE: Field = { key: "role_arn", label: "Role ARN to assume (optional)", p
 const URLS: Field[] = [{ key: "base_url", label: "URL", required: true }, { key: "public_url", label: "Browser link URL (optional)" }];
 
 const SOURCES: Record<string, Source> = {
-  eks: { label: "Amazon EKS", type: "kubernetes", hint: "Reads the cluster with a short-lived token from the pod's AWS identity. That identity needs an EKS access entry.",
+  eks: { label: "Amazon EKS", type: "kubernetes", hint: "Reads the cluster with a short-lived token from the pod's AWS identity. That identity needs an EKS access entry. Read-only until you add config.executor (edit as JSON).",
     defaults: { mode: "eks", region: "us-east-1", timeout_seconds: 15 }, fields: [{ key: "cluster_name", label: "Cluster name", required: true }, REGION, ROLE] },
-  in_cluster: { label: "Kubernetes (this cluster)", type: "kubernetes", hint: "Uses the ServiceAccount of the MOKS pod.", defaults: { mode: "in_cluster", timeout_seconds: 15 }, fields: [] },
+  in_cluster: { label: "Kubernetes (this cluster)", type: "kubernetes", hint: "Uses the ServiceAccount of the MOKS pod.", defaults: { mode: "in_cluster", timeout_seconds: 15, executor: { mode: "in_cluster" } }, fields: [] },
   kubeconfig: { label: "Kubernetes (kubeconfig)", type: "kubernetes", hint: "Needs a mounted kubeconfig file as the credential.", defaults: { mode: "kubeconfig", timeout_seconds: 15 }, fields: [{ key: "context", label: "Context (optional)" }] },
   cloudwatch: { label: "CloudWatch Logs", type: "cloudwatch", hint: "Logs Insights over the listed log groups only.", defaults: { region: "us-east-1", allowed_log_groups: [], max_window_minutes: 360, max_concurrent_queries: 2, poll_timeout_seconds: 60 },
     fields: [REGION, { key: "allowed_log_groups", label: "Allowed log groups", kind: "list", required: true, placeholder: "/aws/eks/prod/*" }, ROLE, { key: "max_window_minutes", label: "Max window (min)", kind: "number" }] },
@@ -107,7 +107,7 @@ function SourceFields({ value, onChange }: { value: SourceValue; onChange: (v: S
 export function Environments() {
   const list = useLoad(() => api<any[]>("/environments"), []);
   const blank = { name: "", display_name: "", kind: "minikube", is_production: false, allowed_namespaces: "*", denied_namespaces: "kube-system", max_query_window_minutes: 360, grafana_url: "",
-    is_default: false, auto_investigate: false, alert_cooldown_minutes: 30, max_replicas: 10, allow_scale_to_zero: false, plan_ttl_minutes: 60 };
+    is_default: false, detection_enabled: false, auto_investigate: false, alert_cooldown_minutes: 30, max_replicas: 10, allow_scale_to_zero: false, plan_ttl_minutes: 60 };
   const [form, setForm] = useState<any>(blank);
   const [editing, setEditing] = useState<string | null>(null);
   const [sources, setSources] = useState<SourceValue[]>(PRESETS.minikube.map(blankSource));
@@ -169,6 +169,7 @@ export function Environments() {
           <label>Grafana URL<input value={form.grafana_url} onChange={(e) => setForm({ ...form, grafana_url: e.target.value })} placeholder="https://…/grafana" /></label>
         </div>
         <div className="row">
+          <label className="inline"><input type="checkbox" checked={form.detection_enabled} onChange={(e) => setForm({ ...form, detection_enabled: e.target.checked })} /> run detection rules</label>
           <label className="inline"><input type="checkbox" checked={form.auto_investigate} onChange={(e) => setForm({ ...form, auto_investigate: e.target.checked })} /> investigate firing alerts automatically</label>
           <label>Alert cooldown (min)<input type="number" min={1} max={1440} value={form.alert_cooldown_minutes} onChange={(e) => setForm({ ...form, alert_cooldown_minutes: Number(e.target.value) })} /></label>
           <label>Max replicas (scale policy)<input type="number" min={1} max={1000} value={form.max_replicas} onChange={(e) => setForm({ ...form, max_replicas: Number(e.target.value) })} /></label>

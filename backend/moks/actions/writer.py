@@ -99,17 +99,6 @@ class KubernetesWriter:
         await self._replace_spec(ns, name, resource_version, mutate)
         return {"rolled_back_to": to_revision, "images": [c.get("image") for c in tmpl["spec"].get("containers", [])]}
 
-    async def restore(self, ns: str, name: str, pre_state: dict) -> dict:
-        """Recovery: put back the template and replicas captured before the action (no RV guard:
-        we are undoing our own change)."""
-        d = await self.deployment(ns, name)
-
-        def mutate(dd):
-            dd["spec"]["template"] = pre_state["template"]
-            dd["spec"]["replicas"] = pre_state["replicas"]
-        await self._replace_spec(ns, name, d["metadata"]["resourceVersion"], mutate)
-        return {"restored_revision_template": pre_state.get("revision"), "replicas": pre_state["replicas"]}
-
     async def patch_resources(self, ns: str, name: str, resource_version: str, container: str, resources: dict) -> dict:
         def mutate(d):
             for c in d["spec"]["template"]["spec"]["containers"]:
@@ -144,11 +133,27 @@ class KubernetesWriter:
                "HorizontalPodAutoscaler": client.AutoscalingV2Api(api).read_namespaced_horizontal_pod_autoscaler}
         return api.sanitize_for_serialization(await self._call(f"get {kind} {ns}/{name}", fns[kind], name, ns))
 
+    async def cluster_uid(self) -> str:
+        return await self.read.cluster_uid()
+
+    async def services(self, ns: str) -> list[dict]:
+        return await self.read.services(ns)
+
     async def pods_of(self, ns: str, name: str) -> list[dict]:
+        """Pods of the Deployment's current revision, followed through ownerReferences. Pods of old
+        ReplicaSets and terminating pods say nothing about whether this revision works."""
+        apps = await self._apps()
+        api = await self.read._client()
         d = await self.deployment(ns, name)
         selector = ",".join(f"{k}={v}" for k, v in (d["spec"]["selector"].get("matchLabels") or {}).items())
-        pods, _ = await self.read.list_pods(ns, selector)
-        return pods
+        revision = (d["metadata"].get("annotations") or {}).get("deployment.kubernetes.io/revision")
+        rss = api.sanitize_for_serialization(await self._call("list replicasets", apps.list_namespaced_replica_set, ns, label_selector=selector))
+        current = {rs["metadata"]["uid"] for rs in rss.get("items", [])
+                   if any(o.get("uid") == d["metadata"]["uid"] for o in rs["metadata"].get("ownerReferences") or [])
+                   and (rs["metadata"].get("annotations") or {}).get("deployment.kubernetes.io/revision") == revision}
+        pods = await self.read.raw_pods(ns)
+        return [summarize_pod(p) for p in pods if not p["metadata"].get("deletionTimestamp")
+                and any(o.get("uid") in current for o in p["metadata"].get("ownerReferences") or [])]
 
     # ---- diagnostic pods (namespace MOKS_DIAGNOSTICS_NAMESPACE only) ------------------------
 

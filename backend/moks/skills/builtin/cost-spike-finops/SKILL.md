@@ -23,6 +23,10 @@ remediation:
   - when: cost
     action: patch_resources
     note: Apply rightsizing recommendations one workload at a time and validate; never reduce below observed p95/max.
+title: Cost spike
+owner: sre
+category: finops
+version: '2'
 ---
 # Cost spikes and waste
 

@@ -31,7 +31,7 @@ seed:
       connectors:
         - type: kubernetes
           name: in-cluster
-          config: {mode: in_cluster, timeout_seconds: 15}
+          config: {mode: in_cluster, timeout_seconds: 15, executor: {mode: in_cluster}}
         - type: prometheus
           name: prometheus
           config: {base_url: "http://prometheus.monitoring.svc.cluster.local:9090/prometheus", public_url: "https://jithendar.com/prometheus", timeout_seconds: 15}

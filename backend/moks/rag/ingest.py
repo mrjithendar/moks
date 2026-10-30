@@ -5,7 +5,9 @@ with a reason, and stamps every document with repository, path, revision, servic
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from fnmatch import fnmatchcase
 from typing import Any
 
@@ -26,6 +28,8 @@ DEFAULT_EXCLUDE = ["**/node_modules/**", "**/vendor/**", "**/dist/**", "**/.git/
                    "**/*.min.js", "**/*.svg", "**/*.png", "**/*.jpg"]
 MAX_FILES = 3000
 MAX_FILE_BYTES = 300_000
+BLOB_DELAY_SECONDS = 0.1  # GitHub asks for serial, spaced requests
+DEFAULT_TOKEN = "MOKS_CRED_GITHUB_TOKEN"
 
 
 def _match(path: str, patterns: list[str]) -> bool:
@@ -49,25 +53,36 @@ async def sync_github(db: AsyncSession, src: KnowledgeSource, transport=None) ->
     repo = cfg.get("repository")
     if not repo:
         raise ConnectorError("config", "github source needs config.repository (owner/name)")
+    # Sources without their own credential share one token: unauthenticated GitHub allows 60 requests an hour.
+    cred = src.credential_ref if (src.credential_ref or {}).get("type") not in (None, "none") else None
+    if cred is None and os.environ.get(DEFAULT_TOKEN):
+        cred = {"type": "env", "name": DEFAULT_TOKEN}
     git = GitConnector({"provider": "github", "repositories": [repo], "api_url": cfg.get("api_url"), "web_url": cfg.get("web_url")},
-                       src.credential_ref, transport=transport)
+                       cred, transport=transport)
     try:
         sha, files = await git.provider.tree(repo, cfg.get("ref"))
         include, exclude = cfg.get("include") or DEFAULT_INCLUDE, (cfg.get("exclude") or []) + DEFAULT_EXCLUDE
         wanted = [f for f in files if _match(f["path"], include) and not _match(f["path"], exclude)]
         skipped_large = [f["path"] for f in wanted if f.get("size", 0) > MAX_FILE_BYTES]
-        wanted = [f for f in wanted if f.get("size", 0) <= MAX_FILE_BYTES][:MAX_FILES]
+        wanted = [f for f in wanted if f.get("size", 0) <= MAX_FILE_BYTES]
+        listed = {f["path"] for f in wanted} | set(skipped_large)
+        capped = len(wanted) > MAX_FILES
+        wanted = wanted[:MAX_FILES]
         existing = {d.path: d for d in (await db.execute(select(Document).where(Document.source_id == src.id))).scalars()}
-        added = updated = unchanged = excluded = 0
+        added = updated = unchanged = excluded = failed = 0
         for f in wanted:
             doc = existing.get(f["path"])
             content_hash = f"git:{f['sha']}"
             if doc and doc.content_hash == content_hash and doc.status in ("active", "excluded"):
                 unchanged += 1
                 continue
+            await asyncio.sleep(BLOB_DELAY_SECONDS)
             try:
                 text = await git.provider.blob(repo, f["sha"])
             except ConnectorError as exc:
+                if exc.kind == "rate_limited":
+                    raise  # every later file would fail too; finished files are committed, so the retry resumes here
+                failed += 1
                 log.warning("skip file", extra={"event": "ingest_skip", "errorType": exc.kind})
                 continue
             doc = await service.index_document(
@@ -82,16 +97,22 @@ async def sync_github(db: AsyncSession, src: KnowledgeSource, transport=None) ->
             await db.commit()
         present = {f["path"] for f in wanted}
         deleted = 0
-        for path, doc in existing.items():
-            if path not in present and doc.status != "deleted":
-                await service.remove_document(db, doc)
-                deleted += 1
-        src.revision = sha
-        await service.mark_indexed_now(db, src, "ok")
+        # Only a complete listing can prove a file is gone. An empty one from a repository we had
+        # documents for is far more likely a bad ref or a filter mistake than a real wipe.
+        trusted = not capped and bool(listed or not [d for d in existing.values() if d.status != "deleted"])
+        if trusted:
+            for path, doc in existing.items():
+                if path not in listed and doc.status != "deleted":
+                    await service.remove_document(db, doc)
+                    deleted += 1
+        if not failed:
+            src.revision = sha
+        problem = f"{failed} files could not be read" if failed else None if trusted else "the listing looked incomplete, so nothing was deleted"
+        await service.mark_indexed_now(db, src, "partial" if problem else "ok", problem)
         INDEXING_DOCUMENTS.labels(src.name, "active").set(len(present) - excluded)
         INDEXING_DOCUMENTS.labels(src.name, "excluded").set(excluded)
         return {"revision": sha, "files_considered": len(wanted), "added": added, "updated": updated, "unchanged": unchanged,
-                "deleted": deleted, "excluded": excluded, "skipped_too_large": skipped_large[:20]}
+                "deleted": deleted, "excluded": excluded, "failed": failed, "deletions_skipped": not trusted, "skipped_too_large": skipped_large[:20]}
     finally:
         await git.aclose()
 

@@ -1,7 +1,6 @@
 ---
 name: config-rightsizing-hygiene
 description: "Review a namespace's workload configuration end to end: right-size requests and limits from measured usage, and find unsafe or fragile settings in probes, images, security context, ConfigMap and Secret usage; propose concrete, reviewable changes."
-version: "1"
 triggers:
   keywords: [rightsizing, right-size, rightsize, provision, oversized, undersized, requests, limits, resources, configuration, config, configmap, secret, secrets, hardening, best practice, best practices, tune, tuning, optimize, optimise, misconfiguration, review, audit, hygiene, overprovisioned, underprovisioned, waste]
   findings: [memory_near_limit, under_provisioned, over_provisioned, config_ref_missing, config_error, plaintext_secret_env, missing_requests, missing_memory_limit, mutable_image_tag, privileged_container, host_path_volume, missing_readiness_probe]
@@ -47,6 +46,10 @@ remediation:
   - when: mutable_image_tag
     action: open_pull_request
     note: "Pin the image to a version tag or digest in the manifest."
+title: Configuration and rightsizing hygiene
+owner: sre
+category: kubernetes
+version: '2'
 ---
 # Configuration and rightsizing review
 

@@ -52,7 +52,7 @@ async def test_session_lifecycle_with_cleanup(client, monkeypatch):
     assert q.json()["status"] == "queued"
     w = FakeWriter()
 
-    async def factory(env):
+    async def factory(env, connector_id=None):
         return w
 
     monkeypatch.setattr(ex, "writer_factory", factory)

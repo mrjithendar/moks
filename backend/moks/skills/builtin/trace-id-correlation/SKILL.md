@@ -11,6 +11,10 @@ steps:
   - tool: loki_search
     args: {namespace: "{namespace}", errors_only: true, limit: 80}
     purpose: errors around the same time
+title: Trace ID correlation
+owner: sre
+category: support
+version: '2'
 ---
 # Trace and request correlation
 

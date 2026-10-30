@@ -23,6 +23,27 @@ Body.
 """
 
 
+def test_every_builtin_skill_is_versioned_and_covers_the_catalog():
+    from moks.skills import load
+
+    lib = load("")
+    assert lib.errors == [] and len(lib.skills) >= 50
+    assert all(s.meta.title and s.meta.version for s in lib.skills.values())
+    assert {s.meta.category for s in lib.skills.values()} >= {"kubernetes", "application", "aws", "devops", "support"}
+    rules = [d.id for s in lib.skills.values() for d in s.meta.detection]
+    assert len(rules) == len(set(rules)) and len(rules) >= 15
+
+
+def test_skill_is_unavailable_with_a_reason():
+    from moks.skills import availability, load
+
+    sk = load("").skills["rds-pressure"]
+    assert availability(sk, {"kubernetes"}, None) == {"available": False, "reasons": ["needs the cloudwatch connector"]}
+    sk = load("").skills["cpu-throttling"]
+    assert "needs metric container_cpu_cfs_throttled_periods_total" in availability(sk, {"prometheus"}, set())["reasons"]
+    assert availability(sk, {"prometheus", "kubernetes"}, None)["available"]
+
+
 def test_builtin_skills_all_load():
     lib = skills.load(extra_dir="")
     assert lib.errors == [] and len(lib.skills) >= 13

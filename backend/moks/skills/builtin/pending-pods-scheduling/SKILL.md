@@ -15,6 +15,18 @@ steps:
     purpose: FailedScheduling / FailedMount details
   - tool: k8s_nodes
     purpose: allocatable capacity, pressure and taints
+title: Pending pods and scheduling
+owner: sre
+category: kubernetes
+version: '2'
+detection:
+- id: pod-unschedulable
+  kind: finding
+  finding: unschedulable
+  sustained_checks: 3
+  severity: sev3
+  auto_resolve: true
+  title: Pod cannot be scheduled
 ---
 # Pending pods
 

@@ -17,6 +17,10 @@ steps:
   - tool: kb_search
     args: {query: "{question} runbook"}
     purpose: the alert's runbook
+title: Alert triage
+owner: sre
+category: support
+version: '2'
 ---
 # Alert triage
 

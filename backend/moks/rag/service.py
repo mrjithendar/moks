@@ -5,14 +5,16 @@ import hashlib
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import delete, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
 from ..connectors.base import ConnectorError
+from ..db import session_scope
 from ..llm.providers import LLMError, provider_for
 from ..models import Chunk, Document, EmbeddingIndex, KnowledgeSource, LLMConfig
 from ..observability import RETRIEVAL_LATENCY
@@ -24,6 +26,8 @@ from .secrets import clean, exclusion_reason
 
 log = logging.getLogger("moks.rag")
 EMBED_BATCH = 32
+INDEX_LOCK = 7_203_114  # advisory lock: creating the first index
+BUILD_STALE = timedelta(minutes=30)
 _opensearch: OpenSearchBackend | None = None
 
 
@@ -52,18 +56,38 @@ async def active_index(db: AsyncSession) -> EmbeddingIndex | None:
                                                           EmbeddingIndex.status == "active"))).scalar_one_or_none()
 
 
+async def embedding_dimensions(cfg: LLMConfig) -> int:
+    """The model's real output size. A configured size must agree: a vector mapping cannot change."""
+    vec = (await provider_for(cfg).embed(["dimension probe"]))[0]
+    if cfg.embedding_dimensions and cfg.embedding_dimensions != len(vec):
+        raise ConnectorError("config", f"{cfg.name} is configured for {cfg.embedding_dimensions} dimensions but returns {len(vec)}")
+    return len(vec)
+
+
 async def ensure_index(db: AsyncSession) -> EmbeddingIndex:
-    """The active index for the current backend; created (keyword-only or for the active embedding
-    model) when none exists. A model change is handled by reindex(), not here."""
+    """The active index for the current backend; created when none exists, with its vector size
+    resolved first. If the embedding model cannot answer, the index is keyword-only and says so;
+    a later reindex adds vectors. A model change is handled by reindex(), not here."""
+    idx = await active_index(db)
+    if idx:
+        return idx
+    await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": INDEX_LOCK})  # two workers' first documents
     idx = await active_index(db)
     if idx:
         return idx
     cfg = await embedding_config(db)
     if backend_name() == "postgres" and cfg and not await PostgresBackend(db).has_vector():
         cfg = None  # pgvector not installed: keyword-only
+    dims, error = None, None
+    if cfg:
+        try:
+            dims = await embedding_dimensions(cfg)
+        except (LLMError, ConnectorError) as exc:
+            error = f"embedding model unavailable: {getattr(exc, 'message', exc)}"
+            log.warning("index created keyword-only", extra={"event": "embedding_failed", "errorType": type(exc).__name__})
+            cfg = None
     idx = EmbeddingIndex(backend=backend_name(), llm_config_id=cfg.id if cfg else None, model_key=model_key(cfg),
-                         dimensions=cfg.embedding_dimensions if cfg else None, index_name="", status="active",
-                         activated_at=datetime.now(timezone.utc))
+                         dimensions=dims, index_name="", status="active", activated_at=datetime.now(timezone.utc), error=error)
     db.add(idx)
     await db.flush()
     idx.index_name = f"moks-chunks-{str(idx.id)[:8]}"
@@ -73,8 +97,8 @@ async def ensure_index(db: AsyncSession) -> EmbeddingIndex:
 
 
 async def _embed(db: AsyncSession, idx: EmbeddingIndex, texts: list[str]) -> list[list[float]] | None:
-    if not idx.llm_config_id:
-        return None
+    if not idx.llm_config_id or not idx.dimensions:
+        return None  # keyword-only index: a vector field does not exist to write to
     cfg = await db.get(LLMConfig, idx.llm_config_id)
     if cfg is None:
         return None
@@ -82,8 +106,8 @@ async def _embed(db: AsyncSession, idx: EmbeddingIndex, texts: list[str]) -> lis
     out: list[list[float]] = []
     for i in range(0, len(texts), EMBED_BATCH):
         out.extend(await provider.embed(texts[i:i + EMBED_BATCH]))
-    if idx.dimensions is None and out:
-        idx.dimensions = len(out[0])
+    if any(len(v) != idx.dimensions for v in out):
+        raise LLMError("bad_response", f"embedding size differs from the index's {idx.dimensions} dimensions; reindex after a model change")
     return out
 
 
@@ -156,47 +180,95 @@ async def remove_document(db: AsyncSession, doc: Document) -> None:
     doc.status, doc.updated_at = "deleted", datetime.now(timezone.utc)
 
 
+async def _index_batch(db: AsyncSession, new: EmbeddingIndex, batch: list) -> None:
+    rows = [_row(c, d, src) for c, d, src in batch]
+    embs = await _embed(db, new, [f"{r['heading']}\n{r['text']}" for r in rows])
+    if backend_name() == "opensearch":
+        await opensearch().index_chunks(new.index_name, rows, embs)
+    else:
+        await PostgresBackend(db).index_chunks(new, rows, embs)
+
+
+async def _pending_rows(db: AsyncSession, done: set) -> list:
+    rows = (await db.execute(select(Chunk, Document, KnowledgeSource).join(Document, Document.id == Chunk.document_id)
+                             .join(KnowledgeSource, KnowledgeSource.id == Document.source_id)
+                             .where(Document.status == "active").order_by(Chunk.id))).all()
+    return [r for r in rows if r[0].id not in done]
+
+
 async def reindex(db: AsyncSession) -> dict:
-    """Build a new index version for the active embedding model from the stored chunks, then switch
-    to it and retire the old one. Search keeps using the old index until the switch."""
+    """Build a new index version beside the active one, then switch in one committed transaction.
+    Search uses the old index until that commit. A failed build leaves the old index active. The
+    old physical index is deleted only after the switch has committed (cleanup_retired)."""
     cfg = await embedding_config(db)
     if backend_name() == "postgres" and cfg and not await PostgresBackend(db).has_vector():
         raise ConnectorError("config", "pgvector is not installed in this PostgreSQL; use the opensearch backend or a pgvector image")
-    old = await active_index(db)
+    await db.execute(update(EmbeddingIndex).where(
+        EmbeddingIndex.backend == backend_name(), EmbeddingIndex.status == "building",
+        EmbeddingIndex.heartbeat_at < datetime.now(timezone.utc) - BUILD_STALE).values(status="failed", error="build stopped responding", cleanup_pending=True))
+    await db.commit()
+    dims = await embedding_dimensions(cfg) if cfg else None
     new = EmbeddingIndex(backend=backend_name(), llm_config_id=cfg.id if cfg else None, model_key=model_key(cfg),
-                         dimensions=cfg.embedding_dimensions if cfg else None, index_name="", status="building")
+                         dimensions=dims, index_name="", status="building", heartbeat_at=datetime.now(timezone.utc))
     db.add(new)
-    await db.flush()
-    new.index_name = f"moks-chunks-{str(new.id)[:8]}"
-    rows_q = (await db.execute(select(Chunk, Document, KnowledgeSource).join(Document, Document.id == Chunk.document_id)
-                               .join(KnowledgeSource, KnowledgeSource.id == Document.source_id)
-                               .where(Document.status == "active").order_by(Chunk.id))).all()
-    first = True
-    total = 0
-    for i in range(0, len(rows_q), 200):
-        batch = rows_q[i:i + 200]
-        rows = [_row(c, d, s) for c, d, s in batch]
-        embs = await _embed(db, new, [f"{r['heading']}\n{r['text']}" for r in rows])
-        if backend_name() == "opensearch":
-            if first:
-                await opensearch().ensure_index(new.index_name, new.dimensions)
-            await opensearch().index_chunks(new.index_name, rows, embs)
-        else:
-            await PostgresBackend(db).index_chunks(new, rows, embs)
-        first = False
-        total += len(rows)
-    if backend_name() == "opensearch" and first:
-        await opensearch().ensure_index(new.index_name, new.dimensions)
-    if old:
-        old.status = "retired"
+    try:
         await db.flush()
-    new.status, new.activated_at, new.chunk_count = "active", datetime.now(timezone.utc), total
-    await db.flush()
-    if old and backend_name() == "opensearch":
-        await opensearch().drop_index(old.index_name)
-    elif old:
-        await db.execute(text("DELETE FROM chunk_embeddings WHERE index_id = :i"), {"i": old.id})
-    return {"index": new.index_name, "model": new.model_key, "chunks": total, "replaced": old.index_name if old else None}
+    except IntegrityError:
+        await db.rollback()
+        raise ConnectorError("conflict", "a reindex is already running") from None
+    new.index_name = f"moks-chunks-{str(new.id)[:8]}"
+    await db.commit()  # visible and recoverable from here on
+    new_id = new.id
+    done: set = set()
+    try:
+        if backend_name() == "opensearch":
+            await opensearch().ensure_index(new.index_name, new.dimensions)
+        while True:  # the second pass catches documents indexed while the first ran
+            rows = await _pending_rows(db, done)
+            if not rows:
+                break
+            for i in range(0, len(rows), 200):
+                batch = rows[i:i + 200]
+                await _index_batch(db, new, batch)
+                done.update(r[0].id for r in batch)
+                new.heartbeat_at = datetime.now(timezone.utc)
+                await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        new = await db.get(EmbeddingIndex, new_id)
+        new.status, new.error, new.cleanup_pending = "failed", str(getattr(exc, "message", exc))[:500], True
+        await db.commit()
+        raise
+    old = await active_index(db)
+    old_name = old.index_name if old else None
+    if old:
+        old.status, old.cleanup_pending = "retired", True
+        await db.flush()
+    new.status, new.activated_at, new.chunk_count = "active", datetime.now(timezone.utc), len(done)
+    result = {"index": new.index_name, "model": new.model_key, "chunks": len(done), "replaced": old_name}
+    await db.commit()
+    return result
+
+
+async def cleanup_retired() -> int:
+    """Delete physical indexes of retired or failed versions. Safe to retry: the row keeps
+    cleanup_pending until the delete succeeds, and the active index is never selected."""
+    async with session_scope() as db:
+        rows = (await db.execute(select(EmbeddingIndex).where(EmbeddingIndex.cleanup_pending.is_(True), EmbeddingIndex.status != "active",
+                                                              EmbeddingIndex.status != "building").with_for_update(skip_locked=True))).scalars().all()
+        done = 0
+        for idx in rows:
+            try:
+                if idx.backend == "opensearch" and idx.index_name:
+                    await opensearch().drop_index(idx.index_name)
+                elif idx.backend == "postgres" and await PostgresBackend(db).has_vector():
+                    await db.execute(text("DELETE FROM chunk_embeddings WHERE index_id = :i"), {"i": idx.id})
+            except ConnectorError as exc:
+                log.warning("index cleanup will retry", extra={"event": "index_cleanup_failed", "errorType": exc.kind})
+                continue
+            idx.cleanup_pending = False
+            done += 1
+        return done
 
 
 async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8, environment: str | None = None,
@@ -217,7 +289,7 @@ async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8,
     else:
         rankings = [await PostgresBackend(db).keyword(query, envs, nss, pool)]
     cfg = await embedding_config(db)
-    if idx and cfg and idx.llm_config_id == cfg.id and idx.model_key == model_key(cfg):
+    if idx and idx.dimensions and cfg and idx.llm_config_id == cfg.id and idx.model_key == model_key(cfg):
         try:
             qv = (await provider_for(cfg).embed([query]))[0]
             if backend_name() == "opensearch":
@@ -271,8 +343,12 @@ async def stats(db: AsyncSession) -> dict:
     counts = dict((await db.execute(text("SELECT status, count(*) FROM documents GROUP BY status"))).all())
     chunks = (await db.execute(text("SELECT count(*) FROM chunks"))).scalar_one()
     idx = await active_index(db)
+    cfg = await embedding_config(db)
+    building = (await db.execute(select(EmbeddingIndex).where(EmbeddingIndex.backend == backend_name(), EmbeddingIndex.status == "building"))).scalars().first()
     return {"backend": backend_name(), "documents": counts, "chunks": chunks,
-            "index": {"name": idx.index_name, "model": idx.model_key, "dimensions": idx.dimensions} if idx else None}
+            "index": {"name": idx.index_name, "model": idx.model_key, "dimensions": idx.dimensions, "mode": "hybrid" if idx.dimensions else "keyword-only",
+                      "note": idx.error, "reindex_needed": bool(cfg and idx.model_key != model_key(cfg))} if idx else None,
+            "reindex_running": building is not None}
 
 
 async def mark_indexed_now(db: AsyncSession, source: KnowledgeSource, status: str, error: str | None = None) -> None:
