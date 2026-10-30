@@ -1,0 +1,119 @@
+# Defaults. Environment-specific files (values-minikube.yaml, values-eks.yaml) override these.
+
+image:
+  repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
+  # Pin a digest for releases (sha256:...); tag is used only when digest is empty.
+  digest: ""
+  tag: latest
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+publicUrl: https://jithendar.com/moks
+basePath: /moks          # served natively by the app; the ingress must not strip it
+
+# Non-secret settings (MOKS_* environment variables).
+config:
+  env: production
+  authMode: oidc          # oidc | local (dev is refused in production)
+  oidcIssuer: ""
+  oidcClientId: ""
+  oidcScopes: "openid email profile"
+  oidcAllowedDomains: ""
+  oidcGroupsClaim: groups
+  oidcGroupRoles: "{}"    # JSON: {"sre-admins": ["admin"], "sre": ["investigator:mk4:*"]}
+  bootstrapAdmins: ""     # comma separated emails that become Administrator at first sign-in
+  apiDocs: false
+  logLevel: INFO
+  maxToolCalls: 16
+  maxDurationSeconds: 180
+  maxQueryWindowMinutes: 360
+  workerConcurrency: 2
+  otelEndpoint: ""        # e.g. http://otel-collector.observability:4318
+
+# Existing Secret with MOKS_DATABASE_URL, MOKS_SESSION_SECRET, MOKS_OIDC_CLIENT_SECRET and any
+# MOKS_CRED_* connector/LLM credentials. Never committed; see deploy/secrets/.
+existingSecret: moks-secrets
+# Extra Secret mounted at /var/run/moks-credentials for file credential references (kubeconfigs).
+credentialsSecret: ""
+
+# Seeded at start-up (create-only; edits made in the admin UI are kept). See dev/seed.local.yaml.
+seed: {}
+
+api:
+  replicas: 2
+  resources:
+    requests: {cpu: 100m, memory: 192Mi}
+    limits: {cpu: "1", memory: 512Mi}
+worker:
+  replicas: 1
+  resources:
+    requests: {cpu: 100m, memory: 192Mi}
+    limits: {cpu: "1", memory: 512Mi}
+
+serviceAccount:
+  create: true
+  name: moks
+  annotations: {}          # EKS IRSA: eks.amazonaws.com/role-arn
+
+# In-cluster Kubernetes connector permissions (read-only, no Secrets).
+rbac:
+  create: true
+  clusterWide: true        # false: bind the ClusterRole only in rbac.namespaces
+  namespaces: []
+
+ingress:
+  enabled: true
+  className: traefik
+  host: jithendar.com
+  tlsSecretName: ""        # empty: Traefik's default TLSStore certificate
+  httpRedirect: true       # HTTP -> HTTPS via a Traefik middleware in this namespace
+  annotations: {}
+
+postgres:
+  bundled: true            # false: point MOKS_DATABASE_URL at an external database (e.g. RDS)
+  image: postgres:17.11-alpine
+  storage: 10Gi
+  storageClass: ""
+  nodeName: ""             # hostPath storage (minikube): pin to the node holding the volume
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  passwordSecret: moks-postgres   # key: password
+
+# Phase 2 retrieval backend. Exactly one may be enabled; nothing uses it in Phase 1.
+rag:
+  backend: none            # none | opensearch | pgvector
+  opensearch:
+    image: opensearchproject/opensearch:3.9.0
+    heapSize: 1g           # container limit = heap x 2
+    storage: 20Gi
+    nodeName: ""
+
+networkPolicy:
+  enabled: true
+  ingressNamespaces: [traefik]       # who may reach the API port
+  metricsNamespaces: [monitoring]    # who may scrape :9464
+  apiServer:                         # Kubernetes API endpoints (kubectl get endpointslices -n default)
+    cidrs: []
+    ports: [443, 6443, 8443]
+  inCluster:                         # in-cluster connector targets
+    - namespace: monitoring
+      ports: [9090, 3100, 80, 3000]
+    - namespace: observability
+      ports: [4318]
+  internetEgress: true               # LLM providers, AWS APIs, OIDC issuer (HTTPS only)
+
+podDisruptionBudget:
+  enabled: true
+
+# Grant a cluster log collector read access to MOKS's own pod logs.
+logCollector:
+  enabled: false
+  serviceAccount: alloy
+  namespace: monitoring
+
+# Grant an image-pull-secret refresher access to this namespace's ecr-pull Secret.
+ecrRefresh:
+  enabled: false
+  serviceAccount: ecr-refresh
+  namespace: roboshop-ai

@@ -1,0 +1,32 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BedrockInvokeSelectedModels",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:Converse"],
+      "Resource": [
+        "arn:aws:bedrock:us-east-1::foundation-model/<model-id>",
+        "arn:aws:bedrock:us-east-1:<account>:inference-profile/<profile-id>"
+      ]
+    },
+    {
+      "Sid": "Phase2CloudWatchLogsReadAllowedGroups",
+      "Effect": "Allow",
+      "Action": ["logs:StartQuery", "logs:GetQueryResults", "logs:StopQuery", "logs:DescribeLogGroups", "logs:FilterLogEvents"],
+      "Resource": ["arn:aws:logs:us-east-1:<account>:log-group:/aws/eks/prod/*", "arn:aws:logs:us-east-1:<account>:log-group:/app/*"]
+    },
+    {
+      "Sid": "Phase2CloudWatchMetricsRead",
+      "Effect": "Allow",
+      "Action": ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics", "cloudwatch:DescribeAlarms"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EksDescribeForConnector",
+      "Effect": "Allow",
+      "Action": ["eks:DescribeCluster"],
+      "Resource": "arn:aws:eks:us-east-1:<account>:cluster/prod"
+    }
+  ]
+}

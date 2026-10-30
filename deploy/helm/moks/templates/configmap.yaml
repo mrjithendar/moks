@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moks-config
+  labels: {{- include "moks.labels" . | nindent 4 }}
+data:
+  MOKS_ENV: {{ .Values.config.env | quote }}
+  MOKS_PUBLIC_URL: {{ .Values.publicUrl | quote }}
+  MOKS_BASE_PATH: {{ .Values.basePath | quote }}
+  MOKS_AUTH_MODE: {{ .Values.config.authMode | quote }}
+  MOKS_OIDC_ISSUER: {{ .Values.config.oidcIssuer | quote }}
+  MOKS_OIDC_CLIENT_ID: {{ .Values.config.oidcClientId | quote }}
+  MOKS_OIDC_SCOPES: {{ .Values.config.oidcScopes | quote }}
+  MOKS_OIDC_ALLOWED_DOMAINS: {{ .Values.config.oidcAllowedDomains | quote }}
+  MOKS_OIDC_GROUPS_CLAIM: {{ .Values.config.oidcGroupsClaim | quote }}
+  MOKS_OIDC_GROUP_ROLES: {{ .Values.config.oidcGroupRoles | quote }}
+  MOKS_BOOTSTRAP_ADMINS: {{ .Values.config.bootstrapAdmins | quote }}
+  MOKS_API_DOCS: {{ .Values.config.apiDocs | quote }}
+  MOKS_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  MOKS_MAX_TOOL_CALLS: {{ .Values.config.maxToolCalls | quote }}
+  MOKS_MAX_DURATION_SECONDS: {{ .Values.config.maxDurationSeconds | quote }}
+  MOKS_MAX_QUERY_WINDOW_MINUTES: {{ .Values.config.maxQueryWindowMinutes | quote }}
+  MOKS_WORKER_CONCURRENCY: {{ .Values.config.workerConcurrency | quote }}
+  MOKS_COOKIE_SECURE: "true"
+  {{- with .Values.config.otelEndpoint }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
+  {{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moks-seed
+  labels: {{- include "moks.labels" . | nindent 4 }}
+data:
+  seed.yaml: |
+{{ toYaml .Values.seed | indent 4 }}

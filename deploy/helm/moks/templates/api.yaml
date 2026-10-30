@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moks-api
+  labels: {{- include "moks.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  revisionHistoryLimit: 5
+  strategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 0, maxSurge: 1}}
+  selector:
+    matchLabels: {app: moks, component: api}
+  template:
+    metadata:
+      labels: {app: moks, component: api}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "moks.podSecurity" . | nindent 6 }}
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        # Migrations are advisory-locked, so replicas starting together do not race.
+        - name: migrate
+          image: {{ include "moks.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c", "moks migrate && moks seed /etc/moks/seed.yaml --if-present"]
+          {{- include "moks.env" . | nindent 10 }}
+          {{- include "moks.containerSecurity" . | nindent 10 }}
+          {{- include "moks.volumeMounts" . | nindent 10 }}
+          resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+      containers:
+        - name: api
+          image: {{ include "moks.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [serve]
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: metrics, containerPort: 9464}
+          {{- include "moks.env" . | nindent 10 }}
+          env:
+            - {name: FORWARDED_ALLOW_IPS, value: "*"}  # only Traefik can reach :8080 (NetworkPolicy)
+          {{- include "moks.containerSecurity" . | nindent 10 }}
+          {{- include "moks.volumeMounts" . | nindent 10 }}
+          startupProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 3, failureThreshold: 40}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 20, timeoutSeconds: 3, failureThreshold: 3}
+          readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3}
+          resources: {{- toYaml .Values.api.resources | nindent 12 }}
+      {{- include "moks.volumes" . | nindent 6 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moks-api
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  selector: {app: moks, component: api}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+# Headless service for Prometheus DNS discovery (dns_sd_configs), like jithendar-com-metrics.
+apiVersion: v1
+kind: Service
+metadata:
+  name: moks-metrics
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector: {app: moks}
+  ports:
+    - {name: metrics, port: 9464, targetPort: 9464}
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.api.replicas) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: moks-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: moks, component: api}
+{{- end }}

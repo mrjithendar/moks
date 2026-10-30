@@ -1,0 +1,32 @@
+# Scenario 2: an invalid configuration value makes "payments" exit at start-up -> CrashLoopBackOff.
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: payments-config, namespace: moks-lab}
+data:
+  PAYMENT_MODE: lve                     # BUG: must be "live" or "sandbox"
+  PAYMENT_TIMEOUT_MS: "2000"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: payments, namespace: moks-lab, labels: {app: payments}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: payments}}
+  template:
+    metadata: {labels: {app: payments}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: payments
+          image: busybox:1.37
+          envFrom: [{configMapRef: {name: payments-config}}]
+          command: [sh, -c]
+          args:
+            - |
+              echo '{"level":"info","event":"startup","message":"payments starting"}'
+              case "$PAYMENT_MODE" in
+                live|sandbox) echo '{"level":"info","event":"ready"}'; while true; do sleep 3600; done ;;
+                *) echo "{\"level\":\"fatal\",\"event\":\"config_invalid\",\"message\":\"invalid PAYMENT_MODE=$PAYMENT_MODE (expected live|sandbox)\"}"; exit 78 ;;
+              esac
+          resources: {requests: {cpu: 5m, memory: 8Mi}, limits: {cpu: 50m, memory: 32Mi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}

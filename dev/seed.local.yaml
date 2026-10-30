@@ -1,0 +1,22 @@
+# Local development seed (moks seed dev/seed.local.yaml). Reaches mk4 through your kubeconfig
+# and kubectl port-forwards; see docs/OPERATOR_GUIDE.md "Local development".
+environments:
+  - name: mk4
+    display_name: Hetzner Minikube (mk4)
+    kind: minikube
+    is_production: false
+    allowed_namespaces: ["*"]
+    denied_namespaces: ["kube-system", "cert-manager", "argocd"]
+    max_query_window_minutes: 360
+    grafana_url: https://jithendar.com/grafana/
+    connectors:
+      - type: kubernetes
+        name: mk4
+        config: {mode: kubeconfig, context: mk4, timeout_seconds: 15}
+        credential_ref: {type: file, path: kubeconfig}   # $MOKS_CREDENTIALS_DIR/kubeconfig
+      - type: prometheus
+        name: prometheus
+        config: {base_url: "http://localhost:19090/prometheus", public_url: "https://jithendar.com/prometheus", timeout_seconds: 15}
+      - type: loki
+        name: loki
+        config: {base_url: "http://localhost:13100", timeout_seconds: 20}

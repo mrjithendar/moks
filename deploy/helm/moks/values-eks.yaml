@@ -1,0 +1,59 @@
+# Optional: MOKS running inside Amazon EKS. Review every value; nothing here has been applied.
+image:
+  repository: <account>.dkr.ecr.<region>.amazonaws.com/moks
+  digest: ""            # pin sha256:...
+imagePullSecrets: []    # EKS nodes pull from ECR with their instance role
+
+publicUrl: https://ops.example.com/moks
+basePath: /moks
+
+config:
+  env: production
+  authMode: oidc
+  oidcIssuer: https://login.example.com/          # Okta / Entra ID / Keycloak issuer URL
+  oidcClientId: moks
+  oidcAllowedDomains: example.com
+  oidcGroupRoles: '{"sre-admins": ["admin"], "sre-oncall": ["investigator:prod-eks:*"], "sre-viewers": ["viewer"]}'
+
+serviceAccount:
+  annotations:
+    # IRSA role from deploy/iam/moks-role-policy.json (Bedrock, CloudWatch read). Or use EKS Pod Identity.
+    eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/moks
+
+rbac:
+  clusterWide: false
+  namespaces: [shop, payments, checkout]   # read access only where MOKS is meant to look
+
+seed:
+  environments:
+    - name: prod-eks
+      display_name: Production (EKS)
+      kind: eks
+      is_production: true
+      allowed_namespaces: [shop, payments, checkout]
+      denied_namespaces: [kube-system]
+      max_query_window_minutes: 360
+      connectors:
+        - type: kubernetes
+          name: in-cluster
+          config: {mode: in_cluster}
+
+ingress:
+  className: alb
+  host: ops.example.com
+  httpRedirect: false
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:<region>:<account>:certificate/<id>
+    # SSE: keep idle timeout above the 15 s keep-alive interval (default 60 s is fine).
+
+postgres:
+  bundled: false        # use RDS PostgreSQL 16+; put its URL in MOKS_DATABASE_URL (moks-secrets)
+
+networkPolicy:
+  ingressNamespaces: []   # ALB target-type ip reaches pods from VPC addresses; restrict with security groups for pods
+  apiServer:
+    cidrs: [10.0.0.0/8]   # EKS control-plane ENIs live in your VPC; narrow to your VPC CIDR
+    ports: [443]

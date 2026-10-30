@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+# Node
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+# Local state and secrets: only examples are committed
+.env
+.env.*
+!.env.example
+*.secret.yaml
+*-secret.yaml
+kubeconfig*
+!deploy/secrets/*.example.yaml
+.DS_Store

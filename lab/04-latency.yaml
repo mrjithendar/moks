@@ -1,0 +1,105 @@
+# Scenario 4: "orders" calls "inventory". Setting inventory's DELAY_MS (a rollout) slows every
+# order; orders logs per-request latency and exposes a Prometheus histogram on :9100/metrics.
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: lab-apps, namespace: moks-lab}
+data:
+  inventory.py: |
+    import http.server, json, os, time
+    DELAY = int(os.environ.get("DELAY_MS", "20")) / 1000
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(DELAY)
+            body = json.dumps({"sku": "rb-100", "stock": 7}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+        def log_message(self, *a): pass
+    http.server.ThreadingHTTPServer(("", 8080), H).serve_forever()
+  orders.py: |
+    import http.server, json, threading, time, urllib.request
+    BUCKETS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5]
+    counts, total, n = [0] * len(BUCKETS), 0.0, 0
+    lock = threading.Lock()
+    def loop():
+        global total, n
+        while True:
+            t = time.time(); status = 200
+            try:
+                urllib.request.urlopen("http://inventory.moks-lab.svc.cluster.local/stock/rb-100", timeout=5).read()
+            except Exception:
+                status = 504
+            d = time.time() - t
+            with lock:
+                n += 1; total += d
+                for i, b in enumerate(BUCKETS):
+                    if d <= b: counts[i] += 1
+            lvl = "warn" if d > 0.5 else "info"
+            print(json.dumps({"level": lvl, "event": "order_request", "route": "/orders", "status": str(status),
+                              "durationMs": int(d * 1000), "dependency": "inventory"}), flush=True)
+            time.sleep(1)
+    class M(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            with lock:
+                lines = ["# TYPE lab_order_duration_seconds histogram"]
+                lines += [f'lab_order_duration_seconds_bucket{{le="{b}"}} {c}' for b, c in zip(BUCKETS, counts)]
+                lines += [f'lab_order_duration_seconds_bucket{{le="+Inf"}} {n}', f"lab_order_duration_seconds_sum {total}", f"lab_order_duration_seconds_count {n}"]
+            body = ("\n".join(lines) + "\n").encode()
+            self.send_response(200); self.send_header("Content-Type", "text/plain; version=0.0.4"); self.end_headers(); self.wfile.write(body)
+        def log_message(self, *a): pass
+    threading.Thread(target=loop, daemon=True).start()
+    http.server.ThreadingHTTPServer(("", 9100), M).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: inventory, namespace: moks-lab, labels: {app: inventory}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: inventory}}
+  template:
+    metadata: {labels: {app: inventory}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: inventory
+          image: python:3.12-alpine
+          command: [python, /app/inventory.py]
+          env: [{name: DELAY_MS, value: "20"}]
+          ports: [{name: http, containerPort: 8080}]
+          resources: {requests: {cpu: 10m, memory: 24Mi}, limits: {cpu: 100m, memory: 64Mi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: app, mountPath: /app}]
+      volumes: [{name: app, configMap: {name: lab-apps}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: inventory, namespace: moks-lab}
+spec:
+  selector: {app: inventory}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: orders, namespace: moks-lab, labels: {app: orders}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: orders}}
+  template:
+    metadata: {labels: {app: orders}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: orders
+          image: python:3.12-alpine
+          command: [python, /app/orders.py]
+          ports: [{name: metrics, containerPort: 9100}]
+          resources: {requests: {cpu: 10m, memory: 24Mi}, limits: {cpu: 100m, memory: 64Mi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: app, mountPath: /app}]
+      volumes: [{name: app, configMap: {name: lab-apps}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: orders-metrics, namespace: moks-lab}
+spec:
+  clusterIP: None
+  selector: {app: orders}
+  ports: [{name: metrics, port: 9100, targetPort: metrics}]

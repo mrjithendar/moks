@@ -1,0 +1,95 @@
+# Scenario 1: a Service selector typo leaves "checkout" without endpoints, so the storefront's
+# reverse proxy answers 502 Bad Gateway. The traffic pod logs every status code it sees.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: checkout, namespace: moks-lab, labels: {app: checkout}}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: checkout}}
+  template:
+    metadata: {labels: {app: checkout, tier: backend}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: checkout
+          image: nginxinc/nginx-unprivileged:1.31-alpine
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /, port: http}, periodSeconds: 5}
+          resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {cpu: 100m, memory: 64Mi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: checkout, namespace: moks-lab}
+spec:
+  selector: {app: checkout-v2}          # BUG: the pods are labelled app=checkout
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: storefront-nginx, namespace: moks-lab}
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      location / {
+        proxy_pass http://checkout.moks-lab.svc.cluster.local:80;
+        proxy_connect_timeout 2s;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: storefront, namespace: moks-lab, labels: {app: storefront}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: storefront}}
+  template:
+    metadata: {labels: {app: storefront}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: storefront
+          image: nginxinc/nginx-unprivileged:1.31-alpine
+          ports: [{name: http, containerPort: 8080}]
+          resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {cpu: 100m, memory: 64Mi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: conf, mountPath: /etc/nginx/conf.d}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: conf, configMap: {name: storefront-nginx}}
+        - {name: tmp, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: storefront, namespace: moks-lab}
+spec:
+  selector: {app: storefront}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: traffic, namespace: moks-lab, labels: {app: traffic}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: traffic}}
+  template:
+    metadata: {labels: {app: traffic}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: traffic
+          image: busybox:1.37
+          command: [sh, -c]
+          args:
+            - |
+              while true; do
+                code=$(wget -S -q -O /dev/null -T 5 http://storefront.moks-lab.svc.cluster.local/ 2>&1 | awk '/^ *HTTP\//{c=$2} END{print c+0}')
+                echo "{\"level\":\"$([ "$code" = 200 ] && echo info || echo error)\",\"event\":\"checkout_request\",\"route\":\"/checkout\",\"status\":\"$code\"}"
+                sleep 2
+              done
+          resources: {requests: {cpu: 5m, memory: 8Mi}, limits: {cpu: 50m, memory: 32Mi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}

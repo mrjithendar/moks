@@ -1,0 +1,100 @@
+name: moks
+
+# check   -> every push and pull request: backend tests against PostgreSQL, frontend typecheck/build,
+#            Helm lint/render
+# release -> default branch: build the arm64 image (mk4 nodes are arm64) and push moks:<sha> to ECR.
+#            CI never touches the cluster; Argo CD deploys the digest pinned in values-minikube.yaml.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: self-hosted
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: {POSTGRES_USER: moks, POSTGRES_PASSWORD: moks, POSTGRES_DB: postgres}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U moks" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Backend tests
+        working-directory: backend
+        env:
+          MOKS_TEST_DATABASE_URL: postgresql://moks:moks@localhost:5432/postgres
+        run: |
+          pip install -r requirements.txt pytest pytest-asyncio
+          pip install --no-deps -e .
+          python -m pytest -q
+      - uses: actions/setup-node@v4
+        with: {node-version: "26", cache: npm, cache-dependency-path: frontend/package-lock.json}
+      - name: Frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          npm test
+      - uses: azure/setup-helm@v4
+      - name: Helm
+        run: |
+          helm lint deploy/helm/moks -f deploy/helm/moks/values-minikube.yaml
+          helm lint deploy/helm/moks -f deploy/helm/moks/values-eks.yaml
+          helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-minikube.yaml > /dev/null
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform
+        working-directory: deploy/terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write   # GitHub OIDC token for AWS; no stored access keys
+    env:
+      AWS_REGION: us-east-1
+      REPOSITORY: moks
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      # Role moks-github-ci from deploy/terraform (output ci_role_arn), stored as the repository
+      # variable AWS_ROLE_ARN. It can push to the moks ECR repository only, and only from master.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: moks-ci-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build, smoke-test and push
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY"
+          docker build -t "$IMAGE:${{ github.sha }}" .
+          # The image must start and answer its probes without a database (readyz reports 503).
+          docker run -d --name smoke -e MOKS_ENV=development -e MOKS_AUTH_MODE=local -p 8080:8080 "$IMAGE:${{ github.sha }}"
+          for i in $(seq 1 30); do curl -fsS localhost:8080/healthz && break; sleep 1; done
+          curl -fsS localhost:8080/moks/ | grep -q '<div id="root">'
+          curl -fsS localhost:8080/moks/api/health
+          docker rm -f smoke
+          docker push "$IMAGE:${{ github.sha }}"
+          echo "digest: $(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:${{ github.sha }}")" >> "$GITHUB_STEP_SUMMARY"

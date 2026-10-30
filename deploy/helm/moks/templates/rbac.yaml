@@ -1,0 +1,58 @@
+{{- if .Values.rbac.create }}
+# Read-only access for the in-cluster Kubernetes connector. Deliberately excludes Secrets,
+# ConfigMap contents, pods/exec, pods/attach, pods/portforward and every write verb.
+# MOKS's own RBAC and environment scope narrow this further per user.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: moks-reader
+  labels: {{- include "moks.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log, services, endpoints, events, namespaces, nodes, persistentvolumeclaims, replicationcontrollers]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, statefulsets, daemonsets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, networkpolicies]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [get, list, watch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods, nodes]
+    verbs: [get, list]
+---
+{{- if .Values.rbac.clusterWide }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: moks-reader
+  labels: {{- include "moks.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: moks-reader}
+subjects:
+  - {kind: ServiceAccount, name: {{ .Values.serviceAccount.name }}, namespace: {{ .Release.Namespace }}}
+{{- else }}
+{{- range .Values.rbac.namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: moks-reader
+  namespace: {{ . }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: moks-reader}
+subjects:
+  - {kind: ServiceAccount, name: {{ $.Values.serviceAccount.name }}, namespace: {{ $.Release.Namespace }}}
+{{- end }}
+{{- end }}
+{{- end }}

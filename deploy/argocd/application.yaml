@@ -1,0 +1,32 @@
+# Named moks-portal: the Application "moks" already exists for the RoboShop shopping widget
+# (roboshop-ai/argocd/moks.yaml) and is unrelated.
+# Manual sync, never with prune enabled from the UI (see docs/OPERATOR_GUIDE.md).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: moks-portal
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  project: moks
+  source:
+    repoURL: https://github.com/mrjithendar/moks.git
+    targetRevision: master
+    path: deploy/helm/moks
+    helm:
+      releaseName: moks
+      valueFiles: [values-minikube.yaml]
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: moks
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+      - FailOnSharedResource=true
+    managedNamespaceMetadata:
+      labels:
+        app.kubernetes.io/part-of: moks
+        pod-security.kubernetes.io/enforce: baseline
+        pod-security.kubernetes.io/warn: restricted

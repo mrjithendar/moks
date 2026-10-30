@@ -1,0 +1,80 @@
+{{- if .Values.postgres.bundled }}
+# Bundled PostgreSQL for single-cluster installs. For EKS prefer RDS (postgres.bundled=false).
+# The PVC carries resource-level Prune=false,Delete=false so an Argo CD prune can never delete it.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: moks-postgres
+  labels: {{- include "moks.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  serviceName: moks-postgres
+  replicas: 1
+  selector:
+    matchLabels: {app: moks-postgres}
+  template:
+    metadata:
+      labels: {app: moks-postgres}
+    spec:
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      {{- with .Values.postgres.nodeName }}
+      # hostPath volumes on minikube have no node affinity: a pod scheduled elsewhere sees an empty disk.
+      nodeSelector: {kubernetes.io/hostname: {{ . }}}
+      {{- end }}
+      securityContext: {runAsNonRoot: true, runAsUser: 70, runAsGroup: 70, fsGroup: 70, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          env:
+            - {name: POSTGRES_USER, value: moks}
+            - {name: POSTGRES_DB, value: moks}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: {{ .Values.postgres.passwordSecret }}, key: password}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports: [{name: postgres, containerPort: 5432}]
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+          readinessProbe: {exec: {command: [pg_isready, -U, moks, -d, moks]}, periodSeconds: 10}
+          livenessProbe: {exec: {command: [pg_isready, -U, moks, -d, moks]}, periodSeconds: 30, failureThreshold: 5}
+          resources: {{- toYaml .Values.postgres.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: run, mountPath: /var/run/postgresql}
+      volumes:
+        - name: run
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        annotations:
+          argocd.argoproj.io/sync-options: Prune=false,Delete=false
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.postgres.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources: {requests: {storage: {{ .Values.postgres.storage }}}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moks-postgres
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  selector: {app: moks-postgres}
+  ports: [{name: postgres, port: 5432, targetPort: postgres}]
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: moks-postgres
+spec:
+  podSelector: {matchLabels: {app: moks-postgres}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: moks}}}]
+      ports: [{port: 5432, protocol: TCP}]
+  egress: []
+{{- end }}
+{{- end }}

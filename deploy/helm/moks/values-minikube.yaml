@@ -1,0 +1,66 @@
+# mk4 (Hetzner, 4-node Minikube, arm64) behind Traefik at https://jithendar.com/moks
+image:
+  repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
+  digest: ""            # scripts/set-image.sh pins sha256:... here; never deploy a mutable tag
+  tag: latest
+imagePullSecrets: [{name: ecr-pull}]   # refreshed by the ecr-refresh CronJob (tools repo); see docs/OPERATOR_GUIDE.md
+
+publicUrl: https://jithendar.com/moks
+basePath: /moks
+
+config:
+  env: production
+  # local: email + password; no self-registration, so the site is closed until you run
+  # `moks create-user` (docs/OPERATOR_GUIDE.md). Switch to oidc once an IdP client exists.
+  authMode: local
+  bootstrapAdmins: ""
+  otelEndpoint: http://otel-collector.observability.svc.cluster.local:4318
+
+seed:
+  environments:
+    - name: mk4
+      display_name: Hetzner Minikube (mk4)
+      kind: minikube
+      is_production: true
+      allowed_namespaces: ["*"]
+      denied_namespaces: []
+      max_query_window_minutes: 360
+      grafana_url: https://jithendar.com/grafana/
+      connectors:
+        - type: kubernetes
+          name: in-cluster
+          config: {mode: in_cluster, timeout_seconds: 15}
+        - type: prometheus
+          name: prometheus
+          config: {base_url: "http://prometheus.monitoring.svc.cluster.local:9090/prometheus", public_url: "https://jithendar.com/prometheus", timeout_seconds: 15}
+        - type: loki
+          name: loki
+          config: {base_url: "http://loki.monitoring.svc.cluster.local:3100", timeout_seconds: 20}
+
+api:
+  replicas: 2
+worker:
+  replicas: 1
+
+ingress:
+  host: jithendar.com
+  tlsSecretName: ""     # Traefik default TLSStore (jithendar-com-tls) covers jithendar.com
+
+postgres:
+  bundled: true
+  storage: 10Gi
+  nodeName: mk4-m04     # hostPath PVs have no node affinity; keep the pod on the node holding the data
+
+rag:
+  backend: none         # Phase 2 sets opensearch (needs ~2.5 GiB) or pgvector
+
+networkPolicy:
+  apiServer:
+    cidrs: [10.96.0.1/32, 192.168.49.2/32]   # kubernetes Service VIP and the endpoint behind it
+    ports: [443, 8443]
+
+logCollector:
+  enabled: true         # monitoring/alloy; also add "moks" to Alloy's namespaces in the tools repo
+
+ecrRefresh:
+  enabled: true         # also add "moks" to TARGET_NAMESPACES of the ecr-refresh CronJob (tools repo)

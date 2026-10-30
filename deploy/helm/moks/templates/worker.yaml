@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moks-worker
+  labels: {{- include "moks.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: {app: moks, component: worker}
+  template:
+    metadata:
+      labels: {app: moks, component: worker}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "moks.podSecurity" . | nindent 6 }}
+      # Lets a running investigation finish (bounded by maxDurationSeconds) on rollout.
+      terminationGracePeriodSeconds: {{ add .Values.config.maxDurationSeconds 20 }}
+      containers:
+        - name: worker
+          image: {{ include "moks.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [worker]
+          ports:
+            - {name: metrics, containerPort: 9464}
+          {{- include "moks.env" . | nindent 10 }}
+          {{- include "moks.containerSecurity" . | nindent 10 }}
+          {{- include "moks.volumeMounts" . | nindent 10 }}
+          livenessProbe: {tcpSocket: {port: metrics}, periodSeconds: 20, failureThreshold: 3}
+          resources: {{- toYaml .Values.worker.resources | nindent 12 }}
+      {{- include "moks.volumes" . | nindent 6 }}

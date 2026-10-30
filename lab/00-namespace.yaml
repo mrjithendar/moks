@@ -1,0 +1,8 @@
+# Demo incident lab. Everything lives in namespace moks-lab and is deleted with it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: moks-lab
+  labels:
+    app.kubernetes.io/part-of: moks-lab
+    pod-security.kubernetes.io/enforce: restricted

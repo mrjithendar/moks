@@ -1,0 +1,10 @@
+# Add to the Prometheus scrape_configs in the tools repository (observability/prometheus),
+# next to the jithendar-com job. The headless Service moks-metrics resolves to every MOKS pod.
+- job_name: moks
+  metrics_path: /metrics
+  dns_sd_configs:
+    - names: [moks-metrics.moks.svc.cluster.local]
+      type: A
+      port: 9464
+  relabel_configs:
+    - {target_label: service, replacement: moks}

@@ -1,0 +1,21 @@
+{{- with .Values.logCollector }}
+{{- if .enabled }}
+# Lets the cluster's log collector read pods and logs in this namespace only (mk4: monitoring/alloy).
+# Also add this namespace to the collector's namespace list (tools repo, observability/alloy).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: alloy-logs
+rules:
+  - {apiGroups: [""], resources: [pods], verbs: [get, list, watch]}
+  - {apiGroups: [""], resources: [pods/log], verbs: [get]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: alloy-logs
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: alloy-logs}
+subjects:
+  - {kind: ServiceAccount, name: {{ .serviceAccount }}, namespace: {{ .namespace }}}
+{{- end }}
+{{- end }}

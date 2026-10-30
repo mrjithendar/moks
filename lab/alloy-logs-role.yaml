@@ -1,0 +1,15 @@
+# Optional: lets the cluster's Alloy collector read moks-lab logs (also add "moks-lab" to the
+# namespaces list in the tools repo's Alloy config). Without it, MOKS still reads pod logs via the
+# Kubernetes API; only the Loki-based evidence is missing.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: alloy-logs, namespace: moks-lab}
+rules:
+  - {apiGroups: [""], resources: [pods], verbs: [get, list, watch]}
+  - {apiGroups: [""], resources: [pods/log], verbs: [get]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: alloy-logs, namespace: moks-lab}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: alloy-logs}
+subjects: [{kind: ServiceAccount, name: alloy, namespace: monitoring}]

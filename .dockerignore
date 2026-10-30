@@ -1,0 +1,15 @@
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+frontend/dist
+.git
+.github
+deploy
+docs
+lab
+dev
+*.md
+!backend/README.md
+**/.env*
+**/kubeconfig*
+backend/tests

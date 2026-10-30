@@ -1,0 +1,143 @@
+# Dependabot version updates. Pull requests run the `check` job in ci.yml (backend tests against
+# PostgreSQL, frontend typecheck/test/build, Helm and Terraform validation). Merging to master
+# releases an image; scripts/set-image.sh + an Argo CD sync still roll it out.
+#
+# Minor and patch updates are grouped to keep the PR count down; majors arrive one PR each.
+# Security updates are not grouped and are not held back by the cooldown.
+
+version: 2
+
+updates:
+  # Backend: backend/requirements.txt (exact pins used by the image)
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    cooldown:
+      default-days: 3
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps(backend)"
+      include: scope
+    labels: [dependencies, python]
+    groups:
+      # FastAPI pins a narrow Starlette range; uvicorn is tested with both.
+      web-framework:
+        patterns: [fastapi, starlette, "uvicorn*"]
+      # The SDK, exporter and instrumentation packages are released in lockstep.
+      opentelemetry:
+        patterns: ["opentelemetry-*"]
+      database:
+        patterns: ["SQLAlchemy*", sqlalchemy, alembic, asyncpg]
+      pydantic:
+        patterns: [pydantic, pydantic-settings, pydantic-core]
+      aws:
+        patterns: [boto3, botocore]
+      python-minor-patch:
+        update-types: [minor, patch]
+
+  # Frontend: frontend/package.json + package-lock.json
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    cooldown:
+      default-days: 3
+    open-pull-requests-limit: 10
+    versioning-strategy: increase
+    commit-message:
+      prefix: "deps(frontend)"
+      include: scope
+    labels: [dependencies, npm]
+    groups:
+      react:
+        patterns: [react, react-dom, react-router-dom, "@types/react", "@types/react-dom", "@testing-library/react"]
+      vite:
+        patterns: [vite, "@vitejs/*", vitest, jsdom]
+      npm-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      # TypeScript 7 is the native (Go) compiler; move to it deliberately, not via a routine bump.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+
+  # Base images in the root Dockerfile (node build stage, python runtime)
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    commit-message:
+      prefix: "deps(docker)"
+    labels: [dependencies, docker]
+    ignore:
+      # Node and Python majors are bumped by hand together with CI (ci.yml) and local tooling.
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # Images in the Helm chart values (postgres, opensearch)
+  - package-ecosystem: helm
+    directory: /deploy/helm/moks
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    commit-message:
+      prefix: "deps(helm)"
+    labels: [dependencies, kubernetes]
+    ignore:
+      # Major PostgreSQL upgrades need a dump/restore of the data volume (docs/OPERATOR_GUIDE.md).
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
+      # The MOKS image is built by CI and pinned by digest with scripts/set-image.sh.
+      - dependency-name: "*/moks"
+
+  # Demo lab manifests (nginx-unprivileged, busybox, python)
+  - package-ecosystem: docker
+    directory: /lab
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps(lab)"
+    labels: [dependencies, docker]
+    groups:
+      lab-images:
+        patterns: ["*"]
+
+  # Terraform AWS provider (deploy/terraform, .terraform.lock.hcl)
+  - package-ecosystem: terraform
+    directory: /deploy/terraform
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    commit-message:
+      prefix: "deps(terraform)"
+    labels: [dependencies, terraform]
+
+  # Actions in .github/workflows
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    commit-message:
+      prefix: "deps(ci)"
+    labels: [dependencies, github-actions]
+    groups:
+      actions:
+        patterns: ["*"]

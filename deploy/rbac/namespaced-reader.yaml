@@ -1,0 +1,26 @@
+# Example: grant MOKS read access to selected namespaces only (instead of the chart's
+# ClusterRoleBinding). Equivalent to rbac.clusterWide=false + rbac.namespaces=[shop] in the chart.
+# Cluster-scoped tools (k8s_nodes) will then fail with a clear "forbidden" message.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: moks-reader
+  namespace: shop
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: moks-reader}
+subjects:
+  - {kind: ServiceAccount, name: moks, namespace: moks}
+---
+# Phase 3 preview (NOT installed): the remediation executor gets its own ServiceAccount, bound
+# per namespace, limited to the allowlisted actions. The investigation pods never get it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: moks-remediator
+  namespace: shop
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, patch]          # restart (annotation patch), rollback (template patch)
+  - apiGroups: [apps]
+    resources: [deployments/scale]
+    verbs: [get, update, patch]  # scale within policy limits enforced by MOKS

@@ -1,0 +1,33 @@
+# AppProject for MOKS: only this repository, only namespace moks, and only the cluster-scoped
+# kinds the chart needs (its read-only ClusterRole/Binding and the namespace).
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: moks
+  namespace: argocd
+spec:
+  description: MOKS SRE portal
+  sourceRepos:
+    - https://github.com/mrjithendar/moks.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: moks
+  clusterResourceWhitelist:
+    - {group: "", kind: Namespace}
+    - {group: rbac.authorization.k8s.io, kind: ClusterRole}
+    - {group: rbac.authorization.k8s.io, kind: ClusterRoleBinding}
+  namespaceResourceWhitelist:
+    - {group: "", kind: ConfigMap}
+    - {group: "", kind: Service}
+    - {group: "", kind: ServiceAccount}
+    - {group: "", kind: PersistentVolumeClaim}
+    - {group: apps, kind: Deployment}
+    - {group: apps, kind: StatefulSet}
+    - {group: networking.k8s.io, kind: Ingress}
+    - {group: networking.k8s.io, kind: NetworkPolicy}
+    - {group: policy, kind: PodDisruptionBudget}
+    - {group: traefik.io, kind: Middleware}
+    - {group: rbac.authorization.k8s.io, kind: Role}
+    - {group: rbac.authorization.k8s.io, kind: RoleBinding}
+  # Secrets are deliberately absent: they are created out of band (deploy/secrets) and Argo CD
+  # can neither create nor prune them.

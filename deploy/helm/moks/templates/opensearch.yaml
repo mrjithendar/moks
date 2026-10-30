@@ -1,0 +1,53 @@
+{{- if eq .Values.rag.backend "opensearch" }}
+# Phase 2 RAG store. Single node, security plugin on, persistent volume. Memory: JVM heap
+# (rag.opensearch.heapSize) plus the same again for Lucene file cache; 1g heap -> 2Gi limit.
+{{- $heap := .Values.rag.opensearch.heapSize }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: moks-opensearch
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  serviceName: moks-opensearch
+  replicas: 1
+  selector: {matchLabels: {app: moks-opensearch}}
+  template:
+    metadata: {labels: {app: moks-opensearch}}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.rag.opensearch.nodeName }}
+      nodeSelector: {kubernetes.io/hostname: {{ . }}}
+      {{- end }}
+      securityContext: {fsGroup: 1000, runAsUser: 1000, runAsNonRoot: true}
+      containers:
+        - name: opensearch
+          image: {{ .Values.rag.opensearch.image }}
+          env:
+            - {name: discovery.type, value: single-node}
+            - {name: OPENSEARCH_JAVA_OPTS, value: "-Xms{{ $heap }} -Xmx{{ $heap }}"}
+            - {name: bootstrap.memory_lock, value: "false"}
+            - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: moks-opensearch, key: admin-password}}
+          ports: [{name: http, containerPort: 9200}]
+          resources:
+            requests: {cpu: 250m, memory: 2Gi}
+            limits: {cpu: "2", memory: 2Gi}
+          volumeMounts: [{name: data, mountPath: /usr/share/opensearch/data}]
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        annotations: {argocd.argoproj.io/sync-options: "Prune=false,Delete=false"}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: {{ .Values.rag.opensearch.storage }}}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moks-opensearch
+spec:
+  selector: {app: moks-opensearch}
+  ports: [{name: http, port: 9200, targetPort: http}]
+{{- else if not (has .Values.rag.backend (list "none" "pgvector")) }}
+{{- fail "rag.backend must be none, opensearch or pgvector (only one vector backend at a time)" }}
+{{- end }}

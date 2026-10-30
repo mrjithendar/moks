@@ -1,0 +1,27 @@
+# Scenario 3: "cache" allocates more memory than its 64Mi limit -> OOMKilled, restarting.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cache, namespace: moks-lab, labels: {app: cache}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: cache}}
+  template:
+    metadata: {labels: {app: cache}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: cache
+          image: python:3.12-alpine
+          command: [python, -c]
+          args:
+            - |
+              import time, json
+              print(json.dumps({"level": "info", "event": "warmup", "message": "loading 160 MiB working set"}), flush=True)
+              blocks = []
+              for i in range(160):
+                  blocks.append(bytearray(1024 * 1024))
+                  time.sleep(0.05)
+              print(json.dumps({"level": "info", "event": "ready"}), flush=True)
+              time.sleep(3600)
+          resources: {requests: {cpu: 10m, memory: 32Mi}, limits: {cpu: 200m, memory: 64Mi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
