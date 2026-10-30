@@ -23,6 +23,7 @@ spec:
       {{- include "moks.podSecurity" . | nindent 6 }}
       # Lets a running investigation finish (bounded by maxDurationSeconds) on rollout.
       terminationGracePeriodSeconds: {{ add .Values.config.maxDurationSeconds 20 }}
+      {{- include "moks.migrateInit" . | nindent 6 }}
       containers:
         - name: worker
           image: {{ include "moks.image" . }}

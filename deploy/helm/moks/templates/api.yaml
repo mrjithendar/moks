@@ -23,16 +23,7 @@ spec:
       {{- end }}
       {{- include "moks.podSecurity" . | nindent 6 }}
       terminationGracePeriodSeconds: 30
-      initContainers:
-        # Migrations are advisory-locked, so replicas starting together do not race.
-        - name: migrate
-          image: {{ include "moks.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["sh", "-c", "moks migrate && moks seed /etc/moks/seed.yaml --if-present"]
-          {{- include "moks.env" . | nindent 10 }}
-          {{- include "moks.containerSecurity" . | nindent 10 }}
-          {{- include "moks.volumeMounts" . | nindent 10 }}
-          resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+      {{- include "moks.migrateInit" . | nindent 6 }}
       containers:
         - name: api
           image: {{ include "moks.image" . }}

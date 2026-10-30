@@ -65,3 +65,17 @@ volumeMounts:
   - {name: credentials, mountPath: /var/run/moks-credentials, readOnly: true}
   {{- end }}
 {{- end -}}
+
+{{/* Migration init container: every component that touches the database waits for the schema it
+     was built for. Migrations take a PostgreSQL advisory lock, so pods starting together are safe. */}}
+{{- define "moks.migrateInit" -}}
+initContainers:
+  - name: migrate
+    image: {{ include "moks.image" . }}
+    imagePullPolicy: {{ .Values.image.pullPolicy }}
+    command: ["sh", "-c", "moks migrate && moks seed /etc/moks/seed.yaml --if-present"]
+    {{- include "moks.env" . | nindent 4 }}
+    {{- include "moks.containerSecurity" . | nindent 4 }}
+    {{- include "moks.volumeMounts" . | nindent 4 }}
+    resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+{{- end -}}

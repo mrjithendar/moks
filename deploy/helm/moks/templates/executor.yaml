@@ -68,6 +68,7 @@ spec:
       {{- end }}
       {{- include "moks.podSecurity" . | nindent 6 }}
       terminationGracePeriodSeconds: 240     # let an in-flight action finish validating
+      {{- include "moks.migrateInit" . | nindent 6 }}
       containers:
         - name: executor
           image: {{ include "moks.image" . }}
