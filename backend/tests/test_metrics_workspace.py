@@ -259,3 +259,12 @@ async def test_history_is_personal(client):
     assert any(tag in i["query"] for i in (await client.get("/moks/api/metrics/history")).json()["items"])
     await login(client, f"v-{tag}@example.com")
     assert not any(tag in i["query"] for i in (await client.get("/moks/api/metrics/history")).json()["items"])
+
+
+async def test_catalog_loads_on_a_machine_that_booted_moments_ago(client, monkeypatch):
+    """time.monotonic() counts from boot, so an empty cache must not look fresh on a new node."""
+    tag, (a, _) = await _envs()
+    await make_user(f"u-{tag}@example.com", [f"investigator:{a}:*"])
+    await login(client, f"u-{tag}@example.com")
+    monkeypatch.setattr(m.time, "monotonic", lambda: 60.0)
+    assert (await client.get("/moks/api/metrics/catalog", params={"environments": a})).json()["total"] == 3

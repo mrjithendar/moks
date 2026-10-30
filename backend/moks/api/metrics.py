@@ -176,7 +176,7 @@ def _note(results: list[dict]) -> str | None:
 async def _catalog(sources: list[Source]) -> dict[str, dict]:
     """metric -> {type, unit, help, environments}, cached per source."""
     merged: dict[str, dict] = {}
-    stale = [s for s in sources if time.monotonic() - _catalog_cache.get(s.key, (0, {}))[0] > CATALOG_TTL]
+    stale = [s for s in sources if s.key not in _catalog_cache or time.monotonic() - _catalog_cache[s.key][0] > CATALOG_TTL]
     names = dict(await _fan_out(stale, "prom_metric_names", {})) if stale else {}
     meta = dict(await _fan_out(stale, "prom_metric_metadata", {})) if stale else {}
     for s in sources:
