@@ -18,3 +18,4 @@ opentelemetry-instrumentation-fastapi==0.66b2
 opentelemetry-instrumentation-httpx==0.66b2
 boto3==1.43.122
 PyYAML==6.0.3
+python-multipart==0.0.32

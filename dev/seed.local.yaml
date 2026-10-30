@@ -20,3 +20,10 @@ environments:
       - type: loki
         name: loki
         config: {base_url: "http://localhost:13100", timeout_seconds: 20}
+      - type: grafana
+        name: grafana
+        config: {base_url: "http://localhost:13000/grafana", public_url: "https://jithendar.com/grafana", timeout_seconds: 15}
+        # Grafana requires a service-account token: {type: env, name: MOKS_CRED_GRAFANA_TOKEN}
+      - type: cost_model
+        name: hetzner
+        config: {monthly_cost_usd: 60, cpu_share: 0.5, currency: USD}   # EXAMPLE price: set your real server cost

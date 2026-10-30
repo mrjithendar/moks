@@ -131,3 +131,14 @@ def test_open_redirects_are_blocked():
     assert safe_next("/moks/investigations/1") == "/moks/investigations/1"
     for evil in ("https://evil.com", "//evil.com", "/moks/../x://", "/other", None, "/moks\\@evil"):
         assert safe_next(evil) == "/moks/"
+
+
+def test_database_dependency_commits_before_the_response():
+    """Depends(get_db) with the default request scope commits AFTER the response is sent, so a client
+    could sign in and immediately get 401 (observed live). Every use must be scope="function"."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "moks"
+    offenders = [str(p) for p in root.rglob("*.py") if re.search(r"Depends\(get_db\)", p.read_text())]
+    assert offenders == []

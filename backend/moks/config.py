@@ -71,6 +71,22 @@ class Settings(BaseSettings):
     rate_investigations_per_minute: int = 10
     rate_api_per_minute: int = 600
 
+    # Retrieval (Phase 2): postgres (full-text, + pgvector when installed) or opensearch (BM25 + k-NN).
+    rag_backend: Literal["postgres", "opensearch"] = "postgres"
+    opensearch_url: str = ""
+    opensearch_username: str = ""
+    opensearch_password: str = Field(default="", repr=False)
+    opensearch_verify_tls: bool = True
+    rag_max_upload_bytes: int = 2_000_000
+
+    # Phase 3 executor / diagnostics
+    process_role: Literal["api", "worker", "executor"] = "api"
+    diagnostics_namespace: str = "moks-diagnostics"
+
+    # Phase 4 alerts: shared secret for the Alertmanager / Grafana webhook (Authorization: Bearer ...)
+    alert_webhook_token: str = Field(default="", repr=False)
+    alert_poll_seconds: int = 60
+
     # Observability
     metrics_port: int = 9464
     log_level: str = "INFO"

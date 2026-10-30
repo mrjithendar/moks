@@ -10,9 +10,11 @@ kubectl --context mk4 apply -f lab/00-namespace.yaml
 kubectl --context mk4 apply -f lab/alloy-logs-role.yaml   # optional: Loki evidence (also add moks-lab to Alloy's namespaces)
 ```
 
-Ask MOKS from **Investigate** with environment `mk4` and namespace `moks-lab`. In Phase 1,
-remediation is **proposed** by MOKS and **applied by you** with the commands below (Phase 3
-turns them into approved allowlisted actions). Each fix should be followed by a fresh
+Ask MOKS from **Investigate** with environment `mk4` and namespace `moks-lab`. The report's
+**Suggested actions** (from skills) and **Propose as action plan** turn a remediation into a
+reviewed plan: a second person approves it (mk4 is production), the executor applies it to
+`moks-lab` (`executor.namespaces`), validates the rollout and restores the previous state if
+validation fails. The `kubectl` commands below are the manual equivalent. Each fix should be followed by a fresh
 investigation to validate recovery; MOKS never claims recovery itself.
 
 Without an active LLM, reports are rule-based. With one, MOKS also plans extra queries (for

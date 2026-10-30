@@ -62,7 +62,9 @@ async def emit(investigation_id: uuid.UUID, seq: int, type_: str, payload: dict[
 
 
 class Investigator:
-    def __init__(self, investigation_id: uuid.UUID, worker_id: str):
+    def __init__(self, investigation_id: uuid.UUID, worker_id: str, connectors_override: dict | None = None, use_llm: bool = True):
+        self.connectors_override = connectors_override  # evaluation runs supply fixture connectors
+        self.use_llm = use_llm
         self.id = investigation_id
         self.worker_id = worker_id
         self.settings = get_settings()
@@ -78,6 +80,7 @@ class Investigator:
         self.calls_seen: set[str] = set()
         self.rejected: list[dict[str, Any]] = []
         self._window: tuple[datetime, datetime] | None = None
+        self.skills: list = []  # (Skill, score, reasons) selected for this investigation
 
     async def _emit(self, type_: str, payload: dict[str, Any]) -> None:
         self.seq += 1
@@ -163,8 +166,11 @@ class Investigator:
             scope = effective_scope(principal, env, P.INVESTIGATION_RUN)
             if inv.namespace != "*":
                 scope.require(inv.namespace)
-            connectors, conn_errors = await registry.for_environment(db, env.id)
-            llm_cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none()
+            if self.connectors_override is not None:
+                connectors, conn_errors = self.connectors_override, {}
+            else:
+                connectors, conn_errors = await registry.for_environment(db, env.id)
+            llm_cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none() if self.use_llm else None
             question, namespace, t_from, t_to = inv.question, inv.namespace, inv.time_from, inv.time_to
             self._window = (t_from, t_to)
             env_name = env.name
@@ -192,7 +198,11 @@ class Investigator:
             await self._baseline(executor, ctx, namespace, question)
             await db.commit()
 
-            # 2. Follow-up evidence: LLM-planned when available, otherwise rule-based
+            # 2. SRE skills matching the question and findings run their playbook steps
+            await self._run_skills(executor, ctx, namespace, question)
+            await db.commit()
+
+            # 3. Follow-up evidence: LLM-planned when available, otherwise rule-based
             provider = provider_for(llm_cfg) if llm_cfg else None
             if provider:
                 try:
@@ -223,6 +233,8 @@ class Investigator:
         payload = report.model_dump()
         payload["scope"] = scope_info
         payload["findings"] = self.findings
+        payload["skills"] = [{"name": sk.name, "description": sk.meta.description, "reasons": why} for sk, _, why in self.skills]
+        payload["skill_actions"] = self._skill_actions(namespace)
         await self._finish("completed", payload, None)
         await self._emit("report", {"report": payload})
         return mode
@@ -327,6 +339,61 @@ class Investigator:
             for name in named:
                 await self._call(executor, "k8s_pod_logs", {"namespace": namespace, "pod": name, "tail_lines": 120}, "application log lines")
 
+    async def _run_skills(self, executor: ToolExecutor, ctx: ToolContext, namespace: str, question: str) -> None:
+        from .. import skills as skill_lib
+        from ..tools.builtin import REGISTRY
+
+        kinds = {f["kind"] for f in self.findings}
+        self.skills = skill_lib.select(question, kinds)
+        if not self.skills:
+            return
+        await self._emit("skills", {"skills": [{"name": sk.name, "reasons": why} for sk, _, why in self.skills]})
+        trace = TRACE_ID.search(question)
+        base = {"namespace": "" if namespace == "*" else namespace, "question": question[:200],
+                "trace_id": trace.group(0).lower() if trace else ""}
+        budget = max(0, self.settings.max_tool_calls - self.tool_calls - 4)  # leave room for follow-ups
+        for sk, _, _ in self.skills:
+            await self._emit("phase", {"phase": "skill", "label": f"Running skill {sk.name}"})
+            for step in sk.meta.steps:
+                spec = REGISTRY[step.tool]
+                if not all(ctx.available(c) for c in (spec.connector_type, *spec.also_requires)):
+                    continue  # connector not configured here: the skill degrades gracefully
+                if spec.cluster_scoped and not ctx.scope.cluster_wide:
+                    continue
+                if step.when_question and not re.search(step.when_question, question, re.I):
+                    continue
+                for c in skill_lib.contexts_for(step, self.findings, base):
+                    args = skill_lib.render(step.args, c)
+                    if args is None or budget <= 0:
+                        continue  # a needed variable (e.g. deployment of a StatefulSet pod) is unknown
+                    out = await self._call(executor, step.tool, args, f"[{sk.name}] {step.purpose or step.tool}")
+                    if out is not None:
+                        budget -= 1
+
+    def _skill_actions(self, namespace: str) -> list[dict]:
+        """Deterministic, allowlisted remediation suggestions from skills whose `when` matched a finding.
+        Suggestions only: turning one into an action plan still needs review (and approval in production)."""
+        from .. import skills as skill_lib
+
+        out, seen = [], set()
+        for sk, _, _ in self.skills:
+            for r in sk.meta.remediation:
+                for f in [f for f in self.findings if f["kind"] == r.when][:3]:
+                    ctx = skill_lib.contexts_for(skill_lib.StepSpec(tool="k8s_events", for_each=f"finding.{r.when}"), [f], {"namespace": namespace})
+                    c = ctx[0] if ctx else {"namespace": namespace}
+                    target = skill_lib.render(r.target, c) if r.target else ""
+                    if r.target and target is None:
+                        continue
+                    kind, _, name = (target or "").partition("/")
+                    key = (r.action, target)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append({"skill": sk.name, "action": r.action, "target_kind": kind or None, "target_name": name or None,
+                                "namespace": c.get("namespace") or namespace, "params": r.params, "note": r.note,
+                                "finding": f["title"], "evidence": f.get("evidence", [])})
+        return out
+
     async def _check_budget(self, cfg: LLMConfig) -> None:
         if self.tokens_in + self.tokens_out >= self.settings.max_tokens_per_investigation:
             raise BudgetExceeded(f"token budget of {self.settings.max_tokens_per_investigation} for this investigation used")
@@ -361,7 +428,7 @@ class Investigator:
     async def _llm_rounds(self, executor: ToolExecutor, ctx: ToolContext, provider, cfg: LLMConfig, question: str, scope_info: dict) -> None:
         tools = [t.schema_for_llm() for t in tools_for_planner(ctx)]
         allowed = {t["name"] for t in tools}
-        system = prompts.PLANNER_SYSTEM.replace("{max_calls}", str(MAX_CALLS_PER_ROUND))
+        system = prompts.PLANNER_SYSTEM.replace("{max_calls}", str(MAX_CALLS_PER_ROUND)) + prompts.skills_section(self.skills)
         for round_no in range(1, self.settings.max_llm_rounds + 1):
             remaining = self.settings.max_tool_calls - self.tool_calls
             if remaining <= 0:
@@ -390,14 +457,31 @@ class Investigator:
                 break
 
     async def _llm_report(self, provider, cfg: LLMConfig, question: str, scope_info: dict) -> Report:
-        raw = await self._llm(provider, cfg, prompts.REPORT_SYSTEM,
+        raw = await self._llm(provider, cfg, prompts.REPORT_SYSTEM + prompts.skills_section(self.skills),
                               prompts.report_user(question, scope_info, self.evidence, self.findings, self.notes),
                               max_tokens=max(cfg.max_output_tokens, 1500))
         refs = {e["ref"] for e in self.evidence if e["ref"]}
         return validate_llm_report(raw, refs, self.notes)
 
     def _correlate(self) -> None:
-        """Time correlation between rollouts and problem onset. Correlation, not causation."""
+        """Time correlation between rollouts and problem onset (correlation, not causation), and
+        capacity risks from rightsizing evidence."""
+        for e in [e for e in self.evidence if e["tool"] == "finops_rightsizing" and e["ok"]]:
+            for r in ((e["data"] or {}).get("recommendations") or [])[:8]:
+                if r["action"] != "increase":
+                    continue
+                oom = any("OOM" in f for f in r["findings"])
+                self.findings.append({
+                    "kind": "memory_near_limit" if oom else "under_provisioned", "severity": "medium",
+                    "title": f"{r['workload']} container {r['container']} " + ("is within 10% of its memory limit" if oom else "uses more CPU than it requests"),
+                    "detail": f"Observed max memory {r['observed']['mem_max']}, p95 CPU {r['observed']['cpu_p95']} cores; current {r['current']}; "
+                              f"recommended {r['recommended']}. " + "; ".join(r["findings"]),
+                    "resources": [r["workload"].lower()], "suspected_cause": "Requests/limits sized below observed usage." if not oom else
+                    "Memory limit too close to the working set; a load spike or leak will OOMKill it.",
+                    "next_checks": ["Check whether usage grows over days (leak) or tracks load (prom_pod_resources)"],
+                    "remediation_hint": f"Raise {r['container']} resources to the recommendation via a reviewed patch_resources plan.",
+                    "evidence": [e["ref"]], "namespace": r["namespace"],
+                })
         rollouts = [e for e in self.evidence if e["tool"] == "k8s_rollout_history" and e["ok"]]
         for e in rollouts:
             revs = (e["data"] or {}).get("revisions") or []

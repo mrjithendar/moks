@@ -98,6 +98,13 @@ class PrometheusConnector:
                 })
         return out
 
+    async def active_alerts(self) -> list[dict]:
+        """Firing and pending alert instances (/api/v1/alerts); used by the alert poller where no
+        Alertmanager exists."""
+        data, _ = await self._api("alerts", "/api/v1/alerts")
+        return [{"labels": a.get("labels", {}), "annotations": a.get("annotations", {}), "state": a.get("state"),
+                 "activeAt": a.get("activeAt"), "value": a.get("value")} for a in data.get("alerts", [])[:500]]
+
     def graph_link(self, promql: str, minutes: int) -> str | None:
         if not self.public_url:
             return None

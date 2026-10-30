@@ -98,7 +98,7 @@ async def roles(ctx: AuthContext = Depends(get_auth)) -> list[dict[str, str]]:
 
 @router.post("/auth/logout")
 async def logout(request: Request, response: Response, ctx: AuthContext = Depends(get_auth),
-                 db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+                 db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     s = get_settings()
     await revoke(db, ctx.session)
     clear_cookie(response)
@@ -125,7 +125,7 @@ class LoginIn(BaseModel):
 
 
 @router.post("/auth/login")
-async def local_login(body: LoginIn, request: Request, response: Response, db: AsyncSession = Depends(get_db)) -> dict[str, str]:
+async def local_login(body: LoginIn, request: Request, response: Response, db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, str]:
     s = get_settings()
     if s.auth_mode != "local":
         raise HTTPException(404, "Password sign-in is not enabled")
@@ -157,7 +157,7 @@ class DevLoginIn(BaseModel):
 
 
 @router.post("/auth/dev-login")
-async def dev_login(body: DevLoginIn, request: Request, response: Response, db: AsyncSession = Depends(get_db)) -> dict[str, str]:
+async def dev_login(body: DevLoginIn, request: Request, response: Response, db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, str]:
     s = get_settings()
     if s.auth_mode != "dev" or s.env != "development":
         raise HTTPException(404, "Not found")
@@ -228,7 +228,7 @@ async def oidc_login(request: Request, next: str | None = None) -> RedirectRespo
 
 
 @router.get("/auth/oidc/callback")
-async def oidc_callback(request: Request, db: AsyncSession = Depends(get_db), code: str | None = None,
+async def oidc_callback(request: Request, db: AsyncSession = Depends(get_db, scope="function"), code: str | None = None,
                         state: str | None = None, error: str | None = None) -> Response:
     s = get_settings()
     if s.auth_mode != "oidc":

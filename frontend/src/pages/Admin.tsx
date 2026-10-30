@@ -26,7 +26,8 @@ const lines = (s: string) => s.split(/[\s,]+/).map((x) => x.trim()).filter(Boole
 
 export function Environments() {
   const list = useLoad(() => api<any[]>("/environments"), []);
-  const blank = { name: "", display_name: "", kind: "minikube", is_production: false, allowed_namespaces: "*", denied_namespaces: "kube-system", max_query_window_minutes: 360, grafana_url: "" };
+  const blank = { name: "", display_name: "", kind: "minikube", is_production: false, allowed_namespaces: "*", denied_namespaces: "kube-system", max_query_window_minutes: 360, grafana_url: "",
+    auto_investigate: false, alert_cooldown_minutes: 30, max_replicas: 10, allow_scale_to_zero: false, plan_ttl_minutes: 60 };
   const [form, setForm] = useState<any>(blank);
   const [editing, setEditing] = useState<string | null>(null);
   const a = useAction();
@@ -69,6 +70,13 @@ export function Environments() {
           <label>Max query window (min)<input type="number" min={5} max={10080} value={form.max_query_window_minutes} onChange={(e) => setForm({ ...form, max_query_window_minutes: Number(e.target.value) })} /></label>
           <label>Grafana URL<input value={form.grafana_url} onChange={(e) => setForm({ ...form, grafana_url: e.target.value })} placeholder="https://…/grafana" /></label>
         </div>
+        <div className="row">
+          <label className="inline"><input type="checkbox" checked={form.auto_investigate} onChange={(e) => setForm({ ...form, auto_investigate: e.target.checked })} /> investigate firing alerts automatically</label>
+          <label>Alert cooldown (min)<input type="number" min={1} max={1440} value={form.alert_cooldown_minutes} onChange={(e) => setForm({ ...form, alert_cooldown_minutes: Number(e.target.value) })} /></label>
+          <label>Max replicas (scale policy)<input type="number" min={1} max={1000} value={form.max_replicas} onChange={(e) => setForm({ ...form, max_replicas: Number(e.target.value) })} /></label>
+          <label className="inline"><input type="checkbox" checked={form.allow_scale_to_zero} onChange={(e) => setForm({ ...form, allow_scale_to_zero: e.target.checked })} /> allow scale to zero</label>
+          <label>Plan TTL (min)<input type="number" min={5} max={1440} value={form.plan_ttl_minutes} onChange={(e) => setForm({ ...form, plan_ttl_minutes: Number(e.target.value) })} /></label>
+        </div>
         <ErrorBox error={a.error} />
         <div className="row"><button disabled={a.busy}>{editing ? "Save" : "Create"}</button>{editing && <button type="button" className="ghost" onClick={() => { setEditing(null); setForm(blank); }}>Cancel</button>}</div>
       </form>
@@ -82,9 +90,11 @@ const TEMPLATES: Record<string, any> = {
   kubernetes: { mode: "in_cluster", timeout_seconds: 15 },
   prometheus: { base_url: "http://prometheus.monitoring.svc:9090/prometheus", public_url: "https://jithendar.com/prometheus", timeout_seconds: 15, auth: "none" },
   loki: { base_url: "http://loki.monitoring.svc:3100", timeout_seconds: 20, namespace_label: "namespace", auth: "none" },
-  grafana: { base_url: "http://grafana.monitoring.svc/grafana" },
-  cloudwatch: { region: "us-east-1", allowed_log_groups: [] },
-  git: { provider: "github", repositories: [] },
+  grafana: { base_url: "http://grafana.monitoring.svc.cluster.local/grafana", public_url: "https://jithendar.com/grafana", timeout_seconds: 15 },
+  cloudwatch: { region: "us-east-1", allowed_log_groups: ["/aws/eks/prod/*"], max_window_minutes: 360, max_concurrent_queries: 2, poll_timeout_seconds: 60 },
+  git: { provider: "github", repositories: ["owner/repo"] },
+  aws_cost: { metric: "UnblendedCost", cache_minutes: 60, max_requests_per_hour: 60, allocation_tag_keys: [] },
+  cost_model: { monthly_cost_usd: 0, cpu_share: 0.5, currency: "USD" },
 };
 
 export function Connectors() {

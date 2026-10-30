@@ -5,8 +5,9 @@ collects live evidence through typed, policy-checked, read-only tools, correlate
 a report that keeps facts, suspected causes, missing evidence, next steps and proposed remediation
 separate. Every fact cites the evidence it came from.
 
-Status: **Phase 1 (read-only vertical slice) is implemented.** Phases 2–4 are designed below but
-not built. See [LIMITATIONS.md](LIMITATIONS.md).
+Status: **Phases 1–4 are implemented, plus FinOps and SRE skills.** Phase 1 runs on mk4; the
+later phases are tested locally and live (read-only) against mk4 but not yet deployed there.
+See [LIMITATIONS.md](LIMITATIONS.md).
 
 ## Components
 
@@ -45,9 +46,9 @@ flowchart LR
 | 1. Web portal and authenticated API | `moks-api` (FastAPI) serves the React build, the JSON API, SSE and OIDC callbacks under `/moks` |
 | 2. Investigation orchestrator | `moks-worker` runs `moks.orchestrator.engine.Investigator`, one asyncio task per investigation |
 | 3. Typed connectors and tool registry | `moks.connectors.*` (Kubernetes, Prometheus, Loki) and `moks.tools` (17 typed tools, one executor) |
-| 4. RAG ingestion/retrieval workers | Phase 2 (OpenSearch; pgvector profile). Chart has the switch, defaulting to `none` |
-| 5. Approval and remediation service | Phase 3. Phase 1 *proposes* remediation only; nothing is executable |
-| 6. Isolated execution workers | Phase 3 (separate ServiceAccount and Job pods per action/diagnostic session) |
+| 4. RAG ingestion/retrieval workers | `moks.rag`: GitHub/upload/postmortem ingestion as background jobs in the worker; Postgres full-text, pgvector or OpenSearch (BM25 + k-NN, RRF) |
+| 5. Approval and remediation service | `moks.actions.service`: allowlisted, hash-bound action plans with approvals, expiry and replay protection |
+| 6. Isolated execution workers | `moks-executor`: the only write-capable process, with its own ServiceAccount bound per namespace; runs actions and diagnostic-session pods in an isolated namespace |
 | 7. Audit and observability | Hash-chained `audit_events` (DB triggers), Prometheus metrics, JSON logs, OTel traces, Grafana dashboard |
 
 The LLM never holds credentials. It receives redacted evidence and returns *requests*. The
@@ -154,29 +155,69 @@ Migration `backend/moks/migrations/versions/0001_initial.py`:
 | `evidence` | Citable results (`E1`…): tool, args, scope, summary, redacted/truncated data, exact query/API source, timing |
 | `audit_events` | Append-only, hash-chained (`chain_seq`, `prev_hash`, `hash`); UPDATE/DELETE/TRUNCATE rejected by triggers |
 
-## Phase 2–4 design (not implemented)
+## Phases 2–4 as built
 
-- **Phase 2:** EKS from outside the cluster (native STS presigned-token auth), CloudWatch Logs
-  Insights (start/poll/stop with account, region, log-group and window allowlists), Grafana
-  (dashboards, data sources, alerting via service-account token), and GitHub (provider adapter,
-  indexing, and image-digest vs Git revision comparison only with recorded metadata). RAG uses
-  **OpenSearch**. *Assumption:* the brief's "OpenGraph vector database" names no product that
-  exists in these repositories, so it is read as OpenSearch with hybrid BM25 + k-NN. There is no
-  graph database. A `pgvector` profile (`rag.backend=pgvector`) uses the existing PostgreSQL
-  instead; only one backend runs at a time. Index names carry the embedding model and dimension
-  (`moks-docs-<model>-<dims>-v<n>`). A model change builds a new index and switches over after
-  reindexing. Access filters (`environment`, `namespace`, `repository`, `access_scope`) are
-  applied as query filters and re-checked on the results. Secrets are excluded at ingestion.
-  Incident workspaces group investigations, evidence and timelines.
-- **Phase 3:** a separate `moks-executor` with its own ServiceAccount bound per namespace to the
-  allowlisted actions (restart, scale within limits, rollback to a verified revision, reviewed
-  patch). Action plans hold exact targets, API call, reason and evidence, impact/blast radius,
-  preconditions, validation, rollback and expiry. An approval binds to the SHA-256 of the
-  canonical plan plus the requester, so any change, expiry or replay invalidates it. Executors
-  re-check permissions and resource state (`resourceVersion`) immediately before acting.
-  Diagnostic sessions run as TTL-bounded Jobs from prebuilt images with NetworkPolicies, non-root,
-  no privilege escalation and a package catalog. Nothing is installed on nodes or in application
-  containers.
-- **Phase 4:** an Alertmanager or Grafana webhook triggers investigations with fingerprint
-  deduplication and cooldowns, incident reports and evaluation datasets built from the lab
-  scenarios.
+```mermaid
+flowchart LR
+  subgraph moks namespace
+    API[moks-api] --- W[moks-worker<br/>investigations · jobs:<br/>ingest, reindex, alert poll, evals]
+    EX[moks-executor<br/>SA moks-executor]
+    PG[(PostgreSQL)]
+    OS[(OpenSearch<br/>optional)]
+  end
+  subgraph moks-diagnostics
+    D[session pods<br/>no SA token, TTL, quota]
+  end
+  subgraph target namespaces
+    T[Deployments / Services / HPAs]
+  end
+  AM[Alertmanager / Grafana] -- webhook --> API
+  W -- poll /api/v1/alerts --> PROM[Prometheus]
+  W --> OS
+  API -- plans, approvals --> PG
+  EX -- claim queued plans --> PG
+  EX -- RoleBinding per namespace --> T
+  EX -- create / exec / delete --> D
+```
+
+- **Connectors (Phase 2):** Grafana (dashboards, panel queries, unified alerting); CloudWatch (Logs
+  Insights start/poll/stop with log-group, region, account and window allowlists, plus metrics and
+  alarms); Git with a GitHub provider (files, commits, compare, and deployment-to-commit resolution
+  that **never guesses**); EKS from outside the cluster (native presigned-STS tokens); FinOps
+  (Cost Explorer, anomalies, budgets, a Kubernetes cost model). See [CONNECTORS.md](CONNECTORS.md)
+  and [FINOPS.md](FINOPS.md).
+- **RAG (Phase 2):** PostgreSQL holds documents and chunks. Chunking follows Markdown headings,
+  YAML documents and code blank-line windows, with line ranges for citations. Sync is incremental
+  (git blob SHA), deletions propagate, secret files are excluded with a recorded reason, and
+  content is redacted. Retrieval is filtered twice (SQL pre-filter, authoritative post-filter).
+  Embedding indexes are versioned (`moks-chunks-<id>`), and a model change builds a new index
+  before switching. *Assumption retained:* "OpenGraph vector database" is read as OpenSearch; there
+  is no graph database.
+- **Incidents (Phase 2):** a workspace with a timeline, hypotheses, linked investigations, action
+  plans and their validation, plus a Markdown report. Approved postmortems are indexed into the
+  knowledge base, scoped to the incident's environment and namespace.
+- **Actions (Phase 3):** plans carry exact targets, the API operation, reason and evidence, impact
+  and blast radius, preconditions, validation, rollback and expiry. They are bound by SHA-256 to
+  environment, namespace, action, target, parameters, requester, expiry and the target's
+  `resourceVersion`. There is no self-approval, and approvals are re-checked at execution.
+  Execution is at most once, with optimistic concurrency, rollout validation, and automatic
+  restore of the captured pre-state on failure.
+- **Diagnostic sessions (Phase 3):** an image catalog (netshoot, curl, python), pinned package
+  catalog and argv-only command templates with validated arguments and an SSRF guard. Sessions
+  have a TTL, are deleted on expiry, and require approval in production or when elevated.
+- **Alerts (Phase 4):** Alertmanager/Grafana webhook (bearer token) and a Prometheus poller.
+  Alerts are fingerprinted, deduplicated against open incidents, subject to a cooldown and an
+  hourly cap, and investigated automatically by the automation principal only where
+  `auto_investigate` is on.
+- **Evaluation (Phase 4):** datasets replay recorded cluster state through the real orchestrator
+  and score expected findings, required facts, forbidden claims, citation validity and false
+  positives.
+- **SRE skills:** `SKILL.md` playbooks select themselves from questions and findings, run
+  read-only steps and suggest allowlisted actions. See [SKILLS.md](SKILLS.md).
+
+Additional tables (migration `0002`): `incidents`, `incident_events`, `jobs`, `knowledge_sources`,
+`documents`, `chunks` (generated `tsvector`), `embedding_indexes`, `chunk_embeddings` (vector
+column when pgvector exists), `action_plans`, `approvals`, `diagnostic_sessions`,
+`diagnostic_commands`, `alert_events`, `eval_runs`, plus environment policy columns
+(`auto_investigate`, cooldown, `max_replicas`, `allow_scale_to_zero`, `plan_ttl_minutes`) and the
+`automation@moks.system` principal.

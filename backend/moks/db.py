@@ -40,7 +40,11 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:
-    """FastAPI dependency: one session per request, committed on success."""
+    """FastAPI dependency: one session per request, committed on success.
+
+    Always declare it as Depends(get_db, scope="function") so the commit happens BEFORE the response
+    is sent; with the default request scope a client could read before the write is committed
+    (e.g. sign in, then get 401 from /auth/me)."""
     async with session_scope() as session:
         yield session
 

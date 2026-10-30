@@ -144,3 +144,134 @@ class FakeKubernetes:
 
     async def dns_health(self):
         return {"deployment": {}, "services": [], "pods": []}
+
+
+# ---- Phase 3 doubles --------------------------------------------------------------------------
+
+DEPLOYMENTS: dict[tuple[str, str], dict] = {}
+
+
+def reset_deployments() -> None:
+    DEPLOYMENTS.clear()
+    DEPLOYMENTS[("shop", "checkout")] = {"resourceVersion": "100", "generation": 3, "replicas": 2, "revision": "3",
+                                         "template": {"metadata": {"labels": {"app": "checkout"}}, "spec": {"containers": [{"name": "app", "image": "example/app:3"}]}}}
+
+
+reset_deployments()
+
+
+async def _deployment_meta(self, namespace, name):
+    d = DEPLOYMENTS.get((namespace, name))
+    if d is None:
+        raise ConnectorError("not_found", f"deployment {namespace}/{name}: not found")
+    return {"name": name, "namespace": namespace, "resourceVersion": d["resourceVersion"], "generation": d["generation"],
+            "annotations": d.get("annotations", {}), "labels": {}, "images": [c["image"] for c in d["template"]["spec"]["containers"]],
+            "replicas": d["replicas"], "summary": {"revision": d["revision"], "ready": d["replicas"]}}
+
+
+async def _rollout_history(self, namespace, deployment):
+    return {"deployment": {"name": deployment}, "revisions": [
+        {"revision": 3, "created": "2026-10-30T09:55:00Z", "images": ["example/app:3"]},
+        {"revision": 2, "created": "2026-10-29T09:00:00Z", "images": ["example/app:2"]}]}
+
+
+async def _object_meta(self, namespace, kind, name):
+    return {"kind": kind, "name": name, "resourceVersion": "7", "spec": {"selector": {"app": "checkout"}}, "generation": 1}
+
+
+FakeKubernetes.deployment_meta = _deployment_meta
+FakeKubernetes.rollout_history = _rollout_history
+FakeKubernetes.object_meta = _object_meta
+
+
+class FakeWriter:
+    """In-memory executor writer. outcome: 'ok' | 'crashloop' (new pods fail) | 'stuck'."""
+
+    instances: list["FakeWriter"] = []
+
+    def __init__(self, outcome: str = "ok"):
+        self.outcome = outcome
+        self.calls: list[tuple] = []
+        self.restored = False
+        self.pods: dict[str, str] = {}
+        FakeWriter.instances.append(self)
+
+    async def aclose(self):
+        pass
+
+    async def state(self, ns, name):
+        d = DEPLOYMENTS[(ns, name)]
+        ready = d["replicas"] if (self.outcome == "ok" or self.restored or not self.calls) else 0
+        return {"resourceVersion": d["resourceVersion"], "generation": d["generation"], "replicas": d["replicas"], "template": d["template"],
+                "revision": d["revision"], "summary": {"generation": d["generation"], "observedGeneration": d["generation"], "ready": ready,
+                                                       "updated": ready, "available": ready}}
+
+    def _bump(self, ns, name):
+        d = DEPLOYMENTS[(ns, name)]
+        d["resourceVersion"] = str(int(d["resourceVersion"]) + 1)
+        d["generation"] += 1
+
+    def _guard(self, ns, name, rv):
+        if DEPLOYMENTS[(ns, name)]["resourceVersion"] != rv:
+            raise ConnectorError("conflict", "changed")
+
+    async def restart(self, ns, name, rv):
+        self._guard(ns, name, rv)
+        self.calls.append(("restart", ns, name))
+        self._bump(ns, name)
+        return {"restartedAt": "now"}
+
+    async def scale(self, ns, name, rv, replicas):
+        self._guard(ns, name, rv)
+        self.calls.append(("scale", ns, name, replicas))
+        DEPLOYMENTS[(ns, name)]["replicas"] = replicas
+        self._bump(ns, name)
+        return {"replicas": replicas}
+
+    async def rollback(self, ns, name, rv, to_revision):
+        self._guard(ns, name, rv)
+        self.calls.append(("rollback", ns, name, to_revision))
+        self._bump(ns, name)
+        return {"rolled_back_to": to_revision}
+
+    async def patch_resources(self, ns, name, rv, container, resources):
+        self._guard(ns, name, rv)
+        self.calls.append(("patch_resources", ns, name, container, resources))
+        self._bump(ns, name)
+        return {"container": container}
+
+    async def merge_patch(self, ns, kind, name, rv, patch):
+        self.calls.append(("merge_patch", ns, kind, name, patch))
+        return {"resourceVersion": "8"}
+
+    async def get_object(self, ns, kind, name):
+        return {"metadata": {"resourceVersion": "7"}, "spec": {"selector": {"app": "checkout"}}}
+
+    async def restore(self, ns, name, pre):
+        self.calls.append(("restore", ns, name, pre["replicas"]))
+        self.restored = True
+        DEPLOYMENTS[(ns, name)]["replicas"] = pre["replicas"]
+        self._bump(ns, name)
+        return {"replicas": pre["replicas"]}
+
+    async def pods_of(self, ns, name):
+        if self.outcome == "crashloop" and not self.restored and self.calls:
+            return [{"name": f"{name}-new", "phase": "Running", "problems": [{"state": "waiting", "reason": "CrashLoopBackOff"}]}]
+        return [{"name": f"{name}-a", "phase": "Running", "problems": []}]
+
+    # diagnostics
+    async def create_pod(self, ns, manifest):
+        self.pods[manifest["metadata"]["name"]] = "Running"
+        self.calls.append(("create_pod", ns, manifest))
+        return manifest["metadata"]["name"]
+
+    async def pod_phase(self, ns, name):
+        return self.pods.get(name, "Failed")
+
+    async def delete_pod(self, ns, name):
+        self.calls.append(("delete_pod", ns, name))
+        self.pods.pop(name, None)
+
+    async def exec(self, ns, pod, argv, timeout=30, max_bytes=64000):
+        self.calls.append(("exec", ns, pod, argv))
+        return 0, "status=200 remote=10.0.0.1:80 total=0.01s\n"

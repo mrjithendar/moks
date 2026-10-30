@@ -155,6 +155,50 @@ Sync the grafana, prometheus and loki Argo apps after committing; they have no a
 See [../lab/README.md](../lab/README.md). It applies to namespace `moks-lab`, and
 `kubectl delete namespace moks-lab` removes it.
 
+## 11. Phases 2–4: what changes on mk4 and in what order
+
+The chart changes in this release add pods and RBAC. Review `argocd app diff moks-portal`, then sync
+**without prune**. Apply the AppProject first (it now allows `moks-diagnostics`, `moks-lab`,
+`ResourceQuota`, `LimitRange` and `Role`):
+
+```sh
+kubectl --context mk4 apply -f deploy/argocd/project.yaml
+argocd app diff moks-portal && argocd app sync moks-portal
+kubectl --context mk4 -n moks rollout status deploy/moks-api deploy/moks-worker deploy/moks-executor
+kubectl --context mk4 -n moks rollout status statefulset/moks-opensearch     # rag.backend: opensearch
+```
+
+The API's init container runs migration `0002` automatically. Take a backup first
+(`scripts/backup.sh mk4`).
+
+1. **Knowledge:** the seed creates the `moks-docs` GitHub source, and the worker syncs it within a
+   minute. Add sources under **Runbooks & knowledge** (GitHub repo or uploads). For private repos,
+   add a token: `kubectl -n moks patch secret moks-secrets --type merge -p '{"stringData":{"MOKS_CRED_GITHUB_TOKEN":"…"}}'`.
+2. **Grafana:** create a service account with the Viewer role in Grafana (Administration →
+   Service accounts), add a token, then:
+   `kubectl -n moks patch secret moks-secrets --type merge -p '{"stringData":{"MOKS_CRED_GRAFANA_TOKEN":"glsa_…"}}'`
+   and restart the API and worker. **Connectors → Test** should then pass.
+3. **FinOps:** set the real monthly server price in `values-minikube.yaml` (`cost_model.monthly_cost_usd`).
+   For AWS spend: `terraform apply` (with `finops_enabled = true`), run `scripts/create-runtime-key.sh mk4`,
+   then uncomment the `aws_cost` connector. See [FINOPS.md](FINOPS.md).
+4. **Remediation:** the executor acts only in `executor.namespaces` (default `[moks-lab]`). To let
+   MOKS act elsewhere, add the namespace there **and** to the AppProject destinations. Set the
+   environment's policy under **Environments** (`max_replicas`, scale-to-zero, plan TTL).
+   `mk4` is marked production, so every action needs a second person with the approver role:
+   `moks grant <approver-email> approver:mk4:*`.
+5. **Alerts:** to investigate firing Prometheus alerts automatically, tick
+   *investigate firing alerts automatically* on the environment; the worker polls every 60 s. For
+   Alertmanager or Grafana contact points, set a token:
+   `kubectl -n moks patch secret moks-secrets --type merge -p '{"stringData":{"MOKS_ALERT_WEBHOOK_TOKEN":"'$(openssl rand -hex 24)'"}}'`
+   and point the webhook at `https://jithendar.com/moks/api/alerts/webhook/mk4` with header
+   `Authorization: Bearer <token>`.
+6. **Diagnostic sessions:** the chart creates `moks-diagnostics` (quota, limits, egress policy).
+   Request sessions under **Diagnostics**; on mk4 (production) each needs an approval.
+7. **SRE skills:** 13 built-in skills are active. Add your own through `customSkills` in the values
+   ([SKILLS.md](SKILLS.md)).
+8. **Evaluation:** **Evaluation → Run lab** (rules mode) should score 1.0. Run it again in LLM mode
+   after configuring a provider, to compare.
+
 ## Local development
 
 ```sh
@@ -213,4 +257,8 @@ image digest (step 4). Roll back data by restoring the backup.
 | Investigation stays `queued` | `kubectl -n moks logs deploy/moks-worker`; worker replicas > 0; database reachable |
 | Connector test `forbidden` | `moks-reader` ClusterRoleBinding exists; with `rbac.clusterWide=false`, the namespace is listed |
 | Connector test `unavailable` | NetworkPolicy egress (`networkPolicy.inCluster`, `apiServer.cidrs`), service DNS name, path prefix (`/prometheus`) |
+| Plan execution fails with "changed after review" | The Deployment changed (another rollout, HPA) after the plan was made; create a new plan |
+| Plan stays `queued` | `kubectl -n moks logs deploy/moks-executor`; the executor needs a RoleBinding in that namespace (`executor.namespaces`) |
+| Knowledge search empty | **Runbooks & knowledge → Sources**: last sync status/error; `kubectl -n moks logs deploy/moks-worker` |
+| OpenSearch pod restarting | Needs ~2 GiB; check node memory and `rag.opensearch.nodeName` pinning |
 | SSE updates only arrive at the end | Something buffers the response: do not attach compress or buffering middleware to the MOKS router |

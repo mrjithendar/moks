@@ -72,6 +72,11 @@ async def k8s_triage(ctx: ToolContext, a: NamespaceArgs) -> ToolResult:
     except ConnectorError:
         ingresses = []
     findings = triage(pods, events, services, workloads, ingresses, since=ctx.time_from)
+    owners = {p["name"]: p.get("owner") for p in pods}
+    for f in findings:  # skills target the owning workload of a pod finding
+        pod_res = next((r for r in f.get("resources", []) if r.startswith("pod/")), None)
+        if pod_res and owners.get(pod_res[4:]):
+            f["owner"] = owners[pod_res[4:]]
     unhealthy = [p for p in pods if is_unhealthy(p, ctx.time_from)]
     recent_events = [e for e in events if in_window(e.get("lastSeen"), ctx.time_from)]
     summary = (f"{len(pods)} pods ({len(unhealthy)} need attention in the window), {len(workloads)} workloads, {len(services)} services, "
@@ -345,4 +350,13 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("loki_query", "Run a bounded LogQL query; selectors must pin a permitted namespace.", "loki", LokiQueryArgs, loki_query, namespace_arg=None),
 ]
 
-REGISTRY: dict[str, ToolSpec] = {t.name: t for t in TOOLS}
+def _all_tools() -> list[ToolSpec]:
+    from .phase2 import TOOLS as PHASE2
+
+    specs = TOOLS + PHASE2
+    # FinOps Kubernetes tools also need live cluster and metrics connectors.
+    return [ToolSpec(**{**t.__dict__, "also_requires": ("kubernetes", "prometheus")}) if t.connector_type == "cost_model" else
+            ToolSpec(**{**t.__dict__, "also_requires": ("kubernetes",)}) if t.name == "git_compare_deployment" else t for t in specs]
+
+
+REGISTRY: dict[str, ToolSpec] = {t.name: t for t in _all_tools()}

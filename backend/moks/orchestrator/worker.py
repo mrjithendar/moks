@@ -66,16 +66,28 @@ async def reap_stale() -> None:
 
 
 async def run_worker(stop: asyncio.Event | None = None) -> None:
+    from .. import jobs
+
     s = get_settings()
     wid = worker_id()
     stop = stop or asyncio.Event()
     running: set[asyncio.Task] = set()
+    job_tasks: set[asyncio.Task] = set()
     log.info("worker started", extra={"event": "worker_started"})
     tick = 0
+    poll_every = max(1, int(s.alert_poll_seconds / max(s.worker_poll_seconds, 0.1)))
     while not stop.is_set():
         try:
             if tick % 30 == 0:
                 await reap_stale()
+            if tick % poll_every == 0:
+                await jobs.schedule_periodic()
+            if not job_tasks:  # one background job at a time per worker
+                jid = await jobs.claim(wid)
+                if jid:
+                    jt = asyncio.create_task(jobs.run_one(jid))
+                    job_tasks.add(jt)
+                    jt.add_done_callback(job_tasks.discard)
             await cancel_queued()
             while len(running) < s.worker_concurrency:
                 iid = await claim(wid)
@@ -93,5 +105,5 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
         except asyncio.TimeoutError:
             pass
     # Graceful shutdown: let running investigations finish within the termination grace period.
-    if running:
-        await asyncio.wait(running, timeout=max(5, s.max_duration_seconds))
+    if running or job_tasks:
+        await asyncio.wait(running | job_tasks, timeout=max(5, s.max_duration_seconds))

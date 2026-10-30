@@ -14,9 +14,9 @@ its evidence), **suspected causes with confidence**, **missing evidence**, **nex
 
 ## Status
 
-Phase 1, the read-only vertical slice, is implemented and tested, including live read-only
-checks against mk4. It is **not deployed yet**: deploying needs a commit, a CI image build and
-the steps in the [operator guide](docs/OPERATOR_GUIDE.md).
+Phases 1–4 are implemented, plus FinOps and SRE skills (109 backend tests, lab evaluation 1.0,
+live read-only checks against mk4). Phase 1 runs on mk4; the rest rolls out with the next image
+and the steps in [operator guide §11](docs/OPERATOR_GUIDE.md).
 
 | | |
 |---|---|
@@ -51,6 +51,8 @@ docs/             Architecture, security/RBAC, connectors, operator guide, testi
 - [Connectors and tool contracts](docs/CONNECTORS.md)
 - [Operator guide](docs/OPERATOR_GUIDE.md): commands in implementation order, local development, backup/restore
 - [Demo incident lab](lab/README.md)
+- [SRE skills (SKILL.md)](docs/SKILLS.md)
+- [FinOps](docs/FINOPS.md)
 - [Testing and results](docs/TESTING.md)
 - [Status and limitations](docs/LIMITATIONS.md)
 

@@ -7,13 +7,15 @@ of each type per environment is used.
 
 ## Status
 
-| Connector | Phase | State |
-|---|---|---|
-| Kubernetes (Minikube; EKS from inside the cluster) | 1 | Implemented. Verified live against mk4 (Kubernetes v1.37). |
-| Prometheus | 1 | Implemented. Verified live against mk4 (Prometheus 3.15, `/prometheus` prefix). |
-| Loki | 1 | Implemented. Verified live against mk4. |
-| Grafana, CloudWatch, Git (GitHub) | 2 | Not implemented. Rows can be saved; **Test** answers "planned for Phase 2". |
-| EKS from outside the cluster | 2 | Not implemented: the image has no `aws` CLI for exec-based kubeconfigs. Native STS token generation is planned. |
+| Connector | State |
+|---|---|
+| Kubernetes (`in_cluster`, `kubeconfig`, `eks`) | Implemented. In-cluster and kubeconfig verified live against mk4; `eks` mode generates presigned-STS tokens (unit-tested; needs an EKS cluster to verify live) |
+| Prometheus, Loki | Implemented, verified live against mk4 |
+| Grafana | Implemented; reaches mk4 Grafana 13.2.4 but needs a service-account token (`auth: 401` until configured) |
+| CloudWatch | Implemented; tested against botocore's Stubber. Needs credentials and log groups to verify live |
+| Git (GitHub) | Implemented; ingestion verified live against the public `mrjithendar/moks` repository |
+| AWS cost (Cost Explorer, anomalies, budgets) | Implemented; tested against the Stubber. Needs `finops_enabled` in Terraform to verify live |
+| Cost model | Implemented; verified live (allocation and rightsizing of `roboshop-ai`) |
 
 ## Common behaviour
 
@@ -91,32 +93,90 @@ estimated cost (from the configured per-million-token prices) are recorded per c
 budget stops LLM use while investigations continue rule-based. Progress streams as structured
 events (tool calls, purposes, results); no private reasoning is requested or shown.
 
+## Grafana
+
+```json
+{"base_url": "http://grafana.monitoring.svc.cluster.local/grafana", "public_url": "https://jithendar.com/grafana", "timeout_seconds": 15}
+```
+plus a credential reference to a service-account token (Viewer). Dashboards link at the
+investigation window; panel queries are listed; unified-alerting rules are filtered by namespace scope.
+
+## CloudWatch
+
+```json
+{"region": "us-east-1", "allowed_log_groups": ["/aws/eks/prod/*"], "max_window_minutes": 360,
+ "max_concurrent_queries": 2, "poll_timeout_seconds": 60, "role_arn": null, "allowed_account_ids": []}
+```
+Logs Insights queries outside the allowlist are refused, `unmask()` is refused, `| limit` is
+appended, and queries that time out or whose investigation is cancelled are stopped
+(`StopQuery`). Metrics use `GetMetricData`; alarms use `DescribeAlarms`.
+
+## Git (GitHub)
+
+```json
+{"provider": "github", "repositories": ["owner/repo"], "api_url": "https://api.github.com"}
+```
+An optional token reference is needed for private repositories, and a write-scoped token for the
+`open_pull_request` action. Secret-looking paths are never read. `git_compare_deployment` ties a
+Deployment to a commit only through a SHA in an image tag or revision annotation; otherwise it
+reports that the revision cannot be determined.
+
+## EKS from outside the cluster
+
+```json
+{"mode": "eks", "cluster_name": "prod", "region": "us-east-1", "role_arn": "arn:aws:iam::<account>:role/moks"}
+```
+Endpoint and CA come from `eks:DescribeCluster`, and a bearer token from a presigned STS
+`GetCallerIdentity` (same as `aws eks get-token`), refreshed every 10 minutes. Map the role with
+an access entry (`deploy/rbac/eks-access-entry.md`).
+
+## FinOps
+
+See [FINOPS.md](FINOPS.md) for `aws_cost` and `cost_model`.
+
 ## Tool contracts
 
-All tools are `read_only=True`. The executor also enforces the investigation window. `*` marks a
-required argument. Source: `backend/moks/tools/builtin.py`.
+All tools are read-only. `*` marks a required argument. Source: `backend/moks/tools/builtin.py`
+and `phase2.py`.
 
-| Tool | Connector | Arguments (bounds) | Scope check | Extra permission |
+| Tool | Connector(s) | Arguments (bounds) | Scope check | Extra permission |
 |---|---|---|---|---|
 | `k8s_triage` | kubernetes | `namespace`* (≤63) | `namespace` in scope | — |
 | `k8s_list_pods` | kubernetes | `namespace`* (≤63), `label_selector`, `unhealthy_only` (default False) | `namespace` in scope | — |
 | `k8s_describe_pod` | kubernetes | `namespace`* (≤63), `pod`* (≤253) | `namespace` in scope | — |
-| `k8s_pod_logs` | kubernetes | `namespace`* (≤63), `pod`* (≤253), `container`, `previous` (default False), `tail_lines` (≤500, ≥1, default 150), `since_minutes` | `namespace` in scope | — |
+| `k8s_pod_logs` | kubernetes | `namespace`* (≤63), `pod`* (≤253), `container`, `previous` (default False), `tail_lines` (≤500, default 150), `since_minutes` | `namespace` in scope | — |
 | `k8s_events` | kubernetes | `namespace`* (≤63), `object_name`, `warnings_only` (default True) | `namespace` in scope | — |
 | `k8s_workloads` | kubernetes | `namespace`* (≤63) | `namespace` in scope | — |
 | `k8s_rollout_history` | kubernetes | `namespace`* (≤63), `deployment`* (≤253) | `namespace` in scope | — |
 | `k8s_services` | kubernetes | `namespace`* (≤63) | `namespace` in scope | — |
 | `k8s_ingresses` | kubernetes | `namespace`* (≤63) | `namespace` in scope | — |
-| `k8s_nodes` | kubernetes | — | cluster-wide | — |
-| `k8s_dns_health` | kubernetes | — | cluster-wide | — |
-| `prom_query` | prometheus | `promql`* (≤2000), `mode` (default range), `minutes` | query content / result filtering | metrics.raw_query |
+| `k8s_nodes` | kubernetes | — | environment-wide | — |
+| `k8s_dns_health` | kubernetes | — | environment-wide | — |
+| `prom_query` | prometheus | `promql`* (≤2000), `mode` (default range), `minutes` | result filtering / query pinning | metrics.raw_query |
 | `prom_pod_resources` | prometheus | `namespace`* (≤63), `pod_regex` (≤200, default .+), `minutes` | `namespace` in scope | — |
-| `prom_alerts` | prometheus | `firing_only` (default True) | query content / result filtering | — |
-| `prom_targets` | prometheus | — | cluster-wide | — |
-| `loki_search` | loki | `namespace`* (≤63), `pod`, `container`, `contains`, `trace_id`, `request_id`, `errors_only` (default False), `limit` (≤500, ≥1, default 100), `minutes` | `namespace` in scope | — |
-| `loki_query` | loki | `logql`* (≤2000), `limit` (≤500, ≥1, default 100), `minutes` | query content / result filtering | — |
+| `prom_alerts` | prometheus | `firing_only` (default True) | result filtering / query pinning | — |
+| `prom_targets` | prometheus | — | environment-wide | — |
+| `loki_search` | loki | `namespace`* (≤63), `pod`, `container`, `contains`, `trace_id`, `request_id`, `errors_only` (default False), `limit` (≤500, default 100), `minutes` | `namespace` in scope | — |
+| `loki_query` | loki | `logql`* (≤2000), `limit` (≤500, default 100), `minutes` | result filtering / query pinning | — |
+| `grafana_dashboards` | grafana | `query`, `tag`, `limit` (≤100, default 20) | result filtering / query pinning | — |
+| `grafana_dashboard` | grafana | `uid`* | result filtering / query pinning | — |
+| `grafana_alerts` | grafana | `firing_only` (default True) | result filtering / query pinning | — |
+| `cw_log_groups` | cloudwatch | `prefix` | environment-wide | — |
+| `cw_logs_query` | cloudwatch | `query`* (≤4000), `log_groups`* (≤20), `limit` (≤500, default 100), `minutes` | environment-wide | — |
+| `cw_metric` | cloudwatch | `namespace`*, `metric`*, `dimensions`, `stat` (default Average), `minutes` | environment-wide | — |
+| `cw_alarms` | cloudwatch | `state` (default ALARM) | environment-wide | — |
+| `git_recent_commits` | git | `repository`*, `path`, `hours` (≤720, default 72), `limit` (≤100, default 20) | environment-wide | — |
+| `git_read_file` | git | `repository`*, `path`*, `ref` | environment-wide | — |
+| `git_compare_deployment` | git, kubernetes | `namespace`* (≤63), `deployment`* (≤253), `repository`* | `namespace` in scope | — |
+| `kb_search` | knowledge | `query`* (≤500), `k` (≤12, default 6) | result filtering / query pinning | — |
+| `finops_aws_costs` | aws_cost | `group_by` (default service), `tag_key`, `days` (≤90, default 14) | environment-wide | finops.read |
+| `finops_aws_forecast` | aws_cost | `days` (≤90, default 30) | environment-wide | finops.read |
+| `finops_aws_anomalies` | aws_cost | `days` (≤90, default 30) | environment-wide | finops.read |
+| `finops_budgets` | aws_cost | — | environment-wide | finops.read |
+| `finops_k8s_allocation` | cost_model, kubernetes, prometheus | `namespace`* (≤63), `days` (≤30, default 7) | `namespace` in scope | finops.read |
+| `finops_rightsizing` | cost_model, kubernetes, prometheus | `namespace`* (≤63), `days` (≤30, default 7) | `namespace` in scope | finops.read |
 
-Each call produces an evidence row (`E<n>`) with the tool, validated arguments, scope
-(environment, namespace, window), summary, redacted data, the exact source (query or API path),
-`collected_at` and duration, plus an audit record. Interactive explorer reads use the same
-executor and checks, but store only the audit record.
+
+Each call produces an evidence row (`E<n>`) with the tool, validated arguments, scope, summary,
+redacted data, the exact source (query, API path or link), `collected_at` and duration, plus an
+audit record. Interactive reads use the same executor and checks.

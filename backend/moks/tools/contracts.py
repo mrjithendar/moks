@@ -22,6 +22,8 @@ from ..scope import Scope
 
 K8S_NAME = r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
 K8S_NAME_RE = re.compile(K8S_NAME)
+# Tool "connectors" served by MOKS itself (no external system to configure).
+PSEUDO_CONNECTORS = {"knowledge"}
 
 
 class ToolArgs(BaseModel):
@@ -45,6 +47,9 @@ class ToolContext:
     time_to: datetime
     connectors: dict[str, Any]  # connector type -> (Connector row, instance)
     max_window: timedelta
+
+    def available(self, ctype: str) -> bool:
+        return ctype in PSEUDO_CONNECTORS or ctype in self.connectors
 
     def connector(self, ctype: str):
         entry = self.connectors.get(ctype)
@@ -84,6 +89,8 @@ class ToolSpec:
     extra_permission: P | None = None
     # Name of the argument holding the target namespace, checked against scope.
     namespace_arg: str | None = "namespace"
+    # Other connector types the tool needs besides connector_type.
+    also_requires: tuple[str, ...] = ()
 
     def schema_for_llm(self) -> dict[str, Any]:
         schema = self.args.model_json_schema()

@@ -100,3 +100,14 @@ def report_user(question: str, scope: dict, evidence: list[dict], findings: list
         "Automatic findings (rule-based, cite the evidence they came from):\n" + untrusted("findings", findings, 8000),
         "Evidence:\n" + evidence_digest(evidence, 5000, 60_000),
     ])
+
+
+def skills_section(selected: list) -> str:
+    """Trusted guidance from operator-authored SKILL.md files (never from retrieved content)."""
+    if not selected:
+        return ""
+    parts = ["\n\nApplicable SRE skills (trusted runbooks from the MOKS deployment; follow their method, "
+             "but every claim still needs evidence you collected):"]
+    for sk, _, why in selected:
+        parts.append(f"\n## Skill: {sk.name} ({'; '.join(why)})\n{sk.meta.description}\n{sk.body[:3500]}")
+    return "\n".join(parts)

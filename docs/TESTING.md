@@ -1,14 +1,16 @@
 # Testing
 
-## Results (2026-10-30, Phase 1)
+## Results (2026-10-30, Phases 1–4, FinOps, skills)
 
 | Suite | Result | Environment |
 |---|---|---|
-| Backend unit + integration (`backend/tests`) | **67 passed**, 4 live tests skipped | Python 3.11, PostgreSQL 17 (fresh database per run) |
+| Backend unit + integration (`backend/tests`) | **109 passed**, 4 live tests skipped | Python 3.11, PostgreSQL 17 (fresh database per run) |
+| Lab evaluation (`moks eval lab`, rules mode) | **score 1.000** on 6 cases (selector 502, crashloop, OOM, latency after rollout, prompt injection, no false positives) | local + fixture connectors |
 | Live read-only checks (`MOKS_LIVE=1 tests/live`) | **4 passed** | mk4: Kubernetes v1.37.0, Prometheus 3.15.0, Loki (via `kubectl port-forward`) |
 | Frontend (`npm test`, `tsc --noEmit`, `vite build`) | **5 passed**, typecheck clean, build 99 KB gzip JS | Node 26 |
 | Helm (`helm lint` for minikube and EKS values) | clean | Helm 4.3 |
-| Rendered chart, `kubectl apply --dry-run=server` on mk4 | all 21 resources accepted | mk4 API server (nothing created) |
+| Rendered chart, `kubectl apply --dry-run=server` on mk4 | all 34 objects accepted (diagnostics objects checked in an existing namespace) | mk4 API server (nothing created) |
+| Terraform `validate` + read-only `plan` | valid; +1 resource (FinOps read policy) | account 881026659929 |
 | End-to-end UI walkthrough in headless Chrome | passed, no unexpected console errors | Local API + worker + built SPA at `/moks`, live connectors to mk4 |
 
 ### Live end-to-end walkthrough (headless Chrome, live cluster data)
@@ -33,6 +35,28 @@ These runs found and fixed several real defects:
 - Literal values of sensitive env vars appeared in pod details; they are now masked by name.
 - An environment deny list hid all non-namespaced data from administrators; "environment-wide" and "unrestricted" scope are now separate.
 
+### Phases 2–4 live checks (read-only, against mk4)
+
+- Connector tests: Kubernetes, Prometheus, Loki and cost model OK; Grafana reachable (13.2.4) but **401 without a token**.
+- FinOps on `roboshop-ai`: allocation for 16 workloads; rightsizing flagged **MongoDB within 10% of its
+  memory limit** and RabbitMQ CPU above request. An investigation ("which pods are close to their
+  memory limits?") selected the `oomkilled-memory` skill and cited that as a fact with a
+  `patch_resources` suggestion.
+- GitHub ingestion of `mrjithendar/moks` (`docs/**`, `lab/README.md`) at commit `03732fc`: 7
+  documents. Search returned the rollout section with a line-anchored GitHub URL.
+- An alert webhook opened an incident and an automatic read-only investigation; the repeat alert was deduplicated.
+- An action plan for `Deployment/mongodb` (`patch_resources`) was created from a rightsizing row
+  with the live `resourceVersion`. It was **not executed**: no executor ran locally.
+
+Defects found and fixed during this round:
+- A race where the DB commit happened after the response was sent (sign in → 401; seen 1 in 3
+  locally). This also affects the deployed Phase 1, and the next rollout fixes it. A guard test
+  enforces `scope="function"`.
+- The Prometheus poller resolved webhook-opened incidents.
+- The rate-limit decision was misreported.
+- Evaluation environments leaked into environment pickers.
+- Policy denials returned 409 instead of 403.
+
 ## Coverage of the required areas
 
 | Area | Tests |
@@ -43,8 +67,14 @@ These runs found and fixed several real defects:
 | Connector failure handling | `test_prometheus_errors_are_classified_and_retried` (503 retried, 401, 404 hint, parse error, timeout, oversize), `test_unreachable_connector_message`, `test_unavailable_connector_is_reported_not_hidden`, `test_credential_references` |
 | `/moks` routing, auth, streaming | `test_routing_auth.py` (308 to `/moks/`, deep links, assets vs SPA fallback, traversal, JSON 404 under `/moks/api`, cookie `Path=/moks`, CSRF + Origin, logout, dev mode refused in production, open-redirect guard, local-login rate limit); `test_sse_stream_replays_events_and_ends` (content type, ordering, `Last-Event-ID` resume); frontend `api.test.ts` (base path, CSRF header, 401 → `/moks/login?next=`) |
 | Audit | append-only triggers, chain verification, tamper detection after a superuser bypass, redacted details |
-| Retrieval access controls | Phase 2 (no RAG yet) |
-| Approval expiry/replay/parameter changes; remediation validation | Phase 3 (no remediation yet) |
+| Retrieval access controls | `test_rag.py::test_retrieval_respects_access_scope` (namespace-scoped, glob and no-binding users), deletion propagation, secret exclusion/redaction |
+| Prompt injection in documents | `test_rag.py::test_prompt_injection_in_documents_cannot_trigger_actions` (a retrieved runbook demanding scale-to-zero; the request is denied and audited) |
+| Approval expiry, replay, parameter changes | `test_actions.py` (self-approval refused, hash mismatch, expiry, replay, parameters tampered after approval, revoked approver, resource changed after review, policy limits, forbidden patch fields) |
+| Remediation validation and failure recovery | `test_actions.py::test_validation_failure_triggers_automatic_recovery`, `test_full_flow_with_separation_of_duties` |
+| Diagnostics | `test_diagnostics_evals.py` (catalog-only commands, SSRF guard, approval for elevated/production, TTL cleanup) |
+| Alerts | `test_phase4_alerts.py` (webhook auth, dedup, cooldown, hourly cap, opt-in, deny lists, poller scope, incident report, postmortem into knowledge) |
+| Phase 2 connectors and FinOps | `test_phase2_connectors.py` (Grafana, Git never guesses, EKS token, Cost Explorer cache/cap, allocation and rightsizing math, finops permission) |
+| SRE skills | `test_skills.py` (load, validation, custom override, selection, executor-checked steps, allowlisted suggestions) |
 
 The fake Kubernetes connector (`tests/fakes.py`) exercises MOKS's own logic. It is **not**
 evidence of a live integration; the `tests/live` suite and the walkthrough above provide that.
@@ -64,7 +94,15 @@ cd ../frontend && npm test && npm run build
 helm lint deploy/helm/moks -f deploy/helm/moks/values-minikube.yaml
 ```
 
-## Not yet verified
+## Not yet verified (Phases 2–4)
+
+- Executor writes, diagnostic pods and OpenSearch have **not run on mk4**. They are covered by fakes
+  and server-side dry runs; deploy, then exercise them on `moks-lab` (lab/README.md).
+- CloudWatch, Cost Explorer/Budgets, remote EKS and OpenSearch were tested against stubs or mock
+  transports only (no credentials or cluster available). Grafana needs a token.
+- No LLM provider was called; LLM mode is tested with a scripted OpenAI-compatible endpoint.
+
+## Not yet verified (Phase 1, original list)
 
 - The container image has not been built: there was no Docker daemon on the development machine.
   CI's `release` job builds it on `ubuntu-24.04-arm` and smoke-tests `/healthz`, `/moks/` and

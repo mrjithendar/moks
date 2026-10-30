@@ -109,6 +109,14 @@ class OpenAIProvider(Provider):
         usage = data.get("usage") or {}
         return LLMResponse(text, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)), self.name, self.cfg.model)
 
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        base = (self.cfg.endpoint or "https://api.openai.com/v1").rstrip("/")
+        body: dict[str, Any] = {"model": self.cfg.model, "input": texts}
+        if self.cfg.embedding_dimensions:
+            body["dimensions"] = self.cfg.embedding_dimensions
+        data = await self._post(f"{base}/embeddings", body, {"Authorization": f"Bearer {self._key()}"})
+        return [d["embedding"] for d in sorted(data.get("data", []), key=lambda d: d.get("index", 0))]
+
 
 class GeminiProvider(Provider):
     name = "gemini"
@@ -132,6 +140,18 @@ class GeminiProvider(Provider):
         usage = data.get("usageMetadata") or {}
         return LLMResponse(text, int(usage.get("promptTokenCount", 0)), int(usage.get("candidatesTokenCount", 0)), self.name, self.cfg.model)
 
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        base = (self.cfg.endpoint or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+        model = self.cfg.model if self.cfg.model.startswith("models/") else f"models/{self.cfg.model}"
+        reqs = []
+        for t in texts:
+            r: dict[str, Any] = {"model": model, "content": {"parts": [{"text": t}]}}
+            if self.cfg.embedding_dimensions:
+                r["outputDimensionality"] = self.cfg.embedding_dimensions
+            reqs.append(r)
+        data = await self._post(f"{base}/{model}:batchEmbedContents", {"requests": reqs}, {"x-goog-api-key": self._key()})
+        return [e["values"] for e in data.get("embeddings", [])]
+
 
 class OllamaProvider(Provider):
     name = "ollama"
@@ -151,6 +171,14 @@ class OllamaProvider(Provider):
         data = await self._post(f"{self.cfg.endpoint.rstrip('/')}/api/chat", body, headers)
         text = (data.get("message") or {}).get("content") or ""
         return LLMResponse(text, int(data.get("prompt_eval_count", 0)), int(data.get("eval_count", 0)), self.name, self.cfg.model)
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        if not self.cfg.endpoint:
+            raise LLMError("config", "ollama needs an endpoint")
+        key = self._key(required=False)
+        data = await self._post(f"{self.cfg.endpoint.rstrip('/')}/api/embed", {"model": self.cfg.model, "input": texts},
+                                {"Authorization": f"Bearer {key}"} if key else {})
+        return data.get("embeddings", [])
 
 
 class BedrockProvider(Provider):
@@ -192,6 +220,27 @@ class BedrockProvider(Provider):
         text = "".join(c.get("text", "") for c in content)
         usage = data.get("usage") or {}
         return LLMResponse(text, int(usage.get("inputTokens", 0)), int(usage.get("outputTokens", 0)), self.name, self.cfg.model)
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """Amazon Titan Text Embeddings v2 (or compatible): one InvokeModel call per text."""
+        import json as _json
+
+        import boto3
+
+        region = self.cfg.region or "us-east-1"
+
+        def call(t: str) -> list[float]:
+            client = boto3.client("bedrock-runtime", region_name=region, endpoint_url=self.cfg.endpoint or None)
+            body: dict[str, Any] = {"inputText": t[:30000]}
+            if self.cfg.embedding_dimensions:
+                body["dimensions"] = self.cfg.embedding_dimensions
+            resp = client.invoke_model(modelId=self.cfg.model, body=_json.dumps(body), contentType="application/json", accept="application/json")
+            return _json.loads(resp["body"].read())["embedding"]
+
+        try:
+            return [await asyncio.wait_for(asyncio.to_thread(call, t), self.cfg.timeout_seconds) for t in texts]
+        except Exception as exc:
+            raise LLMError("unavailable", f"bedrock embedding failed ({type(exc).__name__})") from None
 
 
 PROVIDERS: dict[str, type[Provider]] = {

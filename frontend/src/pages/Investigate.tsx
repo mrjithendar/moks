@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import { api, API } from "../api";
 import { useAuth } from "../auth";
 import { Badge, ErrorBox, LineChart, LogLines, PageHead, ScopePicker, SourceRef, StatusBadge, Time, fmtBytes, useLoad } from "../components";
+import { PlanForm } from "./Ops";
 
 const SUGGESTIONS = [
   "Why is checkout returning 502 errors?",
@@ -32,7 +33,7 @@ export function NewInvestigation() {
     setError(null);
     try {
       const inv = await api<{ id: string }>("/investigations", {
-        method: "POST", body: { question: q, environment: env, namespace: ns, minutes: minutes ? Number(minutes) : undefined },
+        method: "POST", body: { question: q, environment: env, namespace: ns, minutes: minutes ? Number(minutes) : undefined, incident_id: params.get("incident") || undefined },
       });
       nav(`/investigations/${inv.id}`);
     } catch (err) {
@@ -111,6 +112,9 @@ export function InvestigationView() {
   const [events, setEvents] = useState<Ev[]>([]);
   const [open, setOpen] = useState<string | null>(null);
   const [live, setLive] = useState(false);
+  const [propose, setPropose] = useState<any>(null);
+  const nav = useNavigate();
+  const { can } = useAuth();
   const reloadRef = useRef(detail.reload);
   reloadRef.current = detail.reload;
 
@@ -127,7 +131,7 @@ export function InvestigationView() {
       setEvents((xs) => [...xs, ev]);
       if (["tool_result", "report", "done"].includes(ev.type)) reloadRef.current();
     };
-    for (const t of ["queued", "scope", "phase", "tool_call", "tool_result", "llm_usage", "note", "report", "error", "cancelled", "done"]) es.addEventListener(t, onMsg);
+    for (const t of ["queued", "scope", "phase", "skills", "tool_call", "tool_result", "llm_usage", "note", "report", "error", "cancelled", "done"]) es.addEventListener(t, onMsg);
     es.addEventListener("end", () => { es.close(); setLive(false); });
     es.addEventListener("timeout", () => { es.close(); setLive(false); });
     es.onerror = () => { if (es.readyState === EventSource.CLOSED) setLive(false); };
@@ -168,7 +172,7 @@ export function InvestigationView() {
           {inv.error && <div className="alert error" style={{ marginBottom: 12 }}>{inv.error}</div>}
           <div className="grid" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(300px, 1fr)", alignItems: "start" }}>
             <div className="stack">
-              {report ? <Report report={report} onCite={setOpen} /> : (
+              {report ? <Report report={report} onCite={setOpen} onPropose={can("action.request") && inv.namespace !== "*" ? setPropose : undefined} /> : (
                 <div className="card empty">{TERMINAL.has(inv.status) ? "No report was produced." : "Collecting evidence…"}</div>
               )}
               {report?.findings?.length > 0 && <Findings findings={report.findings} onCite={setOpen} />}
@@ -195,6 +199,16 @@ export function InvestigationView() {
             </div>
           </div>
           {opened && <EvidenceDrawer e={opened} grafana={inv.grafana_url} onClose={() => setOpen(null)} />}
+          {propose && <div className="drawer" role="dialog" aria-label="Propose action"><div className="row between"><h2>Propose an action plan</h2>
+            <button className="ghost small" onClick={() => setPropose(null)}>Close</button></div>
+            <p className="small muted">Proposal from the report: {propose.action}</p>
+            <PlanForm env={inv.environment} ns={inv.namespace} initial={{ ...(propose.fromSkill ? { action: propose.action, target_kind: propose.target_kind ?? "Deployment",
+              params: propose.params ?? {} } : {}),
+              target_name: propose.fromSkill ? propose.target_name ?? "" : (propose.target || "").split("/").pop()?.split(" ")[0] ?? "",
+              reason: propose.fromSkill ? `${propose.note}\n\nFinding: ${propose.finding} (skill ${propose.skill}). From investigation: ${inv.question}` : `${propose.action}\n\nFrom investigation: ${inv.question}`,
+              investigation_id: inv.id, incident_id: inv.incident_id ?? undefined,
+              evidence: (report?.observed_facts ?? []).slice(0, 5).map((f: any) => ({ ref: f.evidence.join(","), summary: f.statement })) }}
+              onDone={(id) => nav(`/actions/${id}`)} /></div>}
         </>
       )}
     </>
@@ -207,7 +221,7 @@ function Cites({ refs, onCite }: { refs: string[]; onCite: (r: string) => void }
 
 const CONF: Record<string, "bad" | "warn" | "neutral"> = { high: "bad", medium: "warn", low: "neutral" };
 
-function Report({ report, onCite }: { report: any; onCite: (r: string) => void }) {
+function Report({ report, onCite, onPropose }: { report: any; onCite: (r: string) => void; onPropose?: (r: any) => void }) {
   return (
     <div className="card">
       <div className="row between">
@@ -236,15 +250,30 @@ function Report({ report, onCite }: { report: any; onCite: (r: string) => void }
       {report.next_steps.length > 0 && (
         <div className="report-section steps"><h3>Recommended next steps</h3><ul>{report.next_steps.map((m: string, i: number) => <li key={i}>{m}</li>)}</ul></div>
       )}
+      {report.skills?.length > 0 && (
+        <div className="small" style={{ marginBottom: 12 }}>Skills applied: {report.skills.map((s: any) => (
+          <Link key={s.name} to="/skills" title={s.reasons.join("; ")}><Badge kind="info">{s.name}</Badge></Link>))}</div>
+      )}
+      {report.skill_actions?.length > 0 && (
+        <div className="report-section remediation">
+          <h3>Suggested actions (from skills)</h3>
+          <ul>{report.skill_actions.map((a: any, i: number) => (
+            <li key={i}><span className="mono">{a.action}</span>{a.target_name && <span className="mono small"> · {a.target_kind}/{a.target_name}</span>}
+              <span className="small muted"> — {a.note} (finding: {a.finding}; skill {a.skill})</span>
+              {onPropose && <button className="ghost small" style={{ marginLeft: 8 }} onClick={() => onPropose({ ...a, fromSkill: true })}>Propose as action plan</button>}</li>
+          ))}</ul>
+        </div>
+      )}
       {report.proposed_remediation.length > 0 && (
         <div className="report-section remediation">
           <h3>Proposed remediation</h3>
           <ul>{report.proposed_remediation.map((r: any, i: number) => (
             <li key={i}><strong>{r.action}</strong>{r.target && <span className="mono small"> · {r.target}</span>}
+              {onPropose && <button className="ghost small" style={{ marginLeft: 8 }} onClick={() => onPropose(r)}>Propose as action plan</button>}
               <div className="small muted">{[r.expected_impact && `Impact: ${r.expected_impact}`, r.risk && `Risk: ${r.risk}`, r.rollback && `Rollback: ${r.rollback}`].filter(Boolean).join(" · ")}</div>
             </li>
           ))}</ul>
-          <div className="small muted">Proposals only. Execution needs a reviewed action plan and approval (Phase 3); nothing was changed.</div>
+          <div className="small muted">Proposals only: nothing was changed. Turn one into a reviewed action plan to execute it (approval required in production).</div>
         </div>
       )}
       {report.notes?.length > 0 && <details><summary className="small">Investigation notes ({report.notes.length})</summary><ul className="small">{report.notes.map((n: string, i: number) => <li key={i}>{n}</li>)}</ul></details>}
@@ -284,6 +313,7 @@ function Timeline({ events }: { events: Ev[] }) {
         if (e.type === "tool_call") text = <><span className="mono">{e.tool}</span> {e.args?.namespace && <span className="muted">{e.args.namespace}</span>}{e.purpose && <span className="muted"> — {e.purpose}</span>}</>;
         if (e.type === "tool_result") { dot = e.denied ? "bad" : e.ok ? "ok" : "warn"; text = <>{e.ref && <span className="cite">{e.ref}</span>} {e.denied ? <strong>Denied: </strong> : null}{e.summary} <span className="muted">({e.duration_ms} ms)</span></>; }
         if (e.type === "note") { dot = "warn"; text = e.message; }
+        if (e.type === "skills") { dot = "ok"; text = <>Skills selected: {e.skills.map((s: any) => s.name).join(", ")}</>; }
         if (e.type === "report") { dot = "ok"; text = "Report ready"; }
         if (e.type === "error") { dot = "bad"; text = e.message; }
         if (e.type === "cancelled") { dot = "warn"; text = "Cancelled"; }

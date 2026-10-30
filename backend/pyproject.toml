@@ -23,6 +23,7 @@ dependencies = [
   "opentelemetry-instrumentation-httpx>=0.46b0",
   "boto3>=1.34",
   "pyyaml>=6",
+  "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
@@ -39,7 +40,7 @@ build-backend = "setuptools.build_meta"
 include = ["moks*"]
 
 [tool.setuptools.package-data]
-moks = ["migrations/*.py", "migrations/versions/*.py", "migrations/script.py.mako"]
+moks = ["migrations/*.py", "migrations/versions/*.py", "migrations/script.py.mako", "skills/builtin/*/SKILL.md", "evals/datasets/*.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

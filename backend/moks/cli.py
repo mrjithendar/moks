@@ -7,6 +7,9 @@
   moks create-user EMAIL [--password-stdin] [--grant ROLE[:ENV[:NS]] ...]
   moks grant EMAIL ROLE[:ENV[:NS]]   add a role binding
   moks verify-audit                  recompute the audit hash chain
+  moks executor                      run the action/diagnostics executor (write credentials)
+  moks eval DATASET [--mode rules|llm]  run an evaluation dataset and print scores
+  moks reindex                       rebuild the knowledge index for the active embedding model
 """
 from __future__ import annotations
 
@@ -83,6 +86,21 @@ async def _seed(path: str, upsert: bool) -> None:
                     for k, v in c.items():
                         setattr(row, k, v)
                     print(f"  connector {c['name']}: updated")
+        from .api.environments import sync_automation_binding
+        from .models import KnowledgeSource
+
+        for ks in data.get("knowledge_sources", []):
+            row = (await db.execute(select(KnowledgeSource).where(KnowledgeSource.name == ks["name"]))).scalar_one_or_none()
+            if row is None:
+                db.add(KnowledgeSource(**ks))
+                print(f"knowledge source {ks['name']}: created (first sync is scheduled by the worker)")
+            elif upsert:
+                for k, v in ks.items():
+                    setattr(row, k, v)
+
+        for e in data.get("environments", []):
+            env = (await db.execute(select(Environment).where(Environment.name == e["name"]))).scalar_one()
+            await sync_automation_binding(db, env.name, env.auto_investigate)
         for l in data.get("llm", []):
             row = (await db.execute(select(LLMConfig).where(LLMConfig.name == l["name"]))).scalar_one_or_none()
             if row is None:
@@ -188,6 +206,56 @@ def worker() -> None:
     asyncio.run(main())
 
 
+def executor() -> None:
+    import os
+    import signal
+
+    os.environ["MOKS_PROCESS_ROLE"] = "executor"
+    from .config import get_settings
+
+    get_settings.cache_clear()
+    from .actions.executor import run_executor
+    from .observability import setup_logging, setup_tracing, start_metrics_server
+
+    s = get_settings()
+    setup_logging(s.log_level)
+    setup_tracing(s.otel_service_name + "-executor")
+    start_metrics_server(s.metrics_port)
+
+    async def main():
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+        await run_executor(stop)
+
+    asyncio.run(main())
+
+
+async def _eval(dataset: str, mode: str) -> None:
+    from .evals import runner
+
+    rid = await runner.start(dataset, mode)
+    summary = await runner.execute(rid)
+    from .db import session_scope
+    from .models import EvalRun
+
+    async with session_scope() as db:
+        run = await db.get(EvalRun, rid)
+        for r in run.results:
+            failed = [k for k, v in r["checks"].items() if not v]
+            print(f"{r['case']:40} {r['score']:.2f}  {'FAILED: ' + ', '.join(failed) if failed else 'ok'}")
+    print(f"score {summary['score']:.3f} over {summary['cases']} cases (run {rid})")
+
+
+async def _reindex() -> None:
+    from .db import session_scope
+    from .rag import service
+
+    async with session_scope() as db:
+        print(await service.reindex(db))
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="moks")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -207,6 +275,11 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("email")
     g.add_argument("grant")
     sub.add_parser("verify-audit")
+    sub.add_parser("executor")
+    ev = sub.add_parser("eval")
+    ev.add_argument("dataset")
+    ev.add_argument("--mode", choices=["rules", "llm"], default="rules")
+    sub.add_parser("reindex")
     a = p.parse_args(argv)
 
     if a.cmd == "migrate":
@@ -231,6 +304,12 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_grant(a.email, a.grant))
     elif a.cmd == "verify-audit":
         asyncio.run(_verify())
+    elif a.cmd == "executor":
+        executor()
+    elif a.cmd == "eval":
+        asyncio.run(_eval(a.dataset, a.mode))
+    elif a.cmd == "reindex":
+        asyncio.run(_reindex())
 
 
 if __name__ == "__main__":

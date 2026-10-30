@@ -92,11 +92,13 @@ def tools_for_planner(ctx: ToolContext) -> list[ToolSpec]:
     for spec in REGISTRY.values():
         if not spec.read_only or spec.privileged:
             continue
-        if spec.connector_type not in ctx.connectors:
+        if not all(ctx.available(c) for c in (spec.connector_type, *spec.also_requires)):
             continue
         if spec.cluster_scoped and not ctx.scope.cluster_wide:
             continue
-        if spec.extra_permission and not ctx.principal.can(spec.extra_permission, ctx.environment.name, "*"):
+        if spec.extra_permission and spec.namespace_arg is None and not ctx.principal.can(spec.extra_permission, ctx.environment.name, "*"):
+            continue
+        if spec.extra_permission and spec.namespace_arg and not ctx.principal.can_anywhere(spec.extra_permission):
             continue
         out.append(spec)
     return out
@@ -133,8 +135,11 @@ class ToolExecutor:
             self.ctx.scope.require(ns)
         if spec.cluster_scoped:
             self.ctx.scope.require_cluster_wide(spec.name)
-        if spec.extra_permission and not self.ctx.principal.can(spec.extra_permission, env, "*"):
-            raise ScopeError(f"{spec.name} requires {spec.extra_permission} with access to all namespaces in {env!r}")
+        if spec.extra_permission:
+            ns = getattr(parsed, spec.namespace_arg) if spec.namespace_arg else "*"
+            if not self.ctx.principal.can(spec.extra_permission, env, ns):
+                where = f"namespace {ns!r}" if spec.namespace_arg else "all namespaces"
+                raise ScopeError(f"{spec.name} requires {spec.extra_permission} for {where} in {env!r}")
 
     async def run(self, tool: str, args: dict[str, Any] | None) -> ToolOutcome:
         args = args if isinstance(args, dict) else {}
@@ -185,7 +190,7 @@ class ToolExecutor:
             entry = self.ctx.connectors.get(spec.connector_type)
             self.db.add(Evidence(
                 investigation_id=self.ctx.investigation_id, ref=ref, tool=tool,
-                connector_id=entry[0].id if entry else None, connector_type=spec.connector_type,
+                connector_id=entry[0].id if entry and entry[0] is not None else None, connector_type=spec.connector_type,
                 args=clean_args,
                 scope={"environment": self.ctx.environment.name, "namespace": clean_args.get("namespace"),
                        "from": self.ctx.time_from.isoformat(), "to": self.ctx.time_to.isoformat()},

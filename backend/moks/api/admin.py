@@ -29,7 +29,7 @@ from ..rbac import ROLES, P
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-CONNECTOR_TYPES = ["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git"]
+CONNECTOR_TYPES = ["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git", "aws_cost", "cost_model"]
 
 
 class CredentialRef(BaseModel):
@@ -55,7 +55,7 @@ def _check_no_secrets(config: dict[str, Any]) -> None:
 
 class ConnectorIn(BaseModel):
     environment: str
-    type: Literal["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git"]
+    type: Literal["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git", "aws_cost", "cost_model"]
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,99}$")
     enabled: bool = True
     config: dict[str, Any] = Field(default_factory=dict)
@@ -71,7 +71,7 @@ def connector_out(c: Connector, env_name: str) -> dict[str, Any]:
 
 
 @router.get("/connectors")
-async def list_connectors(ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
+async def list_connectors(ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> list[dict[str, Any]]:
     rows = (await db.execute(select(Connector, Environment.name).join(Environment).order_by(Environment.name, Connector.type))).all()
     return [connector_out(c, n) for c, n in rows]
 
@@ -84,7 +84,7 @@ async def _env_id(db: AsyncSession, name: str) -> uuid.UUID:
 
 
 @router.post("/connectors", status_code=201)
-async def create_connector(body: ConnectorIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+async def create_connector(body: ConnectorIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     _check_no_secrets(body.config)
     c = Connector(environment_id=await _env_id(db, body.environment), type=body.type, name=body.name, enabled=body.enabled,
                   config=body.config, credential_ref=body.credential_ref.model_dump(exclude_none=True))
@@ -97,7 +97,7 @@ async def create_connector(body: ConnectorIn, ctx: AuthContext = Depends(needs(P
 
 @router.put("/connectors/{cid}")
 async def update_connector(cid: uuid.UUID, body: ConnectorIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)),
-                           db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+                           db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     _check_no_secrets(body.config)
     c = await db.get(Connector, cid)
     if c is None:
@@ -113,7 +113,7 @@ async def update_connector(cid: uuid.UUID, body: ConnectorIn, ctx: AuthContext =
 
 
 @router.delete("/connectors/{cid}")
-async def delete_connector(cid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db)) -> dict[str, str]:
+async def delete_connector(cid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, str]:
     c = await db.get(Connector, cid)
     if c is None:
         raise HTTPException(404, "Unknown connector")
@@ -124,7 +124,7 @@ async def delete_connector(cid: uuid.UUID, ctx: AuthContext = Depends(needs(P.AD
 
 
 @router.post("/connectors/{cid}/test")
-async def test_connector(cid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+async def test_connector(cid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     c = await db.get(Connector, cid)
     if c is None:
         raise HTTPException(404, "Unknown connector")
@@ -163,7 +163,7 @@ def llm_out(c: LLMConfig, spent: Decimal | None = None) -> dict[str, Any]:
 
 
 @router.get("/llm")
-async def list_llm(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
+async def list_llm(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> list[dict[str, Any]]:
     from datetime import timedelta
 
     from ..models import LLMUsage
@@ -176,7 +176,7 @@ async def list_llm(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSess
 
 
 @router.post("/llm", status_code=201)
-async def create_llm(body: LLMIn, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+async def create_llm(body: LLMIn, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     c = LLMConfig(**{**body.model_dump(exclude={"credential_ref"}), "credential_ref": body.credential_ref.model_dump(exclude_none=True)})
     db.add(c)
     await db.flush()
@@ -186,7 +186,7 @@ async def create_llm(body: LLMIn, ctx: AuthContext = Depends(needs(P.ADMIN_LLM))
 
 
 @router.put("/llm/{lid}")
-async def update_llm(lid: uuid.UUID, body: LLMIn, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+async def update_llm(lid: uuid.UUID, body: LLMIn, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     c = await db.get(LLMConfig, lid)
     if c is None:
         raise HTTPException(404, "Unknown LLM configuration")
@@ -202,7 +202,7 @@ async def update_llm(lid: uuid.UUID, body: LLMIn, ctx: AuthContext = Depends(nee
 
 @router.post("/llm/{lid}/activate")
 async def activate_llm(lid: uuid.UUID, active: bool = True, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)),
-                       db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+                       db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     c = await db.get(LLMConfig, lid)
     if c is None:
         raise HTTPException(404, "Unknown LLM configuration")
@@ -217,7 +217,7 @@ async def activate_llm(lid: uuid.UUID, active: bool = True, ctx: AuthContext = D
 
 
 @router.post("/llm/{lid}/test")
-async def test_llm(lid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+async def test_llm(lid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     c = await db.get(LLMConfig, lid)
     if c is None:
         raise HTTPException(404, "Unknown LLM configuration")
@@ -257,14 +257,14 @@ async def user_out(db: AsyncSession, u: User) -> dict[str, Any]:
 
 
 @router.get("/users")
-async def list_users(ctx: AuthContext = Depends(needs(P.ADMIN_USERS)), db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
+async def list_users(ctx: AuthContext = Depends(needs(P.ADMIN_USERS)), db: AsyncSession = Depends(get_db, scope="function")) -> list[dict[str, Any]]:
     users = (await db.execute(select(User).order_by(User.email))).scalars().all()
     return [await user_out(db, u) for u in users]
 
 
 @router.post("/users", status_code=201)
 async def create_user(body: UserIn, request: Request, ctx: AuthContext = Depends(needs(P.ADMIN_USERS)),
-                      db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+                      db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     from ..config import get_settings
 
     mode = get_settings().auth_mode
@@ -284,7 +284,7 @@ async def create_user(body: UserIn, request: Request, ctx: AuthContext = Depends
 
 
 @router.post("/users/{uid}/active")
-async def set_active(uid: uuid.UUID, active: bool, ctx: AuthContext = Depends(needs(P.ADMIN_USERS)), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+async def set_active(uid: uuid.UUID, active: bool, ctx: AuthContext = Depends(needs(P.ADMIN_USERS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     u = await db.get(User, uid)
     if u is None:
         raise HTTPException(404, "Unknown user")
@@ -299,7 +299,7 @@ async def set_active(uid: uuid.UUID, active: bool, ctx: AuthContext = Depends(ne
 
 
 @router.post("/users/{uid}/bindings", status_code=201)
-async def add_binding(uid: uuid.UUID, body: BindingIn, ctx: AuthContext = Depends(needs(P.ADMIN_USERS)), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+async def add_binding(uid: uuid.UUID, body: BindingIn, ctx: AuthContext = Depends(needs(P.ADMIN_USERS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     u = await db.get(User, uid)
     if u is None:
         raise HTTPException(404, "Unknown user")
@@ -317,7 +317,7 @@ async def add_binding(uid: uuid.UUID, body: BindingIn, ctx: AuthContext = Depend
 
 
 @router.delete("/users/{uid}/bindings/{bid}")
-async def remove_binding(uid: uuid.UUID, bid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_USERS)), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+async def remove_binding(uid: uuid.UUID, bid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_USERS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     b = await db.get(RoleBinding, bid)
     if b is None or b.user_id != uid:
         raise HTTPException(404, "Unknown binding")
@@ -339,7 +339,7 @@ async def remove_binding(uid: uuid.UUID, bid: uuid.UUID, ctx: AuthContext = Depe
 @router.get("/audit")
 async def list_audit(action: str | None = None, actor: str | None = None, decision: str | None = None, environment: str | None = None,
                      before_id: int | None = None, limit: int = 100, ctx: AuthContext = Depends(needs(P.AUDIT_READ)),
-                     db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+                     db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     q = select(AuditEvent).order_by(AuditEvent.id.desc()).limit(min(max(limit, 1), 500))
     if action:
         q = q.where(AuditEvent.action.like(action.replace("*", "%")))
@@ -360,5 +360,5 @@ async def list_audit(action: str | None = None, actor: str | None = None, decisi
 
 
 @router.get("/audit/verify")
-async def verify_audit(ctx: AuthContext = Depends(needs(P.AUDIT_READ)), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+async def verify_audit(ctx: AuthContext = Depends(needs(P.AUDIT_READ)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     return await audit.verify_chain(db)

@@ -26,7 +26,7 @@ def _origin_ok(request: Request) -> bool:
     return (o.scheme, o.netloc) == (public.scheme, public.netloc)
 
 
-async def get_auth(request: Request, db: AsyncSession = Depends(get_db)) -> AuthContext:
+async def get_auth(request: Request, db: AsyncSession = Depends(get_db, scope="function")) -> AuthContext:
     ctx = await load(db, request.cookies.get(COOKIE))
     if ctx is None:
         raise HTTPException(401, "Not signed in")

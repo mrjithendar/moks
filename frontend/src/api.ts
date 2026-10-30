@@ -57,3 +57,13 @@ export function qs(params: Record<string, string | number | boolean | undefined 
   const s = p.toString();
   return s ? `?${s}` : "";
 }
+
+/** Multipart upload (CSRF header included; the browser sets the boundary). */
+export async function apiForm<T = any>(path: string, form: FormData): Promise<T> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+  const res = await fetch(`${API}${path}`, { method: "POST", headers, body: form, credentials: "same-origin" });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new ApiError(res.status, (data && data.detail) || res.statusText);
+  return data as T;
+}

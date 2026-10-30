@@ -30,7 +30,7 @@ EXPOSED = {
 
 @router.get("/namespaces")
 async def namespaces(environment: str, request: Request, ctx: AuthContext = Depends(get_auth),
-                     db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+                     db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     ex = await live_executor(request, db, ctx, environment, None)
     k = ex.ctx.connectors.get("kubernetes")
     if k is None:
@@ -48,7 +48,7 @@ async def namespaces(environment: str, request: Request, ctx: AuthContext = Depe
 
 @router.get("/{kind}")
 async def read(environment: str, kind: str, request: Request, minutes: int | None = Query(default=None, ge=1, le=10080),
-               ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+               ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     tool = EXPOSED.get(kind)
     if tool is None:
         from fastapi import HTTPException

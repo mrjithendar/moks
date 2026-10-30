@@ -13,6 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Connector
 from .base import ConnectorError
+from .cloudwatch import CloudWatchConnector
+from .finops import AwsCostConnector, CostModelConnector
+from .git import GitConnector
+from .grafana import GrafanaConnector
 from .kubernetes import KubernetesConnector
 from .loki import LokiConnector
 from .prometheus import PrometheusConnector
@@ -21,11 +25,14 @@ CONNECTOR_TYPES: dict[str, Any] = {
     "kubernetes": KubernetesConnector,
     "prometheus": PrometheusConnector,
     "loki": LokiConnector,
+    "grafana": GrafanaConnector,
+    "cloudwatch": CloudWatchConnector,
+    "git": GitConnector,
+    "aws_cost": AwsCostConnector,
+    "cost_model": CostModelConnector,
 }
 
-# Phase 2 types are accepted as configuration (so they can be prepared) but have no
-# implementation yet; they report themselves as not implemented instead of pretending to work.
-PLANNED_TYPES = {"grafana", "cloudwatch", "git"}
+PLANNED_TYPES: set[str] = set()
 
 _cache: dict[uuid.UUID, tuple[str, Any]] = {}
 _lock = asyncio.Lock()

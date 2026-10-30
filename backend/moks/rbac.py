@@ -29,6 +29,8 @@ class P(StrEnum):
     ACTION_EXECUTE = "action.execute"
     ACTION_APPROVE = "action.approve"
     AUDIT_READ = "audit.read"
+    FINOPS_READ = "finops.read"              # cost, allocation and rightsizing data
+    INCIDENT_WRITE = "incident.write"        # create/update incidents and timelines
     ADMIN_USERS = "admin.users"
     ADMIN_CONNECTORS = "admin.connectors"
     ADMIN_LLM = "admin.llm"
@@ -36,9 +38,9 @@ class P(StrEnum):
 
 
 _VIEWER = {P.OVERVIEW_READ, P.INVESTIGATION_READ}
-_INVESTIGATOR = _VIEWER | {P.INVESTIGATION_RUN, P.EXPLORER_READ, P.METRICS_RAW_QUERY}
+_INVESTIGATOR = _VIEWER | {P.INVESTIGATION_RUN, P.EXPLORER_READ, P.METRICS_RAW_QUERY, P.FINOPS_READ, P.INCIDENT_WRITE}
 _OPERATOR = _INVESTIGATOR | {P.ACTION_REQUEST, P.ACTION_EXECUTE}
-_APPROVER = _VIEWER | {P.ACTION_APPROVE}
+_APPROVER = _VIEWER | {P.ACTION_APPROVE, P.FINOPS_READ}
 _ADMIN = set(P)
 
 ROLES: dict[str, frozenset[P]] = {
@@ -51,9 +53,9 @@ ROLES: dict[str, frozenset[P]] = {
 
 ROLE_DESCRIPTIONS = {
     "viewer": "Read permitted dashboards, investigations and incidents.",
-    "investigator": "Run approved read-only investigations and live reads.",
-    "operator": "Request and execute permitted operational actions (Phase 3).",
-    "approver": "Approve actions within the assigned scope (Phase 3).",
+    "investigator": "Run read-only investigations, live reads, knowledge and FinOps queries; manage incidents.",
+    "operator": "Request and execute permitted operational actions and diagnostic sessions.",
+    "approver": "Approve or reject action plans within the assigned scope (never their own).",
     "admin": "Manage users, connectors, LLM providers and policies.",
 }
 

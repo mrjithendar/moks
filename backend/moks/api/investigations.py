@@ -44,6 +44,7 @@ class CreateIn(BaseModel):
     environment: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,99}$")
     namespace: str = Field(pattern=r"^(\*|[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$")
     minutes: int | None = Field(default=None, ge=5, le=10080)
+    incident_id: uuid.UUID | None = None
 
 
 def serialize(inv: Investigation, env_name: str, user_email: str | None = None, full: bool = False) -> dict[str, Any]:
@@ -56,6 +57,7 @@ def serialize(inv: Investigation, env_name: str, user_email: str | None = None, 
         "created_by": user_email, "tool_calls": inv.tool_calls, "tokens_in": inv.tokens_in, "tokens_out": inv.tokens_out,
         "cost_usd": str(inv.cost_usd), "error": inv.error,
         "summary": (inv.report or {}).get("summary") if inv.report else None,
+        "incident_id": str(inv.incident_id) if inv.incident_id else None, "trigger": inv.trigger,
     }
     if full:
         out["report"] = inv.report
@@ -63,7 +65,7 @@ def serialize(inv: Investigation, env_name: str, user_email: str | None = None, 
 
 
 @router.post("/investigations", status_code=201)
-async def create(body: CreateIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+async def create(body: CreateIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     s = get_settings()
     limiter.check(f"inv:{ctx.user.id}", s.rate_investigations_per_minute)
     env = await env_or_404(db, body.environment)
@@ -85,8 +87,18 @@ async def create(body: CreateIn, request: Request, ctx: AuthContext = Depends(ge
     now = datetime.now(timezone.utc)
     inv = Investigation(created_by=ctx.user.id, environment_id=env.id, namespace=body.namespace, question=body.question,
                         time_from=now - window, time_to=now, status="queued")
+    if body.incident_id:
+        from ..incidents import add_event
+        from ..models import Incident
+
+        inc = await db.get(Incident, body.incident_id)
+        if inc is None or inc.environment_id != env.id or not ctx.principal.can(P.INCIDENT_WRITE, env.name, inc.namespace):
+            raise HTTPException(404, "Incident not found in this environment")
+        inv.incident_id = inc.id
     db.add(inv)
     await db.flush()
+    if inv.incident_id:
+        await add_event(db, inv.incident_id, "investigation", {"text": f"Investigation started: {body.question[:200]}", "investigation_id": str(inv.id)}, ctx.user.id)
     db.add(InvestigationEvent(investigation_id=inv.id, seq=0, type="queued",
                               payload={"window_minutes": int(window.total_seconds() // 60), "requested_minutes": minutes}))
     await audit.record(db, action="investigation.create", actor_id=ctx.user.id, actor_email=ctx.user.email,
@@ -111,7 +123,7 @@ async def _load_visible(request: Request, db: AsyncSession, ctx: AuthContext, in
 
 @router.get("/investigations")
 async def list_(request: Request, environment: str | None = None, limit: int = 50, ctx: AuthContext = Depends(get_auth),
-                db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
+                db: AsyncSession = Depends(get_db, scope="function")) -> list[dict[str, Any]]:
     q = (select(Investigation, Environment.name, User.email).join(Environment, Environment.id == Investigation.environment_id)
          .join(User, User.id == Investigation.created_by).order_by(Investigation.created_at.desc()).limit(min(max(limit, 1), 200) * 3))
     if environment:
@@ -126,7 +138,7 @@ async def list_(request: Request, environment: str | None = None, limit: int = 5
 
 
 @router.get("/investigations/{inv_id}")
-async def get(inv_id: uuid.UUID, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+async def get(inv_id: uuid.UUID, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     inv, env = await _load_visible(request, db, ctx, inv_id)
     user = await db.get(User, inv.created_by)
     ev = (await db.execute(select(Evidence).where(Evidence.investigation_id == inv.id).order_by(Evidence.collected_at))).scalars().all()
@@ -141,7 +153,7 @@ async def get(inv_id: uuid.UUID, request: Request, ctx: AuthContext = Depends(ge
 
 
 @router.post("/investigations/{inv_id}/cancel")
-async def cancel(inv_id: uuid.UUID, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db)) -> dict[str, str]:
+async def cancel(inv_id: uuid.UUID, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, str]:
     inv, env = await _load_visible(request, db, ctx, inv_id)
     if inv.created_by != ctx.user.id:
         await require(request, ctx, P.ADMIN_POLICIES, "*", "*")
@@ -155,7 +167,7 @@ async def cancel(inv_id: uuid.UUID, request: Request, ctx: AuthContext = Depends
 
 @router.get("/investigations/{inv_id}/events")
 async def events(inv_id: uuid.UUID, request: Request, after: int = -1, ctx: AuthContext = Depends(get_auth),
-                 db: AsyncSession = Depends(get_db)) -> StreamingResponse:
+                 db: AsyncSession = Depends(get_db, scope="function")) -> StreamingResponse:
     """Server-Sent Events. Resumable with Last-Event-ID; bounded to 10 minutes per connection."""
     await _load_visible(request, db, ctx, inv_id)
     await db.commit()  # release the pooled connection; the stream uses short sessions

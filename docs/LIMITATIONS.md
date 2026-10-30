@@ -4,16 +4,32 @@
 
 | Phase | Scope | State |
 |---|---|---|
-| 1 | Login + RBAC, `/moks` portal, migrations, Kubernetes/Prometheus/Loki connectors, LLM-assisted investigation with cited live evidence, streaming, audit, Helm/Argo deployment | **Implemented and tested.** Not yet deployed (see the operator guide) |
-| 2 | EKS (remote), CloudWatch, Grafana, Git connectors; OpenSearch RAG; incident workspaces | Designed ([ARCHITECTURE.md](ARCHITECTURE.md)); chart switch for the vector backend only |
-| 3 | Approvals, allowlisted remediation, diagnostic sessions, pre/post verification | Designed; no code. All remediation is a non-executable proposal |
-| 4 | Alert-triggered investigations, incident reports, evaluation datasets | Not started |
+| 1 | Login + RBAC, `/moks` portal, Kubernetes/Prometheus/Loki, cited investigations, streaming, audit, Helm/Argo | Deployed on mk4 |
+| 2 | EKS (remote), CloudWatch, Grafana, Git connectors; RAG (Postgres/pgvector/OpenSearch); incident workspaces | Implemented and tested; not yet deployed |
+| 3 | Approvals, allowlisted remediation with pre/post validation and recovery, diagnostic sessions | Implemented and tested with fakes; executor never run against a cluster |
+| 4 | Alert-triggered investigations (webhook + poller) with dedup/cooldowns, incident reports and postmortems, evaluation datasets | Implemented and tested |
+| + | FinOps (AWS cost, anomalies, budgets, Kubernetes allocation and rightsizing, LLM spend) | Implemented; Kubernetes side verified live, AWS side stub-tested |
+| + | SRE skills (`SKILL.md`) | 13 built-in skills; custom skills via ConfigMap |
+
+## Known limitations (Phases 2–4)
+
+- **Remediation** covers Deployments, Services and HPAs; StatefulSet/DaemonSet actions are not allowlisted.
+  Validation checks rollout status and pod health, not application SLOs (add a Prometheus query
+  validation later). Recovery restores the pod template and replicas, not external side effects.
+- **Diagnostic** commands are a fixed catalog; there is no interactive terminal (deliberately).
+  Elevated sessions install OS packages as root inside the disposable pod.
+- **RAG:** UTF-8 text formats only (no PDF/Office parsing). Reranking is RRF fusion, not a
+  cross-encoder. pgvector search is exact (no ANN index). GitHub sync reads at most 3,000 files of
+  300 KB per source.
+- **Alerts:** the poller reads Prometheus rule state only (no Alertmanager silences or inhibition).
+  The automatic-investigation cap (6/hour/environment) is fixed in code.
+- **FinOps:** allocation covers current pods only; Cost Explorer lags up to 24 h and costs $0.01/request (cached and capped).
+- **Evaluation:** fixture-based datasets only test detectors and report discipline against
+  recorded state; they do not measure LLM reasoning quality beyond the listed checks.
 
 ## Known limitations (Phase 1)
 
 **Integrations**
-- Grafana, CloudWatch, Git and remote EKS are not implemented. Their connector rows can be saved,
-  but they report "planned".
 - No LLM provider has been exercised against a real endpoint; only the OpenAI-compatible
   protocol was tested, with a scripted server. Gemini/Bedrock/Ollama request formats follow
   their public APIs as of this writing.

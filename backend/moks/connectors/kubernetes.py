@@ -9,7 +9,9 @@ Results are compact summaries (not raw objects) so evidence stays small and expl
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -54,17 +56,44 @@ class KubernetesConnector:
         self._api = None
         self._lock = asyncio.Lock()
         self._api_groups: set[str] | None = None
+        self._token_expires: float | None = None
+        self._ca_file: str | None = None
+
+    async def _configure_eks(self, cfg) -> None:
+        """Remote EKS: endpoint and CA from eks:DescribeCluster, bearer token from a presigned STS
+        GetCallerIdentity URL (the same mechanism as `aws eks get-token`), refreshed every 10 minutes."""
+        cluster = self.config.get("cluster_name")
+        region = self.config.get("region") or "us-east-1"
+        if not cluster:
+            raise ConnectorError("config", "eks mode needs config.cluster_name and config.region")
+        info, token = await asyncio.to_thread(eks_endpoint_and_token, cluster, region, self.config.get("role_arn"))
+        import base64
+        import tempfile
+
+        if not self._ca_file:
+            fd, self._ca_file = tempfile.mkstemp(prefix="moks-eks-ca-", suffix=".crt")
+            with os.fdopen(fd, "wb") as f:
+                f.write(base64.b64decode(info["ca"]))
+        cfg.host = info["endpoint"]
+        cfg.ssl_ca_cert = self._ca_file
+        cfg.api_key = {"authorization": f"Bearer {token}"}
+        self._token_expires = time.monotonic() + 600
 
     async def _client(self):
         async with self._lock:
-            if self._api is not None:
+            if self._api is not None and not (self._token_expires and time.monotonic() > self._token_expires):
                 return self._api
+            if self._api is not None:  # EKS token about to expire: rebuild the client
+                await self._api.close()
+                self._api = None
             from kubernetes_asyncio import client, config as kconfig
 
             cfg = client.Configuration()
             mode = self.config.get("mode", "in_cluster")
             try:
-                if mode == "in_cluster":
+                if mode == "eks":
+                    await self._configure_eks(cfg)
+                elif mode == "in_cluster":
                     kconfig.load_incluster_config(client_configuration=cfg)
                 elif mode == "kubeconfig":
                     if not self.credential_ref or self.credential_ref.get("type") != "file":
@@ -73,7 +102,7 @@ class KubernetesConnector:
                     await kconfig.load_kube_config(config_file=str(path), context=self.config.get("context") or None,
                                                    client_configuration=cfg)
                 else:
-                    raise ConnectorError("config", f"unknown kubernetes mode {mode!r} (in_cluster | kubeconfig)")
+                    raise ConnectorError("config", f"unknown kubernetes mode {mode!r} (in_cluster | kubeconfig | eks)")
             except ConnectorError:
                 raise
             except Exception as exc:
@@ -237,6 +266,34 @@ class KubernetesConnector:
             })
         revisions.sort(key=lambda r: r["revision"], reverse=True)
         return {"deployment": summarize_workload("Deployment", dep), "revisions": revisions[:15]}
+
+    async def deployment_meta(self, namespace: str, name: str) -> dict:
+        apps = await self.apps()
+        api = await self._client()
+        dep = api.sanitize_for_serialization(await self._call(f"get deployment {namespace}/{name}", apps.read_namespaced_deployment, name, namespace))
+        tmpl = dep.get("spec", {}).get("template", {})
+        return {
+            "name": name, "namespace": namespace,
+            "resourceVersion": dep["metadata"].get("resourceVersion"), "generation": dep["metadata"].get("generation"),
+            "annotations": {**(dep["metadata"].get("annotations") or {}), **((tmpl.get("metadata") or {}).get("annotations") or {})},
+            "labels": dep["metadata"].get("labels") or {},
+            "images": [c.get("image") for c in tmpl.get("spec", {}).get("containers", [])],
+            "replicas": dep.get("spec", {}).get("replicas"),
+            "summary": summarize_workload("Deployment", dep),
+        }
+
+    async def object_meta(self, namespace: str, kind: str, name: str) -> dict:
+        """resourceVersion and spec of a patchable object (Deployment, Service, HPA)."""
+        from kubernetes_asyncio import client
+
+        api = await self._client()
+        fns = {"Deployment": client.AppsV1Api(api).read_namespaced_deployment, "Service": client.CoreV1Api(api).read_namespaced_service,
+               "HorizontalPodAutoscaler": client.AutoscalingV2Api(api).read_namespaced_horizontal_pod_autoscaler}
+        if kind not in fns:
+            raise ConnectorError("bad_request", f"unsupported kind {kind}")
+        obj = api.sanitize_for_serialization(await self._call(f"get {kind} {namespace}/{name}", fns[kind], name, namespace))
+        return {"kind": kind, "name": name, "resourceVersion": obj["metadata"].get("resourceVersion"), "spec": obj.get("spec", {}),
+                "generation": obj["metadata"].get("generation")}
 
     async def services(self, namespace: str) -> list[dict]:
         """Services with their selectors, ports, ready endpoint counts and matching pods."""
@@ -467,3 +524,37 @@ def _near_miss(selector: dict[str, str], pods: list[dict]) -> list[dict]:
         if all(k in labels for k in selector) and any(labels[k] != v for k, v in selector.items()):
             out.append({"pod": p["metadata"]["name"], "labels": {k: labels[k] for k in selector}})
     return out[:5]
+
+
+def eks_endpoint_and_token(cluster: str, region: str, role_arn: str | None = None, session=None) -> tuple[dict, str]:
+    """Return ({endpoint, ca}, token) for an EKS cluster using the AWS default credential chain."""
+    import base64
+
+    import boto3
+    from botocore.signers import RequestSigner
+
+    session = session or boto3.session.Session(region_name=region)
+    if role_arn:
+        c = session.client("sts").assume_role(RoleArn=role_arn, RoleSessionName="moks-eks", DurationSeconds=3600)["Credentials"]
+        session = boto3.session.Session(aws_access_key_id=c["AccessKeyId"], aws_secret_access_key=c["SecretAccessKey"],
+                                        aws_session_token=c["SessionToken"], region_name=region)
+    try:
+        desc = session.client("eks", region_name=region).describe_cluster(name=cluster)["cluster"]
+        info = {"endpoint": desc["endpoint"], "ca": desc["certificateAuthority"]["data"]}
+    except Exception as exc:
+        raise ConnectorError("unavailable", f"eks:DescribeCluster {cluster} failed ({type(exc).__name__})") from None
+    return info, eks_token(session, cluster, region)
+
+
+def eks_token(session, cluster: str, region: str) -> str:
+    import base64
+
+    from botocore.signers import RequestSigner
+
+    sts = session.client("sts", region_name=region)
+    signer = RequestSigner(sts.meta.service_model.service_id, region, "sts", "v4", session.get_credentials(), session.events)
+    url = signer.generate_presigned_url(
+        {"method": "GET", "url": f"https://sts.{region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15",
+         "body": {}, "headers": {"x-k8s-aws-id": cluster}, "context": {}},
+        region_name=region, expires_in=60, operation_name="")
+    return "k8s-aws-v1." + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")

@@ -79,6 +79,11 @@ class Environment(Base):
     denied_namespaces: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
     max_query_window_minutes: Mapped[int] = mapped_column(Integer, default=360)
     grafana_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    auto_investigate: Mapped[bool] = mapped_column(Boolean, default=False)
+    alert_cooldown_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    max_replicas: Mapped[int] = mapped_column(Integer, default=10)
+    allow_scale_to_zero: Mapped[bool] = mapped_column(Boolean, default=False)
+    plan_ttl_minutes: Mapped[int] = mapped_column(Integer, default=60)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -144,6 +149,8 @@ class Investigation(Base):
     report: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     mode: Mapped[str] = mapped_column(String(20), default="llm")  # llm | deterministic
+    incident_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("incidents.id", ondelete="SET NULL"), nullable=True)
+    trigger: Mapped[str] = mapped_column(String(20), default="user")  # user | alert | eval
     tool_calls: Mapped[int] = mapped_column(Integer, default=0)
     tokens_in: Mapped[int] = mapped_column(Integer, default=0)
     tokens_out: Mapped[int] = mapped_column(Integer, default=0)
@@ -205,3 +212,234 @@ class AuditEvent(Base):
     chain_seq: Mapped[int] = mapped_column(BigInteger, default=0)
     prev_hash: Mapped[str] = mapped_column(String(64), default="")
     hash: Mapped[str] = mapped_column(String(64), default="")
+
+
+AUTOMATION_USER_ID = uuid.UUID("00000000-0000-4000-8000-00000000a070")
+
+
+class Incident(Base):
+    __tablename__ = "incidents"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    title: Mapped[str] = mapped_column(String(300))
+    severity: Mapped[str] = mapped_column(String(10), default="sev3")
+    status: Mapped[str] = mapped_column(String(20), default="open")
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id"))
+    namespace: Mapped[str] = mapped_column(String(253), default="*")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    hypotheses: Mapped[list] = mapped_column(JSONB, default=list)
+    source: Mapped[str] = mapped_column(String(20), default="manual")
+    fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    commander_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    postmortem: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    postmortem_status: Mapped[str] = mapped_column(String(20), default="none")
+    postmortem_approved_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class IncidentEvent(Base):
+    __tablename__ = "incident_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    incident_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("incidents.id", ondelete="CASCADE"))
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    kind: Mapped[str] = mapped_column(String(30))
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    type: Mapped[str] = mapped_column(String(40))
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    dedupe_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class KnowledgeSource(Base):
+    __tablename__ = "knowledge_sources"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    type: Mapped[str] = mapped_column(String(20))  # github | upload | incident
+    config: Mapped[dict] = mapped_column(JSONB, default=dict)
+    credential_ref: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    scope_environment: Mapped[str] = mapped_column(String(100), default="*")
+    scope_namespace: Mapped[str] = mapped_column(String(253), default="*")
+    service: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    owner: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    revision: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Document(Base):
+    __tablename__ = "documents"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    source_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("knowledge_sources.id", ondelete="CASCADE"))
+    path: Mapped[str] = mapped_column(String(1000))
+    title: Mapped[str] = mapped_column(String(500), default="")
+    kind: Mapped[str] = mapped_column(String(30), default="text")
+    revision: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    service: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    environment: Mapped[str] = mapped_column(String(100), default="*")
+    namespace: Mapped[str] = mapped_column(String(253), default="*")
+    owner: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    excluded_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    ord: Mapped[int] = mapped_column(Integer)
+    heading: Mapped[str] = mapped_column(String(500), default="")
+    text: Mapped[str] = mapped_column(Text)
+    start_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    end_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class EmbeddingIndex(Base):
+    __tablename__ = "embedding_indexes"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    backend: Mapped[str] = mapped_column(String(20))
+    llm_config_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("llm_configs.id", ondelete="SET NULL"), nullable=True)
+    model_key: Mapped[str] = mapped_column(String(300))
+    dimensions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    index_name: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(20), default="building")
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ActionPlan(Base):
+    __tablename__ = "action_plans"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    incident_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("incidents.id", ondelete="SET NULL"), nullable=True)
+    investigation_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("investigations.id", ondelete="SET NULL"), nullable=True)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id"))
+    namespace: Mapped[str] = mapped_column(String(253))
+    action: Mapped[str] = mapped_column(String(40))
+    target_kind: Mapped[str] = mapped_column(String(40))
+    target_name: Mapped[str] = mapped_column(String(253))
+    params: Mapped[dict] = mapped_column(JSONB, default=dict)
+    reason: Mapped[str] = mapped_column(Text)
+    evidence: Mapped[list] = mapped_column(JSONB, default=list)
+    expected_impact: Mapped[str] = mapped_column(Text, default="")
+    blast_radius: Mapped[str] = mapped_column(Text, default="")
+    preconditions: Mapped[list] = mapped_column(JSONB, default=list)
+    validation: Mapped[list] = mapped_column(JSONB, default=list)
+    rollback: Mapped[str] = mapped_column(Text, default="")
+    auto_recover: Mapped[bool] = mapped_column(Boolean, default=True)
+    pre_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    requires_approval: Mapped[bool] = mapped_column(Boolean, default=True)
+    plan_hash: Mapped[str] = mapped_column(String(64))
+    requested_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    executed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Approval(Base):
+    __tablename__ = "approvals"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    plan_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("action_plans.id", ondelete="CASCADE"))
+    approver_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    decision: Mapped[str] = mapped_column(String(10))
+    plan_hash: Mapped[str] = mapped_column(String(64))
+    comment: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DiagnosticSession(Base):
+    __tablename__ = "diagnostic_sessions"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id"))
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("action_plans.id", ondelete="SET NULL"), nullable=True)
+    image_key: Mapped[str] = mapped_column(String(60))
+    image: Mapped[str] = mapped_column(String(300))
+    packages: Mapped[list] = mapped_column(JSONB, default=list)
+    elevated: Mapped[bool] = mapped_column(Boolean, default=False)
+    ttl_minutes: Mapped[int] = mapped_column(Integer)
+    pod_name: Mapped[str | None] = mapped_column(String(253), nullable=True)
+    pod_namespace: Mapped[str | None] = mapped_column(String(253), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="requested")
+    requested_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    reason: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DiagnosticCommand(Base):
+    __tablename__ = "diagnostic_commands"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("diagnostic_sessions.id", ondelete="CASCADE"))
+    actor_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    tool: Mapped[str] = mapped_column(String(40))
+    args: Mapped[dict] = mapped_column(JSONB, default=dict)
+    argv: Mapped[list] = mapped_column(JSONB, default=list)
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AlertEvent(Base):
+    __tablename__ = "alert_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id"))
+    source: Mapped[str] = mapped_column(String(20))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    alertname: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(10))
+    labels: Mapped[dict] = mapped_column(JSONB, default=dict)
+    annotations: Mapped[dict] = mapped_column(JSONB, default=dict)
+    starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    decision: Mapped[str] = mapped_column(String(20))
+    incident_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("incidents.id", ondelete="SET NULL"), nullable=True)
+    investigation_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("investigations.id", ondelete="SET NULL"), nullable=True)
+
+
+class EvalRun(Base):
+    __tablename__ = "eval_runs"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    dataset: Mapped[str] = mapped_column(String(100))
+    mode: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), default="running")
+    score: Mapped[Decimal | None] = mapped_column(Numeric(6, 4), nullable=True)
+    results: Mapped[list] = mapped_column(JSONB, default=list)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

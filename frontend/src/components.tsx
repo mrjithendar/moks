@@ -18,6 +18,12 @@ export function Layout({ children }: { children: ReactNode }) {
         <NavLink to="/" end>Overview</NavLink>
         {can("investigation.read") && <NavLink to="/investigate">Investigate</NavLink>}
         {can("investigation.read") && <NavLink to="/investigations">Investigations</NavLink>}
+        {can("investigation.read") && <NavLink to="/incidents">Incidents</NavLink>}
+        {(can("action.request") || can("action.approve")) && <NavLink to="/actions">Approvals &amp; actions</NavLink>}
+        {can("action.request") && <NavLink to="/diagnostics">Diagnostics</NavLink>}
+        {can("investigation.read") && <NavLink to="/knowledge">Runbooks &amp; knowledge</NavLink>}
+        {can("investigation.read") && <NavLink to="/skills">SRE skills</NavLink>}
+        {can("finops.read") && <NavLink to="/finops">FinOps</NavLink>}
         {can("explorer.read") && <>
           <div className="group">Live</div>
           <NavLink to="/explorer">Kubernetes explorer</NavLink>
@@ -30,6 +36,7 @@ export function Layout({ children }: { children: ReactNode }) {
         {can("admin.connectors") && <NavLink to="/admin/connectors">Connectors</NavLink>}
         {can("admin.llm") && <NavLink to="/admin/llm">LLM providers</NavLink>}
         {can("admin.users") && <NavLink to="/admin/users">Users &amp; roles</NavLink>}
+        {can("admin.policies") && <NavLink to="/evals">Evaluation</NavLink>}
         <div className="spacer" />
         <div className="user">
           <div title={me?.email}>{me?.display_name}</div>
