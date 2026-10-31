@@ -20,3 +20,4 @@ bedrock_inference_profile_id = "us.amazon.nova-2-lite-v1:0" # same profile RoboS
 bedrock_model_id             = "amazon.nova-2-lite-v1:0"
 cloudwatch_log_group_arns    = []   # CloudWatch connector: list allowed log group ARNs
 finops_enabled               = true # Cost Explorer + Budgets read for the FinOps page
+terminal_enabled             = true # read-only role and gateway user for web terminals (docs/TERMINAL.md)

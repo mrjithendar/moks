@@ -19,3 +19,4 @@ kubeconfig*
 .DS_Store
 
 moks-secrets.yaml
+roboshop-secrets.yaml

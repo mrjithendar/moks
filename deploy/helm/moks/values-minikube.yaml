@@ -101,6 +101,30 @@ diagnostics:
   enabled: true
   namespace: moks-diagnostics
 
+# Web terminal (docs/TERMINAL.md). enabled: true fails to render until image.digest is set, so set both together.
+terminal:
+  enabled: true
+  image: "busybox"
+  tag: "latest"
+  imagePullSecrets: [ecr-pull]   # created in every namespace by the ecr-refresh CronJob (tools repo)
+  profiles:
+    - name: mk4-readonly
+      label: mk4, read-only
+      environment: mk4
+      account: "881026659929"
+      roleArn: arn:aws:iam::881026659929:role/moks/moks-terminal-readonly
+      regions: [us-east-1]
+      eksClusters: []
+      inCluster: true
+  kubernetes:
+    namespaces: [moks-lab]       # add namespaces only when a shell should read them
+  network:
+    apiServer: true
+    egress:                      # AWS needs HTTPS, so sessions reach any public HTTPS host
+      - cidr: 0.0.0.0/0
+        except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+        ports: [443]
+
 networkPolicy:
   apiServer:
     cidrs: [10.96.0.1/32, 192.168.49.2/32]   # kubernetes Service VIP and the endpoint behind it

@@ -140,7 +140,7 @@ Each step here is a change to AWS or to mk4, and is yours to run.
 4. **Migration:** take and verify a backup, then deploy so that migration 0023 runs. It adds `terminal_sessions` and widens the list of allowed roles.
 5. **Database role:** run `moks db-grants` with `MOKS_DB_PASSWORD_TERMINAL` set.
 6. **Secret:** create `moks-terminal-secrets` from `deploy/secrets/moks-terminal-secrets.example.yaml`.
-7. **Pull secret:** create `ecr-pull` in `moks-terminals`, and add that namespace to `TARGET_NAMESPACES` of the ecr-refresh CronJob in the tools repo.
+7. **Pull secret:** the ecr-refresh CronJob (tools repo) creates `ecr-pull` in every namespace, but only every 6 hours. Once `moks-terminals` exists, run it once: `kubectl -n roboshop-ai create job ecr-refresh-now --from=cronjob/ecr-refresh`.
 8. **Values:** set `terminal.enabled`, `terminal.image.digest`, `terminal.imagePullSecrets: [ecr-pull]`, `terminal.profiles`, `terminal.kubernetes.namespaces` and `terminal.network`.
 9. **Argo:** apply `deploy/argocd/project.yaml`, then sync without prune.
 10. **Grant** the `terminal` role to one person, and open a session in `moks-lab`.
