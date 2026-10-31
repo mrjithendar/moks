@@ -78,10 +78,11 @@ variable "bedrock_enabled" {
   default = false
 }
 
+# No default on purpose: without tfvars/mk4.tfvars every optional resource would be destroyed, so a run
+# that forgot -var-file must stop here. Always pass -var-file=tfvars/mk4.tfvars.
 variable "terminal_enabled" {
   description = "Create the read-only role terminals assume, and the IAM user the gateway uses on mk4. No key is created by Terraform."
   type        = bool
-  default     = false
 }
 
 variable "terminal_gateway_role_arns" {
