@@ -39,7 +39,6 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
        "connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'")
 
 
-@asynccontextmanager
 async def _follow_skills(stop: asyncio.Event) -> None:
     """Registers the image's skills, then follows the active generation and reports what this process runs."""
     from . import versions
@@ -58,6 +57,7 @@ async def _follow_skills(stop: asyncio.Event) -> None:
         await asyncio.sleep(30)
 
 
+@asynccontextmanager
 async def lifespan(app: FastAPI):
     s = get_settings()
     stop = asyncio.Event()

@@ -399,3 +399,20 @@ def test_the_documented_example_skill_validates_and_its_case_runs():
     fx = yaml.safe_load((Path(gates.__file__).parent / "datasets/skills.yaml").read_text())["fixtures"][sk.meta.evaluation[0].fixture]
     planned = [p["tool"] for p in gates._plan(sk, fx["findings"], "payments")]
     assert all(t in planned for t in sk.meta.evaluation[0].expect.tools)
+
+
+async def test_the_real_app_starts_publishes_skills_and_reports_itself():
+    from moks.main import create_app
+
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        for _ in range(200):
+            import asyncio
+
+            await asyncio.sleep(0.02)
+            async with session_scope() as db:
+                if (await db.execute(select(ComponentVersion).where(ComponentVersion.component == "api"))).first():
+                    break
+        async with session_scope() as db:
+            row = (await db.execute(select(ComponentVersion).where(ComponentVersion.component == "api"))).scalars().first()
+        assert row is not None and row.skill_generation == skills.library().generation

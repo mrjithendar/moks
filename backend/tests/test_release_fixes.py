@@ -121,7 +121,7 @@ async def test_scope_change_reaches_opensearch_and_a_failure_saves_nothing(clien
         assert (await db.get(KnowledgeSource, sid)).scope_environment == "prod"
     await service.drain_outbox()
     async with session_scope() as db:
-        assert (await service.stats(db))["outbox"]["pending"] >= 1  # kept for retry, and visible
+        assert (await service.stats(db))["outbox"]["retrying"] >= 1  # kept for retry, and visible
     async with session_scope() as db:
         await db.execute(EmbeddingIndex.__table__.delete().where(EmbeddingIndex.backend == "opensearch"))
 
