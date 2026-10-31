@@ -5,7 +5,7 @@
 # Build context: deploy/terminal. Works on arm64 (mk4) and amd64 through BuildKit's TARGETARCH.
 
 FROM debian:trixie-20261027-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS base
-ARG DEBIAN_SNAPSHOT=20261015T000000Z
+ARG DEBIAN_SNAPSHOT=20261031T000000Z
 # Plain http is only for the base image, which has no CA certificates yet: apt verifies every package's signature.
 RUN printf '%s\n' \
       "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} trixie main" \

@@ -1,0 +1,7 @@
+# Findings accepted for now, each with a reason and an expiry. CI fails again on the date, so move to a
+# fixed release or decide again. Fix anything else instead of adding it here.
+
+# kubectl v1.37.2, the newest release, is built with x/net 0.57.0 and x/text 0.40.0, and release-1.37 has
+# not moved yet. Rebuilding kubectl here would lose its published checksum. Check each new 1.37 release.
+CVE-2026-78669 exp:2026-12-01
+CVE-2026-56851 exp:2026-12-01

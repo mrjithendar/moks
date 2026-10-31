@@ -102,6 +102,7 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
+          trivyignores: deploy/terminal/.trivyignore
       - uses: helm/kind-action@v1
         with: {cluster_name: kind}
       - name: Isolation on a real cluster
