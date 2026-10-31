@@ -136,15 +136,13 @@ Each step here is a change to AWS or to mk4, and is yours to run.
 
 1. **Terraform:** set `terminal_enabled = true` and apply. It also creates the `moks-terminal` repository and lets CI push there.
 2. **Image:** merge, and take the digest from CI's summary.
-3. **Key:** create an access key for `moks-terminal-gateway` by hand. Do not reuse `moks-mk4-runtime`.
-4. **Migration:** take and verify a backup, then deploy so that migration 0023 runs. It adds `terminal_sessions` and widens the list of allowed roles.
-5. **Database role:** run `moks db-grants` with `MOKS_DB_PASSWORD_TERMINAL` set.
-6. **Secret:** create `moks-terminal-secrets` from `deploy/secrets/moks-terminal-secrets.example.yaml`.
-7. **Pull secret:** the ecr-refresh CronJob (tools repo) creates `ecr-pull` in every namespace, but only every 6 hours. Once `moks-terminals` exists, run it once: `kubectl -n roboshop-ai create job ecr-refresh-now --from=cronjob/ecr-refresh`.
-8. **Values:** set `terminal.enabled`, `terminal.image.digest`, `terminal.imagePullSecrets: [ecr-pull]`, `terminal.profiles`, `terminal.kubernetes.namespaces` and `terminal.network`.
-9. **Argo:** apply `deploy/argocd/project.yaml`, then sync without prune.
-10. **Grant** the `terminal` role to one person, and open a session in `moks-lab`.
-11. **Verify on that cluster,** from inside the session:
+3. **Migration:** take and verify a backup, then deploy so that migration 0023 runs. It adds `terminal_sessions` and widens the list of allowed roles.
+4. **Key, database role and Secret:** run `scripts/create-terminal-secrets.sh`. It creates a key for `moks-terminal-gateway`, sets the `moks_terminal` password and grants through `moks db-grants`, and writes `moks-terminal-secrets`. Add `ROTATE=1` to replace them. Do not reuse `moks-mk4-runtime`.
+5. **Pull secret:** the ecr-refresh CronJob (tools repo) creates `ecr-pull` in every namespace, but only every 6 hours. Once `moks-terminals` exists, run it once: `kubectl -n roboshop-ai create job ecr-refresh-now --from=cronjob/ecr-refresh`.
+6. **Values:** set `terminal.enabled`, `terminal.image.digest`, `terminal.imagePullSecrets: [ecr-pull]`, `terminal.profiles`, `terminal.kubernetes.namespaces` and `terminal.network`.
+7. **Argo:** apply `deploy/argocd/project.yaml`, then sync without prune.
+8. **Grant** the `terminal` role to one person, and open a session in `moks-lab`.
+9. **Verify on that cluster,** from inside the session:
 
 ```sh
 MOKS_VERIFY_BLOCKED="moks-postgres.moks.svc.cluster.local:5432 moks-api.moks.svc.cluster.local:8080" moks-verify-isolation
