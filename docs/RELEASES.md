@@ -6,7 +6,7 @@ Git does not record which build is running. Check it with `/api/health`.
 
 ## Release
 
-1. A merge to `master` passes CI. CI builds one image, tags it with the commit SHA and moves `latest` to it. If CI fails, `latest` does not move.
+1. A pull request passes the `check` job, which runs on pull requests only. Merging it to `master` builds one image, tags it with the commit SHA and moves `latest` to it. A failed image build or smoke test leaves `latest` where it was. A direct push to `master` is released without `check`, so require `check` in branch protection.
 2. Check any migration the release brings. Migrations run when the new API pods start.
 3. Restart the pods, which pull `latest`:
 
