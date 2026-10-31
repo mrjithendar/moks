@@ -758,6 +758,42 @@ class DiagnosticSession(Base):
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class TerminalSession(Base):
+    """One disposable shell pod. No credential, terminal input or output is ever stored here."""
+    __tablename__ = "terminal_sessions"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    login_session: Mapped[str] = mapped_column(String(64))  # the portal sign-in that opened it
+    environment: Mapped[str] = mapped_column(String(100))
+    profile: Mapped[str] = mapped_column(String(100))
+    aws_account: Mapped[str] = mapped_column(String(12))
+    role_arn: Mapped[str] = mapped_column(Text)
+    region: Mapped[str] = mapped_column(String(30))
+    cluster: Mapped[str | None] = mapped_column(String(200), nullable=True)  # "in-cluster", an EKS name, or none
+    namespaces: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    purpose: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="starting")  # starting | ready | failed | ended
+    end_reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    image: Mapped[str] = mapped_column(Text)
+    pod_name: Mapped[str] = mapped_column(String(253))
+    pod_namespace: Mapped[str] = mapped_column(String(253))
+    pod_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    aws_identity: Mapped[str | None] = mapped_column(Text, nullable=True)
+    kube_identity: Mapped[str | None] = mapped_column(Text, nullable=True)
+    role_session_name: Mapped[str] = mapped_column(String(64))
+    idle_minutes: Mapped[int] = mapped_column(Integer)
+    lifetime_minutes: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    credential_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_input_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attachment: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # the browser connection in charge
+    attach_count: Mapped[int] = mapped_column(Integer, default=0)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class DiagnosticCommand(Base):
     __tablename__ = "diagnostic_commands"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)

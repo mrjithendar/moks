@@ -12,8 +12,11 @@ export default defineConfig({
   build: { outDir: "dist", sourcemap: false, assetsDir: "assets" },
   server: {
     port: 5173,
-    // `npm run dev` proxies the API to a local backend (moks serve on :8080).
-    proxy: { [`${base}api`]: { target: "http://localhost:8080", changeOrigin: false } },
+    // `npm run dev` proxies the API to a local backend (moks serve on :8080) and terminals to moks terminal on :8081.
+    proxy: {
+      [`${base}api/terminal`]: { target: "http://localhost:8081", changeOrigin: false, ws: true },
+      [`${base}api`]: { target: "http://localhost:8080", changeOrigin: false },
+    },
   },
   test: { environment: "jsdom", globals: false, env: { BASE_URL: base } },
 });

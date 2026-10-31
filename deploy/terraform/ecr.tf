@@ -14,6 +14,22 @@ resource "aws_ecr_repository" "moks" {
   }
 }
 
+# The terminal's diagnostic image. Sessions run it by digest, so tags cannot change what runs, and
+# nothing here expires: an old digest must stay pullable until the chart moves on from it.
+resource "aws_ecr_repository" "terminal" {
+  name                 = "${var.repository_name}-terminal"
+  image_tag_mutability = "IMMUTABLE"
+  force_delete         = false
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
 resource "aws_ecr_lifecycle_policy" "moks" {
   repository = aws_ecr_repository.moks.name
   policy = jsonencode({

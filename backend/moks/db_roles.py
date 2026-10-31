@@ -18,7 +18,7 @@ RW = "SELECT, INSERT, UPDATE, DELETE"
 READ = "SELECT"
 APPEND = "SELECT, INSERT"
 
-ROLES = ("moks_api", "moks_worker", "moks_executor", "moks_backup")
+ROLES = ("moks_api", "moks_worker", "moks_executor", "moks_backup", "moks_terminal")
 
 _API_RW = ("users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_events", "evidence",
            "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks", "embedding_indexes", "conversations", "conversation_participants", "conversation_reads", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations",
@@ -31,8 +31,11 @@ _EXECUTOR_RW = ("diagnostic_sessions", "diagnostic_commands", "incidents", "inci
 TABLES = ("users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_events", "evidence", "audit_events",
           "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks", "embedding_indexes", "conversations", "conversation_participants", "conversation_reads", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations",
           "conversation_messages", "backup_runs", "backup_stores", "database_backups", "database_backup_schedules", "skill_policies", "detection_policies", "detection_runs", "detection_states", "maintenance_windows",
-          "saved_queries", "index_outbox", "llm_reservations", "component_versions", "action_plans", "approvals", "diagnostic_sessions", "diagnostic_commands", "alert_events", "eval_runs", "alembic_version")
-HIDDEN = {"moks_worker": {"sessions"}, "moks_executor": {"sessions"}}  # session hashes are the API's business
+          "saved_queries", "index_outbox", "llm_reservations", "component_versions", "action_plans", "approvals", "diagnostic_sessions", "diagnostic_commands", "terminal_sessions", "alert_events", "eval_runs", "alembic_version")
+# The gateway signs people in and runs shells, so it sees only that. Its session updates are the two columns load() touches.
+_TERMINAL_READS = {"users", "role_bindings", "sessions", "environments", "terminal_sessions", "alembic_version"}
+HIDDEN = {"moks_worker": {"sessions", "terminal_sessions"}, "moks_executor": {"sessions", "terminal_sessions"},  # session hashes are the API's business
+          "moks_terminal": set(TABLES) - _TERMINAL_READS}
 
 API_PLAN_COLUMNS = ("status", "plan_hash", "executed_by", "queued_at", "finished_at", "result")
 EXECUTOR_PLAN_COLUMNS = ("status", "worker_id", "executed_at", "heartbeat_at", "lease_expires_at", "execution_token", "mutation_state", "checkpoint", "finished_at", "result")
@@ -49,6 +52,7 @@ def statements() -> list[str]:
     out += [f"GRANT {RW} ON {t} TO moks_worker" for t in _WORKER_RW]
     out += [f"GRANT {RW} ON {t} TO moks_executor" for t in _EXECUTOR_RW]
     out += [f"GRANT {APPEND} ON audit_events TO {r}" for r in ROLES]
+    out += [f"GRANT {RW} ON terminal_sessions TO moks_terminal", "GRANT UPDATE (last_seen_at, revoked_at) ON sessions TO moks_terminal"]
     out += ["GRANT INSERT ON approvals TO moks_api", "GRANT INSERT ON action_plans TO moks_api", "GRANT INSERT ON backup_runs TO moks_backup",
             f"GRANT UPDATE ({', '.join(API_PLAN_COLUMNS)}) ON action_plans TO moks_api",
             f"GRANT UPDATE ({', '.join(EXECUTOR_PLAN_COLUMNS)}) ON action_plans TO moks_executor"]

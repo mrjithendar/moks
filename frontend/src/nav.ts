@@ -23,6 +23,7 @@ export const NAV: NavGroup[] = [
   { label: "Operate", items: [
     { to: "/actions", label: "Approvals & actions", icon: "check", show: (can) => can("action.request") || can("action.approve") },
     { to: "/diagnostics", label: "Diagnostics", icon: "tool", show: (can) => can("action.request") },
+    { to: "/terminal", label: "Terminal", icon: "terminal", show: (can) => can("terminal.use") || can("terminal.revoke") },
     { to: "/explorer", label: "Kubernetes explorer", icon: "cube", show: live },
     { to: "/backups", label: "Backups", icon: "archive", show: (can) => can("backup.read") },
   ] },

@@ -1,0 +1,14 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::<account>:role/<moks-terminal-gateway-role>"},
+      "Action": ["sts:AssumeRole", "sts:SetSourceIdentity"],
+      "Condition": {
+        "StringLike": {"sts:RoleSessionName": ["moks-term-*", "moks-audit-*"]},
+        "Null": {"sts:SourceIdentity": "false"}
+      }
+    }
+  ]
+}

@@ -32,6 +32,8 @@ class P(StrEnum):
     FINOPS_READ = "finops.read"              # cost, allocation and rightsizing data
     BACKUP_READ = "backup.read"              # cluster backup status (names and counts, no contents)
     INCIDENT_WRITE = "incident.write"        # create/update incidents and timelines
+    TERMINAL_USE = "terminal.use"            # open a shell; granted only by the terminal role, never by admin
+    TERMINAL_REVOKE = "terminal.revoke"      # end someone else's terminal session; never attach to it
     ADMIN_USERS = "admin.users"
     ADMIN_CONNECTORS = "admin.connectors"
     ADMIN_LLM = "admin.llm"
@@ -42,13 +44,15 @@ _VIEWER = {P.OVERVIEW_READ, P.INVESTIGATION_READ}
 _INVESTIGATOR = _VIEWER | {P.INVESTIGATION_RUN, P.EXPLORER_READ, P.METRICS_RAW_QUERY, P.FINOPS_READ, P.INCIDENT_WRITE, P.BACKUP_READ}
 _OPERATOR = _INVESTIGATOR | {P.ACTION_REQUEST, P.ACTION_EXECUTE}
 _APPROVER = _VIEWER | {P.ACTION_APPROVE, P.FINOPS_READ, P.BACKUP_READ}
-_ADMIN = set(P)
+_TERMINAL = _VIEWER | {P.TERMINAL_USE}
+_ADMIN = set(P) - {P.TERMINAL_USE}  # a shell is arbitrary code: it is granted to a person on purpose, not bundled
 
 ROLES: dict[str, frozenset[P]] = {
     "viewer": frozenset(_VIEWER),
     "investigator": frozenset(_INVESTIGATOR),
     "operator": frozenset(_OPERATOR),
     "approver": frozenset(_APPROVER),
+    "terminal": frozenset(_TERMINAL),
     "admin": frozenset(_ADMIN),
 }
 
@@ -57,16 +61,18 @@ ROLE_DESCRIPTIONS = {
     "investigator": "Run read-only investigations, live reads, knowledge and FinOps queries; manage incidents.",
     "operator": "Request and execute permitted operational actions and diagnostic sessions.",
     "approver": "Approve or reject action plans within the assigned scope (never their own).",
-    "admin": "Manage users, connectors, LLM providers and policies. Their own action plans need no second approval.",
+    "terminal": "Open a disposable Bash terminal with short-lived, read-only credentials. Needs namespace '*'. Not part of any other role, including admin.",
+    "admin": "Manage users, connectors, LLM providers and policies, and end anyone's terminal session. Their own action plans need no second approval.",
 }
 
 # Permissions that only make sense globally: a binding grants them only when both its
 # environment and namespace are '*'.
-GLOBAL_PERMISSIONS = {P.ADMIN_USERS, P.ADMIN_CONNECTORS, P.ADMIN_LLM, P.ADMIN_POLICIES, P.AUDIT_READ}
+GLOBAL_PERMISSIONS = {P.ADMIN_USERS, P.ADMIN_CONNECTORS, P.ADMIN_LLM, P.ADMIN_POLICIES, P.AUDIT_READ, P.TERMINAL_REVOKE}
 
 # Raw PromQL cannot be reliably restricted to a namespace, so it requires a binding whose
 # namespace is '*' for the environment. Namespace-scoped users get templated metric tools.
-NAMESPACE_WIDE_PERMISSIONS = {P.METRICS_RAW_QUERY}
+# A terminal's reach is set by its IAM role and Kubernetes RBAC, not by a MOKS namespace, so the same rule applies.
+NAMESPACE_WIDE_PERMISSIONS = {P.METRICS_RAW_QUERY, P.TERMINAL_USE}
 
 
 @dataclass(frozen=True)

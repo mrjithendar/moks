@@ -12,9 +12,11 @@ const investigate = () => import("./pages/Investigate");
 const live = () => import("./pages/Live");
 const ops = () => import("./pages/Ops");
 const backups = () => import("./pages/Backups");
+const terminal = () => import("./pages/Terminal");
 const page = <M,>(load: () => Promise<M>, name: keyof M) => lazy(() => load().then((m) => ({ default: m[name] as ComponentType })));
 
 const Audit = page(admin, "Audit"), Connectors = page(admin, "Connectors"), Environments = page(admin, "Environments"), LLMProviders = page(admin, "LLMProviders"), Users = page(admin, "Users");
+const Terminals = page(terminal, "Terminals"), TerminalView = page(terminal, "TerminalView");
 const Backups = page(backups, "Backups"), BackupStorage = page(backups, "BackupStorage");
 const Workspace = lazy(() => import("./pages/Conversations").then((m) => ({ default: m.Workspace })));
 const InvestigationView = page(investigate, "InvestigationView"), NewInvestigation = page(investigate, "NewInvestigation");
@@ -60,6 +62,8 @@ export default function App() {
         <Route path="/actions/:id" element={<Need any={["investigation.read", "action.approve"]}><PlanView /></Need>} />
         <Route path="/diagnostics" element={<Need any={["action.request"]}><Diagnostics /></Need>} />
         <Route path="/diagnostics/:id" element={<Need any={["action.request"]}><DiagnosticView /></Need>} />
+        <Route path="/terminal" element={<Need any={["terminal.use", "terminal.revoke"]}><Terminals /></Need>} />
+        <Route path="/terminal/:id" element={<Need any={["terminal.use", "terminal.revoke"]}><TerminalView /></Need>} />
         <Route path="/knowledge" element={<Knowledge />} />
         <Route path="/finops" element={<Need any={["finops.read"]}><FinOps /></Need>} />
         <Route path="/evals" element={<Need any={["admin.policies"]}><Evals /></Need>} />

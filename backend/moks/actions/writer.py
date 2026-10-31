@@ -16,7 +16,7 @@ from typing import Any
 from .. import velero
 from ..config import get_settings
 from ..connectors.base import ConnectorError
-from ..connectors.kubernetes import KubernetesConnector, _api_error, summarize_pod, summarize_workload
+from ..connectors.kubernetes import KubernetesConnector, _api_error, open_exec, summarize_pod, summarize_workload
 
 STRATEGIC = "application/strategic-merge-patch+json"
 MERGE = "application/merge-patch+json"
@@ -252,15 +252,12 @@ class KubernetesWriter:
     async def exec_stream(self, ns: str, pod: str, container: str, argv: list[str], sink, timeout: int) -> tuple[int | None, str]:
         """Runs a fixed command and hands its stdout to sink as it arrives. Returns the exit code, None
         when the stream ended without one, and the end of stderr."""
-        from kubernetes_asyncio import client
         from kubernetes_asyncio.stream import WsApiClient
 
         cfg = (await self.read._client()).configuration
         async with WsApiClient(configuration=cfg) as ws:
-            api = client.CoreV1Api(api_client=ws)
             try:
-                resp = await asyncio.wait_for(api.connect_get_namespaced_pod_exec(
-                    pod, ns, command=argv, container=container, stderr=True, stdout=True, stdin=False, tty=False, _preload_content=False), 15)
+                resp = await asyncio.wait_for(open_exec(ws, pod, ns, command=argv, container=container, stderr=True, stdout=True, stdin=False, tty=False), 15)
             except Exception as exc:
                 raise _api_error(exc, f"exec in {ns}/{pod}") from None
             err, code = bytearray(), None
@@ -287,15 +284,12 @@ class KubernetesWriter:
     async def exec(self, ns: str, pod: str, argv: list[str], timeout: int = 30, max_bytes: int = 64_000) -> tuple[int | None, str]:
         """Run argv (no shell) in a diagnostic pod; returns (exit code, combined output, truncated)."""
         self._diag_ns(ns)
-        from kubernetes_asyncio import client
         from kubernetes_asyncio.stream import WsApiClient
 
         cfg = (await self.read._client()).configuration
         async with WsApiClient(configuration=cfg) as ws:
-            api = client.CoreV1Api(api_client=ws)
             try:
-                resp = await asyncio.wait_for(api.connect_get_namespaced_pod_exec(
-                    pod, ns, command=argv, stderr=True, stdout=True, stdin=False, tty=False, _preload_content=False), 10)
+                resp = await asyncio.wait_for(open_exec(ws, pod, ns, command=argv, stderr=True, stdout=True, stdin=False, tty=False), 10)
             except Exception as exc:
                 raise _api_error(exc, "exec in diagnostic pod") from None
             out, code = bytearray(), None

@@ -49,7 +49,7 @@ resource "aws_iam_role_policy" "ci_push" {
           "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage",
           "ecr:DescribeImages", "ecr:DescribeRepositories",
         ]
-        Resource = aws_ecr_repository.moks.arn
+        Resource = [aws_ecr_repository.moks.arn, aws_ecr_repository.terminal.arn]
       },
     ]
   })

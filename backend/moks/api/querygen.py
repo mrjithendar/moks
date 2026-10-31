@@ -68,7 +68,7 @@ async def _unless_disconnected(request: Request, coro) -> Any:
     return task.result()
 
 
-async def draft(request: Request, cfg: LLMConfig, system: str, user: str, user_id: uuid.UUID) -> dict:
+async def draft(request: Request, cfg: LLMConfig, system: str, user: str, user_id: uuid.UUID, needs_query: bool = True) -> dict:
     """The model's answer as a dictionary whose `query` is a string, or a clear HTTP error."""
     try:
         resp = await _unless_disconnected(request, budget.complete(provider_for(cfg), system, [{"role": "user", "content": user}], json_mode=True,
@@ -80,6 +80,6 @@ async def draft(request: Request, cfg: LLMConfig, system: str, user: str, user_i
         raise HTTPException(502, f"the model could not answer: {exc.message}") from None
     except (ValueError, json.JSONDecodeError):
         raise HTTPException(502, USABLE) from None
-    if not isinstance(data, dict) or not isinstance(data.get("query"), str):
+    if not isinstance(data, dict) or (needs_query and not isinstance(data.get("query"), str)):
         raise HTTPException(502, USABLE)
     return data

@@ -1,0 +1,238 @@
+{{- if .Values.terminal.enabled }}
+{{- $ns := .Values.terminal.namespace }}
+{{- $t := .Values.terminal }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (toString $t.image.digest)) }}{{- fail "terminal.image.digest must be sha256:<64 hex characters>: terminals run a pinned, scanned image, never a tag" }}{{- end }}
+{{- if not $t.profiles }}{{- fail "terminal.profiles is empty: a terminal needs an explicit account, role and region" }}{{- end }}
+# One disposable pod per session, reached only through the moks-terminal gateway. A shell is arbitrary
+# code in here: these limits, the session's IAM role and its RBAC are the controls. See docs/TERMINAL.md.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: moks
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata: {name: terminals, namespace: {{ $ns }}}
+spec:
+  hard:
+    pods: {{ $t.quota.pods | quote }}
+    limits.cpu: {{ $t.quota.cpu | quote }}
+    limits.memory: {{ $t.quota.memory | quote }}
+    limits.ephemeral-storage: {{ $t.quota.ephemeralStorage | quote }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata: {name: terminals, namespace: {{ $ns }}}
+spec:
+  limits:
+    - type: Container
+      max: {cpu: {{ $t.resources.cpu | quote }}, memory: {{ $t.resources.memory | quote }}, ephemeral-storage: 512Mi}
+      default: {cpu: 250m, memory: 256Mi, ephemeral-storage: 256Mi}
+      defaultRequest: {cpu: 50m, memory: 128Mi, ephemeral-storage: 64Mi}
+---
+# Default deny. Nothing connects in: the shell is reached by exec through the API server. Going out
+# there is DNS, the API server when a profile needs it, and exactly what terminal.network.egress lists.
+# NetworkPolicy matches addresses, not hostnames, so "AWS only" cannot be written here. See docs/TERMINAL.md.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: terminals, namespace: {{ $ns }}}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    {{- if $t.network.apiServer }}
+    {{- with .Values.networkPolicy.apiServer.cidrs }}
+    - to:
+        {{- range . }}
+        - ipBlock: {cidr: {{ . }}}
+        {{- end }}
+      ports:
+        {{- range $.Values.networkPolicy.apiServer.ports }}
+        - {port: {{ . }}, protocol: TCP}
+        {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- range $t.network.egress }}
+    - to:
+        - ipBlock:
+            cidr: {{ .cidr }}
+            {{- with .except }}
+            except: {{ toJson . }}
+            {{- end }}
+      ports:
+        {{- range .ports }}
+        - {port: {{ . }}, protocol: TCP}
+        {{- end }}
+    {{- end }}
+---
+# The identity a shell's kubectl uses. Its pods never mount a token: the gateway issues one per
+# session, bound to the pod, so deleting the pod ends it.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: moks-terminal-session, namespace: {{ $ns }}}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: moks-terminal-reader
+  labels: {{- include "moks.labels" . | nindent 4 }}
+rules:   # no Secrets, no ConfigMap contents, no exec, attach or port-forward, and no write verb
+  - apiGroups: [""]
+    resources: [pods, pods/log, services, endpoints, events, namespaces, persistentvolumeclaims]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, statefulsets, daemonsets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, networkpolicies]
+    verbs: [get, list, watch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch]
+{{- range $t.kubernetes.namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: moks-terminal-reader, namespace: {{ . }}}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: moks-terminal-reader}
+subjects:
+  - {kind: ServiceAccount, name: moks-terminal-session, namespace: {{ $ns }}}
+{{- end }}
+---
+# The gateway: its own identity, and power over this namespace only. Not moks-executor, and no write
+# access to anything that runs a workload.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: moks-terminal
+  labels: {{- include "moks.labels" . | nindent 4 }}
+  {{- with $t.gateway.serviceAccountAnnotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: moks-terminal-gateway, namespace: {{ $ns }}}
+rules:
+  - {apiGroups: [""], resources: [pods], verbs: [create, get, list, delete]}
+  - {apiGroups: [""], resources: [pods/exec], verbs: [create, get]}
+  - {apiGroups: [""], resources: [serviceaccounts/token], resourceNames: [moks-terminal-session], verbs: [create]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: moks-terminal-gateway, namespace: {{ $ns }}}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: moks-terminal-gateway}
+subjects:
+  - {kind: ServiceAccount, name: moks-terminal, namespace: {{ .Release.Namespace }}}
+{{- if .Values.ecrRefresh.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: ecr-refresh, namespace: {{ $ns }}}
+rules:
+  - {apiGroups: [""], resources: [secrets], resourceNames: [ecr-pull], verbs: [get, patch]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: ecr-refresh, namespace: {{ $ns }}}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: ecr-refresh}
+subjects:
+  - {kind: ServiceAccount, name: {{ .Values.ecrRefresh.serviceAccount }}, namespace: {{ .Values.ecrRefresh.namespace }}}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moks-terminal
+  labels: {{- include "moks.labels" . | nindent 4 }}
+    app.kubernetes.io/component: terminal
+spec:
+  replicas: {{ $t.gateway.replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: {app: moks, component: terminal}
+  template:
+    metadata:
+      labels: {app: moks, component: terminal}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: moks-terminal
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "moks.podSecurity" . | nindent 6 }}
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: wait-schema
+          image: {{ include "moks.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [wait-schema]
+          envFrom:
+            - configMapRef: {name: moks-config}
+            - secretRef: {name: {{ $t.gateway.existingSecret }}}
+          {{- include "moks.containerSecurity" . | nindent 10 }}
+          resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+      containers:
+        - name: terminal
+          image: {{ include "moks.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [terminal]
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: metrics, containerPort: 9464}
+          envFrom:
+            - configMapRef: {name: moks-config}
+            - secretRef: {name: {{ $t.gateway.existingSecret }}}   # database, session secret and AWS base identity; nothing else
+          env:
+            - {name: FORWARDED_ALLOW_IPS, value: "*"}  # only Traefik can reach :8080 (NetworkPolicy)
+            - {name: MOKS_PROCESS_ROLE, value: terminal}
+            - {name: MOKS_TERMINAL_NAMESPACE, value: {{ $ns | quote }}}
+            - {name: MOKS_TERMINAL_IMAGE, value: "{{ $t.image.repository }}@{{ $t.image.digest }}"}
+            - {name: MOKS_TERMINAL_IMAGE_PULL_SECRETS, value: {{ join "," $t.imagePullSecrets | quote }}}
+            - {name: MOKS_TERMINAL_PROFILES, value: {{ toJson $t.profiles | quote }}}
+            - {name: MOKS_TERMINAL_KUBE_NAMESPACES, value: {{ join "," $t.kubernetes.namespaces | quote }}}
+            - {name: MOKS_TERMINAL_IDLE_MINUTES, value: {{ $t.idleMinutes | quote }}}
+            - {name: MOKS_TERMINAL_MAX_MINUTES, value: {{ $t.maxMinutes | quote }}}
+            - {name: MOKS_TERMINAL_USER_SESSIONS, value: {{ $t.userSessions | quote }}}
+            - {name: MOKS_TERMINAL_CPU_LIMIT, value: {{ $t.resources.cpu | quote }}}
+            - {name: MOKS_TERMINAL_MEMORY_LIMIT, value: {{ $t.resources.memory | quote }}}
+          {{- include "moks.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+          startupProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 3, failureThreshold: 40}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 20, timeoutSeconds: 3, failureThreshold: 3}
+          readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3}
+          resources: {{- toYaml $t.gateway.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moks-terminal
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  selector: {app: moks, component: terminal}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+{{- end }}

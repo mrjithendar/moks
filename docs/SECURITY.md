@@ -181,6 +181,10 @@ argv templates from the catalog with validated arguments (hosts, URLs, ports, jq
 no shell, metadata and loopback targets are refused, and none of it is exposed to the LLM. Output
 is redacted and audited, and pods are deleted at TTL or termination.
 
+## Web terminal
+
+A separate component, disposable pods and a role of its own: see [TERMINAL.md](TERMINAL.md). `terminal.use` is granted only by the `terminal` role, which no other role includes, not even `admin`. It needs namespace `*`, because a shell's reach is set by IAM and Kubernetes RBAC, not by a MOKS namespace. `terminal.revoke` lets an admin end a session, never attach to it. Terminal input and output are not stored, and never reach an LLM.
+
 ## Alerts
 
 The webhook requires `Authorization: Bearer $MOKS_ALERT_WEBHOOK_TOKEN` (disabled when unset) and is

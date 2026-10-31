@@ -2,6 +2,7 @@ name: moks
 
 # check   -> pull requests only: backend tests against PostgreSQL, frontend typecheck/build,
 #            Helm lint/render
+# terminal -> pull requests only: diagnostic image build, scan and isolation test on kind
 # release -> default branch: build the arm64 image once, tag it with the commit and move latest to it.
 #            mk4 runs latest, and new pods pull it when restarted. CI never touches the cluster.
 
@@ -66,6 +67,51 @@ jobs:
           terraform init -backend=false -input=false
           terraform validate
 
+  # The diagnostic image on both architectures, its vulnerability scan, and real isolation checks on
+  # kind, which runs the same network plugin as mk4. Runs when something the terminal depends on changes.
+  terminal:
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@v7
+        with: {python-version: "3.12"}
+      - uses: azure/setup-helm@v5
+      - uses: docker/setup-buildx-action@v4
+      - name: Build
+        run: docker buildx build --load -t moks-terminal:test deploy/terminal
+      - name: Runs read-only, unprivileged, with every tool present
+        run: |
+          docker run --rm --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges --user 10002:10002 moks-terminal:test \
+            bash -c 'aws --version && kubectl version --client && curl --version | head -1 && jq --version && dig -v && tmux -V && test "$(id -u)" = 10002'
+      - name: The shell survives detaching, as a reconnect needs
+        run: |
+          docker run --rm --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges --user 10002:10002 -e HOME=/tmp/home -e TMUX_TMPDIR=/tmp moks-terminal:test bash -c '
+            tmux -u new-session -d -s moks && sleep 1 && tmux send-keys -t moks "echo still-$((40+2))" Enter && sleep 1
+            tmux capture-pane -p -t moks | grep -q still-42 && tmux has-session -t moks'
+      - name: Scan
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: moks-terminal:test
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - uses: helm/kind-action@v1
+        with: {cluster_name: kind}
+      - name: Isolation on a real cluster
+        env:
+          IMAGE: moks-terminal:test
+        run: |
+          pip install -r backend/requirements.txt
+          pip install --no-deps -e backend
+          scripts/terminal-isolation-test.sh
+
   release:
     needs: check
     # check is skipped on a push, and a skipped need would skip this job too, so that case is allowed here.
@@ -105,3 +151,38 @@ jobs:
           docker tag "$IMAGE" "$LATEST"
           docker push "$LATEST"
           echo "pushed $IMAGE and $LATEST ($DIGEST). Restart mk4 to run it; see docs/RELEASES.md." >> "$GITHUB_STEP_SUMMARY"
+
+  # Pushed only when the image changed. Sessions run a digest, so this changes nothing until the chart's
+  # terminal.image.digest is moved to what this reports.
+  terminal-image:
+    if: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      REPOSITORY: moks-terminal
+    steps:
+      - uses: actions/checkout@v7
+        with: {fetch-depth: 2}
+      - id: changed
+        run: git diff --quiet HEAD~1 HEAD -- deploy/terminal || echo "image=true" >> "$GITHUB_OUTPUT"
+      - if: steps.changed.outputs.image == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: moks-ci-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+      - if: steps.changed.outputs.image == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - if: steps.changed.outputs.image == 'true'
+        uses: docker/setup-buildx-action@v4
+      - if: steps.changed.outputs.image == 'true'
+        name: Build and push for arm64 and amd64
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:${{ github.sha }}"
+          docker buildx build --platform linux/arm64,linux/amd64 --provenance=false --build-arg GIT_COMMIT=${{ github.sha }} -t "$IMAGE" --push --metadata-file meta.json deploy/terminal
+          echo "pushed $IMAGE. Set terminal.image.digest to $(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")." >> "$GITHUB_STEP_SUMMARY"

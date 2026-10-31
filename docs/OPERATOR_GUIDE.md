@@ -197,6 +197,10 @@ The API's init container runs migration `0002` automatically. Take a backup firs
    model, investigations and **Analyze with AI** use rule-based reports. Set input and output prices there
    so FinOps can show cost as well as tokens. An inactive provider can be deleted; its usage history stays.
 
+## Enabling the web terminal
+
+See [TERMINAL.md](TERMINAL.md). It is off until `terminal.enabled` is set, and needs a Terraform apply, a Secret, a database role and an image digest first.
+
 ## Using Amazon OpenSearch Service
 
 This keeps BM25 and k-NN search in a managed domain instead of a pod. Requests are signed with the AWS

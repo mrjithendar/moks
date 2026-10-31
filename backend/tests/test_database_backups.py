@@ -326,7 +326,10 @@ async def _stream(monkeypatch, frames):
 
         async def connect_get_namespaced_pod_exec(self, pod, ns, **kw):
             assert kw["container"] == "db" and kw["stdin"] is False and kw["tty"] is False
-            return resp
+
+            async def connected():  # as the real client: this returns a connection still to be awaited
+                return resp
+            return connected()
 
     async def client():
         return SimpleNamespace(configuration=None)

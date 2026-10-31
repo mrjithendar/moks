@@ -90,11 +90,23 @@ class Settings(BaseSettings):
     rag_chunk_overlap_tokens: int = 30
 
     # Executor and diagnostics
-    process_role: Literal["api", "worker", "executor"] = "api"
+    process_role: Literal["api", "worker", "executor", "terminal"] = "api"
     sync_timezone: str = "UTC"  # shown beside knowledge sync schedules
     database_volume_gib: int = 10  # capacity of the database volume, for the size alert
     diagnostics_namespace: str = "moks-diagnostics"
     velero_namespace: str = "velero"
+    # Terminal gateway. Profiles are JSON from the chart, so a change of IAM role is a reviewed change.
+    terminal_namespace: str = "moks-terminals"
+    terminal_image: str = ""
+    terminal_image_pull_secrets: str = ""
+    terminal_service_account: str = "moks-terminal-session"
+    terminal_profiles: str = "[]"
+    terminal_kube_namespaces: str = ""
+    terminal_idle_minutes: int = 15
+    terminal_max_minutes: int = 60
+    terminal_user_sessions: int = 2
+    terminal_cpu_limit: str = "500m"
+    terminal_memory_limit: str = "512Mi"
     argocd_namespace: str = "argocd"
     build_commit: str = "dev"  # baked into the image at build time
     llm_user_daily_budget_usd: float | None = None      # None: no per-person limit

@@ -452,3 +452,23 @@ select.manage { padding: 4px 6px; font-size: 12px; }
 @media (max-width: 900px) { .plan-decision { position: static; } }
 .menu-trigger svg, .ident-more svg { stroke-width: 3; }
 .skill-run { padding: var(--sp-2) 0; border-top: 1px solid var(--border-soft); }
+
+/* Terminal */
+.term-scope { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 8px 12px; margin-bottom: var(--sp-2); background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); font-size: var(--fs-xs); }
+.term-scope div { min-width: 0; overflow-wrap: anywhere; }
+.term-scope dt { display: inline; color: var(--muted); margin-right: 4px; }
+.term-scope dd { display: inline; margin: 0; font-family: var(--mono); }
+.term-frame { background: #0b0e12; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px; height: min(62vh, 640px); min-height: 280px; overflow: hidden; }
+.term-frame.off { opacity: .55; }
+.term-host { width: 100%; height: 100%; }
+.term-keys { display: flex; gap: 4px; flex-wrap: wrap; margin-top: var(--sp-2); }
+.term-keys button { min-width: 44px; min-height: 40px; }
+.term-suggestion { border-top: 1px solid var(--border-soft); padding-top: var(--sp-2); }
+@media (max-width: 900px) {
+  .term-frame { height: 52dvh; min-height: 220px; }
+  .term-scope { position: static; }
+}
+.term-scope-line { position: sticky; top: 0; z-index: 5; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 10px; font-size: var(--fs-xs); }
+.term-scope-line summary { min-height: 28px; cursor: pointer; overflow-wrap: anywhere; }
+.term-scope-line .term-scope { position: static; border: 0; padding: 6px 0 0; margin: 0; }
+.term-warn { color: var(--warn); font-weight: 600; }

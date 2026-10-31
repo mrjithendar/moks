@@ -10,6 +10,7 @@
   moks grant EMAIL ROLE[:ENV[:NS]]   add a role binding
   moks verify-audit                  recompute the audit hash chain
   moks executor                      run the action/diagnostics executor (write credentials)
+  moks terminal                      run the terminal gateway (pods in the terminal namespace only)
   moks eval DATASET [--mode rules|llm]  run an evaluation dataset and print scores
   moks reindex                       rebuild the knowledge index for the active embedding model
 """
@@ -242,6 +243,18 @@ def serve() -> None:
                 log_config=None, access_log=False, timeout_graceful_shutdown=20)
 
 
+def terminal() -> None:
+    import uvicorn
+
+    from .config import get_settings
+
+    if get_settings().process_role != "terminal":
+        raise SystemExit("moks terminal needs MOKS_PROCESS_ROLE=terminal")
+    uvicorn.run("moks.terminal.app:create_app", factory=True, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")),
+                proxy_headers=True, forwarded_allow_ips=os.environ.get("FORWARDED_ALLOW_IPS", "*"), ws_max_size=1_048_576,
+                log_config=None, access_log=False, timeout_graceful_shutdown=20)
+
+
 def worker() -> None:
     import signal
 
@@ -443,6 +456,7 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("grant")
     sub.add_parser("verify-audit")
     sub.add_parser("executor")
+    sub.add_parser("terminal")
     ev = sub.add_parser("eval")
     ev.add_argument("dataset")
     ev.add_argument("--mode", choices=["rules", "llm"], default="rules")
@@ -470,6 +484,8 @@ def main(argv: list[str] | None = None) -> None:
             print(f"{a.file} not present; nothing to seed")
             return
         asyncio.run(_seed(a.file, a.upsert))
+    elif a.cmd == "terminal":
+        terminal()
     elif a.cmd == "serve":
         serve()
     elif a.cmd == "worker":

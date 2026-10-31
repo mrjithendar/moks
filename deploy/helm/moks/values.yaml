@@ -168,6 +168,45 @@ diagnostics:
   namespace: moks-diagnostics
   quota: {pods: "5", cpu: "1", memory: 1Gi}
 
+# Web terminal (docs/TERMINAL.md). Off, and nobody holds the terminal role until an admin grants it.
+terminal:
+  enabled: false
+  namespace: moks-terminals
+  image:
+    repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-terminal
+    digest: ""             # required: terminals run a pinned, scanned image, never a tag
+  imagePullSecrets: []     # must exist in terminal.namespace
+  idleMinutes: 15
+  maxMinutes: 60           # a role session of over an hour needs the role's MaxSessionDuration raised
+  userSessions: 2
+  resources: {cpu: 500m, memory: 512Mi}       # limits of each session pod
+  quota: {pods: "4", cpu: "2", memory: 2Gi, ephemeralStorage: 2Gi}
+  # What may be opened. Nothing else can be selected, and a session never falls back to another identity.
+  profiles: []
+  #  - name: mk4-readonly
+  #    label: mk4, read-only
+  #    environment: mk4
+  #    account: "123456789012"
+  #    roleArn: arn:aws:iam::123456789012:role/moks/moks-terminal-readonly
+  #    regions: [us-east-1]
+  #    eksClusters: []     # EKS clusters this role has an access entry on
+  #    inCluster: true     # offer this cluster, through terminal.kubernetes.namespaces
+  kubernetes:
+    namespaces: []         # where a session's in-cluster identity may read
+  network:
+    apiServer: false       # needed by inCluster profiles: allows networkPolicy.apiServer.cidrs
+    egress: []             # default deny. AWS needs HTTPS; see docs/TERMINAL.md for why this is by address
+    #  - cidr: 0.0.0.0/0
+    #    except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+    #    ports: [443]
+  gateway:
+    replicas: 1
+    existingSecret: moks-terminal-secrets
+    serviceAccountAnnotations: {}   # EKS: eks.amazonaws.com/role-arn of the gateway's base role
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 384Mi}
+
 networkPolicy:
   enabled: true
   ingressNamespaces: [traefik]       # who may reach the API port

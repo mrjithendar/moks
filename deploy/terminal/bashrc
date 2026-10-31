@@ -1,0 +1,12 @@
+# Runs for every shell in a MOKS terminal. Shows the scope; it is not a security control. A shell can
+# change anything here: what it can reach is decided by IAM, Kubernetes RBAC and network policy.
+mkdir -p "$HOME"
+PS1='\[\e[2m\][${MOKS_ENVIRONMENT:-moks} ${MOKS_ACCOUNT:-?} ${AWS_REGION:-?}]\[\e[0m\] \w \$ '
+HISTFILE=/tmp/home/.bash_history
+HISTSIZE=5000
+alias ll='ls -la'
+if [ -z "${MOKS_GREETED:-}" ]; then
+  export MOKS_GREETED=1
+  printf 'MOKS terminal. Read-only by IAM and RBAC. Changes belong in an action plan.\n'
+  printf 'Run moks-verify-isolation to check what this session can reach.\n\n'
+fi

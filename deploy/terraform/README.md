@@ -69,3 +69,7 @@ more is needed. Otherwise, add its ARN to `ecr_pull_principal_arns` in `mk4.tfva
 not match the trust policy. Compare `gh api repos/mrjithendar/moks/actions/oidc/customization/sub`
 (field `sub_claim_prefix`) with `github_oidc_subject_prefix` in `tfvars/mk4.tfvars`. Workflows that
 use a GitHub environment send `:environment:<name>` instead of `:ref:...`.
+
+## Web terminal
+
+`terminal_enabled` creates the read-only role terminals assume and the `moks-terminal-gateway` user, which can only assume it. Terraform creates no access key. `terminal_gateway_role_arns` adds EKS base identities and `terminal_eks_cluster_arns` adds clusters. The `moks-terminal` ECR repository is always created. See [docs/TERMINAL.md](../../docs/TERMINAL.md).

@@ -23,6 +23,12 @@ spec:
     - host: {{ .Values.ingress.host }}
       http:
         paths:
+          {{- if .Values.terminal.enabled }}
+          # Longer, so it wins over the rule below. Traefik carries the WebSocket upgrade as is.
+          - path: {{ .Values.basePath }}/api/terminal
+            pathType: Prefix
+            backend: {service: {name: moks-terminal, port: {name: http}}}
+          {{- end }}
           - path: {{ .Values.basePath }}
             pathType: Prefix
             backend: {service: {name: moks-api, port: {name: http}}}

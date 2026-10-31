@@ -15,6 +15,8 @@ spec:
     - server: https://kubernetes.default.svc
       namespace: moks-diagnostics      # diagnostic session namespace (chart-managed)
     - server: https://kubernetes.default.svc
+      namespace: moks-terminals        # terminal session namespace, when terminal.enabled is true (chart-managed)
+    - server: https://kubernetes.default.svc
       namespace: moks-lab              # executor RoleBinding; add every namespace listed in executor.namespaces
     - server: https://kubernetes.default.svc
       namespace: jithendar          # Role for database backups (databaseBackups.namespaces)

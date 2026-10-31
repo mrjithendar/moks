@@ -78,6 +78,24 @@ variable "bedrock_enabled" {
   default = false
 }
 
+variable "terminal_enabled" {
+  description = "Create the read-only role terminals assume, and the IAM user the gateway uses on mk4. No key is created by Terraform."
+  type        = bool
+  default     = false
+}
+
+variable "terminal_gateway_role_arns" {
+  description = "Base identities on EKS (IRSA or Pod Identity roles of the gateway) that may also assume the terminal role."
+  type        = list(string)
+  default     = []
+}
+
+variable "terminal_eks_cluster_arns" {
+  description = "EKS clusters a terminal may configure kubectl for. Each still needs an access entry for the role; see docs/TERMINAL.md."
+  type        = list(string)
+  default     = []
+}
+
 variable "bedrock_claude_enabled" {
   description = "Let the runtime user call current Claude models (anthropic.claude-opus-5-5 and so on) on Bedrock."
   type        = bool

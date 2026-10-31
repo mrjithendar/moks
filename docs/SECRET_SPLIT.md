@@ -9,6 +9,7 @@ Until `secrets.split` is true, every MOKS component shares `moks-secrets` and co
 | API | `moks-api-secrets` | `moks-api` | `moks_api` | read-only, no Secrets |
 | Worker | `moks-worker-secrets` | `moks-worker` | `moks_worker` | read-only, no Secrets |
 | Executor | `moks-executor-secrets` | `moks-executor` | `moks_executor` | writes, per namespace |
+| Terminal gateway | `moks-terminal-secrets` (always its own, split or not) | `moks-terminal` | `moks_terminal` | pods and exec in the terminal namespace only |
 | Migration job | `moks-migrate-secrets` | `moks-migrate` (no token) | schema owner | none |
 | Backup | `moks-backup` | `moks-backup` (no token) | `moks_backup` | none |
 

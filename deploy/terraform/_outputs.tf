@@ -18,6 +18,16 @@ output "bedrock_model_for_moks" {
   value       = var.runtime_user_enabled && var.bedrock_enabled ? var.bedrock_inference_profile_id : null
 }
 
+output "terminal_role_arn" {
+  description = "roleArn for a terminal profile in the Helm values. Null when terminals are disabled."
+  value       = try(aws_iam_role.terminal[0].arn, null)
+}
+
+output "terminal_gateway_user_name" {
+  description = "IAM user for the terminal gateway on mk4. Create its key by hand into moks-terminal-secrets. Null when disabled."
+  value       = try(aws_iam_user.terminal_gateway[0].name, null)
+}
+
 output "opensearch_url_for_moks" {
   description = "Set as rag.opensearch.url in the Helm values, with rag.backend opensearch. Null when no domain is configured."
   value       = local.opensearch_enabled ? "https://${aws_opensearch_domain.moks[0].endpoint}" : null

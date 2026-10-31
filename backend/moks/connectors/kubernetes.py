@@ -47,6 +47,14 @@ def _api_error(exc: Exception, what: str) -> ConnectorError:
     return ConnectorError("unavailable", f"{what} failed ({type(exc).__name__})")
 
 
+async def open_exec(ws_client, pod: str, ns: str, **kwargs):
+    """An open exec WebSocket. The client returns aiohttp's connection context, and awaiting that is what connects."""
+    from kubernetes_asyncio import client
+
+    connecting = await client.CoreV1Api(api_client=ws_client).connect_get_namespaced_pod_exec(pod, ns, _preload_content=False, **kwargs)
+    return await connecting
+
+
 class KubernetesConnector:
     type = "kubernetes"
 

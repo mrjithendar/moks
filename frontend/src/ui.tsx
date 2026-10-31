@@ -226,7 +226,7 @@ export function useIsMobile(width = 900): boolean {
 const ICONS: Record<string, string> = {
   grid: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z", chart: "M4 20V4M4 20h16M8 16l4-5 3 3 5-7", lines: "M4 6h16M4 12h16M4 18h10",
   radar: "M12 12l6-6M12 3a9 9 0 1 0 9 9M12 8a4 4 0 1 0 4 4", plus: "M12 5v14M5 12h14", chat: "M4 5h16v11H9l-5 4z", alert: "M12 4l9 16H3zM12 10v4M12 17v.5",
-  check: "M4 12l5 5L20 6", tool: "M15 6a4 4 0 0 0-5 5l-6 6 3 3 6-6a4 4 0 0 0 5-5l-3 3-3-3z", cube: "M12 3l8 4.5v9L12 21l-8-4.5v-9zM4 7.5l8 4.5 8-4.5M12 12v9",
+  check: "M4 12l5 5L20 6", terminal: "M4 5h16v14H4zM7 9l3 3-3 3M12 15h5", tool: "M15 6a4 4 0 0 0-5 5l-6 6 3 3 6-6a4 4 0 0 0 5-5l-3 3-3-3z", cube: "M12 3l8 4.5v9L12 21l-8-4.5v-9zM4 7.5l8 4.5 8-4.5M12 12v9",
   archive: "M4 5h16v4H4zM5 9v10h14V9M10 13h4", book: "M5 4h12a2 2 0 0 1 2 2v14H7a2 2 0 0 1-2-2zM5 18a2 2 0 0 1 2-2h12", spark: "M12 3v6M12 15v6M3 12h6M15 12h6",
   coin: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 7v10M9 15h4a2 2 0 0 0 0-4h-2a2 2 0 0 1 0-4h4", shield: "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z",
   layers: "M12 3l9 5-9 5-9-5zM3 13l9 5 9-5", plug: "M9 3v5M15 3v5M6 8h12v3a6 6 0 0 1-12 0zM12 17v4", cloud: "M7 18a4 4 0 0 1 0-8 5 5 0 0 1 9.6-1A4.5 4.5 0 0 1 17 18z",

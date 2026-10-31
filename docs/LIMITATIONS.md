@@ -25,6 +25,10 @@ See [TESTING.md](TESTING.md#live-status-2026-10-30) for the evidence behind each
   evaluation runner does not read them. Some skills reference metrics that vary by deployment.
 - **Argo CD:** read-only, through the Kubernetes connector. MOKS reads Application status but cannot sync, refresh or see diffs, and suggests where a missing path moved without knowing which candidate is right. Apps outside the reader's namespaces are hidden.
 
+## Web terminal
+
+See [TERMINAL.md](TERMINAL.md#limitations). The image has never been built, and no terminal has run on a cluster. CI builds it and tests it on kind once a pull request exists.
+
 ## Conversations and logs
 
 - **Delete is soft.** A deleted message or conversation is hidden from people and from MOKS and can be

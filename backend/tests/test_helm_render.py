@@ -141,3 +141,66 @@ def test_velero_project_allows_everything_the_chart_renders():
     allowed = {w["kind"] for w in project["spec"]["clusterResourceWhitelist"] + project["spec"]["namespaceResourceWhitelist"]}
     rendered = {d["kind"] for d in yaml.safe_load_all(out.stdout) if d}
     assert rendered <= allowed, rendered - allowed
+
+
+TERMINAL = ("terminal.enabled=true", "terminal.image.digest=sha256:" + "a" * 64, "terminal.profiles[0].name=ro", "terminal.kubernetes.namespaces={moks-lab}", "terminal.network.apiServer=true")
+
+
+def of(docs, kind, name):
+    return next(d for d in docs if d["kind"] == kind and d["metadata"]["name"] == name)
+
+
+def test_terminals_are_off_by_default():
+    assert not [d for d in render("values-minikube.yaml") if "terminal" in d["metadata"]["name"]]
+
+
+def test_a_tag_or_no_profile_is_refused():
+    with pytest.raises(subprocess.CalledProcessError):
+        render("values-minikube.yaml", "terminal.enabled=true", "terminal.profiles[0].name=ro")
+    with pytest.raises(subprocess.CalledProcessError):
+        render("values-minikube.yaml", "terminal.enabled=true", "terminal.image.digest=sha256:" + "a" * 64)
+
+
+def test_the_gateway_is_routed_under_the_base_path_and_keeps_to_its_own_identity():
+    docs = render("values-minikube.yaml", *TERMINAL)
+    paths = of(docs, "Ingress", "moks")["spec"]["rules"][0]["http"]["paths"]
+    assert paths[0]["path"] == "/moks/api/terminal" and paths[0]["backend"]["service"]["name"] == "moks-terminal"
+    assert paths[1]["path"] == "/moks" and paths[1]["backend"]["service"]["name"] == "moks-api"
+    pod = dict(pods(docs))["moks-terminal"]
+    assert pod["serviceAccountName"] == "moks-terminal" and secrets(pod) == {"moks-terminal-secrets"}
+    assert not pod["containers"][0].get("volumeMounts", [])[1:]  # no credentials volume, no seed
+
+
+def test_the_gateway_can_touch_only_the_terminal_namespace():
+    docs = render("values-minikube.yaml", *TERMINAL)
+    assert not [d for d in docs if d["kind"] in ("ClusterRoleBinding", "RoleBinding") and any(s["name"] == "moks-terminal" for s in d.get("subjects", [])) and d["metadata"].get("namespace") != "moks-terminals"]
+    rules = of(docs, "Role", "moks-terminal-gateway")["rules"]
+    assert {r for rule in rules for r in rule["resources"]} == {"pods", "pods/exec", "serviceaccounts/token"}
+    assert next(r for r in rules if "serviceaccounts/token" in r["resources"])["resourceNames"] == ["moks-terminal-session"]
+
+
+def test_the_session_identity_is_read_only_and_never_sees_secrets():
+    docs = render("values-minikube.yaml", *TERMINAL)
+    rules = of(docs, "ClusterRole", "moks-terminal-reader")["rules"]
+    assert {v for r in rules for v in r["verbs"]} == {"get", "list", "watch"}
+    assert not {"secrets", "configmaps", "pods/exec", "pods/attach", "pods/portforward"} & {x for r in rules for x in r["resources"]}
+    binding = of(docs, "RoleBinding", "moks-terminal-reader")
+    assert binding["metadata"]["namespace"] == "moks-lab" and binding["subjects"][0]["name"] == "moks-terminal-session"
+    assert not [d for d in docs if d["kind"] == "ClusterRoleBinding" and "terminal" in d["metadata"]["name"]]
+
+
+def test_the_terminal_namespace_is_restricted_and_closed_by_default():
+    docs = render("values-minikube.yaml", *TERMINAL)
+    ns = of(docs, "Namespace", "moks-terminals")["metadata"]["labels"]
+    assert ns["pod-security.kubernetes.io/enforce"] == "restricted"
+    policy = of(docs, "NetworkPolicy", "terminals")["spec"]
+    assert policy["podSelector"] == {} and policy["ingress"] == [] and set(policy["policyTypes"]) == {"Ingress", "Egress"}
+    assert not [r for r in policy["egress"] for t in r["to"] if t.get("ipBlock", {}).get("cidr") == "0.0.0.0/0"]  # nothing beyond DNS and the API server
+    quota = of(docs, "ResourceQuota", "terminals")["spec"]["hard"]
+    assert {"pods", "limits.cpu", "limits.memory", "limits.ephemeral-storage"} <= set(quota)
+
+
+def test_configured_egress_is_exactly_what_was_listed():
+    docs = render("values-minikube.yaml", *TERMINAL, "terminal.network.egress[0].cidr=0.0.0.0/0", "terminal.network.egress[0].except={10.0.0.0/8,169.254.0.0/16}", "terminal.network.egress[0].ports={443}")
+    rule = of(docs, "NetworkPolicy", "terminals")["spec"]["egress"][-1]
+    assert rule["to"][0]["ipBlock"]["except"] == ["10.0.0.0/8", "169.254.0.0/16"] and rule["ports"] == [{"port": 443, "protocol": "TCP"}]

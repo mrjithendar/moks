@@ -1,5 +1,31 @@
 # Testing
 
+## Web terminal
+
+Results from 2026-10-31. Nothing here ran on mk4, on AWS, or in a container.
+
+| Check | Result | How |
+|---|---|---|
+| Backend suite | 829 passed, 4 live tests skipped | PostgreSQL 17 |
+| Frontend suite, typecheck, build | 99 passed, clean | Node 26, xterm mocked |
+| Access, ownership, Origin, expiry, revocation, cleanup, identity mismatch | passed | `test_terminal.py`: real database and gateway, fake AWS and pods |
+| Foreign or missing Origin refused at the upgrade, 4401 without a session | passed | real uvicorn and a real WebSocket client |
+| Whole session under `moks_terminal`, and what it is refused | passed | `test_db_grants.py`, real grants |
+| Keystrokes, resize, Ctrl-C, UTF-8, exit codes, credential file at mode 600 | passed | real Kubernetes client, real Bash on a real PTY, local stand-in for the API server |
+| Terminal in Chrome, desktop and phone: typing, resize, Tab, F6, phone keys, reload, stop, no CSP errors, no sideways overflow | 22 of 22 | real xterm, real WebSocket, local Bash, fake AWS. tmux was not present, so a reload started a new shell |
+| Chart: routing under `/moks`, gateway's reach, read-only RBAC, restricted Pod Security, default deny | passed | `helm template` |
+| Terraform | `validate` and `fmt` clean, not applied | |
+
+**Not run, because no container runtime was available here:**
+
+- The image has never been built or scanned, and its tmux configuration has never run.
+- No pod has been admitted by Pod Security.
+- **Network isolation is untested:** metadata, database and egress blocking, and whether kindnet enforces the policy.
+- Read-only RBAC and IAM have not been tested against a real API server or AWS.
+- Pod-bound token expiry has not been tested.
+
+The `terminal` CI job covers the first four on arm64 and amd64, on kind, when a pull request runs. That job and `scripts/terminal-isolation-test.sh` have never run either. `moks-verify-isolation` repeats the checks on the real cluster; see [TERMINAL.md](TERMINAL.md#enabling-it).
+
 ## Results (2026-10-30, Phases 1–4, FinOps, skills)
 
 | Suite | Result | Environment |

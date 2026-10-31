@@ -1,0 +1,10 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid": "SessionAudit", "Effect": "Allow", "Action": ["cloudtrail:LookupEvents"], "Resource": "*"},
+    {"Sid": "FindClusters", "Effect": "Allow", "Action": ["eks:DescribeCluster"], "Resource": "arn:aws:eks:<region>:<account>:cluster/<name>"},
+    {"Sid": "NeverSecrets", "Effect": "Deny",
+     "Action": ["secretsmanager:GetSecretValue", "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "kms:Decrypt", "s3:GetObject", "iam:CreateAccessKey", "sts:AssumeRole"],
+     "Resource": "*"}
+  ]
+}

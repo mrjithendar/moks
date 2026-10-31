@@ -143,3 +143,47 @@ async def test_an_investigation_runs_under_the_worker_role(client):
     role.reset(token)
     async with session_scope() as db:
         assert (await db.execute(text("SELECT status FROM investigations WHERE id = :i"), {"i": r.json()["id"]})).scalar() == "completed"
+
+
+# ---- the terminal gateway ------------------------------------------------------------------------
+
+from tests.test_terminal import Socket, cookie, gateway, gw, opened, person, world  # noqa: E402,F401
+
+
+async def test_a_whole_terminal_session_runs_under_the_gateways_role(world, gw, gateway):  # noqa: F811
+    from moks.terminal import service
+    from tests.conftest import make_env
+
+    env, _, fake_pods = world
+    await make_env(env)
+    _, h = await person(gw, env)
+    token = role.set("moks_terminal")
+    try:
+        sid = await opened(gw, env, h)
+        ws = Socket(gateway, sid, cookie(gw))
+        assert (await ws.first())["type"] == "websocket.accept"
+        await ws.send(data=b"ls\r")
+        await ws.leave()
+        assert (await gw.get("/moks/api/terminal/options")).status_code == 200
+        assert (await gw.post(f"/moks/api/terminal/sessions/{sid}/stop", headers=h)).json()["status"] == "ended"
+        await service.reap(fake_pods)
+    finally:
+        role.reset(token)
+    assert fake_pods.deleted
+
+
+@pytest.mark.parametrize("table", ["connectors", "llm_configs", "action_plans", "conversation_messages", "backup_stores"])
+async def test_the_gateway_cannot_read_the_rest_of_the_portal(table):
+    await refused("moks_terminal", f"SELECT * FROM {table}")
+
+
+async def test_the_gateway_changes_only_what_signing_in_needs():
+    await refused("moks_terminal", "UPDATE users SET is_active = true")
+    await refused("moks_terminal", "UPDATE role_bindings SET role = 'admin'")
+    await refused("moks_terminal", "UPDATE sessions SET user_id = user_id")
+    await refused("moks_terminal", "DELETE FROM sessions")
+
+
+@pytest.mark.parametrize("r", ["moks_worker", "moks_executor"])
+async def test_other_components_do_not_see_terminal_sessions(r):
+    await refused(r, "SELECT * FROM terminal_sessions")
