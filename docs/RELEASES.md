@@ -10,7 +10,9 @@ An image is built once, tagged with its commit, and deployed by digest. Git hold
 4. Sync the `moks-portal` app in Argo CD by hand, without prune. Pods roll only because the digest changed.
 5. Check the running build: `curl https://jithendar.com/moks/api/health` shows the commit, and the profile menu warns if components differ.
 
-No `kubectl rollout restart` is involved, and the chart refuses `image.tag: latest`.
+No `kubectl rollout restart` is involved, and the chart refuses `image.tag: latest` and any `image.digest` that is not a full `sha256:` digest.
+
+Merging a release does not start another build: pushes that change only `values-minikube.yaml` skip CI, so a change to that file alone needs no new image. If Actions may not create pull requests, the build still succeeds and its summary says to open the pull request by hand from `release/<sha>`.
 
 ## Roll back
 

@@ -104,3 +104,9 @@ def test_the_chart_ships_the_consistent_dump():
     assert "consistent-dump.sql" in dump and "--manifest" in by["moks-backup"]["containers"][0]["args"]
     cm = next(d for d in docs if d["metadata"]["name"] == "moks-backup-scripts")
     assert "--snapshot" in cm["data"]["consistent-dump.sql"]
+
+
+@pytest.mark.parametrize("digest", ["latest", "sha256:abc", "99f94e21"])
+def test_a_malformed_digest_is_refused(digest):
+    done = subprocess.run(["helm", "template", "moks", str(CHART), "--set", f"image.digest={digest}"], capture_output=True, text=True)
+    assert done.returncode != 0 and "image.digest must be" in done.stderr
