@@ -28,6 +28,8 @@ spec:
     - {group: "", kind: ServiceAccount}
     - {group: "", kind: PersistentVolumeClaim}
     - {group: apps, kind: Deployment}
+    - {group: apps, kind: ReplicaSet}  # Argo CD leaves unlisted kinds out of the app tree, so these
+    - {group: "", kind: Pod}           # two are what show the portal's pods, logs and events
     - {group: apps, kind: StatefulSet}
     - {group: networking.k8s.io, kind: Ingress}
     - {group: networking.k8s.io, kind: NetworkPolicy}

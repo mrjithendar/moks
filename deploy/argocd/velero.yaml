@@ -23,6 +23,8 @@ spec:
     - {group: "", kind: Service}
     - {group: "", kind: ServiceAccount}
     - {group: apps, kind: Deployment}
+    - {group: apps, kind: ReplicaSet}  # Argo CD leaves unlisted kinds out of the app tree, so these
+    - {group: "", kind: Pod}           # two are what show Velero's pods, logs and events
     - {group: rbac.authorization.k8s.io, kind: Role}
     - {group: rbac.authorization.k8s.io, kind: RoleBinding}
 ---
