@@ -1,7 +1,7 @@
 ---
 name: gitops-drift-argocd
 title: GitOps drift and Argo CD sync failures
-version: '2'
+version: '3'
 owner: sre
 category: devops
 description: Read what Argo CD reports about each application, then compare the running workload with what Git declares.
@@ -31,6 +31,7 @@ steps:
   args:
     namespace: '{namespace}'
     deployment: '{deployment}'
+    repository: '{repository}'
   purpose: running image against Git
 resource_types:
 - Deployment

@@ -1,0 +1,42 @@
+name: skills
+kind: skills
+description: Which skill is chosen, what it plans, and what must never happen. Deterministic; no model involved.
+fixtures:
+  crashloop-config: {question: "why is payments crashing with a configuration error", findings: [crashloop, config_error], connectors: [kubernetes, knowledge]}
+  dependency-latency: {question: "checkout latency and timeout to its dependency after the rollout", findings: [recent_rollout], connectors: [kubernetes, prometheus, loki]}
+  broken-selector: {question: "checkout returns 502 errors", findings: [service_selector_mismatch], connectors: [kubernetes]}
+  oomkilled: {question: "pods are oomkilled", findings: [oomkilled], connectors: [kubernetes, prometheus]}
+  failed-rollout: {question: "the rollout is stuck", findings: [workload_unavailable, recent_rollout], connectors: [kubernetes]}
+  telemetry-outage: {question: "telemetry looks wrong, scrape targets down", findings: [], connectors: [kubernetes, prometheus]}
+cases:
+  - id: selects-the-matching-skill
+    fixture: crashloop-config
+    expect: {selected: [crashloop-triage], tools: [k8s_pod_logs, k8s_describe_pod]}
+  - id: finding-outranks-a-loose-word
+    question: "something is slow"
+    findings: [oomkilled]
+    connectors: [kubernetes]
+    expect: {selected: [oomkilled-memory]}
+  - id: negative-control-healthy-namespace
+    question: "give me a status summary"
+    findings: []
+    connectors: [kubernetes]
+    expect: {none_selected: true}
+  - id: unavailable-skill-gives-way-to-an-alternative
+    question: "cloudwatch ingestion gaps and pods crashing"
+    findings: [crashloop]
+    connectors: [kubernetes]
+    expect: {selected: [crashloop-triage], rejected: [cloudwatch-ingestion-gaps]}
+  - id: disabled-skill-is-not-selected
+    fixture: broken-selector
+    disabled: [http-5xx-service-routing]
+    expect: {rejected: [http-5xx-service-routing], selected: [ingress-gateway-errors]}
+  - id: operator-choice-comes-first
+    question: "what is going on"
+    findings: []
+    connectors: [kubernetes]
+    requested: crashloop-triage
+    expect: {selected: [crashloop-triage]}
+  - id: arguments-stay-in-the-scope
+    fixture: crashloop-config
+    expect: {argument_namespace: payments}

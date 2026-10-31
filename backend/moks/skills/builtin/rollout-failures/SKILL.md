@@ -56,7 +56,9 @@ recovery_validation:
 - no pod of the new revision failing
 evaluation:
 - fixture: failed-rollout
-  expect: workload_unavailable finding and a rollback hint
+  expect:
+    selected: true
+    note: 'workload_unavailable finding and a rollback hint'
 detection:
 - id: rollout-unavailable
   kind: finding

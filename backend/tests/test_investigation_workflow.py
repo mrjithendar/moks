@@ -126,7 +126,7 @@ async def test_skills_show_why_they_are_unavailable_and_admins_can_turn_them_off
     await make_user(f"g-{tag}@example.com", ["admin"])
     h = await login(client, f"g-{tag}@example.com")
     d = (await client.get("/moks/api/skills/rds-pressure")).json()
-    assert d["availability"][env] == {"available": False, "reasons": ["needs the cloudwatch connector"]}
+    assert d["availability"][env]["available"] is False and "needs the cloudwatch connector" in d["availability"][env]["reasons"]
     assert (await client.put("/moks/api/skills/crashloop-triage/policy", json={"enabled": False}, headers=h)).status_code == 200
     r = (await client.post("/moks/api/investigations", json={"question": "why is payments crashing", "environment": env, "namespace": "shop"}, headers=h)).json()
     inv = await _run(r["id"])

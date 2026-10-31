@@ -29,22 +29,47 @@ export function Knowledge() {
       </form>
       <ErrorBox error={error} />
       {res && <div className="stack" style={{ marginTop: 14 }}>
-        <div className="small muted">{res.results.length} results ({res.mode}). Only sources you are allowed to read are searched and returned.</div>
+        <div className="small muted">{res.results.length} results · {res.mode === "hybrid" ? "keyword and vector search" : res.mode === "keyword" ? "keyword search" : res.mode}. Only sources you are allowed to read are searched and returned.</div>
+        {res.fallback_reason && <div className="alert warn small">Vector search was not used: {res.fallback_reason}.</div>}
+        {res.evidence && res.evidence.state !== "supported" && <div className="alert info small">{res.evidence.reason}</div>}
+        <div className="small muted">These passages are documented knowledge. Current production facts need live evidence.</div>
         {res.results.map((h: any) => (
           <div key={h.chunk_id} className="card">
             <div className="stack tight"><strong className="clamp-2" title={h.title}>{h.title}{h.heading && <span className="muted"> › {h.heading}</span>}</strong>
-              <span className="small muted">{h.citation.source} · {h.scope.environment}/{h.scope.namespace}</span></div>
+              <span className="small muted">{h.citation.source} · {h.scope.environment}/{h.scope.namespace}</span>
+              {h.freshness.state !== "current" && <span><Badge kind="warn">{h.freshness.state}</Badge> <span className="small muted">{h.freshness.reason}</span></span>}
+              {h.freshness.possible_conflict && <span><Badge kind="warn">may conflict</Badge> <span className="small muted">Another document here has the same title. Check which applies.</span></span>}</div>
             <pre className="passage">{h.text.slice(0, 1200)}</pre>
             <div className="small" style={{ marginTop: 6 }}>
               {h.citation.url ? <a href={h.citation.url} target="_blank" rel="noreferrer noopener">{h.citation.path}{h.citation.lines?.[0] ? ` L${h.citation.lines[0]}-${h.citation.lines[1]}` : ""}</a> : h.citation.path}
               {h.citation.revision && <span className="mono muted"> @ {h.citation.revision.slice(0, 10)}</span>}
-              <span className="muted"> · updated <Time iso={h.freshness.document_updated} /></span>
+              {h.freshness.content_changed_in && h.freshness.content_changed_in !== h.citation.revision && <span className="mono muted"> · last changed in {h.freshness.content_changed_in.slice(0, 10)}</span>}
+              <span className="muted"> · checked against its source <Time iso={h.freshness.last_checked} /></span>
             </div>
           </div>
         ))}
       </div>}
+      {status.data && can("admin.connectors") && <IndexHealth s={status.data} />}
       {can("admin.connectors") && <KnowledgeSources onChange={status.reload} />}
     </>
+  );
+}
+
+function IndexHealth({ s }: { s: any }) {
+  const e = s.embedding, o = s.outbox;
+  return (
+    <div className="card mt stack">
+      <h2>Index health</h2>
+      <div className="stat-row">
+        <Stat value={e.coverage == null ? "—" : `${Math.round(e.coverage * 100)}%`} label={e.coverage == null ? "no vectors in this index" : "documents with vectors"} />
+        <Stat value={o.pending + o.retrying} label={o.retrying ? `index changes pending, ${o.retrying} retrying` : "index changes pending"} />
+        <Stat value={o.dead} label="index changes given up on" />
+        <Stat value={o.documents_behind} label="documents behind the index" />
+        <Stat value={s.pipeline.documents_behind} label={`on an older pipeline than v${s.pipeline.version}`} />
+      </div>
+      {e.missing > 0 && <div className="alert warn small">{e.missing} documents are searchable by keyword only because embedding failed. MOKS retries them on its own once embedding works.</div>}
+      {s.reindex_progress && <div className="small muted">Reindex running: {s.reindex_progress.chunks} of {s.reindex_progress.of} passages copied.</div>}
+    </div>
   );
 }
 
@@ -56,6 +81,8 @@ function SyncState({ s }: { s: any }) {
   return (
     <>
       {s.last_sync_status ? <Badge kind={kind}>{s.last_sync_status}</Badge> : <Badge>not synced yet</Badge>} {s.stale && <Badge kind="warn">stale</Badge>}
+      {s.sync?.listing && s.sync.listing !== "complete" && <Badge kind="warn">listing {s.sync.listing}</Badge>}
+      {s.sync?.discovered > 0 && <div className="muted">{s.sync.processed} of {s.sync.discovered} files · {s.sync.excluded} excluded · {s.sync.failed} failed · {s.sync.remaining} remaining</div>}
       {s.sync_state !== "idle" && <Badge kind="info">{s.sync_state}</Badge>}
       <div className="muted">last success <Time iso={s.last_success_at} /> · last attempt <Time iso={s.last_attempt_at} /></div>
       {c && <div className="muted">+{c.added} added, {c.updated} updated, {c.deleted} deleted, {c.excluded} excluded</div>}
@@ -70,7 +97,8 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
   const { can } = useAuth();
   const list = useLoad(() => api<any[]>("/knowledge/sources"), []);
   useInterval(() => { if (!list.loading && list.data?.some((s) => s.sync_state !== "idle")) list.reload(); }, 3000);
-  const [f, setF] = useState({ name: "", type: "github", repository: "", include: "", scope_environment: "*", scope_namespace: "*", credType: "none", credName: "" });
+  const [f, setF] = useState({ name: "", type: "github", repository: "", include: "", scope_environment: "", scope_namespace: "*", credType: "none", credName: "", shared: false, team: "", classification: "internal", review: "" });
+  const [detail, setDetail] = useState<any>(null);
   const [error, setError] = useState<unknown>();
   const [editing, setEditing] = useState<any>(null);
   async function add(e: FormEvent) {
@@ -78,7 +106,8 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
     setError(null);
     try {
       await api("/knowledge/sources", { method: "POST", body: { name: f.name, type: f.type, repository: f.type === "github" ? f.repository : null,
-        include: f.include ? f.include.split(/[\s,]+/).filter(Boolean) : [], scope_environment: f.scope_environment, scope_namespace: f.scope_namespace,
+        include: f.include ? f.include.split(/[\s,]+/).filter(Boolean) : [], scope_environment: f.shared ? "*" : f.scope_environment || "*", scope_namespace: f.shared ? "*" : f.scope_namespace,
+        shared_globally: f.shared, team: f.team || null, classification: f.classification, review_interval_days: f.review ? Number(f.review) : null,
         credential_ref: f.credType === "env" ? { type: "env", name: f.credName } : { type: "none" } } });
       list.reload(); onChange();
     } catch (err) { setError(err); }
@@ -100,6 +129,10 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
     } catch (err) { setError(err); }
   }
   const ed = (k: string, v: unknown) => setEditing({ ...editing, [k]: v });
+  async function lifecycle(s: any, to: string) {
+    if (to !== "active" && !await ask({ title: `${to === "quarantined" ? "Quarantine" : "Archive"} ${s.name}?`, body: "Search stops returning it at once. Its documents are kept.", action: to === "quarantined" ? "Quarantine" : "Archive", danger: true })) return;
+    try { await api(`/knowledge/sources/${s.id}/lifecycle`, { method: "PUT", body: { lifecycle: to, reason: "changed in the admin page" } }); list.reload(); } catch (e: any) { toast(e.message, "bad"); }
+  }
   async function upload(id: string, file: File) {
     const form = new FormData();
     form.append("file", file);
@@ -113,12 +146,16 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
       {list.data && <DataTable label="Knowledge sources" rows={list.data} rowKey={(s) => s.id} empty={<Empty title="No sources yet.">Add a repository or an upload source below.</Empty>}
         menu={(s) => ({ label: `Actions for ${s.name}`, items: [
           ...(s.syncable ? [{ label: s.sync_state === "idle" ? "Sync now" : "Sync in progress", disabled: s.sync_state !== "idle", run: () => { api(`/knowledge/sources/${s.id}/sync`, { method: "POST" }).then(list.reload); } }] : []),
+          { label: "Details and failures", run: () => setDetail(s) },
           { label: "Edit", run: () => startEdit(s) },
+          { label: "Mark as reviewed", run: () => { api(`/knowledge/sources/${s.id}/review`, { method: "POST" }).then(list.reload, (e) => toast(e.message, "bad")); } },
+          ...(s.lifecycle === "active" ? [{ label: "Quarantine", danger: true, run: () => lifecycle(s, "quarantined") }, { label: "Archive", run: () => lifecycle(s, "archived") }] : [{ label: "Make active", run: () => lifecycle(s, "active") }]),
           { label: "Delete", danger: true, run: async () => { if (await ask({ title: `Delete ${s.name}?`, body: "This removes its documents from search.", action: "Delete source", danger: true })) api(`/knowledge/sources/${s.id}`, { method: "DELETE" }).then(list.reload); } },
         ] })}
         cols={[
-          { key: "n", head: "Source", primary: true, cell: (s) => <><span className="row tight"><Truncate text={s.name} /><Badge>{s.type}</Badge></span>{s.config?.repository && <Truncate text={`${s.config.repository}${s.revision ? ` @ ${s.revision.slice(0, 8)}` : ""}`} mono />}</> },
+          { key: "n", head: "Source", primary: true, cell: (s) => <><span className="row tight"><Truncate text={s.name} /><Badge>{s.type}</Badge>{s.lifecycle !== "active" && <Badge kind="warn">{s.lifecycle}</Badge>}{s.shared_globally && <Badge kind="info">shared globally</Badge>}{s.review_overdue && <Badge kind="warn">review overdue</Badge>}</span>{s.config?.repository && <Truncate text={`${s.config.repository}${s.revision ? ` @ ${s.revision.slice(0, 8)}` : ""}`} mono />}</> },
           { key: "sc", head: "Scope", cell: (s) => <span className="mono small">{s.scope_environment}/{s.scope_namespace}</span> },
+          { key: "own", head: "Owner", cell: (s) => <span className="small">{s.team || s.owner || <span className="muted">no owner</span>} · {s.classification}</span> },
           { key: "d", head: "Documents", cell: (s) => <span className="small">{Object.entries(s.documents).map(([k, v]) => `${v} ${k}`).join(", ") || "none"}</span> },
           { key: "sy", head: "Sync", cell: (s) => <span className="small">{s.syncable ? <SyncState s={s} /> : <span className="muted">Managed by uploads</span>}</span> },
           { key: "sch", head: "Schedule", cell: (s) => (s.syncable ? <span className="small">
@@ -148,14 +185,20 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
         <div className="small muted">Indexed documents are kept. A new scope applies straight away; new include or exclude rules apply at the next sync, which removes files that no longer qualify. The value of a token is never entered here: this names the variable that holds it.</div>
         <div className="row"><button>Save</button><button type="button" className="ghost" onClick={() => setEditing(null)}>Cancel</button></div>
       </form>}
+      {detail && <SourceDetail s={detail} onClose={() => { setDetail(null); list.reload(); }} />}
       <form className="stack" onSubmit={add}>
         <div className="row">
           <label>Name<input required pattern="[a-z0-9][a-z0-9\-]*" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></label>
           <label>Type<select value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })}><option value="github">GitHub repository</option><option value="upload">Uploads</option></select></label>
           {f.type === "github" && <label>Repository<input required placeholder="owner/name" value={f.repository} onChange={(e) => setF({ ...f, repository: e.target.value })} /></label>}
-          <label>Scope env<input value={f.scope_environment} onChange={(e) => setF({ ...f, scope_environment: e.target.value })} /></label>
-          <label>Scope namespace<input value={f.scope_namespace} onChange={(e) => setF({ ...f, scope_namespace: e.target.value })} /></label>
+          <label>Scope env<input disabled={f.shared} required={!f.shared} value={f.scope_environment} onChange={(e) => setF({ ...f, scope_environment: e.target.value })} placeholder="prod" /></label>
+          <label>Scope namespace<input disabled={f.shared} value={f.scope_namespace} onChange={(e) => setF({ ...f, scope_namespace: e.target.value })} /></label>
+          <label>Team<input value={f.team} onChange={(e) => setF({ ...f, team: e.target.value })} /></label>
+          <label>Classification<select value={f.classification} onChange={(e) => setF({ ...f, classification: e.target.value })}>{["public", "internal", "confidential", "restricted"].map((c) => <option key={c}>{c}</option>)}</select></label>
+          <label>Review every (days)<input type="number" min={1} max={3650} value={f.review} onChange={(e) => setF({ ...f, review: e.target.value })} /></label>
         </div>
+        <label className="inline"><input type="checkbox" checked={f.shared} disabled={["confidential", "restricted"].includes(f.classification)} onChange={(e) => setF({ ...f, shared: e.target.checked })} /> Share with everyone who can read knowledge, in every environment</label>
+        {f.shared && <div className="alert warn small">Anyone with any read access will be able to retrieve this source. Use it only for content that is safe everywhere.</div>}
         {f.type === "github" && <div className="row">
           <label style={{ flex: 1 }}>Include globs (default: docs, runbooks, Markdown, YAML, Helm, Terraform, workflows)<input value={f.include} onChange={(e) => setF({ ...f, include: e.target.value })} placeholder="docs/** **/*.md k8s/**" /></label>
           <label>Token<select value={f.credType} onChange={(e) => setF({ ...f, credType: e.target.value })}><option value="none">public repo</option><option value="env">env variable</option></select></label>
@@ -165,6 +208,62 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
         <div><button>Add source</button></div>
       </form>
     </div>
+  );
+}
+
+function SourceDetail({ s, onClose }: { s: any; onClose: () => void }) {
+  const { toast } = useFeedback();
+  const failures = useLoad(() => api<any>(`/knowledge/sources/${s.id}/failures`), [s.id]);
+  const docs = useLoad(() => api<any[]>(`/knowledge/sources/${s.id}/documents`), [s.id]);
+  const [email, setEmail] = useState("");
+  const [preview, setPreview] = useState<any>(null);
+  const [open, setOpen] = useState<any>(null);
+  const [error, setError] = useState<unknown>();
+  async function checkAccess(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    try { setPreview(await api(`/knowledge/sources/${s.id}/access${qs({ email })}`)); } catch (err) { setError(err); }
+  }
+  const items: any[] = failures.data?.items ?? [];
+  const excluded = (docs.data ?? []).filter((d) => d.status === "excluded");
+  return (
+    <Drawer title={s.name} onClose={onClose}>
+      <div className="stack">
+        <dl className="kv small">
+          <dt>Owner</dt><dd>{s.team || s.owner || "none"}</dd><dt>Classification</dt><dd>{s.classification}</dd><dt>Scope</dt><dd className="mono">{s.scope_environment}/{s.scope_namespace}</dd>
+          <dt>Pinned revision</dt><dd className="mono">{s.sync?.revision?.slice(0, 12) ?? s.revision?.slice(0, 12) ?? "—"}</dd>
+          <dt>Listing</dt><dd>{s.sync?.listing ?? "—"}</dd><dt>Content</dt><dd>{s.sync?.content ?? "—"}</dd>
+          <dt>Stale content</dt><dd>{s.stale_policy === "exclude" ? "Left out of search" : "Marked in results"}</dd>
+        </dl>
+        <h3>Who can read this</h3>
+        <form className="row nowrap" onSubmit={checkAccess}><input className="grow" type="email" required aria-label="Person to check" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="person@example.com" /><button className="ghost">Check</button></form>
+        <ErrorBox error={error} />
+        {preview && <div className="small"><Badge kind={preview.can_read ? "ok" : "neutral"}>{preview.can_read ? "can read" : "cannot read"}</Badge> {preview.reason} <span className="muted mono">{preview.grants.join(", ")}</span></div>}
+        <div className="row between"><h3>Files not indexed ({items.length})</h3>
+          {items.some((i) => i.state === "failed") && <button className="ghost small" onClick={() => api(`/knowledge/sources/${s.id}/retry`, { method: "POST" }).then((r) => { toast(`${r.requeued} files queued`); failures.reload(); }, (e) => toast(e.message, "bad"))}>Retry failed</button>}</div>
+        <Loading load={failures} />
+        {failures.data && <DataTable label="Files not indexed" rows={items} rowKey={(i) => i.path} empty={<Empty title="Every listed file was read." />} cols={[
+          { key: "p", head: "Path", primary: true, cell: (i) => <Truncate text={i.path} mono /> },
+          { key: "s", head: "State", status: true, cell: (i) => <Badge kind={i.state === "failed" ? "bad" : i.state === "pending" ? "info" : "neutral"}>{i.state}</Badge> },
+          { key: "r", head: "Reason", cell: (i) => <span className="small">{i.reason ?? "—"}</span> },
+        ]} />}
+        {failures.data?.index_events.length > 0 && <><h3>Index changes</h3>{failures.data.index_events.map((e: any) => <div key={e.id} className="small"><Badge kind={e.state === "dead" ? "bad" : "warn"}>{e.state}</Badge> {e.op} · {e.attempts} tries · {e.error}</div>)}</>}
+        <h3>Documents ({docs.data?.length ?? 0})</h3>
+        {excluded.length > 0 && <div className="small muted">{excluded.length} excluded. Their content was not stored, so only the reason is shown.</div>}
+        <Loading load={docs} />
+        {docs.data && <DataTable label="Documents" rows={docs.data} rowKey={(d) => d.id} onRow={(d) => api(`/knowledge/documents/${d.id}`).then(setOpen, (e) => toast(e.message, "bad"))} cols={[
+          { key: "p", head: "Path", primary: true, cell: (d) => <Truncate text={d.path} mono /> },
+          { key: "s", head: "State", status: true, cell: (d) => <Badge kind={d.status === "active" ? "ok" : "neutral"}>{d.status}</Badge> },
+          { key: "v", head: "Vectors", cell: (d) => d.vector_state },
+          { key: "r", head: "Note", cell: (d) => <span className="small muted">{d.excluded_reason ?? (d.doc_state !== "current" ? d.doc_state : d.behind ? "index catching up" : "")}</span> },
+        ]} />}
+        {open && <Drawer title={open.path} onClose={() => setOpen(null)}>
+          <div className="stack"><div className="small muted">{open.source} · revision {open.revision?.slice(0, 12) ?? "—"}{open.changed_revision ? ` · last changed in ${open.changed_revision.slice(0, 12)}` : ""}</div>
+            {open.chunks.map((c: any) => <div key={c.ord} className="stack tight"><div className="small muted">{c.heading} · lines {c.lines[0]}-{c.lines[1]} · about {c.tokens} tokens</div><pre className="passage">{c.text}</pre></div>)}
+            {!open.chunks.length && <Empty title="No text is stored for this document.">{open.excluded_reason}</Empty>}</div>
+        </Drawer>}
+      </div>
+    </Drawer>
   );
 }
 
@@ -376,10 +475,17 @@ export function Evals() {
       {runs.data?.map((r) => (
         <div key={r.id} className="card" style={{ marginBottom: 12 }}>
           <div className="row between"><h2>{r.dataset} · {r.mode}</h2><span>{r.score != null ? <Badge kind={r.score >= 0.9 ? "ok" : r.score >= 0.7 ? "warn" : "bad"}>score {r.score.toFixed(3)}</Badge> : <Badge>{r.status}</Badge>} <Time iso={r.created_at} /></span></div>
-          <div className="table-wrap" role="region" aria-label={`Results of ${r.dataset}`} tabIndex={0}><table><thead><tr><th>Case</th><th>Score</th><th>Failed checks</th><th>Findings</th><th>Tools</th></tr></thead>
+          {r.gates?.length > 0 && <div className="stack">
+            <div className="row small">{r.gates.map((g: any) => <Badge key={g.name} kind={g.passed ? "ok" : "bad"}>{g.name.replace(/_/g, " ")}: {g.passed ? "passed" : "failed"}</Badge>)}</div>
+            {r.gates.filter((g: any) => !g.passed).flatMap((g: any) => g.failures.slice(0, 5).map((f: string) => <div key={g.name + f} className="alert error small">{g.name}: {f}</div>))}
+            {r.versions?.metrics && <div className="small muted mono">{Object.entries(r.versions.metrics).map(([k, v]) => `${k} ${v}`).join(" · ")}</div>}
+            <div className="small muted">Gates are deterministic checks. The score summarizes quality; a failed gate fails the run whatever the score says.</div>
+          </div>}
+          {r.versions?.dataset && <div className="small muted mono">dataset {r.versions.dataset} · skills generation {r.versions.skills_generation ?? "none"} · pipeline {r.versions.pipeline} · prompt {r.versions.prompt}</div>}
+          {r.kind === "investigation" && <div className="table-wrap" role="region" aria-label={`Results of ${r.dataset}`} tabIndex={0}><table><thead><tr><th>Case</th><th>Score</th><th>Failed checks</th><th>Findings</th><th>Tools</th></tr></thead>
             <tbody>{r.results.map((c: any) => <tr key={c.case}><td className="mono small">{c.case}</td><td>{c.score.toFixed(2)}</td>
               <td className="small">{Object.entries(c.checks).filter(([, v]) => !v).map(([k]) => k).join(", ") || "—"}</td>
-              <td className="small">{c.findings.join(", ")}</td><td>{c.tool_calls}</td></tr>)}</tbody></table></div>
+              <td className="small">{c.findings.join(", ")}</td><td>{c.tool_calls}</td></tr>)}</tbody></table></div>}
         </div>
       ))}
     </>
@@ -398,9 +504,19 @@ export function Skills() {
   const phone = useIsMobile();
   const chips: Chip[] = [...(category ? [{ key: "c", label: category, onRemove: () => setF({ category: "" }) }] : []), ...(text ? [{ key: "q", label: `matches ${text}`, onRemove: () => setF({ q: "" }) }] : [])];
   const detail = useLoad(() => (open ? api<any>(`/skills/${open}`) : Promise.resolve(null)), [open]);
+  const generation = useLoad(() => api<any>("/skills/generation"), []);
+  const registry = useLoad(() => (can("admin.policies") ? api<any>("/skills/registry").catch(() => null) : Promise.resolve(null)), []);
+  const { toast } = useFeedback();
+  const waiting: any[] = (registry.data?.versions ?? []).filter((v: any) => v.state === "validated" || v.state === "draft");
+  async function publish(name: string, digest: string, path = "publish") {
+    try { await api(`/skills/${name}/${path}`, { method: "POST", body: { digest, note: "" } }); await api("/skills/reload", { method: "POST" }); list.reload(); detail.reload(); registry.reload(); generation.reload(); toast("Published. Every process moves to the new generation within a minute."); }
+    catch (e: any) { toast(e.message, "bad"); }
+  }
   const rows = (list.data?.skills ?? []).filter((s: any) => (!category || s.category === category) && JSON.stringify([s.name, s.title, s.description]).toLowerCase().includes(text.toLowerCase()));
   const d = detail.data;
   const blocked = (s: any) => Object.entries(s.availability as Record<string, any>).filter(([, v]) => !v.available);
+  const guidance = (rows: any[]) => rows.filter((x) => typeof x === "string");
+  const checked = (rows: any[]) => rows.filter((x) => typeof x !== "string");
   async function toggle(s: any) {
     await api(`/skills/${s.name}/policy`, { method: "PUT", body: { enabled: !s.enabled } });
     list.reload();
@@ -411,13 +527,20 @@ export function Skills() {
               {can("admin.policies") && <button className="ghost small" onClick={() => toggle(d)}>{d.enabled ? "Turn off" : "Turn on"}</button>}</div>
             <p className="muted" style={{ margin: 0 }}>{d.description}</p>
             <div className="small">Needs: {d.needs.join(", ") || "nothing beyond MOKS"}{d.telemetry.length > 0 && <> · metrics {d.telemetry.join(", ")}</>}</div>
-            <div className="row small">{Object.entries(d.availability as Record<string, any>).map(([e, v]) => <Badge key={e} kind={v.available ? "ok" : "neutral"}>{e}: {v.available ? "available" : v.reasons[0]}</Badge>)}</div>
+            <div className="small muted">Version {d.version} · <span className="mono">{d.digest?.slice(0, 12)}</span></div>
+            <div className="row small">{Object.entries(d.availability as Record<string, any>).map(([e, v]) => <Badge key={e} kind={v.state === "ready" ? "ok" : v.state === "unavailable" ? "bad" : "warn"}>{e}: {v.state}{v.reasons[0] ? ` (${v.reasons[0]})` : ""}</Badge>)}</div>
+            {d.history?.length > 1 && <><h3>Versions</h3>{d.history.map((h: any) => <div key={h.digest} className="row between small"><span>v{h.version} <Badge kind={h.digest === d.digest ? "ok" : "neutral"}>{h.digest === d.digest ? "running" : h.state}</Badge> <span className="mono muted">{h.digest.slice(0, 12)}</span></span>
+              {can("admin.policies") && h.digest !== d.digest && ["published", "deprecated"].includes(h.state) && <button className="ghost small" onClick={() => publish(d.name, h.digest, "rollback")}>Roll back to this</button>}</div>)}</>}
             <h3>Triggers</h3><div className="small">keywords: {d.triggers.keywords.join(", ") || "—"} · findings: {d.triggers.findings.join(", ") || "—"}</div>
             {d.steps.length > 0 && <><h3>Steps (read-only, policy-checked)</h3>
               <ol className="small">{d.steps.map((s: any, i: number) => <li key={i}><span className="mono">{s.tool}</span> {s.for_each && <Badge>{s.for_each}</Badge>} {s.purpose}</li>)}</ol></>}
             {d.detection.length > 0 && <><h3>Detection rules</h3><ul className="small">{d.detection.map((r: any) => <li key={r.id}><span className="mono">{r.id}</span> {r.kind} · {r.severity} · every {r.interval_minutes} min, {r.sustained_checks} checks to open</li>)}</ul></>}
             {d.hypotheses.length > 0 && <><h3>Hypotheses</h3><ul className="small">{d.hypotheses.map((h: any, i: number) => <li key={i}>{h.statement} <span className="muted">Supported by: {h.supports || "—"} Refuted by: {h.refutes || "—"}</span></li>)}</ul></>}
-            {d.recovery_validation.length > 0 && <><h3>Recovery validation</h3><ul className="small">{d.recovery_validation.map((x: string, i: number) => <li key={i}>{x}</li>)}</ul></>}
+            {(d.evidence_required.length > 0 || d.verification.length > 0) && <><h3>Checked in every run</h3>
+              {[...checked(d.evidence_required), ...checked(d.verification)].length === 0 && <div className="small muted">Nothing here is checked automatically yet.</div>}
+              <ul className="small">{[...checked(d.evidence_required), ...checked(d.verification)].map((x: any, i: number) => <li key={i}>{x.label || x.tool || x.finding}</li>)}</ul>
+              {[...guidance(d.evidence_required), ...guidance(d.verification)].length > 0 && <><h3>Guidance only, not checked</h3><ul className="small">{[...guidance(d.evidence_required), ...guidance(d.verification)].map((x: string, i: number) => <li key={i}>{x}</li>)}</ul></>}</>}
+            {d.recovery_validation.length > 0 && <><h3>Recovery validation (guidance only)</h3><ul className="small">{d.recovery_validation.map((x: string, i: number) => <li key={i}>{x}</li>)}</ul></>}
             {d.remediation.length > 0 && <><h3>Remediation hints</h3><ul className="small">{d.remediation.map((r: any, i: number) => <li key={i}>when <Badge kind="warn">{r.when}</Badge> → <span className="mono">{r.action}</span> {r.target} <span className="muted">{r.note}</span></li>)}</ul></>}
             <h3>Guidance</h3><pre className="logbox">{d.body}</pre>
   </>;
@@ -427,6 +550,16 @@ export function Skills() {
         {can("admin.policies") && <button className="ghost" onClick={() => api("/skills/reload", { method: "POST" }).then(list.reload)}>Reload</button>}
       </PageHead>
       {list.data?.errors?.length > 0 && <div className="alert error" style={{ marginBottom: 12 }}>{list.data.errors.map((e: any) => <div key={e.path} className="small">{e.path}: {e.error}</div>)}</div>}
+      {generation.data?.active && <div className="card stack">
+        <div className="row between"><span className="small">Skill generation <strong>{generation.data.active.generation}</strong> · {generation.data.active.skills} skills · <span className="mono">{generation.data.active.digest.slice(0, 12)}</span></span>
+          <Badge kind={generation.data.consistent ? "ok" : "warn"}>{generation.data.consistent ? "every process current" : "processes differ"}</Badge></div>
+        <div className="row small">{generation.data.processes.map((p: any) => <span key={p.instance} title={p.error ?? p.instance}><Badge kind={p.error ? "bad" : p.current ? "ok" : "warn"}>{p.component} {p.generation ?? "none"}</Badge></span>)}</div>
+        {generation.data.processes.filter((p: any) => p.error).map((p: any) => <div key={p.instance} className="alert error small">{p.instance} kept its last valid generation: {p.error}</div>)}
+      </div>}
+      {waiting.length > 0 && <div className="card stack mt"><h2>Waiting for review ({waiting.length})</h2>
+        {waiting.map((v) => <div key={v.digest} className="row between small"><span><strong>{v.skill}</strong> v{v.version} · {v.owner} · <span className="mono">{v.digest.slice(0, 12)}</span> {v.validation.filter((i: any) => i.level === "error").map((i: any) => <div key={i.message} className="muted">{i.where}: {i.message}</div>)}</span>
+          {v.state === "validated" ? <button className="ghost small" onClick={() => publish(v.skill, v.digest)}>Publish</button> : <Badge kind="bad">failed validation</Badge>}</div>)}</div>}
+      <div className="mt" />
       <FilterPanel chips={chips} onClear={clearF} search={<input type="search" className="grow" aria-label="Search skills" value={text} onChange={(e) => setF({ q: e.target.value })} placeholder="Search skills" />}>
         <label>Category<select value={category} onChange={(e) => setF({ category: e.target.value })}><option value="">All</option>{CATEGORIES.map((c) => <option key={c}>{c}</option>)}</select></label>
       </FilterPanel>

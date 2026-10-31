@@ -451,3 +451,4 @@ select.manage { padding: 4px 6px; font-size: 12px; }
 .plan-decision { position: sticky; top: 0; }
 @media (max-width: 900px) { .plan-decision { position: static; } }
 .menu-trigger svg, .ident-more svg { stroke-width: 3; }
+.skill-run { padding: var(--sp-2) 0; border-top: 1px solid var(--border-soft); }

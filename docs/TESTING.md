@@ -192,3 +192,15 @@ helm lint deploy/helm/moks -f deploy/helm/moks/values-minikube.yaml
 | `test_llm_budget.py` | Concurrent calls for the last of a budget, timeouts, retries, crashes |
 | `test_restore_drill.py` | Real `pg_dump` and `pg_restore`: missing table or rows, corruption, wrong key, clean restore |
 | `test_velero.py` | Cluster backups stay inside the plan path, and Secret values never surface |
+
+## Evaluation gates
+
+`rag` and `skills` datasets run real code with deterministic assertions, on the Evaluation page and in `tests/test_eval_gates.py`,
+so a regression fails CI. No model judges them. A gate passes or fails; the score only summarizes quality.
+
+- **rag:** recall@5, MRR, nDCG, exact identifiers, access isolation, abstention, stale and superseded documents, injection, latency.
+- **skills:** selection and rejection, planned tools, argument scope, disabled and unavailable skills, publication validation,
+  declared `evaluation` cases, detection identity and repeats, unsupported remediation.
+
+Each result stores the dataset, skill generation, pipeline and prompt versions. Embedding outages and external backends are
+covered by tests with simulated services (`test_rag_governance.py`, `test_pinecone.py`), not by the gates.

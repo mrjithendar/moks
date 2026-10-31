@@ -54,7 +54,9 @@ recovery_validation:
 - gateway error rate back to baseline
 evaluation:
 - fixture: broken-selector
-  expect: service_selector_mismatch verified with near-miss pods
+  expect:
+    selected: true
+    note: 'service_selector_mismatch verified with near-miss pods'
 remediation:
 - when: service_selector_mismatch
   action: apply_config_patch

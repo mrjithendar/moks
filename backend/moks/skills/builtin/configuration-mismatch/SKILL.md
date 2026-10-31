@@ -33,7 +33,9 @@ hypotheses:
   refutes: All references resolve.
 evaluation:
 - fixture: crashloop-config
-  expect: invalid PAYMENT_MODE found in previous logs
+  expect:
+    selected: true
+    note: 'invalid PAYMENT_MODE found in previous logs'
 remediation:
 - when: config_ref_missing
   action: open_pull_request

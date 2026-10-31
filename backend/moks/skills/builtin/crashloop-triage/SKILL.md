@@ -10,6 +10,7 @@ steps:
     limit: 2
     args: {namespace: "{namespace}", pod: "{pod}", previous: true, tail_lines: 150}
     purpose: output of the crashed container
+    required: true
   - tool: k8s_describe_pod
     for_each: finding.crashloop
     limit: 2
@@ -34,9 +35,14 @@ remediation:
     action: open_pull_request
     note: If the logs show an invalid configuration value, fix it in Git (manifest/ConfigMap) rather than live.
 title: CrashLoopBackOff
+evidence_required:
+- {tool: k8s_pod_logs, when_finding: crashloop, label: output of the crashed container}
+- {tool: k8s_describe_pod, when_finding: crashloop, label: the pod's configuration and last exit code}
+verification:
+- {finding: crashloop, expect: present, label: the crash loop was observed directly}
 owner: sre
 category: kubernetes
-version: '2'
+version: '3'
 detection:
 - id: pod-crashloop
   kind: finding
@@ -48,7 +54,9 @@ detection:
   title: Pod crash-looping
 evaluation:
 - fixture: crashloop-config
-  expect: the lab's expected finding
+  expect:
+    selected: true
+    note: "the lab's expected finding"
 ---
 # CrashLoopBackOff triage
 

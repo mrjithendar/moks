@@ -741,18 +741,17 @@ def _rerank(allowed: list, query: str, tokens: list[str], service: str | None, k
     scored.sort(key=lambda t: (-t[0], t[2]))
     results: list[dict[str, Any]] = []
     per_doc: dict[uuid.UUID, int] = {}
-    seen_hash: set[str] = set()
-    seen_shingles: list[set[str]] = []
-    dropped = 0
+    seen_hash: set[tuple] = set()
+    seen_shingles: dict[tuple, list[set[str]]] = {}
     for rank, signals, cid, c, d, s, state, why in scored:
-        shingles = _shingles(c.text)
-        if per_doc.get(d.id, 0) >= PER_DOCUMENT or (c.text_hash and c.text_hash in seen_hash) or any(_is_near_duplicate(shingles, x) for x in seen_shingles):
-            dropped += 1
+        shingles, where = _shingles(c.text), (d.environment, d.namespace)  # the same text for two scopes says two things
+        same = seen_shingles.setdefault(where, [])
+        if per_doc.get(d.id, 0) >= PER_DOCUMENT or (c.text_hash and (where, c.text_hash) in seen_hash) or any(_is_near_duplicate(shingles, x) for x in same):
             continue
         per_doc[d.id] = per_doc.get(d.id, 0) + 1
-        seen_shingles.append(shingles)
+        same.append(shingles)
         if c.text_hash:
-            seen_hash.add(c.text_hash)
+            seen_hash.add((where, c.text_hash))
         results.append({
             "chunk_id": cid, "document_id": str(d.id), "ord": c.ord, "score": round(rank, 5), "signals": signals, "title": d.title, "heading": c.heading, "text": c.text,
             "citation": {"source": s.name, "source_type": s.type, "repository": (s.config or {}).get("repository"), "path": d.path, "revision": d.revision,

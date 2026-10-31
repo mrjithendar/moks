@@ -83,7 +83,7 @@ async def test_deleting_a_source_removes_it_from_search(client):
     tag = uuid.uuid4().hex[:6]
     await make_user(f"kadmin-{tag}@example.com", ["admin"])
     h = await login(client, f"kadmin-{tag}@example.com")
-    src = (await client.post("/moks/api/knowledge/sources", json={"name": f"up-{tag}", "type": "upload"}, headers=h)).json()
+    src = (await client.post("/moks/api/knowledge/sources", json={"name": f"up-{tag}", "type": "upload", "shared_globally": True}, headers=h)).json()
     up = await client.post(f"/moks/api/knowledge/sources/{src['id']}/upload", files={"file": ("guide.md", f"# Guide\nquokka{tag} procedure".encode())},
                            data={"environment": "*", "namespace": "*"}, headers=h)
     assert up.status_code == 201 and up.json()["status"] == "active"
@@ -274,13 +274,13 @@ async def test_new_source_syncs_now_and_then_daily_and_duplicates_are_refused(cl
     tag = uuid.uuid4().hex[:6]
     await make_user(f"k-{tag}@example.com", ["admin"])
     h = await login(client, f"k-{tag}@example.com")
-    s = (await client.post("/moks/api/knowledge/sources", json={"name": f"daily-{tag}", "type": "github", "repository": "acme/ops"}, headers=h)).json()
+    s = (await client.post("/moks/api/knowledge/sources", json={"name": f"daily-{tag}", "type": "github", "repository": "acme/ops", "shared_globally": True}, headers=h)).json()
     assert s["sync_interval_minutes"] == 1440 and s["syncable"]
     r = (await client.post(f"/moks/api/knowledge/sources/{s['id']}/sync", headers=h)).json()
     assert r == {"queued": False, "already_running": True}  # the first sync is already queued
     row = next(x for x in (await client.get("/moks/api/knowledge/sources")).json() if x["id"] == s["id"])
     assert row["sync_state"] == "queued" and row["timezone"] == "UTC" and row["stale"]
-    u = (await client.post("/moks/api/knowledge/sources", json={"name": f"up-{tag}", "type": "upload"}, headers=h)).json()
+    u = (await client.post("/moks/api/knowledge/sources", json={"name": f"up-{tag}", "type": "upload", "shared_globally": True}, headers=h)).json()
     assert u["syncable"] is False and u["sync_interval_minutes"] == 0
     assert (await client.post(f"/moks/api/knowledge/sources/{u['id']}/sync", headers=h)).status_code == 404
     off = (await client.put(f"/moks/api/knowledge/sources/{s['id']}/schedule", json={"sync_interval_minutes": 0}, headers=h)).json()
@@ -339,7 +339,7 @@ async def test_opensearch_backend_contract():
     assert seen[-1][1] == "/_bulk" and '"embedding"' in seen[-1][2]
     ids = (await os_.keyword("moks-chunks-x", "redis failover", [access.Grant("prod", "shop")], 5))[0]
     body = json.loads(seen[-1][2])
-    assert ids == ["c1"] and {"terms": {"environment": ["*", "prod"]}} in body["query"]["bool"]["filter"]
+    assert ids == ["c1"] and body["query"]["bool"]["filter"] == [{"bool": {"should": [{"bool": {"filter": [{"terms": {"environment": ["*", "prod"]}}, {"terms": {"namespace": ["*", "shop"]}}]}}], "minimum_should_match": 1}}]
 
 
 async def test_prompt_injection_in_documents_cannot_trigger_actions(client, monkeypatch):

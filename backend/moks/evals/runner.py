@@ -21,6 +21,7 @@ from sqlalchemy import select
 from ..db import session_scope
 from ..models import AUTOMATION_USER_ID, Environment, EvalRun, Evidence, Investigation, RoleBinding
 from ..orchestrator.engine import Investigator
+from . import gates
 from .fixture import FixtureKubernetes
 
 DATASETS = Path(__file__).parent / "datasets"
@@ -30,7 +31,7 @@ def list_datasets() -> list[dict]:
     out = []
     for p in sorted(DATASETS.glob("*.yaml")):
         d = yaml.safe_load(p.read_text())
-        out.append({"name": d["name"], "cases": len(d["cases"])})
+        out.append({"name": d["name"], "cases": len(d["cases"]), "kind": d.get("kind", "investigation")})
     return out
 
 
@@ -77,9 +78,9 @@ def score_case(case: dict, inv: Investigation, evidence_refs: set[str]) -> dict:
 
 
 async def start(dataset: str, mode: str, created_by=None) -> uuid.UUID:
-    load(dataset)
+    data = load(dataset)
     async with session_scope() as db:
-        run = EvalRun(dataset=dataset, mode=mode, created_by=created_by)
+        run = EvalRun(dataset=dataset, mode=mode, created_by=created_by, kind=data.get("kind", "investigation"))
         db.add(run)
         await db.flush()
         return run.id
@@ -90,6 +91,13 @@ async def execute(run_id: uuid.UUID) -> dict[str, Any]:
         run = await db.get(EvalRun, run_id)
         dataset, mode = run.dataset, run.mode
     data = load(dataset)
+    if data.get("kind") in ("rag", "skills"):
+        out = await (gates.run_rag(data, run_id) if data["kind"] == "rag" else gates.run_skills(data))
+        async with session_scope() as db:
+            run = await db.get(EvalRun, run_id)
+            run.results, run.score, run.status, run.finished_at = out["results"], Decimal(str(out["score"])), "completed", datetime.now(timezone.utc)
+            run.gates, run.versions = out["gates"], {**gates.versions(data), "metrics": out["metrics"]}
+        return {"score": out["score"], "gates_passed": all(g["passed"] for g in out["gates"])}
     env_id = await _eval_env(f"eval-{dataset}")
     results = []
     for case in data["cases"]:
@@ -110,4 +118,5 @@ async def execute(run_id: uuid.UUID) -> dict[str, Any]:
     async with session_scope() as db:
         run = await db.get(EvalRun, run_id)
         run.results, run.score, run.status, run.finished_at = results, Decimal(str(total)), "completed", datetime.now(timezone.utc)
+        run.versions = gates.versions(data)
     return {"score": total, "cases": len(results)}

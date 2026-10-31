@@ -1,8 +1,8 @@
-# Every image is tagged with its commit and deployed by digest, so a tag can never move.
-# The old :latest images stay until they age out, and a rollback pins a digest from Git history.
+# Every image is tagged with its commit, and CI moves latest to the newest build, which mk4 runs.
+# latest has to move, so tags are mutable. A rollback points latest back at a commit tag.
 resource "aws_ecr_repository" "moks" {
   name                 = var.repository_name
-  image_tag_mutability = "IMMUTABLE"
+  image_tag_mutability = "MUTABLE"
   force_delete         = false # never lose the images a rollback needs
 
   encryption_configuration {

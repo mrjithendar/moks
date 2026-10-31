@@ -155,11 +155,13 @@ async def sync_github(db: AsyncSession, src: KnowledgeSource, transport=None) ->
         cursor = dict(src.sync_cursor or {})
         resuming = cursor.get("state") == "ingesting" and datetime.now(timezone.utc) - datetime.fromisoformat(cursor["started_at"]) < timedelta(hours=PIN_HOURS)
         if not resuming:
+            source_id = src.id
             try:
                 cursor = dict(await _take_inventory(db, src, git, repo, cfg))
             except ConnectorError:
                 await db.rollback()
-                src.sync_cursor = {**(src.sync_cursor or {}), "listing": "failed"}
+                row = await db.get(KnowledgeSource, source_id)
+                row.sync_cursor = {**(row.sync_cursor or {}), "listing": "failed"}
                 await db.commit()
                 raise
         await _read_batch(db, src, git, repo, cfg, cursor)

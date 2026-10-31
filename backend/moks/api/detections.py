@@ -17,6 +17,7 @@ from ..auth.sessions import AuthContext
 from ..db import get_db
 from ..models import Connector, DetectionPolicy, DetectionRun, DetectionState, Environment, MaintenanceWindow
 from ..rbac import P
+from ..skills import registry as skill_registry
 
 router = APIRouter(prefix="/detections", tags=["detections"])
 
@@ -44,6 +45,7 @@ async def rules(ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends
     for c in (await db.execute(select(Connector).where(Connector.environment_id.in_(ids), Connector.enabled.is_(True)))).scalars():
         connectors.setdefault(c.environment_id, set()).add(c.type)
     names = {e.id: e.name for e in envs}
+    view = await skill_registry.policy(db)
     out = []
     for r in detection.all_rules():
         policy = policies.get(r.id)
@@ -53,7 +55,8 @@ async def rules(ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends
                     "enabled": spec.enabled, "interval_minutes": spec.interval_minutes, "lookback_minutes": spec.lookback_minutes, "sustained_checks": spec.sustained_checks,
                     "recovery_checks": spec.recovery_checks, "cooldown_minutes": spec.cooldown_minutes, "threshold": spec.threshold, "operator": spec.operator, "query": spec.query,
                     "finding": spec.finding, "auto_investigate": spec.auto_investigate, "auto_resolve": spec.auto_resolve, "owner": spec.owner or r.skill.meta.owner,
-                    "policy_environments": policy.environments if policy else [],
+                    "policy_environments": policy.environments if policy else [], "digest": r.skill.digest,
+                    "blocked": {e.name: why for e in envs if (why := detection.blocked(r, e, view))},
                     "unavailable_in": [e.name for e in envs if needed not in connectors.get(e.id, set())], "needs": needed,
                     "runs": [{"environment": names[x.environment_id], "at": x.last_run_at.isoformat(), "status": x.last_status, "reason": x.last_reason} for x in runs if x.rule_id == r.id]})
     return {"rules": out, "environments": [{"name": e.name, "detection_enabled": e.detection_enabled} for e in envs]}

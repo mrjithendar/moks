@@ -2,15 +2,11 @@ name: moks
 
 # check   -> every push and pull request: backend tests against PostgreSQL, frontend typecheck/build,
 #            Helm lint/render
-# release -> default branch: build the arm64 image once, tag it with the commit, then open a pull
-#            request that pins its digest. Merging that pull request is the release; nothing mutable
-#            is used, and CI never touches the cluster.
+# release -> default branch: build the arm64 image once, tag it with the commit and move latest to it.
+#            mk4 runs latest, and new pods pull it when restarted. CI never touches the cluster.
 
 on:
   push:
-    # Merging a release changes only the digest. Building again here would make a new image of the
-    # same code and a new release pull request, for ever. Pull requests still run the checks.
-    paths-ignore: [deploy/helm/moks/values-minikube.yaml]
   pull_request:
   workflow_dispatch:
 
@@ -75,8 +71,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     permissions:
-      contents: write        # the branch holding the digest pull request
-      pull-requests: write
+      contents: read
       id-token: write        # GitHub OIDC token for AWS; no stored access keys
     env:
       AWS_REGION: us-east-1
@@ -104,21 +99,7 @@ jobs:
           docker rm -f smoke
           docker push "$IMAGE"
           DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2)"
-          echo "DIGEST=$DIGEST" >> "$GITHUB_ENV"
-          echo "pushed $IMAGE ($DIGEST)" >> "$GITHUB_STEP_SUMMARY"
-      # The same digest moves on through review: no rebuild, and no rollout until this is merged.
-      - name: Propose the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          scripts/set-image.sh "$DIGEST"
-          git diff --quiet && exit 0
-          BRANCH="release/${GITHUB_SHA::12}"
-          git config user.name moks-release
-          git config user.email moks-release@users.noreply.github.com
-          git switch -c "$BRANCH"
-          git commit -am "Release ${GITHUB_SHA::12}"
-          git push origin "$BRANCH"
-          gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" --title "Release ${GITHUB_SHA::12}" \
-            --body "Pins image $DIGEST built from ${{ github.sha }}. Merging this and syncing Argo CD is the rollout; see docs/RELEASES.md." \
-            || echo "The image and branch $BRANCH are ready, but GitHub refused the pull request: open it by hand, or allow Actions to create pull requests in the repository settings." >> "$GITHUB_STEP_SUMMARY"
+          LATEST="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
+          docker tag "$IMAGE" "$LATEST"
+          docker push "$LATEST"
+          echo "pushed $IMAGE and $LATEST ($DIGEST). Restart mk4 to run it; see docs/RELEASES.md." >> "$GITHUB_STEP_SUMMARY"

@@ -82,6 +82,14 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
     poll_every = max(1, int(s.alert_poll_seconds / max(s.worker_poll_seconds, 0.1)))
     housekeeping: asyncio.Task | None = None
 
+    from ..skills import registry as skill_registry
+
+    if skill_registry.scan_on_start():
+        try:
+            await skill_registry.scan()
+        except Exception as exc:  # the worker still runs on the last published generation
+            log.warning("skill scan failed", extra={"event": "skill_scan_failed", "errorType": type(exc).__name__})
+
     async def maintain(reap: bool, schedule: bool) -> None:
         await versions.report("worker")
         if reap:

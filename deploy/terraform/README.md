@@ -4,7 +4,7 @@ This module creates everything MOKS needs in AWS account `881026659929` (us-east
 
 | Resource | Purpose |
 |---|---|
-| ECR repository `moks` | Immutable tags, scan on push, AES-256. Lifecycle: untagged images expire after 1 day; the newest 30 commit images are kept. `force_delete = false` |
+| ECR repository `moks` | Mutable tags (CI moves `latest`), scan on push, AES-256. Lifecycle: untagged images expire after 1 day; the newest 30 commit images are kept. `force_delete = false` |
 | ECR repository policy (optional) | Pull access for listed principals (`ecr_pull_principal_arns`) |
 | IAM OIDC provider `token.actions.githubusercontent.com` | Lets GitHub Actions use short-lived credentials. It is account-wide; set `create_github_oidc_provider = false` if another stack manages it |
 | IAM role `moks-github-ci` | Assumable only by `master` of this repository, matched on GitHub's immutable subject `repo:mrjithendar@20453233/moks@1439332847:ref:refs/heads/master` (`github_oidc_subject_prefix`); can push to `moks` only |

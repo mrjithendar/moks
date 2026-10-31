@@ -72,7 +72,8 @@ export function Detections() {
             { label: r.enabled ? "Turn off" : "Turn on", run: () => toggle(r) } ] as MenuItem[] }) : undefined}
           cols={[
             { key: "rule", head: "Rule", primary: true, cell: (r) => <><span className="row tight"><Truncate text={r.title} lines={2} />{!r.enabled && <Badge>off</Badge>}</span><Truncate text={`${r.id} · ${r.skill} v${r.version} · ${r.owner}`} mono />
-              {r.unavailable_in.length > 0 && <span className="small muted">Needs {r.needs} in {r.unavailable_in.join(", ")}</span>}</> },
+              {r.unavailable_in.length > 0 && <span className="small muted">Needs {r.needs} in {r.unavailable_in.join(", ")}</span>}
+              {Object.keys(r.blocked ?? {}).length > 0 && <span className="small muted">Not running in {Object.keys(r.blocked).join(", ")}: {Object.values(r.blocked)[0] as string}</span>}</> },
             { key: "sev", head: "Severity", status: true, cell: (r) => <Badge kind={SEV[r.severity]}>{r.severity}</Badge> },
             { key: "src", head: "Source", wide: true, cell: (r) => <span className="small">{r.kind === "finding" ? `detector: ${r.finding}` : r.kind}{r.query && <Truncate text={r.query} mono />}</span> },
             { key: "sch", head: "Schedule", cell: (r) => <span className="small">every {r.interval_minutes} min, {r.sustained_checks} to open, {r.recovery_checks} to clear{r.auto_investigate ? ", investigates" : ""}{r.auto_resolve ? ", auto-resolves" : ""}</span> },

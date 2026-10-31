@@ -301,6 +301,16 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose }
         ))}</ul>
         <div className="small muted proposal-note">Proposals only: nothing was changed. Turn one into a reviewed action plan to execute it (approval required in production).</div>
       </Section>}
+      {report.skill_runs?.length > 0 && <Section title="What each skill did" count={report.skill_runs.length} open={false}>
+        {report.skill_runs.map((r: any) => <div key={r.skill} className="stack tight skill-run">
+          <div className="small"><strong>{r.skill}</strong> <span className="muted">v{r.version} · <span className="mono">{r.digest?.slice(0, 12)}</span> · {r.reasons.join("; ")}</span></div>
+          {r.stopped && <div className="alert warn small">Stopped during this run: {r.stopped}</div>}
+          {r.gaps?.map((g: string) => <div key={g} className="alert warn small">{g}</div>)}
+          <ul className="small">{r.steps.map((s: any, i: number) => <li key={i}><span className="mono">{s.tool}</span> <Badge kind={s.status === "executed" ? "ok" : s.status === "failed" ? "bad" : "neutral"}>{s.status}</Badge>{s.evidence.length > 0 && <Cites refs={[...new Set<string>(s.evidence)]} onCite={onCite} />} <span className="muted">{s.reason ?? s.errors[0] ?? ""}</span></li>)}</ul>
+          {r.checks?.filter((c: any) => c.status !== "guidance_only").map((c: any, i: number) => <div key={i} className="small"><Badge kind={c.status === "passed" ? "ok" : c.status === "failed" ? "bad" : "neutral"}>{c.status.replace("_", " ")}</Badge> {c.text}</div>)}
+        </div>)}
+        {report.skill_rejected?.length > 0 && <div className="small muted">Not used: {report.skill_rejected.map((r: any) => `${r.skill} (${r.reason})`).join("; ")}</div>}
+      </Section>}
       {report.skills?.length > 0 && <div className="small" style={{ marginTop: 8 }}>Skills applied: {report.skills.map((s: any) => (
         <Link key={s.name} to="/skills" title={s.reasons.join("; ")}><Badge kind="info">{s.name}</Badge></Link>))}</div>}
       {report.notes?.length > 0 && <details><summary className="small">Investigation notes ({report.notes.length})</summary><ul className="small">{report.notes.map((n: string, i: number) => <li key={i}>{n}</li>)}</ul></details>}

@@ -1,8 +1,9 @@
 # mk4 (Hetzner, 4-node Minikube, arm64) behind Traefik at https://jithendar.com/moks
 image:
   repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
-  digest: "latest"
-  pullPolicy: Always
+  # Updated by the release pull request CI opens. Roll back by reverting that commit (docs/RELEASES.md).
+  digest: "sha256:a8a6fe2aa5b93a7a2bcc68e9fd550643b7416972c8604f4aa32872314f06fa2a"
+  pullPolicy: IfNotPresent   # a digest never changes, so a cached copy is always correct
 imagePullSecrets: [{name: ecr-pull}]   # refreshed by the ecr-refresh CronJob (tools repo); see docs/OPERATOR_GUIDE.md
 
 # Cluster backups. Velero itself is the Argo CD app in deploy/argocd/velero.yaml.

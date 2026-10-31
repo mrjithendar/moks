@@ -48,6 +48,7 @@ class CreateIn(BaseModel):
     namespace: str | None = Field(default=None, pattern=r"^(\*|[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$")
     minutes: int | None = Field(default=None, ge=5, le=10080)
     incident_id: uuid.UUID | None = None
+    skill: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{1,60}$")  # run this skill first, if it may run here
 
 
 def serialize(inv: Investigation, env_name: str, user_email: str | None = None, full: bool = False) -> dict[str, Any]:
@@ -185,7 +186,7 @@ async def start_investigation(body: CreateIn, request: Request, ctx: AuthContext
     minutes = body.minutes or window_from_question(body.question) or s.default_query_window_minutes
     window = min(timedelta(minutes=minutes), max_window(env))
     now = datetime.now(timezone.utc)
-    inv = Investigation(created_by=ctx.user.id, environment_id=env.id, namespace=body.namespace, question=body.question,
+    inv = Investigation(created_by=ctx.user.id, environment_id=env.id, namespace=body.namespace, question=body.question, requested_skill=body.skill,
                         time_from=now - window, time_to=now, status="queued")
     if body.incident_id:
         from ..incidents import add_event
