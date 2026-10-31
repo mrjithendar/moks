@@ -186,8 +186,8 @@ def handlers() -> dict[str, Handler]:
 
     async def knowledge_sync(db: AsyncSession, p: dict) -> dict:
         src = await db.get(KnowledgeSource, uuid.UUID(p["source_id"]))
-        if src is None or not src.enabled:
-            return {"skipped": "source missing or disabled"}
+        if src is None or not src.enabled or src.lifecycle != "active":
+            return {"skipped": "source missing, disabled or not active"}
         if src.type != "github":
             return {"skipped": f"{src.type} sources are updated on upload/approval"}
         src.last_attempt_at = datetime.now(timezone.utc)
@@ -203,11 +203,14 @@ def handlers() -> dict[str, Handler]:
             await db.commit()
             raise
         src = await db.get(KnowledgeSource, src.id)
-        src.last_counts = {k: result.get(k, 0) for k in ("added", "updated", "deleted", "unchanged", "excluded", "failed")}
-        if not result.get("failed"):
+        src.last_counts = {k: result.get(k, 0) for k in ("added", "updated", "deleted", "unchanged", "excluded", "failed", "discovered", "processed", "remaining")}
+        src.last_counts.update(listing=result.get("listing"), content=result.get("content"))
+        if result.get("complete"):
             src.last_success_at = datetime.now(timezone.utc)
         await _plan_next(db, src)
-        await audit.record(db, action="knowledge.sync", resource_type="knowledge_source", resource_id=str(src.id), outcome="partial" if result.get("failed") else "success",
+        if result.get("remaining"):
+            src.next_sync_at = datetime.now(timezone.utc) + timedelta(seconds=30)  # the same listing carries on, whatever the schedule
+        await audit.record(db, action="knowledge.sync", resource_type="knowledge_source", resource_id=str(src.id), outcome="success" if result.get("complete") else "partial",
                            details=src.last_counts)
         return result
 

@@ -21,6 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..connectors.base import ConnectorError
+from . import access
 
 RRF_K = 60
 
@@ -40,15 +41,8 @@ def rrf(*rankings: list[str]) -> list[tuple[str, float]]:
     return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
 
 
-def _filters_sql(envs: list[str] | None, nss: list[str] | None, params: dict) -> str:
-    clauses = ["d.status = 'active'"]
-    if envs is not None:
-        clauses.append("(d.environment = '*' OR d.environment = ANY(:envs))")
-        params["envs"] = envs
-    if nss is not None:
-        clauses.append("(d.namespace = '*' OR d.namespace = ANY(:nss))")
-        params["nss"] = nss
-    return " AND ".join(clauses)
+def _filters_sql(found: list[access.Grant], params: dict) -> str:
+    return f"d.status = 'active' AND s.lifecycle = 'active' AND {access.sql(found, params)}"
 
 
 class PostgresBackend:
@@ -62,11 +56,11 @@ class PostgresBackend:
             "SELECT 1 FROM information_schema.columns WHERE table_name = 'chunk_embeddings' AND column_name = 'embedding'"))).first()
         return row is not None
 
-    async def keyword(self, query: str, envs, nss, k: int) -> list[str]:
+    async def keyword(self, query: str, found: list[access.Grant], k: int) -> list[str]:
         params: dict[str, Any] = {"q": query, "k": k}
-        where = _filters_sql(envs, nss, params)
+        where = _filters_sql(found, params)
         rows = (await self.db.execute(text(f"""
-            SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id
+            SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id JOIN knowledge_sources s ON s.id = d.source_id
             WHERE {where} AND c.tsv @@ websearch_to_tsquery('english', :q)
             ORDER BY ts_rank_cd(c.tsv, websearch_to_tsquery('english', :q)) DESC LIMIT :k"""), params)).all()
         if not rows:  # fall back to OR-semantics so partial matches still rank
@@ -74,16 +68,33 @@ class PostgresBackend:
             if terms:
                 params["q2"] = " | ".join(terms)
                 rows = (await self.db.execute(text(f"""
-                    SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id
+                    SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id JOIN knowledge_sources s ON s.id = d.source_id
                     WHERE {where} AND c.tsv @@ to_tsquery('english', :q2)
                     ORDER BY ts_rank_cd(c.tsv, to_tsquery('english', :q2)) DESC LIMIT :k"""), params)).all()
         return [str(r[0]) for r in rows]
 
-    async def vector(self, embedding: list[float], index_id: uuid.UUID, envs, nss, k: int) -> list[str]:
-        params: dict[str, Any] = {"v": json.dumps(embedding), "k": k, "idx": index_id}
-        where = _filters_sql(envs, nss, params)
+    async def identifiers(self, tokens: list[str], found: list[access.Grant], k: int) -> list[str]:
+        """Exact matches for error codes, resource names, paths and configuration keys, which a text
+        search stems and splits. PostgreSQL holds the text whichever backend ranks the rest."""
+        if not tokens:
+            return []
+        params: dict[str, Any] = {"k": k}
+        where = _filters_sql(found, params)
+        hits = []
+        for i, t in enumerate(tokens[:6]):
+            params[f"t{i}"] = "%" + t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            hits.append(f"(CASE WHEN c.text ILIKE :t{i} OR d.path ILIKE :t{i} OR c.heading ILIKE :t{i} THEN 1 ELSE 0 END)")
+        score = " + ".join(hits)
         rows = (await self.db.execute(text(f"""
-            SELECT c.id FROM chunk_embeddings e JOIN chunks c ON c.id = e.chunk_id JOIN documents d ON d.id = c.document_id
+            SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id JOIN knowledge_sources s ON s.id = d.source_id
+            WHERE {where} AND ({score}) > 0 ORDER BY ({score}) DESC, c.id LIMIT :k"""), params)).all()
+        return [str(r[0]) for r in rows]
+
+    async def vector(self, embedding: list[float], index_id: uuid.UUID, found: list[access.Grant], k: int) -> list[str]:
+        params: dict[str, Any] = {"v": json.dumps(embedding), "k": k, "idx": index_id}
+        where = _filters_sql(found, params)
+        rows = (await self.db.execute(text(f"""
+            SELECT c.id FROM chunk_embeddings e JOIN chunks c ON c.id = e.chunk_id JOIN documents d ON d.id = c.document_id JOIN knowledge_sources s ON s.id = d.source_id
             WHERE {where} AND e.index_id = :idx
             ORDER BY e.embedding <=> CAST(:v AS vector) LIMIT :k"""), params)).all()
         return [str(r[0]) for r in rows]
@@ -181,27 +192,24 @@ class OpenSearchBackend:
             "script": {"lang": "painless", "source": "ctx._source.environment = params.e; ctx._source.namespace = params.n",
                        "params": {"e": environment, "n": namespace}}}, ok404=True)
 
-    def _filter(self, envs, nss) -> list[dict]:
-        f: list[dict] = []
-        if envs is not None:
-            f.append({"terms": {"environment": ["*", *envs]}})
-        if nss is not None:
-            f.append({"terms": {"namespace": ["*", *nss]}})
-        return f
+    async def count_document(self, index_name: str, document_id: uuid.UUID) -> int | None:
+        resp = await self._req("POST", f"/{index_name}/_count", {"query": {"term": {"document_id": str(document_id)}}}, ok404=True)
+        return resp.get("count") if resp else 0
 
-    async def keyword(self, index_name: str, query: str, envs, nss, k: int) -> list[str]:
+    async def keyword(self, index_name: str, query: str, found: list[access.Grant], k: int) -> tuple[list[str], bool]:
+        flt, exact = access.opensearch(found)
         body = {"size": k, "_source": ["chunk_id"], "query": {"bool": {
-            "must": [{"multi_match": {"query": query, "fields": ["heading^2", "text", "path^1.5"]}}], "filter": self._filter(envs, nss)}}}
+            "must": [{"multi_match": {"query": query, "fields": ["heading^2", "text", "path^1.5"]}}], "filter": [flt] if flt else []}}}
         resp = await self._req("POST", f"/{index_name}/_search", body, ok404=True)
-        return [h["_source"]["chunk_id"] for h in (resp.get("hits") or {}).get("hits", [])]
+        return [h["_source"]["chunk_id"] for h in (resp.get("hits") or {}).get("hits", [])], exact
 
-    async def vector(self, index_name: str, embedding: list[float], envs, nss, k: int) -> list[str]:
-        body = {"size": k, "_source": ["chunk_id"], "query": {"knn": {"embedding": {
-            "vector": embedding, "k": k, "filter": {"bool": {"filter": self._filter(envs, nss)}} if (envs is not None or nss is not None) else None}}}}
-        if body["query"]["knn"]["embedding"]["filter"] is None:
-            del body["query"]["knn"]["embedding"]["filter"]
-        resp = await self._req("POST", f"/{index_name}/_search", body, ok404=True)
-        return [h["_source"]["chunk_id"] for h in (resp.get("hits") or {}).get("hits", [])]
+    async def vector(self, index_name: str, embedding: list[float], found: list[access.Grant], k: int) -> tuple[list[str], bool]:
+        flt, exact = access.opensearch(found)
+        knn: dict[str, Any] = {"vector": embedding, "k": k}
+        if flt:
+            knn["filter"] = flt  # applied during the search, so unreadable neighbours do not use up k
+        resp = await self._req("POST", f"/{index_name}/_search", {"size": k, "_source": ["chunk_id"], "query": {"knn": {"embedding": knn}}}, ok404=True)
+        return [h["_source"]["chunk_id"] for h in (resp.get("hits") or {}).get("hits", [])], exact
 
     async def drop_index(self, index_name: str) -> None:
         await self._req("DELETE", f"/{index_name}", ok404=True)
@@ -301,19 +309,18 @@ class PineconeBackend:
             await self._req("POST", f"https://{host}/vectors/update", {"filter": {"document_id": {"$eq": str(document_id)}}, "namespace": self.NAMESPACE,
                                                                        "setMetadata": {"environment": environment, "namespace": namespace}}, ok404=True)
 
-    async def vector(self, index_name: str, embedding: list[float], envs, nss, k: int) -> list[str]:
+    async def count_document(self, index_name: str, document_id: uuid.UUID) -> int | None:
+        return None  # Pinecone cannot count by metadata; revision tracking is what is available
+
+    async def vector(self, index_name: str, embedding: list[float], found: list[access.Grant], k: int) -> tuple[list[str], bool]:
         host = await self._host(index_name)
         if not host:
-            return []
-        conditions = []
-        if envs is not None:
-            conditions.append({"environment": {"$in": ["*", *envs]}})
-        if nss is not None:
-            conditions.append({"namespace": {"$in": ["*", *nss]}})
+            return [], True
+        flt, exact = access.pinecone(found)
         body: dict[str, Any] = {"vector": embedding, "topK": k, "namespace": self.NAMESPACE, "includeMetadata": False, "includeValues": False}
-        if conditions:
-            body["filter"] = {"$and": conditions}
-        return [m["id"] for m in (await self._req("POST", f"https://{host}/query", body)).get("matches", [])]
+        if flt:
+            body["filter"] = flt
+        return [m["id"] for m in (await self._req("POST", f"https://{host}/query", body)).get("matches", [])], exact
 
     async def drop_index(self, index_name: str) -> None:
         await self._req("DELETE", f"{self.CONTROL}/indexes/{index_name}", ok404=True)

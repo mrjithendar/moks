@@ -94,8 +94,11 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
         from ..rag import service
 
         await service.drain_outbox()
+        if tick % 60 == 0:
+            await service.backfill_vectors()
         if tick % 600 == 0:
             await service.reconcile_index()
+            await service.verify_index()
 
     outbox: asyncio.Task | None = None
     while not stop.is_set():

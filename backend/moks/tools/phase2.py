@@ -174,10 +174,12 @@ async def kb_search(ctx: ToolContext, a: KbArgs) -> ToolResult:
     from ..rag import service
 
     async with session_scope() as db:
-        r = await service.search(db, ctx.principal, a.query, a.k, environment=None)
+        r = await service.search(db, ctx.principal, a.query, a.k, environment=ctx.environment.name, namespace=ctx.focus_namespace, neighbors=True)
     hits = r["results"]
-    return ToolResult(f"{len(hits)} knowledge passages ({r.get('mode')}) for {a.query!r}", hits,
-                      {"index": r.get("index"), "citations": [h["citation"] for h in hits]})
+    summary = f"{len(hits)} knowledge passages ({r.get('mode')}) for {a.query!r}. Documented knowledge only: current state needs live evidence."
+    if r["evidence"]["state"] != "supported":
+        summary += f" {r['evidence']['reason']}"
+    return ToolResult(summary, hits, {"index": r.get("index"), "citations": [h["citation"] for h in hits], "evidence": r["evidence"], "fallback_reason": r.get("fallback_reason")})
 
 
 # ---- FinOps -----------------------------------------------------------------------------------

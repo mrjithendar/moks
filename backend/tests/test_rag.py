@@ -13,7 +13,7 @@ from sqlalchemy import text
 from moks import jobs
 from moks.db import session_scope
 from moks.models import Job, KnowledgeSource
-from moks.rag import ingest, service
+from moks.rag import access, ingest, service
 from moks.rag.chunking import chunk
 from moks.rbac import Binding, Principal
 from tests.conftest import login, make_user
@@ -258,9 +258,16 @@ async def test_failed_listing_deletes_nothing(monkeypatch):
 async def test_files_past_the_cap_are_not_treated_as_deleted(monkeypatch):
     gh = FakeGitHub({f"docs/{i}.md": f"# {i}" for i in range(4)})
     sid = await _synced(monkeypatch, gh)
-    monkeypatch.setattr(ingest, "MAX_FILES", 2)
+    from moks.connectors.git import GitHubProvider
+
+    real = GitHubProvider.inventory
+
+    async def partial(self, repo, ref):
+        sha, files, _ = await real(self, repo, ref)
+        return sha, files[:2], "partial"
+    monkeypatch.setattr(GitHubProvider, "inventory", partial)
     r = await _sync_again(sid)
-    assert r["deleted"] == 0 and r["deletions_skipped"]
+    assert r["deleted"] == 0 and r["deletions_skipped"] and r["listing"] == "partial"
 
 
 async def test_new_source_syncs_now_and_then_daily_and_duplicates_are_refused(client, monkeypatch):
@@ -330,7 +337,7 @@ async def test_opensearch_backend_contract():
     await os_.index_chunks("moks-chunks-x", [{"chunk_id": "c1", "document_id": "d1", "environment": "*", "namespace": "shop", "repository": "r",
                                               "service": "", "path": "p", "heading": "h", "text": "t"}], [[0.1] * 8])
     assert seen[-1][1] == "/_bulk" and '"embedding"' in seen[-1][2]
-    ids = await os_.keyword("moks-chunks-x", "redis failover", ["prod"], ["shop"], 5)
+    ids = (await os_.keyword("moks-chunks-x", "redis failover", [access.Grant("prod", "shop")], 5))[0]
     body = json.loads(seen[-1][2])
     assert ids == ["c1"] and {"terms": {"environment": ["*", "prod"]}} in body["query"]["bool"]["filter"]
 

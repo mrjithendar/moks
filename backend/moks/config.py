@@ -80,6 +80,8 @@ class Settings(BaseSettings):
     opensearch_password: str = Field(default="", repr=False)
     opensearch_verify_tls: bool = True
     rag_max_upload_bytes: int = 2_000_000
+    rag_chunk_tokens: int = 350
+    rag_chunk_overlap_tokens: int = 30
 
     # Executor and diagnostics
     process_role: Literal["api", "worker", "executor"] = "api"
