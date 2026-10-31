@@ -34,6 +34,9 @@ class GitProvider(Protocol):
     def blob_url(self, repo: str, path: str, ref: str, start_line: int | None = None, end_line: int | None = None) -> str: ...
 
 
+MAX_TREE_REQUESTS = 2000
+
+
 class GitHubProvider:
     def __init__(self, config: dict[str, Any], credential_ref: dict[str, Any] | None, transport: httpx.AsyncBaseTransport | None = None):
         token = resolve_credential(credential_ref) if credential_ref else None
@@ -66,6 +69,28 @@ class GitHubProvider:
         if body.get("truncated"):
             raise ConnectorError("too_large", f"{repo} tree is too large for one listing; narrow the source paths")
         return sha, [{"path": t["path"], "sha": t["sha"], "size": t.get("size", 0)} for t in body.get("tree", []) if t.get("type") == "blob"]
+
+    async def inventory(self, repo: str, ref: str | None) -> tuple[str, list[dict], str]:
+        """(pinned commit, files, complete | partial). GitHub cuts a recursive tree off at about 100,000
+        entries, so a truncated one is walked directory by directory, within a bound."""
+        ref = ref or await self.default_branch(repo)
+        sha = (await self.http.get_json("commit", f"/repos/{repo}/commits/{quote(ref, safe='')}"))["sha"]
+        body = await self.http.get_json("tree", f"/repos/{repo}/git/trees/{sha}", params={"recursive": "1"})
+        blobs = lambda rows, prefix="": [{"path": prefix + t["path"], "sha": t["sha"], "size": t.get("size", 0)} for t in rows if t.get("type") == "blob"]
+        if not body.get("truncated"):
+            return sha, blobs(body.get("tree", [])), "complete"
+        files: list[dict] = []
+        todo, requests, listing = [("", sha)], 0, "complete"
+        while todo:
+            if requests >= MAX_TREE_REQUESTS:
+                return sha, files, "partial"
+            prefix, tree = todo.pop()
+            body = await self.http.get_json("tree", f"/repos/{repo}/git/trees/{tree}")
+            requests += 1
+            listing = "partial" if body.get("truncated") else listing  # a single directory too large to list
+            files += blobs(body.get("tree", []), prefix)
+            todo += [(f"{prefix}{t['path']}/", t["sha"]) for t in body.get("tree", []) if t.get("type") == "tree"]
+        return sha, files, listing
 
     async def read(self, repo: str, path: str, ref: str | None) -> tuple[str, str]:
         if SECRET_PATHS.search(path):

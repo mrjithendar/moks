@@ -10,7 +10,7 @@ from moks.connectors.base import ConnectorError
 from moks.db import session_scope
 from moks.llm.providers import LLMError
 from moks.models import Document, EmbeddingIndex, KnowledgeSource, LLMConfig
-from moks.rag import service
+from moks.rag import access, service
 from moks.rag.backends import PineconeBackend
 from moks.rbac import Binding, Principal
 
@@ -142,7 +142,7 @@ async def test_query_applies_scope_and_returns_ids():
     a, c = rows(), rows()
     c[0]["environment"] = "other"
     await b.index_chunks("x", a + c, [[0.1, 0.2]] * 2)
-    assert await b.vector("x", [0.1, 0.2], ["mk4"], ["shop"], 5) == [a[0]["chunk_id"]]
+    assert (await b.vector("x", [0.1, 0.2], [access.Grant("mk4", "shop")], 5))[0] == [a[0]["chunk_id"]]
     query = next(r for r in fake.requests if r[1] == "/query")[2]
     assert query["topK"] == 5 and query["filter"]["$and"][0] == {"environment": {"$in": ["*", "mk4"]}}
     assert query["includeValues"] is False

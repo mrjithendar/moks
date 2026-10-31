@@ -150,6 +150,9 @@ class ComponentVersion(Base):
     commit_sha: Mapped[str] = mapped_column(String(64))
     version: Mapped[str] = mapped_column(String(30))
     seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    skill_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    skill_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    skill_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class LLMReservation(Base):
@@ -182,6 +185,9 @@ class Investigation(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     mode: Mapped[str] = mapped_column(String(20), default="llm")  # llm | deterministic
     incident_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("incidents.id", ondelete="SET NULL"), nullable=True)
+    requested_skill: Mapped[str | None] = mapped_column(String(120), nullable=True)  # an operator's explicit choice
+    skill_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    skill_pins: Mapped[list] = mapped_column(JSONB, default=list)  # the exact versions this run used, and what they did
     parent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # follow-up question
     group_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # one question, several environments
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
@@ -283,6 +289,7 @@ class Incident(Base):
     owner_team: Mapped[str | None] = mapped_column(String(120), nullable=True)
     severity_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     runbook: Mapped[str | None] = mapped_column(Text, nullable=True)
+    skill_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class IncidentEvent(Base):
@@ -338,6 +345,43 @@ class KnowledgeSource(Base):
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_counts: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    lifecycle: Mapped[str] = mapped_column(String(20), default="active")  # active | quarantined | archived | deleted
+    team: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    classification: Mapped[str] = mapped_column(String(20), default="internal")  # public | internal | confidential | restricted
+    shared_globally: Mapped[bool] = mapped_column(Boolean, default=False)  # the explicit decision behind a */* scope
+    applies_to: Mapped[dict] = mapped_column(JSONB, default=dict)  # {"services": [...], "resources": [...]}
+    authority: Mapped[int] = mapped_column(Integer, default=0)  # -2..2: a ranking signal, not a trust grant
+    review_interval_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    stale_policy: Mapped[str] = mapped_column(String(20), default="flag")  # flag | exclude
+    stale_after_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sync_cursor: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
+class KnowledgeSyncItem(Base):
+    """One file of a source's listing and how far it got, so a sync resumes and no file starves."""
+    __tablename__ = "knowledge_sync_items"
+    source_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("knowledge_sources.id", ondelete="CASCADE"), primary_key=True)
+    path: Mapped[str] = mapped_column(String(1000), primary_key=True)
+    blob_sha: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    revision: Mapped[str] = mapped_column(String(100))
+    state: Mapped[str] = mapped_column(String(20), default="pending")  # pending | done | excluded | failed
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_tried_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DocumentIndexState(Base):
+    """What one index generation holds for one document."""
+    __tablename__ = "document_index_state"
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    index_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("embedding_indexes.id", ondelete="CASCADE"), primary_key=True)
+    revision: Mapped[int] = mapped_column(BigInteger, default=0)
+    chunks: Mapped[int] = mapped_column(Integer, default=0)
+    vectors: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Document(Base):
@@ -361,6 +405,13 @@ class Document(Base):
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     content_revision: Mapped[int] = mapped_column(BigInteger, default=0)  # moves with every change in PostgreSQL
     indexed_revision: Mapped[int] = mapped_column(BigInteger, default=0)  # what the external index has
+    pipeline_version: Mapped[int] = mapped_column(Integer, default=0)  # chunking, redaction and extraction it went through
+    changed_revision: Mapped[str | None] = mapped_column(String(100), nullable=True)  # the revision its content last changed in
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # last successful check against the source
+    superseded_by: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    doc_state: Mapped[str] = mapped_column(String(20), default="current")  # current | deprecated | superseded
+    vector_state: Mapped[str] = mapped_column(String(20), default="unknown")  # unknown | complete | missing | not_applicable
+    vector_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class IndexOutbox(Base):
@@ -387,6 +438,10 @@ class Chunk(Base):
     text: Mapped[str] = mapped_column(Text)
     start_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
     end_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    start_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)  # characters into the stored (redacted) document
+    end_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    token_estimate: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    text_hash: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class EmbeddingIndex(Base):
@@ -486,6 +541,39 @@ class SkillPolicy(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     updated_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    environments: Mapped[list] = mapped_column(JSONB, default=list)  # empty: every environment
+    allow_override: Mapped[bool] = mapped_column(Boolean, default=False)  # a custom skill may replace this built-in
+
+
+class SkillVersion(Base):
+    """One immutable version of a skill. The digest is SHA-256 of the SKILL.md text."""
+    __tablename__ = "skill_versions"
+    digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    skill_id: Mapped[str] = mapped_column(String(120))
+    version: Mapped[str] = mapped_column(String(40))
+    owner: Mapped[str] = mapped_column(String(120), default="sre")
+    source: Mapped[str] = mapped_column(String(20), default="builtin")
+    content: Mapped[str] = mapped_column(Text)
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+    state: Mapped[str] = mapped_column(String(20), default="draft")  # draft | validated | published | deprecated | disabled
+    validation: Mapped[list] = mapped_column(JSONB, default=list)
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    published_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SkillGeneration(Base):
+    """The exact set of skill versions every process should run. Only one is active."""
+    __tablename__ = "skill_generations"
+    generation: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    digest: Mapped[str] = mapped_column(String(64))
+    manifest: Mapped[dict] = mapped_column(JSONB)  # skill id -> version digest
+    status: Mapped[str] = mapped_column(String(20), default="active")  # active | retired
+    reason: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class DetectionPolicy(Base):
@@ -506,6 +594,10 @@ class DetectionRun(Base):
     last_status: Mapped[str] = mapped_column(String(20))
     last_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     cursor: Mapped[int] = mapped_column(Integer, default=0)  # next namespace in rotation
+    skill: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    skill_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    skill_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    skill_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 class DetectionState(Base):
@@ -664,6 +756,9 @@ class EvalRun(Base):
     status: Mapped[str] = mapped_column(String(20), default="running")
     score: Mapped[Decimal | None] = mapped_column(Numeric(6, 4), nullable=True)
     results: Mapped[list] = mapped_column(JSONB, default=list)
+    kind: Mapped[str] = mapped_column(String(20), default="investigation")  # investigation | rag | skills
+    versions: Mapped[dict] = mapped_column(JSONB, default=dict)  # dataset, skills, model, prompt and index it ran against
+    gates: Mapped[list] = mapped_column(JSONB, default=list)  # deterministic pass or fail, separate from the score
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

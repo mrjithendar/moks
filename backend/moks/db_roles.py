@@ -21,15 +21,15 @@ APPEND = "SELECT, INSERT"
 ROLES = ("moks_api", "moks_worker", "moks_executor", "moks_backup")
 
 _API_RW = ("users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_events", "evidence",
-           "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks", "embedding_indexes", "conversations", "conversation_participants", "conversation_reads",
+           "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks", "embedding_indexes", "conversations", "conversation_participants", "conversation_reads", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations",
            "conversation_messages", "backup_stores", "skill_policies", "detection_policies", "detection_states", "maintenance_windows", "saved_queries",
            "diagnostic_sessions", "diagnostic_commands", "alert_events", "eval_runs", "index_outbox", "llm_reservations", "component_versions")
 _WORKER_RW = ("llm_usage", "investigations", "investigation_events", "evidence", "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks",
-              "embedding_indexes", "conversations", "conversation_participants", "conversation_messages", "detection_runs", "detection_states", "alert_events", "eval_runs", "index_outbox", "llm_reservations", "component_versions")
+              "embedding_indexes", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations", "conversations", "conversation_participants", "conversation_messages", "detection_runs", "detection_states", "alert_events", "eval_runs", "index_outbox", "llm_reservations", "component_versions")
 _EXECUTOR_RW = ("diagnostic_sessions", "diagnostic_commands", "incidents", "incident_events", "component_versions")
 
 TABLES = ("users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_events", "evidence", "audit_events",
-          "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks", "embedding_indexes", "conversations", "conversation_participants", "conversation_reads",
+          "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks", "embedding_indexes", "conversations", "conversation_participants", "conversation_reads", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations",
           "conversation_messages", "backup_runs", "backup_stores", "skill_policies", "detection_policies", "detection_runs", "detection_states", "maintenance_windows",
           "saved_queries", "index_outbox", "llm_reservations", "component_versions", "action_plans", "approvals", "diagnostic_sessions", "diagnostic_commands", "alert_events", "eval_runs", "alembic_version")
 HIDDEN = {"moks_worker": {"sessions"}, "moks_executor": {"sessions"}}  # session hashes are the API's business
