@@ -204,3 +204,9 @@ so a regression fails CI. No model judges them. A gate passes or fails; the scor
 
 Each result stores the dataset, skill generation, pipeline and prompt versions. Embedding outages and external backends are
 covered by tests with simulated services (`test_rag_governance.py`, `test_pinecone.py`), not by the gates.
+
+## LLM providers and generated queries
+
+`test_llm_providers.py` covers each provider's request and response shape with the network simulated: no call reaches
+a real model. Query drafts use a stand-in model. `format_query` and scoped label lookups were checked by hand against mk4's
+Prometheus and Loki.

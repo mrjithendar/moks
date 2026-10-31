@@ -21,8 +21,11 @@ of each type per environment is used.
 
 - **Timeouts:** per connector (`timeout_seconds`), with a hard per-tool-call ceiling of 45 s
   inside investigations and 30 s for interactive reads.
-- **Retries:** idempotent GETs retry twice on timeouts, connection errors, 429 and 5xx, with
-  backoff of 0.3 s and 0.9 s. 4xx responses are not retried.
+- **Retries:** idempotent reads retry twice on timeouts, connection errors and 5xx, with backoff
+  of 0.3 s and 0.9 s. A 429 is not retried, because repeating a rate-limited request extends the
+  block: the error carries the wait, and jobs come back after it. Other 4xx are not retried.
+- **Rotation:** a mounted credential file is re-read when it changes. A value in an environment
+  variable changes with the pod. Old clients close two minutes later, so calls in flight finish.
 - **Size:** responses over 8 MB are refused (`too_large`). Results are redacted, then truncated
   structurally to `MOKS_MAX_RESULT_BYTES` (48 KB) with `truncated: true`.
 - **Pagination:** Kubernetes lists page 250 items at a time up to 1,000 per call. Prometheus
@@ -30,7 +33,7 @@ of each type per environment is used.
   2,000 characters each.
 - **Errors** carry a kind and a message the user can act on: `config` (bad setup or missing
   credential), `auth`, `forbidden` (credential lacks RBAC), `unavailable`, `timeout`,
-  `bad_request` (with the backend's own error, such as a PromQL parse error), `not_found` (with a
+  `bad_request` (with the backend's own error, such as a PromQL parse error, or where a redirect leads), `not_found` (with a
   base-URL/path-prefix hint) and `too_large`.
 
 ## Kubernetes

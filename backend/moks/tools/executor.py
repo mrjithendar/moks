@@ -189,6 +189,8 @@ class ToolExecutor:
         if outcome.ok:
             outcome.data, outcome.truncated = truncate_json(redact_obj(outcome.data), self.settings.max_result_bytes)
         TOOL_CALLS.labels(tool, "ok" if outcome.ok else (outcome.error_kind or "error")).inc()
+        log.info("tool call", extra={"event": "tool_call", "tool": tool, "operation": tool, "dependency": spec.connector_type, "outcome": "success" if outcome.ok else "failure",
+                                     "durationMs": outcome.duration_ms, **({} if outcome.ok else {"errorCode": outcome.error_kind or "error"})})
 
         if self.db is not None and self._next_ref is not None:
             ref = self._next_ref()

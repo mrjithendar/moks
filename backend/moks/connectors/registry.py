@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Connector
-from .base import ConnectorError
+from .base import ConnectorError, resolve_credential_path
 from .cloudwatch import CloudWatchConnector
 from .finops import AwsCostConnector, CostModelConnector
 from .git import GitConnector
@@ -33,11 +33,33 @@ CONNECTOR_TYPES: dict[str, Any] = {
 }
 
 _cache: dict[uuid.UUID, tuple[str, Any]] = {}
+_closing: set[asyncio.Task] = set()
+CLOSE_DELAY = 120
 _lock = asyncio.Lock()
 
 
 def _fingerprint(row: Connector) -> str:
     return hashlib.sha256(json.dumps([row.type, row.config, row.credential_ref], sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _build_key(row: Connector) -> str:
+    """A mounted credential file can rotate with nothing else changing, so its age is part of the key."""
+    stamp = None
+    if (row.credential_ref or {}).get("type") == "file":
+        try:
+            stamp = resolve_credential_path(row.credential_ref).stat().st_mtime
+        except (ConnectorError, OSError):
+            pass
+    return f"{_fingerprint(row)}:{stamp}"
+
+
+async def _close_later(inst: Any) -> None:
+    """Calls already using the old client finish first."""
+    await asyncio.sleep(CLOSE_DELAY)
+    try:
+        await inst.aclose()
+    except Exception:
+        pass
 
 
 def build(row: Connector) -> Any:
@@ -48,17 +70,16 @@ def build(row: Connector) -> Any:
 
 
 async def instance(row: Connector) -> Any:
-    fp = _fingerprint(row)
+    fp = _build_key(row)
     async with _lock:
         cached = _cache.get(row.id)
         if cached and cached[0] == fp:
             return cached[1]
+        inst = build(row)  # first: if the new settings are bad, the running client stays
         if cached:
-            try:
-                await cached[1].aclose()
-            except Exception:
-                pass
-        inst = build(row)
+            task = asyncio.create_task(_close_later(cached[1]))
+            _closing.add(task)
+            task.add_done_callback(_closing.discard)
         _cache[row.id] = (fp, inst)
         return inst
 

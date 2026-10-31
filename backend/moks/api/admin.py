@@ -141,7 +141,7 @@ async def test_connector(cid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMI
 class LLMIn(BaseModel):
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,99}$")
     purpose: Literal["chat", "embedding"] = "chat"
-    provider: Literal["openai", "gemini", "bedrock", "ollama"]
+    provider: Literal["anthropic", "openai", "azure_openai", "gemini", "bedrock", "ollama"]
     model: str = Field(min_length=1, max_length=200)
     endpoint: str | None = Field(default=None, max_length=500, pattern=r"^https?://")
     region: str | None = Field(default=None, pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")

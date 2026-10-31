@@ -30,7 +30,7 @@ from ..auth.revocation import CHECK_SECONDS as WATCH_SECONDS, AccessGuard, Acces
 from ..llm import budget
 from ..llm.providers import LLMError, provider_for
 from ..models import SkillPolicy, Environment, Investigation, InvestigationEvent, LLMConfig, RoleBinding, User
-from ..observability import INVESTIGATION_DURATION, INVESTIGATIONS, INVESTIGATIONS_RUNNING
+from ..observability import INVESTIGATION_DURATION, INVESTIGATIONS, INVESTIGATIONS_RUNNING, continue_trace, tracer
 from ..rbac import Binding, P, Principal
 from ..scope import ScopeError, effective_scope
 from ..tools.contracts import ToolContext
@@ -115,6 +115,13 @@ class Investigator:
     # ---- entry point ----------------------------------------------------------------------
 
     async def run(self) -> None:
+        async with session_scope() as db:
+            queued = (await db.execute(select(InvestigationEvent.payload).where(InvestigationEvent.investigation_id == self.id, InvestigationEvent.seq == 0))).scalar_one_or_none()
+        with tracer().start_as_current_span("investigation", context=continue_trace((queued or {}).get("traceparent"))) as span:
+            span.set_attribute("moks.investigation.id", str(self.id))
+            await self._run()
+
+    async def _run(self) -> None:
         INVESTIGATIONS_RUNNING.inc()
         start = time.monotonic()
         mode = "unknown"
@@ -153,6 +160,8 @@ class Investigator:
         await self._emit("done", {"status": status})
         INVESTIGATIONS.labels(status, mode).inc()
         INVESTIGATION_DURATION.labels(mode).observe(time.monotonic() - start)
+        log.info("investigation finished", extra={"event": "investigation_finished", "investigation_id": str(self.id), "operation": mode, "outcome": "success" if status == "completed" else "failure",
+                                                  "durationMs": int((time.monotonic() - start) * 1000), **({} if status == "completed" else {"errorCode": status})})
 
     async def _watch(self, task: asyncio.Task) -> None:
         last_check = time.monotonic()

@@ -111,7 +111,7 @@ class LLMConfig(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
     name: Mapped[str] = mapped_column(String(100), unique=True)
     purpose: Mapped[str] = mapped_column(String(20))  # chat | embedding
-    provider: Mapped[str] = mapped_column(String(20))  # openai | gemini | bedrock | ollama
+    provider: Mapped[str] = mapped_column(String(20))  # anthropic | openai | azure_openai | gemini | bedrock | ollama
     model: Mapped[str] = mapped_column(String(200))
     endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
     region: Mapped[str | None] = mapped_column(String(40), nullable=True)

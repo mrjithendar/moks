@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import Field, field_validator
 
 from ..connectors.base import ConnectorError
-from ..connectors.loki import analyze_logql, logql_escape
+from ..connectors.loki import analyze_logql, line_shape, logql_escape
 from ..connectors.prometheus import auto_step
 from ..diagnosis.detectors import in_window, is_unhealthy, triage
 from ..rbac import P
@@ -557,6 +557,7 @@ LABEL_SAFE = re.compile(r"^[A-Za-z0-9._:/@-]{1,120}$")
 LABELS_WITH_VALUES = ("app", "app_kubernetes_io_name", "service", "service_name", "component", "container", "job", "level", "detected_level", "severity", "stream")
 MAX_LABELS = 60
 MAX_VALUES = 30
+SHAPE_LINES = 50
 
 
 class LokiLabelsArgs(ToolArgs):
@@ -585,7 +586,11 @@ async def loki_labels(ctx: ToolContext, a: LokiLabelsArgs) -> ToolResult:
             if name == loki.namespace_label:
                 found = [v for v in found if ctx.scope.allows(v)]
             values[name] = [redact(v) for v in found if LABEL_SAFE.match(v)][:MAX_VALUES]  # label values are untrusted: only plain tokens go further
-    return ToolResult(f"{len(labels)} Loki labels", {"labels": labels, "values": values, "namespace_label": loki.namespace_label}, {"api": "GET /loki/api/v1/labels"})
+    # What fields lines hold decides whether a text filter can match. Key names go on; the lines do not.
+    sample = await loki.query_range(selector or f'{{{loki.namespace_label}=~".+"}}', start, end, limit=SHAPE_LINES)
+    kind, fields = line_shape([row["line"] for row in sample.get("lines", [])])
+    return ToolResult(f"{len(labels)} Loki labels, {kind} lines", {"labels": labels, "values": values, "namespace_label": loki.namespace_label, "line_format": kind, "fields": fields},
+                      {"api": "GET /loki/api/v1/labels"})
 
 
 TOOLS: list[ToolSpec] = [

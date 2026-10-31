@@ -23,6 +23,7 @@ from ..auth.sessions import AuthContext, client_ip
 from ..config import get_settings
 from ..db import get_db, session_scope
 from ..models import Conversation, ConversationMessage, Environment, Evidence, Investigation, InvestigationEvent, User
+from ..observability import traceparent
 from ..rbac import P
 from ..scope import ScopeError, effective_scope
 from .common import env_or_404, max_window
@@ -202,7 +203,7 @@ async def start_investigation(body: CreateIn, request: Request, ctx: AuthContext
         await add_event(db, inv.incident_id, "investigation", {"text": f"Investigation started: {body.question[:200]}", "investigation_id": str(inv.id)}, ctx.user.id)
     db.add(InvestigationEvent(investigation_id=inv.id, seq=0, type="queued",
                               payload={"window_minutes": int(window.total_seconds() // 60), "requested_minutes": minutes,
-                                       "environment": env.name, "environment_reason": why_env, "namespace": ns}))
+                                       "environment": env.name, "environment_reason": why_env, "namespace": ns, "traceparent": traceparent()}))
     await audit.record(db, action="investigation.create", actor_id=ctx.user.id, actor_email=ctx.user.email,
                        resource_type="investigation", resource_id=str(inv.id), environment=env.name, namespace=body.namespace,
                        decision="allow", details={"question_chars": len(body.question), "window_minutes": int(window.total_seconds() // 60)},

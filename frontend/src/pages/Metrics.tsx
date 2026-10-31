@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api, qs } from "../api";
-import { Badge, ErrorBox, LineChart, Loading, PageHead, type Scope, Time, useInterval, useLoad, useScopes, rowAction } from "../components";
+import { Badge, ErrorBox, LineChart, Loading, PageHead, type Scope, Time, useInterval, useLoad, useRequest, useScopes, rowAction } from "../components";
 import { type Chip, FilterPanel, MultiSelect } from "../filters";
 import { Empty, Truncate } from "../ui";
 
@@ -230,7 +230,8 @@ function QueryEditor({ environments, connectors, query, onQuery, canRaw }: { env
   const [prompt, setPrompt] = useState("");
   const [draft, setDraft] = useState<any>(null);
   const [genError, setGenError] = useState<unknown>();
-  const [generating, setGenerating] = useState(false);
+  const gen = useRequest<any>();
+  const [previous, setPrevious] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [saveName, setSaveName] = useState("");
   const [shared, setShared] = useState(false);
@@ -243,17 +244,19 @@ function QueryEditor({ environments, connectors, query, onQuery, canRaw }: { env
   const token = /[a-zA-Z_:][a-zA-Z0-9_:]*$/.exec(query)?.[0] ?? "";
   const suggestions = token.length >= 2 ? (catalog.data?.items ?? []).filter((m: any) => m.name.startsWith(token) && m.name !== token).slice(0, 8) : [];
   async function generate() {
-    setGenerating(true);
+    if (gen.busy) return;
     setGenError(null);
     try {
-      const d = await api<any>("/metrics/generate", { method: "POST", body: { prompt, environments, connectors } });
+      const d = await gen.run("/metrics/generate", { prompt, environments, connectors });
+      if (!d) return;
       setDraft(d);
-      if (d.query) onQuery(d.query);
-      setForm((x) => ({ ...x, minutes: WINDOWS.includes(d.suggested_minutes) ? d.suggested_minutes : x.minutes, step: d.suggested_step_seconds ? String(d.suggested_step_seconds) : x.step }));
+      if (d.query) {
+        if (query && query !== d.query) setPrevious(query);
+        onQuery(d.query);
+        setForm((x) => ({ ...x, minutes: WINDOWS.includes(d.suggested_minutes) ? d.suggested_minutes : x.minutes, step: d.suggested_step_seconds ? String(d.suggested_step_seconds) : x.step }));
+      }
     } catch (e) {
       setGenError(e);
-    } finally {
-      setGenerating(false);
     }
   }
   function run(e?: FormEvent) {
@@ -267,14 +270,15 @@ function QueryEditor({ environments, connectors, query, onQuery, canRaw }: { env
       <div className="card stack">
         <div className="filters">
           <label style={{ flex: 1 }}>Describe the query<input value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Show the top 10 pods by CPU usage over the last hour" /></label>
-          <button type="button" className="ghost" disabled={generating || prompt.length < 5 || !canRaw} onClick={generate}>{generating ? "Generating…" : "Generate query"}</button>
+          <button type="button" className="ghost" disabled={gen.busy || prompt.length < 5 || !canRaw} onClick={generate}>{gen.busy ? "Generating…" : "Generate query"}</button>
+          {gen.busy && <button type="button" className="ghost" onClick={gen.cancel}>Cancel</button>}
         </div>
         <ErrorBox error={genError} />
         {draft && <div className="small stack">
           {draft.explanation && <div>{draft.explanation}</div>}
           {draft.assumptions.length > 0 && <div className="muted">Assumes: {draft.assumptions.join("; ")}</div>}
           {draft.cautions.map((c: string, i: number) => <div key={i} className="alert warn small">{c}</div>)}
-          <div className="muted">Drafted by {draft.model}. Nothing has run: review it, then press Run.</div>
+          {draft.query && <div className="muted">Drafted by {draft.model}{draft.syntax_checked ? ", syntax checked by Prometheus" : ""}. Nothing has run: review it, then press Run.</div>}
         </div>}
         <form className="stack" onSubmit={run}>
           <label>PromQL<textarea rows={4} className="mono" spellCheck={false} value={query} onChange={(e) => onQuery(e.target.value)}
@@ -289,7 +293,8 @@ function QueryEditor({ environments, connectors, query, onQuery, canRaw }: { env
             {r.busy && <button type="button" className="danger" onClick={r.cancel}>Cancel</button>}
             <button type="button" className="ghost" onClick={() => onQuery(query.replace(/[ \t]+/g, " ").replace(/\s*\n\s*/g, " ").trim())}>Format</button>
             <button type="button" className="ghost" onClick={async () => { await navigator.clipboard.writeText(query); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>{copied ? "Copied" : "Copy"}</button>
-            <button type="button" className="ghost" onClick={() => { onQuery(""); r.clear(); setDraft(null); }}>Clear</button>
+            <button type="button" className="ghost" onClick={() => { onQuery(""); r.clear(); setDraft(null); setPrevious(null); }}>Clear</button>
+            {previous !== null && <button type="button" className="ghost" onClick={() => { onQuery(previous); setPrevious(null); }}>Restore previous query</button>}
           </div>
         </form>
       </div>

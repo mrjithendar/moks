@@ -3,7 +3,8 @@
 The orchestrator only needs "complete this conversation, preferably as JSON", which every
 supported provider offers. Tool use is negotiated in our own JSON protocol (see
 moks.orchestrator.prompts) rather than each vendor's function-calling API, so the same
-policy-checked tool loop works with OpenAI, Gemini, Bedrock and local Ollama models.
+policy-checked tool loop works with Anthropic, OpenAI, Azure OpenAI, Gemini, Bedrock, Ollama and any
+server that speaks the OpenAI chat API (see presets in the admin page).
 
 The LLM never receives infrastructure credentials: it sees redacted evidence and returns
 tool *requests*, which the executor validates and authorizes.
@@ -11,6 +12,7 @@ tool *requests*, which the executor validates and authorizes.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -21,6 +23,14 @@ import httpx
 from ..connectors.base import ConnectorError, resolve_credential
 from ..models import LLMConfig
 from ..observability import LLM_COST, LLM_LATENCY, LLM_REQUESTS, LLM_TOKENS, tracer
+
+
+RETRY_STATUS = {429, 500, 502, 503, 504, 529}
+RETRIES = 2
+MAX_WAIT = 10.0
+
+
+log = logging.getLogger("moks.llm")
 
 
 class LLMError(Exception):
@@ -60,13 +70,19 @@ class Provider:
         return key
 
     async def _post(self, url: str, body: dict, headers: dict[str, str]) -> dict:
-        try:
-            async with httpx.AsyncClient(timeout=self.cfg.timeout_seconds, transport=self.transport) as c:
-                r = await c.post(url, json=body, headers=headers)
-        except httpx.TimeoutException:
-            raise LLMError("timeout", f"{self.name} did not answer within {self.cfg.timeout_seconds}s") from None
-        except httpx.TransportError as exc:
-            raise LLMError("unavailable", f"cannot reach {self.name} ({type(exc).__name__})") from None
+        """Waits out rate limits and overload a little, because a provider's own Retry-After is the
+        cheapest fix. Anything longer goes back to the caller as rate_limited."""
+        async with httpx.AsyncClient(timeout=self.cfg.timeout_seconds, transport=self.transport) as c:
+            for attempt in range(RETRIES + 1):
+                try:
+                    r = await c.post(url, json=body, headers=headers)
+                except httpx.TimeoutException:
+                    raise LLMError("timeout", f"{self.name} did not answer within {self.cfg.timeout_seconds}s") from None
+                except httpx.TransportError as exc:
+                    raise LLMError("unavailable", f"cannot reach {self.name} ({type(exc).__name__})") from None
+                if r.status_code not in RETRY_STATUS or attempt == RETRIES:
+                    break
+                await asyncio.sleep(_wait(r, attempt))
         if r.status_code in (401, 403):
             raise LLMError("auth", f"{self.name} rejected the credentials (HTTP {r.status_code})")
         if r.status_code == 429:
@@ -87,35 +103,151 @@ class Provider:
         raise LLMError("config", f"embeddings are not implemented for {self.name}")
 
 
+def _wait(r: httpx.Response, attempt: int) -> float:
+    value = r.headers.get("retry-after", "")
+    return min(float(value), MAX_WAIT) if value.replace(".", "", 1).isdigit() else 0.5 * 2 ** attempt
+
+
+def _content_text(content: Any) -> str:
+    """Most servers send a string; some send a list of parts."""
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return content or ""
+
+
 class OpenAIProvider(Provider):
+    """api.openai.com and everything that speaks its chat API. Those servers differ in small ways, so a
+    400 naming a parameter is answered by adapting and asking once more, rather than a table of models."""
+
     name = "openai"
 
+    def _base(self) -> str:
+        return (self.cfg.endpoint or "https://api.openai.com/v1").rstrip("/")
+
+    def _headers(self) -> dict[str, str]:
+        key = self._key(required=not self.cfg.endpoint)  # a local server may need none
+        return {"Authorization": f"Bearer {key}"} if key else {}
+
+    def _tokens_field(self, base: str) -> str:
+        # api.openai.com uses max_completion_tokens; most OpenAI-compatible servers use max_tokens.
+        return "max_completion_tokens" if "api.openai.com" in base else "max_tokens"
+
+    async def _chat(self, base: str, body: dict) -> dict:
+        for _ in range(3):
+            try:
+                return await self._post(f"{base}/chat/completions", body, self._headers())
+            except LLMError as exc:
+                text = exc.message.lower()
+                if exc.kind != "bad_response" or " 400" not in text and " 422" not in text:
+                    raise
+                if "temperature" in text and "temperature" in body:
+                    del body["temperature"]  # reasoning models accept only their default
+                elif "response_format" in text and "response_format" in body:
+                    del body["response_format"]  # the instruction in the prompt still asks for JSON
+                elif "max_completion_tokens" in text and "max_completion_tokens" in body:
+                    body["max_tokens"] = body.pop("max_completion_tokens")
+                elif "max_tokens" in text and "max_tokens" in body:
+                    body["max_completion_tokens"] = body.pop("max_tokens")
+                else:
+                    raise
+        return await self._post(f"{base}/chat/completions", body, self._headers())
+
     async def complete(self, system, messages, *, json_mode, max_tokens, temperature=0.1):
-        base = (self.cfg.endpoint or "https://api.openai.com/v1").rstrip("/")
+        base = self._base()
         body: dict[str, Any] = {
             "model": self.cfg.model,
             "messages": [{"role": "system", "content": system}] + messages,
             "temperature": temperature,
         }
-        # api.openai.com uses max_completion_tokens; most OpenAI-compatible servers use max_tokens.
-        body["max_completion_tokens" if "api.openai.com" in base else "max_tokens"] = max_tokens
+        body[self._tokens_field(base)] = max_tokens
         if json_mode:
             body["response_format"] = {"type": "json_object"}
-        data = await self._post(f"{base}/chat/completions", body, {"Authorization": f"Bearer {self._key()}"})
+            body["messages"][0] = {"role": "system", "content": system + "\nRespond with a single JSON object and nothing else."}  # some servers require the word
+        data = await self._chat(base, body)
         try:
-            text = data["choices"][0]["message"]["content"] or ""
-        except (KeyError, IndexError, TypeError):
-            raise LLMError("bad_response", "openai response has no message content") from None
+            choice = data["choices"][0]
+            text = _content_text(choice["message"].get("content"))
+        except (KeyError, IndexError, TypeError, AttributeError):
+            raise LLMError("bad_response", f"{self.name} response has no message content") from None
+        if not text:
+            why = choice["message"].get("refusal") or choice.get("finish_reason") or "unknown reason"
+            raise LLMError("bad_response", f"{self.name} returned no text ({str(why)[:200]})")
         usage = data.get("usage") or {}
         return LLMResponse(text, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)), self.name, self.cfg.model)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        base = (self.cfg.endpoint or "https://api.openai.com/v1").rstrip("/")
         body: dict[str, Any] = {"model": self.cfg.model, "input": texts}
         if self.cfg.embedding_dimensions:
             body["dimensions"] = self.cfg.embedding_dimensions
-        data = await self._post(f"{base}/embeddings", body, {"Authorization": f"Bearer {self._key()}"})
+        data = await self._post(f"{self._base()}/embeddings", body, self._headers())
         return [d["embedding"] for d in sorted(data.get("data", []), key=lambda d: d.get("index", 0))]
+
+
+class AzureOpenAIProvider(OpenAIProvider):
+    """The v1 API on an Azure OpenAI resource. `model` is the deployment name."""
+
+    name = "azure_openai"
+
+    def _base(self) -> str:
+        if not self.cfg.endpoint:
+            raise LLMError("config", "azure_openai needs the resource endpoint, e.g. https://my-resource.openai.azure.com")
+        return f"{self.cfg.endpoint.rstrip('/').removesuffix('/openai/v1')}/openai/v1"
+
+    def _headers(self) -> dict[str, str]:
+        return {"api-key": self._key() or ""}
+
+    def _tokens_field(self, base: str) -> str:
+        return "max_completion_tokens"
+
+
+class AnthropicProvider(Provider):
+    """Claude through the official SDK, which retries 429, 5xx and connection errors on its own.
+
+    Sampling parameters and assistant prefill are refused by current models, so neither is sent: JSON
+    is asked for in the system prompt, and report.parse_json_object tolerates a code fence around it.
+    Thinking counts against max_tokens on current models, so short calls get enough room to answer."""
+
+    name = "anthropic"
+    MIN_TOKENS = 4000
+    # Models that can hand a declined request to another model instead of failing it.
+    FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
+
+    def _client(self):
+        from anthropic import AsyncAnthropic
+
+        return AsyncAnthropic(api_key=self._key(), base_url=self.cfg.endpoint or None, timeout=float(self.cfg.timeout_seconds), max_retries=RETRIES)
+
+    async def complete(self, system, messages, *, json_mode, max_tokens, temperature=0.1):
+        import anthropic
+
+        args: dict[str, Any] = {"model": self.cfg.model, "max_tokens": max(max_tokens, self.MIN_TOKENS), "messages": messages,
+                                "system": system + ("\nRespond with a single JSON object and nothing else." if json_mode else "")}
+        direct = not self.cfg.endpoint  # a gateway may not know the beta
+        try:
+            async with self._client() as client:
+                if direct and self.cfg.model in self.FALLBACK_MODELS:
+                    data = await client.beta.messages.create(betas=["server-side-fallback-2026-07-01"], fallbacks="default", **args)
+                else:
+                    data = await client.messages.create(**args)
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+            raise LLMError("auth", f"anthropic rejected the credentials (HTTP {exc.status_code})") from None
+        except anthropic.RateLimitError:
+            raise LLMError("rate_limited", "anthropic rate limited the request (HTTP 429)") from None
+        except anthropic.APITimeoutError:
+            raise LLMError("timeout", f"anthropic did not answer within {self.cfg.timeout_seconds}s") from None
+        except anthropic.APIConnectionError as exc:
+            raise LLMError("unavailable", f"cannot reach anthropic ({type(exc).__name__})") from None
+        except anthropic.APIStatusError as exc:
+            raise LLMError("unavailable" if exc.status_code >= 500 else "bad_response", f"anthropic returned HTTP {exc.status_code}: {str(exc.message)[:300]}") from None
+        if data.stop_reason == "refusal":
+            raise LLMError("refused", "anthropic declined this request (safety classifier)")
+        text = "".join(b.text for b in data.content if b.type == "text")
+        if not text:
+            raise LLMError("bad_response", f"anthropic returned no text (stop reason {data.stop_reason})")
+        return LLMResponse(text, int(data.usage.input_tokens or 0), int(data.usage.output_tokens or 0), self.name, self.cfg.model)
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        raise LLMError("config", "Anthropic has no embedding API; use another provider for the embedding model")
 
 
 class GeminiProvider(Provider):
@@ -244,7 +376,8 @@ class BedrockProvider(Provider):
 
 
 PROVIDERS: dict[str, type[Provider]] = {
-    "openai": OpenAIProvider, "gemini": GeminiProvider, "ollama": OllamaProvider, "bedrock": BedrockProvider,
+    "anthropic": AnthropicProvider, "openai": OpenAIProvider, "azure_openai": AzureOpenAIProvider, "gemini": GeminiProvider,
+    "ollama": OllamaProvider, "bedrock": BedrockProvider,
 }
 
 
@@ -271,6 +404,7 @@ async def complete_metered(provider: Provider, system: str, messages: list[Messa
             LLM_REQUESTS.labels(cfg.provider, cfg.model, exc.kind).inc()
             LLM_LATENCY.labels(cfg.provider).observe(time.monotonic() - start)
             span.set_attribute("moks.outcome", exc.kind)
+            log.warning("llm call failed", extra={"event": "llm_call", "dependency": cfg.provider, "operation": "complete", "outcome": "failure", "errorCode": exc.kind, "durationMs": int((time.monotonic() - start) * 1000)})
             raise
         span.set_attribute("gen_ai.usage.input_tokens", resp.tokens_in)
         span.set_attribute("gen_ai.usage.output_tokens", resp.tokens_out)
@@ -280,4 +414,5 @@ async def complete_metered(provider: Provider, system: str, messages: list[Messa
     LLM_TOKENS.labels(cfg.provider, cfg.model, "input").inc(resp.tokens_in)
     LLM_TOKENS.labels(cfg.provider, cfg.model, "output").inc(resp.tokens_out)
     LLM_COST.labels(cfg.provider, cfg.model).inc(float(resp.cost_usd))
+    log.info("llm call", extra={"event": "llm_call", "dependency": cfg.provider, "operation": "complete", "outcome": "success", "durationMs": int((time.monotonic() - start) * 1000)})
     return resp

@@ -3,7 +3,8 @@
 - Prometheus metrics on a separate port (MOKS_METRICS_PORT, default 9464), never routed by
   the ingress.
 - JSON logs on stdout using the field names the cluster's Alloy pipeline keeps
-  (level, event, trace_id, route, method, status, durationMs, outcome, errorType).
+  (level, event, trace_id, route, method, status, durationMs, dependency, operation, outcome,
+  errorType, errorCode, logger_name). Alloy forwards only those, so the rest stay in `kubectl logs`.
 - OpenTelemetry traces exported over OTLP/HTTP when OTEL_EXPORTER_OTLP_ENDPOINT is set.
   Spans carry metadata only: never prompts, model output or log contents.
 """
@@ -77,8 +78,9 @@ def start_metrics_server(port: int) -> None:
 
 _EXTRA_FIELDS = (
     "event", "route", "method", "status", "durationMs", "outcome", "errorType", "operation",
-    "dependency", "investigation_id", "tool", "action", "decision", "connector_type", "request_id",
+    "dependency", "investigation_id", "tool", "action", "decision", "connector_type", "request_id", "errorCode",
 )
+MAX_STACK = 4000
 
 
 class JsonFormatter(logging.Formatter):
@@ -87,6 +89,7 @@ class JsonFormatter(logging.Formatter):
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(record.created)) + f".{int(record.msecs):03d}Z",
             "level": record.levelname.lower(),
             "logger": record.name,
+            "logger_name": record.name,
             "message": record.getMessage(),
         }
         for key in _EXTRA_FIELDS:
@@ -103,6 +106,9 @@ class JsonFormatter(logging.Formatter):
             pass
         if record.exc_info:
             out["errorType"] = record.exc_info[0].__name__ if record.exc_info[0] else "Exception"
+            from .redaction import redact
+
+            out["stack"] = redact(self.formatException(record.exc_info))[-MAX_STACK:]  # the end of a traceback says the most
         return json.dumps(out, default=str)
 
 
@@ -112,8 +118,13 @@ def setup_logging(level: str = "INFO") -> None:
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level.upper())
-    for noisy in ("uvicorn.access", "httpx", "httpcore", "botocore", "urllib3"):
+    for noisy in ("uvicorn.access", "httpx", "httpx2", "httpcore", "anthropic", "botocore", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    logging.captureWarnings(True)
+
+    def crashed(kind, value, tb):  # a crash is the line most worth having as JSON
+        logging.getLogger("moks").critical("process crashed", exc_info=(kind, value, tb), extra={"event": "process_crashed"})
+    sys.excepthook = crashed
 
 
 # ---- Tracing -----------------------------------------------------------------------------
@@ -133,14 +144,19 @@ def setup_tracing(service_name: str, app=None) -> None:
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-    provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
+    from . import __version__
+    from .config import get_settings
+
+    provider = TracerProvider(resource=Resource.create({
+        "service.name": service_name, "service.namespace": "moks", "service.version": __version__,
+        "service.instance.id": os.environ.get("HOSTNAME", ""), "vcs.ref.head.revision": get_settings().build_commit}))
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
     trace.set_tracer_provider(provider)
     HTTPXClientInstrumentor().instrument()
     if app is not None:
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
-        FastAPIInstrumentor.instrument_app(app, excluded_urls="healthz,readyz")
+        FastAPIInstrumentor.instrument_app(app, excluded_urls="healthz,readyz", exclude_spans=["send", "receive"])
     _tracing_ready = True
 
 
@@ -148,3 +164,19 @@ def tracer():
     from opentelemetry import trace
 
     return trace.get_tracer("moks")
+
+
+def traceparent() -> str | None:
+    """The current span as a W3C header value, to store with work another process will pick up."""
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    carrier: dict[str, str] = {}
+    TraceContextTextMapPropagator().inject(carrier)
+    return carrier.get("traceparent")
+
+
+def continue_trace(value: str | None):
+    """A context that makes the next span a child of the request that queued this work."""
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    return TraceContextTextMapPropagator().extract({"traceparent": value}) if value else None

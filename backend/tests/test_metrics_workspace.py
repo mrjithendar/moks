@@ -6,7 +6,9 @@ import pytest
 from sqlalchemy import select
 
 from moks.api import metrics as m
+from moks.api import querygen
 from moks.connectors import registry
+from moks.connectors.base import ConnectorError
 from moks.db import session_scope
 from moks.models import AuditEvent, LLMConfig, LLMUsage
 from tests.conftest import login, make_env, make_user
@@ -14,6 +16,7 @@ from tests.conftest import login, make_env, make_user
 
 class Prom:
     type = "prometheus"
+    reject = False
     calls: list = []
     fail: set = set()
     slow: set = set()
@@ -46,6 +49,11 @@ class Prom:
     async def metadata(self):
         return {"up": {"type": "gauge", "unit": "", "help": "target up"}}
 
+    async def format_query(self, q):
+        if Prom.reject:
+            raise ConnectorError("bad_request", "prometheus: parse error")
+        return q
+
     async def range(self, q, start, end, step):
         self._check(q)
         if self.url in Prom.slow:
@@ -64,7 +72,7 @@ def fake(monkeypatch):
     monkeypatch.setitem(registry.CONNECTOR_TYPES, "prometheus", Prom)
     registry._cache.clear()
     m._catalog_cache.clear()
-    Prom.calls, Prom.fail, Prom.slow = [], set(), set()
+    Prom.calls, Prom.fail, Prom.slow, Prom.reject = [], set(), set(), False
     yield
     registry._cache.clear()
 
@@ -193,7 +201,7 @@ class Model:
 
 @pytest.fixture
 async def chat(monkeypatch):
-    monkeypatch.setattr(m, "provider_for", lambda cfg: Model(cfg))
+    monkeypatch.setattr(querygen, "provider_for", lambda cfg: Model(cfg))
     Model.seen = []
     async with session_scope() as db:
         for c in (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat"))).scalars():
@@ -268,3 +276,35 @@ async def test_catalog_loads_on_a_machine_that_booted_moments_ago(client, monkey
     await login(client, f"u-{tag}@example.com")
     monkeypatch.setattr(m.time, "monotonic", lambda: 60.0)
     assert (await client.get("/moks/api/metrics/catalog", params={"environments": a})).json()["total"] == 3
+
+
+async def _generated(client, reply, tag_env=None):
+    tag, (a, _) = await _envs()
+    await make_user(f"g-{tag}@example.com", [f"investigator:{a}:*"])
+    h = await login(client, f"g-{tag}@example.com")
+    Model.reply = reply
+    return await client.post("/moks/api/metrics/generate", json={"prompt": "how many targets are up", "environments": a}, headers=h)
+
+
+async def test_generate_grounds_the_model_in_real_labels(client, chat):
+    await _generated(client, '{"query": "sum(up)"}')
+    assert "pod" in Model.seen[0][1][0]["content"] and "Labels of the likeliest metrics" in Model.seen[0][1][0]["content"]
+
+
+async def test_generate_discards_what_prometheus_cannot_parse(client, chat):
+    Prom.reject = True
+    r = (await _generated(client, '{"query": "sum(up"}')).json()
+    assert r["query"] == "" and "discarded" in r["cautions"][0]
+
+
+async def test_generate_flags_labels_and_lookback_it_cannot_support(client, chat):
+    r = (await _generated(client, '{"query": "sum by (team) (rate(up{bogus=\\"x\\"}[30d]))", "suggested_minutes": 99999, "suggested_step_seconds": 2}')).json()
+    text = " ".join(r["cautions"])
+    assert "Label bogus was not found" in text and "Label team was not found" in text and "looks back further" in text
+    assert r["suggested_minutes"] == 360 and r["suggested_step_seconds"] == 5 and r["syntax_checked"] is True
+
+
+@pytest.mark.parametrize("reply", ["no json here", "[1]", '{"query": 5}'])
+async def test_generate_reports_unusable_answers_clearly(client, chat, reply):
+    r = await _generated(client, reply)
+    assert r.status_code == 502 and "usable answer" in r.text

@@ -1,6 +1,6 @@
-import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import { EnvNsFilter, ErrorBox, levelOf, LineChart, Loading, LogLines, type Multi, PageHead, PartialErrors, type Scope, Time, useInterval, useScopes, useLoad } from "../components";
+import { EnvNsFilter, ErrorBox, useRequest, levelOf, LineChart, Loading, LogLines, type Multi, PageHead, PartialErrors, type Scope, Time, useInterval, useScopes, useLoad } from "../components";
 import { type Chip, FilterPanel, useUrlFilters } from "../filters";
 import { CopyButton, Empty, Icon, Skeleton, useIsMobile } from "../ui";
 
@@ -107,29 +107,6 @@ interface Draft { query: string; explanation: string; query_type: "log" | "metri
 interface Run { summary: string; data: any; kind: "log" | "metric"; environment: string; connector: string; limit: number; limit_reached: boolean; truncated: boolean; collected_at: string; duration_ms: number; source: { query?: string } }
 
 const LOGQL = { environment: "", connector: "", namespace: "", pod: "", container: "", minutes: 60, limit: 200 };
-
-/** A cancellable POST: a second call replaces the first, and an abandoned answer is never shown. */
-export function useRequest<T>() {
-  const [busy, setBusy] = useState(false);
-  const ctl = useRef<AbortController | null>(null);
-  async function run(path: string, body: any): Promise<T | undefined> {
-    ctl.current?.abort();
-    const c = new AbortController();
-    ctl.current = c;
-    setBusy(true);
-    try {
-      return await api<T>(path, { method: "POST", body, signal: c.signal });
-    } catch (e: any) {
-      if (e?.name === "AbortError") return undefined;
-      throw e;
-    } finally {
-      if (ctl.current === c) { ctl.current = null; setBusy(false); }
-    }
-  }
-  const cancel = () => { ctl.current?.abort(); ctl.current = null; setBusy(false); };
-  useEffect(() => () => ctl.current?.abort(), []);
-  return { busy, run, cancel };
-}
 
 export function LogQLWorkspace({ scopes }: { scopes?: Scope[] }) {
   const sources = useLoad(() => api<Sources>("/logs/sources"), []);

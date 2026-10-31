@@ -40,7 +40,7 @@ from ..connectors.base import ConnectorError
 from ..db import session_scope
 from ..incidents import add_event
 from ..models import ActionPlan, Connector, Environment
-from ..observability import ACTIONS
+from ..observability import ACTIONS, tracer
 from .catalog import CATALOG, check_patch, get_path, patch_leaves, paths_patch
 from .service import PlanError, verify_for_execution
 
@@ -500,6 +500,16 @@ async def _perform(fence: Fence, snapshot: dict, identity: dict | None, env, tim
 
 
 async def execute_plan(claim: Claim) -> None:
+    start = time.monotonic()
+    with tracer().start_as_current_span("action.execute") as span:
+        span.set_attribute("moks.plan.id", str(claim[0]))
+        await _execute_plan(claim)
+    async with session_scope() as db:
+        plan = await db.get(ActionPlan, claim[0])
+    log.info("action finished", extra={"event": "action_finished", "operation": plan.action, "action": plan.action, "outcome": "success" if plan.status == "succeeded" else "failure", "durationMs": int((time.monotonic() - start) * 1000)})
+
+
+async def _execute_plan(claim: Claim) -> None:
     plan_id, token = claim
     fence = Fence(claim)
     async with session_scope() as db:

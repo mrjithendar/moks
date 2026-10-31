@@ -455,3 +455,30 @@ uses the same daily budget as investigations. Scoped users must choose a namespa
 6. Custom skills are not published automatically: publish them from **SRE skills**. Until then their built-ins or nothing run.
 
 To roll back the image, follow docs/RELEASES.md: the schema stays and older builds ignore the new columns.
+
+## Logs and traces from MOKS itself
+
+Every process writes one JSON object per line to stdout, including warnings and crashes with a redacted stack.
+On mk4, Alloy collects the `moks` namespace into Loki, so MOKS's own logs appear on the **Logs** page. Alloy keeps
+only its allowlisted fields and rewrites each line as `event=... level=... route=...`, which keeps messages and
+stack traces out of Loki. Those stay in `kubectl logs`. A new namespace needs both `templates/alloy-logs.yaml` and
+an entry in `observability/loki/config.alloy` in the tools repo.
+
+Useful events: `http_request`, `tool_call`, `llm_call`, `job_finished`, `investigation_finished`, `action_finished`,
+`connector_request_failed`. Each carries `trace_id` when a trace is active.
+
+Traces go to `OTEL_EXPORTER_OTLP_ENDPOINT` as `moks`, `moks-worker` and `moks-executor`. A request that queues work
+shares one trace with it: investigations and jobs continue the request's trace, with tool and LLM calls as children.
+
+## LLM providers
+
+**LLM providers** offers presets for Anthropic, OpenAI, Google AI, Azure OpenAI, Bedrock, Mistral, Groq, DeepSeek, xAI,
+Together, Fireworks, OpenRouter and Ollama. Any other server that speaks the OpenAI chat API works with its endpoint.
+A preset only fills in the form. Put the key in the Secret under the variable it names, and press **Test**.
+
+- Anthropic, OpenAI, Azure and Gemini have their own request formats. Everything else uses the OpenAI format.
+- If a server refuses a parameter such as `temperature` or `response_format`, MOKS sends the request again without it.
+- Claude models that support it hand a declined request to another model (`fallbacks: "default"`), billed at that
+  model's rates. It is off when a custom endpoint is set. A declined request that no model will answer shows as refused.
+- Enter prices. With none, spend counts as $0 and the daily budget cannot limit the model.
+- The network policy allows outbound 443 to public addresses. A self-hosted server inside the cluster needs its own egress rule.

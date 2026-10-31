@@ -27,7 +27,7 @@ from . import audit
 from .config import get_settings
 from .db import session_scope
 from .models import BackupRun, Environment, Job, KnowledgeSource
-from .observability import (BACKUP_LAST_RUN_OK, BACKUP_LAST_SUCCESS, DATABASE_SIZE, DATABASE_VOLUME, JOB_DELAY, JOB_RETRIES, JOB_RUNTIME, JOBS_ABANDONED, JOBS_OLDEST_AGE,
+from .observability import (continue_trace, traceparent, tracer, BACKUP_LAST_RUN_OK, BACKUP_LAST_SUCCESS, DATABASE_SIZE, DATABASE_VOLUME, JOB_DELAY, JOB_RETRIES, JOB_RUNTIME, JOBS_ABANDONED, JOBS_OLDEST_AGE,
                             JOBS_QUEUED, JOBS_REJECTED, JOBS_RUNNING)
 
 log = logging.getLogger("moks.jobs")
@@ -85,7 +85,8 @@ async def enqueue(type_: str, payload: dict[str, Any], *, dedupe_key: str | None
             if queued >= get_settings().job_queue_limit:
                 JOBS_REJECTED.labels(cls).inc()
                 raise QueueFull(cls)
-            job = Job(type=type_, job_class=cls, payload=payload, dedupe_key=dedupe_key, created_by=created_by,
+            parent = traceparent()
+            job = Job(type=type_, job_class=cls, payload={**payload, **({"_traceparent": parent} if parent else {})}, dedupe_key=dedupe_key, created_by=created_by,
                       run_after=datetime.now(timezone.utc) + timedelta(seconds=delay_seconds))
             db.add(job)
             await db.flush()
@@ -233,6 +234,13 @@ async def run_one(job_id: uuid.UUID) -> None:
     async with session_scope() as db:
         job = await db.get(Job, job_id)
         payload, type_, attempts, worker = dict(job.payload), job.type, job.attempts, job.worker_id
+    with tracer().start_as_current_span(f"job {type_}", context=continue_trace(payload.get("_traceparent"))) as span:
+        span.set_attribute("moks.job.id", str(job_id))
+        span.set_attribute("moks.job.attempt", attempts)
+        await _run_one(job_id, payload, type_, attempts, worker)
+
+
+async def _run_one(job_id: uuid.UUID, payload: dict, type_: str, attempts: int, worker: str | None) -> None:
     policy = POLICIES.get(type_, DEFAULT_POLICY)
     fn = handlers().get(type_)
     status, result, error = "succeeded", None, None
@@ -263,6 +271,7 @@ async def run_one(job_id: uuid.UUID) -> None:
             return
         job.status, job.result, job.error, job.lease_expires_at = status, result, error, None
         JOB_RUNTIME.labels(job_class(type_), type_).observe(time.monotonic() - started)
+        log.info("job finished", extra={"event": "job_finished", "operation": type_, "outcome": "failure" if error else "success", "durationMs": int((time.monotonic() - started) * 1000)})
         if status == "queued":
             JOB_RETRIES.labels(type_).inc()
             job.run_after = datetime.now(timezone.utc) + timedelta(seconds=max(wait, RATE_LIMIT_MIN_WAIT) if wait is not None else 30 * (3 ** (attempts - 1)))

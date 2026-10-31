@@ -6,7 +6,7 @@ import uuid
 import pytest
 from sqlalchemy import select
 
-from moks.api import logs as logs_api
+from moks.api import querygen
 from moks.connectors import registry
 from moks.connectors.base import ConnectorError
 from moks.connectors.loki import analyze_logql, selector_namespaces
@@ -22,6 +22,7 @@ class Loki:
     namespace_label = "namespace"
     calls: list = []
     fail_format: str | None = None
+    line = "token=abcdefghijklmnopqrstuvwxyz error"
 
     def __init__(self, config, credential_ref=None):
         pass
@@ -49,7 +50,7 @@ class Loki:
         Loki.calls.append(("query", q, limit))
         if "rate(" in q:
             return {"resultType": "matrix", "series": [{"metric": {"app": "a"}, "values": [[1.0, 2.0]]}], "total_series": 1}
-        return {"resultType": "streams", "lines": [{"ts": "2026-10-31T00:00:00+00:00", "labels": {"namespace": "shop"}, "line": "token=abcdefghijklmnopqrstuvwxyz error"}]}
+        return {"resultType": "streams", "lines": [{"ts": "2026-10-31T00:00:00+00:00", "labels": {"namespace": "shop"}, "line": Loki.line}]}
 
 
 DRAFT = '{"query": "{namespace=\\"shop\\"} |= \\"timeout\\"", "explanation": "Timeouts in shop.", "query_type": "metric", "required_labels": ["namespace"], "suggested_minutes": 30, "warnings": []}'
@@ -71,9 +72,9 @@ class Resp:
 def fake(monkeypatch):
     monkeypatch.setitem(registry.CONNECTOR_TYPES, "loki", Loki)
     registry._cache.clear()
-    Loki.calls, Loki.fail_format = [], None
+    Loki.calls, Loki.fail_format, Loki.line = [], None, "token=abcdefghijklmnopqrstuvwxyz error"
     Reply.text, Reply.error, Reply.seen, Reply.delay = DRAFT, None, [], 0.0
-    logs_api._generating.clear()
+    querygen._running.clear()
 
     async def complete(provider, system, messages, **kw):
         Reply.seen.append((system, messages))
@@ -83,7 +84,7 @@ def fake(monkeypatch):
             raise Reply.error
         return Resp()
     monkeypatch.setattr(budget, "complete", complete)
-    monkeypatch.setattr(logs_api, "provider_for", lambda cfg: object())
+    monkeypatch.setattr(querygen, "provider_for", lambda cfg: object())
     yield
     registry._cache.clear()
 
@@ -209,7 +210,7 @@ async def test_generate_drafts_and_runs_nothing(client, chat):
     assert r["query_type"] == "log"  # read from the query, not from what the model claimed
     assert r["suggested_minutes"] == 30 and r["scope"] == {"environment": env, "connector": "loki", "namespace": "shop"}
     assert r["syntax_checked"] is True
-    assert not [c for c in Loki.calls if c[0] == "query"]
+    assert not [c for c in Loki.calls if c[0] == "query" and "timeout" in c[1]]
     assert all('namespace="shop"' in (c[-1] or "") for c in Loki.calls if c[0] in ("labels", "values"))
     async with session_scope() as db:
         assert (await db.execute(select(AuditEvent).where(AuditEvent.action == "logs.generate", AuditEvent.environment == env))).scalars().first()
@@ -316,6 +317,32 @@ async def test_a_second_generation_is_refused_while_one_runs(client, chat):
     Reply.delay = 0.3
     first, second = await asyncio.gather(_gen(client, h, env), _gen(client, h, env))
     assert sorted([first.status_code, second.status_code]) == [200, 409]
+
+
+async def test_the_model_is_told_the_line_shape_but_no_line(client, chat):
+    env = await _env()
+    h = await _user(client, [f"investigator:{env}:shop"])
+    Loki.line = 'event=http_request level=info route=/shop/pay status=500 duration_ms=12'
+    r = (await _gen(client, h, env)).json()
+    text = Reply.seen[0][1][0]["content"]
+    assert r["line_format"] == "logfmt" and "Line format: logfmt" in text and "route" in text and "/shop/pay" not in text
+    assert any("text search only matches" in w for w in r["warnings"])
+
+
+def test_line_shape_reads_keys_and_never_values():
+    from moks.connectors.loki import line_shape
+
+    assert line_shape(['{"level": "info", "secret_value": 1}', '{"level": "warn"}']) == ("json", ["level", "secret_value"])
+    assert line_shape(["a=1 b=2", "a=3 c=4"])[0] == "logfmt"
+    assert line_shape(["plain words here", "and more of them"]) == ("text", [])
+    assert line_shape([]) == ("text", [])
+
+
+async def test_a_filter_the_draft_ignored_is_pointed_out(client, chat):
+    env = await _env()
+    h = await _user(client, [f"investigator:{env}:shop"])
+    r = (await _gen(client, h, env, pod="checkout-*")).json()
+    assert any("pod filter" in w for w in r["warnings"])
 
 
 async def test_log_search_text_can_be_sent_in_the_body(client):

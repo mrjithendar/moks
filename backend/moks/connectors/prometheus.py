@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime
 from typing import Any
 
@@ -9,6 +10,7 @@ import httpx
 
 from .base import BoundedHttp, ConnectorError, HttpLimits, http_auth_from
 
+LABEL = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 MAX_SERIES = 25
 MAX_POINTS_PER_SERIES = 240
 
@@ -79,7 +81,19 @@ class PrometheusConnector:
         return {name: {"type": m[0].get("type", ""), "unit": m[0].get("unit", ""), "help": (m[0].get("help") or "")[:300]}
                 for name, m in (data or {}).items() if m}
 
+    async def format_query(self, promql: str) -> str | None:
+        """Prometheus's own parser: rejects bad syntax and reads no data. None if this server has no such endpoint."""
+        try:
+            await self._api("format_query", "/api/v1/format_query", {"query": promql})
+            return promql
+        except ConnectorError as exc:
+            if exc.kind == "not_found":
+                return None
+            raise
+
     async def label_values(self, label: str, match: str | None, start: datetime, end: datetime, limit: int = 500) -> list[str]:
+        if not LABEL.fullmatch(label):
+            raise ConnectorError("bad_request", f"invalid label name {label!r}")
         params: list[tuple[str, Any]] = [("start", start.timestamp()), ("end", end.timestamp())]
         if match:
             params.append(("match[]", match))

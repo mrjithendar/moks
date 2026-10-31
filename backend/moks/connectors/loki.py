@@ -1,6 +1,7 @@
 """Loki HTTP API connector (bounded LogQL queries and label discovery)."""
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -98,6 +99,37 @@ class LokiConnector:
                       for r in data.get("result", [])[:25]]
             return {"resultType": "matrix", "series": series, "total_series": len(data.get("result", [])), "stats": _stats(data)}
         return {"resultType": rtype, "raw": data.get("result")}
+
+
+LOGFMT_KEY = re.compile(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_.]{0,60})=")
+
+
+def line_shape(lines: list[str]) -> tuple[str, list[str]]:
+    """(json | logfmt | text, field names), from what lines look like. Returns keys only, never a value,
+    so it is safe to tell a model about. A collector may rewrite lines, so this cannot be assumed."""
+    keys: dict[str, int] = {}
+    json_lines = logfmt_lines = 0
+    for line in lines:
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                body = json.loads(line)
+            except ValueError:
+                body = None
+            if isinstance(body, dict):
+                json_lines += 1
+                for k in body:
+                    keys[k] = keys.get(k, 0) + 1
+                continue
+        found = LOGFMT_KEY.findall(line)
+        if len(found) >= 2:
+            logfmt_lines += 1
+            for k in found:
+                keys[k] = keys.get(k, 0) + 1
+    enough = max(len(lines) // 2, 1)
+    kind = "json" if json_lines >= enough else "logfmt" if logfmt_lines >= enough else "text"
+    names = [k for k, _ in sorted(keys.items(), key=lambda kv: (-kv[1], kv[0])) if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,60}", k)]
+    return kind, names[:30] if kind != "text" else []
 
 
 def _stats(data: dict[str, Any]) -> dict[str, Any]:

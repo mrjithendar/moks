@@ -137,6 +137,29 @@ export function useInterval(fn: () => void, ms: number, enabled = true) {
   }, [ms, enabled]);
 }
 
+/** A cancellable POST: a second call replaces the first, and an abandoned answer is never shown. */
+export function useRequest<T>() {
+  const [busy, setBusy] = useState(false);
+  const ctl = useRef<AbortController | null>(null);
+  async function run(path: string, body: any): Promise<T | undefined> {
+    ctl.current?.abort();
+    const c = new AbortController();
+    ctl.current = c;
+    setBusy(true);
+    try {
+      return await api<T>(path, { method: "POST", body, signal: c.signal });
+    } catch (e: any) {
+      if (e?.name === "AbortError") return undefined;
+      throw e;
+    } finally {
+      if (ctl.current === c) { ctl.current = null; setBusy(false); }
+    }
+  }
+  const cancel = () => { ctl.current?.abort(); ctl.current = null; setBusy(false); };
+  useEffect(() => () => ctl.current?.abort(), []);
+  return { busy, run, cancel };
+}
+
 export interface Multi<T = any> {
   items: T[]; errors: { environment: string; namespace: string | null; error: string; denied: boolean }[]; environments: string[];
   queries: Record<string, string>; collected_at: string | null; step?: number; missing_references?: any[];

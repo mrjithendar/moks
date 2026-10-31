@@ -271,12 +271,30 @@ export function Connectors() {
 
 // ---- LLM providers ----------------------------------------------------------------------------
 
-const LLM_PROVIDERS: Record<string, { label: string; models: string[]; hint: string }> = {
-  bedrock: { label: "Amazon Bedrock", models: ["us.amazon.nova-2-lite-v1:0"], hint: "Uses the pod's AWS identity, or the keys from scripts/create-runtime-key.sh." },
-  openai: { label: "OpenAI-compatible", models: [], hint: "Any endpoint that speaks the OpenAI chat API." },
-  gemini: { label: "Google Gemini", models: [], hint: "Needs an API key reference." },
-  ollama: { label: "Ollama", models: [], hint: "Self-hosted; the endpoint is required." },
+interface Preset { label: string; provider: string; endpoint?: string; key?: string; models?: string[]; prices?: Record<string, [string, string]>; hint: string }
+
+/** A preset only fills in the form. Prices are USD per million tokens, from the provider's list, and worth checking. */
+const LLM_PRESETS: Record<string, Preset> = {
+  anthropic: { label: "Anthropic Claude", provider: "anthropic", key: "MOKS_CRED_ANTHROPIC_API_KEY", hint: "Claude has no embedding API, so embeddings need another provider.",
+    models: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
+    prices: { "claude-opus-5-5": ["4", "20"], "claude-sonnet-5-5": ["2", "10"], "claude-haiku-5-5": ["0.10", "0.50"] } },
+  openai: { label: "OpenAI", provider: "openai", key: "MOKS_CRED_OPENAI_API_KEY", hint: "Use a model name from your OpenAI account." },
+  google: { label: "Google AI (Gemini)", provider: "gemini", key: "MOKS_CRED_GEMINI_API_KEY", hint: "Uses the Gemini API with an API key." },
+  azure: { label: "Azure OpenAI", provider: "azure_openai", endpoint: "https://YOUR-RESOURCE.openai.azure.com", key: "MOKS_CRED_AZURE_OPENAI_API_KEY", hint: "Model is your deployment name." },
+  bedrock: { label: "Amazon Bedrock", provider: "bedrock", models: ["us.amazon.nova-2-lite-v1:0"], hint: "Uses the pod's AWS identity, or the keys from scripts/create-runtime-key.sh." },
+  mistral: { label: "Mistral", provider: "openai", endpoint: "https://api.mistral.ai/v1", key: "MOKS_CRED_MISTRAL_API_KEY", hint: "OpenAI-compatible API." },
+  groq: { label: "Groq", provider: "openai", endpoint: "https://api.groq.com/openai/v1", key: "MOKS_CRED_GROQ_API_KEY", hint: "OpenAI-compatible API." },
+  deepseek: { label: "DeepSeek", provider: "openai", endpoint: "https://api.deepseek.com/v1", key: "MOKS_CRED_DEEPSEEK_API_KEY", hint: "OpenAI-compatible API." },
+  xai: { label: "xAI Grok", provider: "openai", endpoint: "https://api.x.ai/v1", key: "MOKS_CRED_XAI_API_KEY", hint: "OpenAI-compatible API." },
+  together: { label: "Together AI", provider: "openai", endpoint: "https://api.together.xyz/v1", key: "MOKS_CRED_TOGETHER_API_KEY", hint: "OpenAI-compatible API." },
+  fireworks: { label: "Fireworks AI", provider: "openai", endpoint: "https://api.fireworks.ai/inference/v1", key: "MOKS_CRED_FIREWORKS_API_KEY", hint: "OpenAI-compatible API." },
+  openrouter: { label: "OpenRouter", provider: "openai", endpoint: "https://openrouter.ai/api/v1", key: "MOKS_CRED_OPENROUTER_API_KEY", hint: "One key for many providers." },
+  ollama: { label: "Ollama", provider: "ollama", endpoint: "http://ollama.ollama:11434", hint: "Self-hosted; the endpoint is required." },
+  compatible: { label: "Other OpenAI-compatible server", provider: "openai", endpoint: "https://", hint: "vLLM, LiteLLM, LM Studio or any server that speaks the OpenAI chat API." },
 };
+const presetOf = (form: any) => Object.keys(LLM_PRESETS).find((k) => LLM_PRESETS[k].provider === form.provider && (LLM_PRESETS[k].endpoint ?? "") === (form.endpoint ?? "")) ?? (form.provider === "openai" ? "compatible" : Object.keys(LLM_PRESETS).find((k) => LLM_PRESETS[k].provider === form.provider) ?? "compatible");
+
+export { LLM_PRESETS, presetOf };
 
 export function LLMProviders() {
   const { confirm: ask } = useFeedback();
@@ -330,9 +348,9 @@ export function LLMProviders() {
         <div className="row">
           <label>Name<input required pattern="[a-z0-9][a-z0-9\-]*" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
           <label>Purpose<select value={form.purpose} onChange={(e) => setForm({ ...form, purpose: e.target.value })}><option>chat</option><option>embedding</option></select></label>
-          <label>Provider<select value={form.provider} onChange={(e) => setForm({ ...form, provider: e.target.value })}>{Object.entries(LLM_PROVIDERS).map(([k, p]) => <option key={k} value={k}>{p.label}</option>)}</select></label>
-          <label>Model<input required list="llm-models" value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} placeholder={form.provider === "bedrock" ? "inference profile or model ID" : "model name"} /></label>
-          <datalist id="llm-models">{LLM_PROVIDERS[form.provider]?.models.map((m) => <option key={m} value={m} />)}</datalist>
+          <label>Provider<select value={presetOf(form)} onChange={(e) => { const p = LLM_PRESETS[e.target.value]; setForm({ ...form, provider: p.provider, endpoint: p.endpoint ?? "", model: "", credType: p.key ? "env" : "none", credName: p.key ?? "" }); }}>{Object.entries(LLM_PRESETS).map(([k, p]) => <option key={k} value={k}>{p.label}</option>)}</select></label>
+          <label>Model<input required list="llm-models" value={form.model} onChange={(e) => { const price = LLM_PRESETS[presetOf(form)].prices?.[e.target.value]; setForm({ ...form, model: e.target.value, ...(price ? { input_price_per_mtok: price[0], output_price_per_mtok: price[1] } : {}) }); }} placeholder={form.provider === "bedrock" ? "inference profile or model ID" : "model name"} /></label>
+          <datalist id="llm-models">{LLM_PRESETS[presetOf(form)].models?.map((m) => <option key={m} value={m} />)}</datalist>
           <datalist id="aws-regions">{REGIONS.map((r) => <option key={r} value={r} />)}</datalist>
         </div>
         <div className="row">
@@ -342,7 +360,7 @@ export function LLMProviders() {
             <label>API key reference<select value={form.credType} onChange={(e) => setForm({ ...form, credType: e.target.value })}><option value="none">none</option><option value="env">environment variable</option></select></label>
           )}
           {form.credType === "env" && form.provider !== "bedrock" && <label>Variable<input value={form.credName} onChange={(e) => setForm({ ...form, credName: e.target.value })} placeholder="MOKS_CRED_OPENAI_API_KEY" /></label>}
-          <span className="small muted">{LLM_PROVIDERS[form.provider]?.hint}</span>
+          <span className="small muted">{LLM_PRESETS[presetOf(form)].hint}</span>
         </div>
         <div className="row">
           <label>Timeout (s)<input type="number" value={form.timeout_seconds} onChange={(e) => setForm({ ...form, timeout_seconds: Number(e.target.value) })} /></label>
@@ -350,6 +368,7 @@ export function LLMProviders() {
           <label>Daily budget (USD)<input value={form.daily_budget_usd} onChange={(e) => setForm({ ...form, daily_budget_usd: e.target.value })} /></label>
           <label>Input $ / 1M tokens<input value={form.input_price_per_mtok} onChange={(e) => setForm({ ...form, input_price_per_mtok: e.target.value })} /></label>
           <label>Output $ / 1M tokens<input value={form.output_price_per_mtok} onChange={(e) => setForm({ ...form, output_price_per_mtok: e.target.value })} /></label>
+          {Number(form.input_price_per_mtok) === 0 && Number(form.output_price_per_mtok) === 0 && form.provider !== "ollama" && <span className="small muted">With no prices set, spend counts as $0 and the daily budget cannot limit this model.</span>}
         </div>
         <ErrorBox error={a.error} />
         <div className="row"><button disabled={a.busy}>{editing ? "Save" : "Add"}</button>{editing && <button type="button" className="ghost" onClick={() => { setEditing(null); setForm(blank); }}>Cancel</button>}</div>

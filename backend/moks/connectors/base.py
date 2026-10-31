@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ import httpx
 
 from ..observability import CONNECTOR_LATENCY, CONNECTOR_REQUESTS
 
+log = logging.getLogger("moks.connectors")
 CREDENTIALS_DIR = Path(os.environ.get("MOKS_CREDENTIALS_DIR", "/var/run/moks-credentials"))
 
 
@@ -50,7 +52,7 @@ def resolve_credential(ref: dict[str, Any] | None) -> str | None:
         value = os.environ.get(name)
         if value is None:
             raise ConnectorError("config", f"credential environment variable {name} is not set")
-        return value
+        return value.strip()  # a value made with `echo` or from a file ends in a newline, which is an illegal header
     if kind == "file":
         path = resolve_credential_path(ref)
         try:
@@ -149,6 +151,8 @@ class BoundedHttp:
         assert last is not None
         CONNECTOR_REQUESTS.labels(self.connector_type, operation, last.kind).inc()
         CONNECTOR_LATENCY.labels(self.connector_type, operation).observe(time.monotonic() - start)
+        log.warning("connector request failed", extra={"event": "connector_request_failed", "dependency": self.connector_type, "operation": operation, "outcome": "failure",
+                                                       "errorCode": last.kind, "durationMs": int((time.monotonic() - start) * 1000)})
         raise last
 
     async def _once(self, method: str, path: str, params: Any, data: Any) -> Any:
@@ -171,6 +175,8 @@ class BoundedHttp:
             raise ConnectorError("rate_limited", f"{self.connector_type} rate limit reached (HTTP {status}); retry in about {wait:.0f}s", retry_after=wait)
         if status in (401, 403):
             raise ConnectorError("auth" if status == 401 else "forbidden", f"{self.connector_type} rejected the credentials (HTTP {status})")
+        if 300 <= status < 400:
+            raise ConnectorError("bad_request", f"{self.connector_type} redirected to {headers.get('location', 'another address')}; put the final address in base_url")
         if status == 404:
             raise ConnectorError("not_found", f"{self.connector_type} endpoint not found (HTTP 404); check the base URL/path prefix")
         if status >= 500:
