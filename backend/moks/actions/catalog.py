@@ -288,6 +288,9 @@ def needs_approval(action: ActionDef, env: Environment) -> bool:
 def check_policy(action: str, params: Params, env: Environment, pre: dict | None, target_kind: str | None = None) -> None:
     if action in ("velero_backup", "velero_schedule", "velero_restore"):
         velero.check_scope(env, params.included_namespaces, params.excluded_namespaces)  # type: ignore[attr-defined]
+        wants = params.restore_volumes if action == "velero_restore" else params.include_volumes  # type: ignore[attr-defined]
+        if wants and not velero.supports_volumes(env):
+            raise ConnectorError("invalid_args", f"{env.name} uses hostPath volumes, which Velero cannot back up or restore")
     if action == "apply_config_patch":
         check_patch(target_kind or "", params.patch, env, {"spec": pre["spec"]} if pre and "spec" in pre else None)  # type: ignore[attr-defined]
     if action == "delete_pod" and pre is not None and not pre.get("owner"):
@@ -322,7 +325,7 @@ def _describe_velero(action: str, params: Params, target: str, pre: dict) -> dic
     scope = f"namespaces {', '.join(p2.included_namespaces)}, excluding {', '.join(p2.excluded_namespaces) or 'none'}"
     if action in ("velero_backup", "velero_schedule"):
         when = "One backup now" if action == "velero_backup" else f"Scheduled backups ({p2.cron})"
-        volumes = "with PersistentVolume data" if p2.include_volumes else "without PersistentVolume data"
+        volumes = "with PersistentVolume data" if p2.include_volumes else "WITHOUT PersistentVolume data"
         return {"impact": f"{when} of {scope}, {volumes}, including Secret objects. Each is kept {p2.ttl_days} days, then Velero deletes it from R2.",
                 "blast_radius": "No workload changes. Volume copies add disk and network load on each node while they run.",
                 "preconditions": ["the R2 location is Available"], "validation": ["Velero accepts the object (it does not fail validation)"],

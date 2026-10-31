@@ -1,0 +1,56 @@
+# Velero on mk4, deployed by Argo CD. Apply once, then sync by hand like moks-portal, never with
+# prune. The storage location, Secrets, schedules and backups are created by MOKS through reviewed
+# plans, so Argo does not track them. Its own project keeps cluster-wide CRDs out of project moks.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: velero
+  namespace: argocd
+spec:
+  description: Velero cluster backups
+  sourceRepos:
+    - https://github.com/mrjithendar/moks.git
+    - https://vmware-tanzu.github.io/helm-charts
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: velero
+  clusterResourceWhitelist:
+    - {group: "", kind: Namespace}
+    - {group: rbac.authorization.k8s.io, kind: ClusterRoleBinding}
+    - {group: apiextensions.k8s.io, kind: CustomResourceDefinition}
+  namespaceResourceWhitelist:
+    - {group: "", kind: ConfigMap}
+    - {group: "", kind: Service}
+    - {group: "", kind: ServiceAccount}
+    - {group: apps, kind: Deployment}
+    - {group: rbac.authorization.k8s.io, kind: Role}
+    - {group: rbac.authorization.k8s.io, kind: RoleBinding}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: velero
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  project: velero
+  sources:
+    - repoURL: https://vmware-tanzu.github.io/helm-charts
+      chart: velero
+      targetRevision: 12.2.2
+      helm:
+        releaseName: velero
+        valueFiles: [$values/deploy/velero/values-r2-minikube.yaml]
+    - repoURL: https://github.com/mrjithendar/moks.git
+      targetRevision: master
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: velero
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true        # Velero's CRDs are too large for client-side apply
+      - PruneLast=true
+      - FailOnSharedResource=true

@@ -6,7 +6,7 @@ import { Badge, ErrorBox, PageHead, Time, useInterval, useLoad, type Env } from 
 import { Dialog } from "../ui";
 
 const PHASE: Record<string, "ok" | "warn" | "bad" | "info"> = { Completed: "ok", PartiallyFailed: "warn", Failed: "bad", FailedValidation: "bad", InProgress: "info" };
-const REFS = [["access_key_id", "R2 access key id"], ["secret_access_key", "R2 secret access key"], ["sse_key", "Encryption key (32 bytes, base64)"], ["repo_password", "Volume repository password"]];
+const REFS = [["access_key_id", "Variable holding the R2 access key id"], ["secret_access_key", "Variable holding the R2 secret access key"], ["sse_key", "Variable holding the encryption key (32 bytes, base64)"], ["repo_password", "Variable holding the volume repository password"]];
 
 function parseList(text: string): string[] { return text.split(/[\s,]+/).filter(Boolean); }
 
@@ -55,12 +55,12 @@ export function Backups() {
   const namespaces = parseList(ns);
   const d = s.data;
   const scope = <label>Namespaces (space separated, * for all)<input value={ns} onChange={(e) => setNs(e.target.value)} /></label>;
-  const data = <><label className="inline"><input type="checkbox" checked={volumes} onChange={(e) => setVolumes(e.target.checked)} /> Include PersistentVolume data</label>
+  const data = <>{d?.volumes_supported !== false && <label className="inline"><input type="checkbox" checked={volumes} onChange={(e) => setVolumes(e.target.checked)} /> Include PersistentVolume data</label>}
     <label>Keep for (days)<input type="number" min={1} max={3650} value={days} onChange={(e) => setDays(Number(e.target.value))} /></label></>;
   const q = encodeURIComponent(`Review cluster backups: are they healthy, complete and restorable? Explain any failure.`);
   return (
     <>
-      <PageHead title="Backups" sub="Every cluster object including Secrets, and volume data, stored encrypted in Cloudflare R2 by Velero.">
+      <PageHead title="Backups" sub="Cluster objects including Secrets, and volume data where the cluster supports it, stored encrypted in Cloudflare R2 by Velero.">
         <label>Environment<select value={env} onChange={(e) => setPicked(e.target.value)}>{envs.data?.map((e) => <option key={e.name} value={e.name}>{e.display_name}{e.is_production ? " (production)" : ""}</option>)}</select></label>
       </PageHead>
       <ErrorBox error={s.error ?? envs.error} />
@@ -129,7 +129,8 @@ export function BackupStorage() {
           <label>Jurisdiction<select value={f.jurisdiction} onChange={(e) => set({ jurisdiction: e.target.value })}><option value="default">Default</option><option value="eu">EU</option></select></label>
         </div>
         <h2>Credential references</h2>
-        <div className="filters">{REFS.map(([k, label]) => <label key={k}>{label}<input required pattern="MOKS_CRED_[A-Z0-9_]+" className="mono" value={f.names[k]} onChange={(e) => set({ names: { ...f.names, [k]: e.target.value } })} />
+        <p className="small muted" style={{ margin: 0 }}>Enter variable names here, not keys. The values go in the Kubernetes Secret, and this page never accepts them.</p>
+        <div className="filters">{REFS.map(([k, label]) => <label key={k}>{label}<input required pattern="MOKS_CRED_[A-Z0-9_]+" title="The name of a variable in the Secret, such as MOKS_CRED_R2_ACCESS_KEY_ID. Never the key itself." className="mono" value={f.names[k]} onChange={(e) => set({ names: { ...f.names, [k]: e.target.value } })} />
           {store && <span className="small">{store.credential_status[k].available ? "available here" : "not set here"}</span>}</label>)}</div>
         <div className="row"><button disabled={busy}>Save</button>
           {store && <button type="button" className="ghost" disabled={busy} onClick={() => run(() => api("/backups/store/test", { method: "POST" }))}>Test write, read and delete</button>}

@@ -110,7 +110,7 @@ async def k8s_backup_status(ctx: ToolContext, a: NoArgs) -> ToolResult:
     """Velero's own status objects. No backup contents and no Secret data are read."""
     from .. import velero
 
-    s = await velero.status(ctx.connector("kubernetes"))
+    s = await velero.status(ctx.connector("kubernetes"), velero.supports_volumes(ctx.environment))
     bad = [f["text"] for f in s["findings"] if f["severity"] == "bad"]
     data = {**s, "backups": s["backups"][:20], "restores": s["restores"][:10]}
     return ToolResult(f"{len(s['backups'])} backups, {len(s['schedules'])} schedules, {len(s['findings'])} findings" + (f": {bad[0]}" if bad else ""), data,

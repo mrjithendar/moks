@@ -110,3 +110,34 @@ def test_the_chart_ships_the_consistent_dump():
 def test_a_malformed_digest_is_refused(digest):
     done = subprocess.run(["helm", "template", "moks", str(CHART), "--set", f"image.digest={digest}"], capture_output=True, text=True)
     assert done.returncode != 0 and "image.digest must be" in done.stderr
+
+
+def test_mk4_has_velero_access_and_no_node_agent():
+    docs = render("values-minikube.yaml")
+    assert {"moks-velero-reader", "moks-executor-velero"} <= {d["metadata"]["name"] for d in docs if d["kind"] == "Role"}
+    values = yaml.safe_load((CHART.parents[1] / "velero/values-r2-minikube.yaml").read_text())
+    assert values["deployNodeAgent"] is False and values["configuration"]["defaultVolumesToFsBackup"] is False
+
+
+def test_argo_can_deploy_velero_in_either_order():
+    docs = render("values-minikube.yaml")
+    ns = next(d for d in docs if d["kind"] == "Namespace" and d["metadata"]["name"] == "velero")
+    assert ns["metadata"]["annotations"]["argocd.argoproj.io/sync-wave"] == "-1"  # before the Roles inside it
+    assert "Prune=false" in ns["metadata"]["annotations"]["argocd.argoproj.io/sync-options"]
+    project, app = yaml.safe_load_all((CHART.parents[1] / "argocd/velero.yaml").read_text())
+    assert app["spec"]["project"] == project["metadata"]["name"] and "automated" not in app["spec"]["syncPolicy"]
+    values = app["spec"]["sources"][0]["helm"]["valueFiles"][0].replace("$values/", "")
+    assert (CHART.parents[2] / values).exists()
+    assert {s["repoURL"] for s in app["spec"]["sources"]} <= set(project["spec"]["sourceRepos"])
+    assert yaml.safe_load((CHART.parents[2] / values).read_text())["upgradeCRDs"] is False
+
+
+def test_velero_project_allows_everything_the_chart_renders():
+    out = subprocess.run(["helm", "template", "velero", "velero", "--repo", "https://vmware-tanzu.github.io/helm-charts", "--version", "12.2.2", "-n", "velero",
+                          "--include-crds", "-f", str(CHART.parents[1] / "velero/values-r2-minikube.yaml")], capture_output=True, text=True)
+    if out.returncode:
+        pytest.skip("the Velero chart repository is unreachable")
+    project = next(yaml.safe_load_all((CHART.parents[1] / "argocd/velero.yaml").read_text()))
+    allowed = {w["kind"] for w in project["spec"]["clusterResourceWhitelist"] + project["spec"]["namespaceResourceWhitelist"]}
+    rendered = {d["kind"] for d in yaml.safe_load_all(out.stdout) if d}
+    assert rendered <= allowed, rendered - allowed

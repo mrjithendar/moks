@@ -149,7 +149,7 @@ async def status(environment: str, request: Request, ctx: AuthContext = Depends(
     if k8s is None:
         raise HTTPException(409, "No kubernetes connector in this environment")
     try:
-        state = await velero.status(k8s[1])
+        state = await velero.status(k8s[1], velero.supports_volumes(env))
     except ConnectorError as exc:
         raise HTTPException(502, exc.message) from None
     store = await velero.get_store(db)
@@ -188,7 +188,7 @@ async def configure(environment: str, body: Reason, ctx: AuthContext = Depends(g
 async def backup(environment: str, body: BackupIn, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     env = await env_or_404(db, environment)
     return await _plan(db, ctx, env, "velero_backup", "Backup", "new", {
-        **_scoped(env, body.included_namespaces, velero.always_excluded()), "include_volumes": body.include_volumes, "ttl_days": body.ttl_days}, body.reason)
+        **_scoped(env, body.included_namespaces, velero.always_excluded()), "include_volumes": body.include_volumes and velero.supports_volumes(env), "ttl_days": body.ttl_days}, body.reason)
 
 
 @router.post("/{environment}/schedule", status_code=201)
@@ -197,7 +197,7 @@ async def schedule(environment: str, body: ScheduleIn, ctx: AuthContext = Depend
     if not NAME.match(body.name):
         raise HTTPException(422, "invalid schedule name")
     return await _plan(db, ctx, env, "velero_schedule", "Schedule", body.name, {
-        **_scoped(env, body.included_namespaces, velero.always_excluded()), "include_volumes": body.include_volumes, "ttl_days": body.ttl_days,
+        **_scoped(env, body.included_namespaces, velero.always_excluded()), "include_volumes": body.include_volumes and velero.supports_volumes(env), "ttl_days": body.ttl_days,
         "cron": body.cron, "paused": body.paused}, body.reason)
 
 
@@ -206,4 +206,4 @@ async def restore(environment: str, body: RestoreIn, ctx: AuthContext = Depends(
     env = await env_or_404(db, environment)
     return await _plan(db, ctx, env, "velero_restore", "Restore", body.backup, {
         **_scoped(env, body.included_namespaces, velero.restore_excluded()), "existing_resource_policy": body.existing_resource_policy,
-        "restore_volumes": body.restore_volumes, "pre_restore_backup": body.pre_restore_backup}, body.reason)
+        "restore_volumes": body.restore_volumes and velero.supports_volumes(env), "pre_restore_backup": body.pre_restore_backup}, body.reason)

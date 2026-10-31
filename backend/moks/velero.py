@@ -1,7 +1,8 @@
 """Cluster backups: Velero does the work, Cloudflare R2 holds the data, MOKS is the control plane.
 
 Velero runs in each cluster and backs up every API object, Secrets included, plus PersistentVolume
-contents through its node agent. MOKS never reads a Secret: its read role covers only Velero's own
+contents through its node agent where it can: Velero does not support hostPath volumes, and every
+volume on Minikube is one, so a Minikube backup holds objects only and says so. MOKS never reads a Secret: its read role covers only Velero's own
 objects, so nothing in an investigation, a tool result or an LLM prompt can contain Secret data.
 
 Every write (location, schedule, backup, restore) is an action plan, so it has the same RBAC,
@@ -44,6 +45,10 @@ DONE = {"Completed", "PartiallyFailed", "Failed", "FailedValidation"}
 NS_PATTERN = re.compile(r"^(\*|[a-z0-9*?]([-a-z0-9*?]{0,61}[a-z0-9*?])?)$")
 STALE_HOURS = 26
 KEEP_DAYS = 3650  # nothing is removed automatically unless someone chooses a shorter retention
+
+
+def supports_volumes(env: Environment) -> bool:
+    return env.kind != "minikube"
 
 
 def namespace() -> str:
@@ -244,8 +249,10 @@ def findings(state: dict[str, Any], now: datetime | None = None) -> list[dict[st
         hours = (now - last).total_seconds() / 3600
         if hours > STALE_HOURS:
             add("warn", "stale", f"The last completed backup is {hours:.0f} hours old.")
-        if not any(b["volumes"] for b in good):
+        if state.get("volumes_supported", True) and not any(b["volumes"] for b in good):
             add("warn", "no_volumes", "No completed backup includes PersistentVolume data.")
+    if not state.get("volumes_supported", True):
+        add("warn", "volumes_not_covered", "Volume data is not backed up here: Velero does not support the hostPath volumes this cluster uses. Back up databases separately.")
     if not state["schedules"]:
         add("warn", "no_schedule", "No backup schedule exists, so backups only run when someone starts one.")
     for s in state["schedules"]:
@@ -258,8 +265,8 @@ def findings(state: dict[str, Any], now: datetime | None = None) -> list[dict[st
     return out
 
 
-async def status(k8s: Any) -> dict[str, Any]:
-    state: dict[str, Any] = {"installed": True, "locations": [], "backups": [], "restores": [], "schedules": []}
+async def status(k8s: Any, volumes_supported: bool = True) -> dict[str, Any]:
+    state: dict[str, Any] = {"installed": True, "volumes_supported": volumes_supported, "locations": [], "backups": [], "restores": [], "schedules": []}
     try:
         locations, backups, restores, schedules = await asyncio.gather(*(k8s.velero_list(p) for p in ("backupstoragelocations", "backups", "restores", "schedules")))
     except ConnectorError as exc:

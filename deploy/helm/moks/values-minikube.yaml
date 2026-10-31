@@ -6,6 +6,10 @@ image:
   pullPolicy: IfNotPresent   # a digest never changes, so a cached copy is always correct
 imagePullSecrets: [{name: ecr-pull}]   # refreshed by the ecr-refresh CronJob (tools repo); see docs/OPERATOR_GUIDE.md
 
+# Cluster backups. Velero itself is the Argo CD app in deploy/argocd/velero.yaml.
+velero:
+  enabled: true
+
 publicUrl: https://jithendar.com/moks
 basePath: /moks
 

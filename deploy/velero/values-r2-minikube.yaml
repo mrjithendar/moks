@@ -1,0 +1,19 @@
+# Velero on Minikube (mk4), deployed by deploy/argocd/velero.yaml. Same as values-r2.yaml without the node agent: Velero does not support
+# hostPath volumes, and every Minikube volume is one, so the agent would run privileged for nothing.
+# This backs up every API object, including Secrets. See docs/CLUSTER_BACKUPS.md for volume data.
+initContainers:
+  - name: velero-plugin-for-aws
+    image: velero/velero-plugin-for-aws:v1.14.4
+    volumeMounts:
+      - {name: plugins, mountPath: /target}
+upgradeCRDs: false           # the CRDs ship in the chart; Argo CD applies them, so no hook Job is needed
+credentials:
+  useSecret: false
+snapshotsEnabled: false
+backupsEnabled: true
+deployNodeAgent: false
+configuration:
+  backupStorageLocation: []
+  volumeSnapshotLocation: []
+  uploaderType: kopia
+  defaultVolumesToFsBackup: false

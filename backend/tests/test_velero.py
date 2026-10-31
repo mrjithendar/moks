@@ -72,12 +72,12 @@ async def world(monkeypatch):
     registry._cache.clear()
 
 
-async def _env(prod=False, denied=()):
+async def _env(prod=False, denied=(), kind="eks"):
     name = f"vel-{uuid.uuid4().hex[:6]}"
     env_id = await make_env(name, connectors=[{"type": "kubernetes", "name": "k8s", "config": {"mode": "in_cluster", "executor": {"mode": "in_cluster"}}}])
     async with session_scope() as db:
         e = await db.get(Environment, env_id)
-        e.is_production, e.denied_namespaces = prod, list(denied)
+        e.is_production, e.denied_namespaces, e.kind = prod, list(denied), kind
     tag = uuid.uuid4().hex[:6]
     op, ap, scoped = f"op-{tag}@example.com", f"ap-{tag}@example.com", f"sc-{tag}@example.com"
     await make_user(op, [f"operator:{name}:*"])
@@ -267,3 +267,24 @@ def test_findings_catch_the_quiet_failures():
     old["status"]["completionTimestamp"] = "2026-01-01T00:00:00Z"
     state = {"installed": True, "locations": [velero.location_row(bsl("Unavailable"))], "backups": [velero.backup_row(old)], "restores": [], "schedules": [{"name": "d", "paused": True}]}
     assert {f["code"] for f in velero.findings(state)} == {"location_unavailable", "stale", "paused"}
+
+
+async def test_minikube_is_honest_about_volume_data(client):
+    t = await _env(kind="minikube")
+    h = await login(client, t[1])
+    body = (await client.get(f"/moks/api/backups/{t[0]}")).json()
+    assert body["volumes_supported"] is False and "volumes_not_covered" in {f["code"] for f in body["findings"]}
+    pid = (await client.post(f"/moks/api/backups/{t[0]}/backup", json={"reason": "before the upgrade", "include_volumes": True}, headers=h)).json()["plan_id"]
+    plan = (await client.get(f"/moks/api/actions/plans/{pid}")).json()
+    assert plan["params"]["include_volumes"] is False and "WITHOUT PersistentVolume data" in plan["expected_impact"]
+    w = Writer()
+    await _run_plan(client, t, pid, w)
+    assert next(v for k, v in w.objects.items() if k[0] == "backups")["spec"]["defaultVolumesToFsBackup"] is False
+
+
+async def test_a_volume_plan_cannot_run_on_minikube(client):
+    from moks.actions.catalog import BackupP, check_policy
+
+    env = Environment(name="m", kind="minikube", allowed_namespaces=["*"], denied_namespaces=[])
+    with pytest.raises(ConnectorError):
+        check_policy("velero_backup", BackupP(included_namespaces=["*"], excluded_namespaces=[], include_volumes=True), env, None, "Backup")

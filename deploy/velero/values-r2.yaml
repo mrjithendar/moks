@@ -6,6 +6,7 @@ initContainers:
     image: velero/velero-plugin-for-aws:v1.14.4
     volumeMounts:
       - {name: plugins, mountPath: /target}
+upgradeCRDs: false           # the CRDs ship in the chart; Argo CD applies them, so no hook Job is needed
 credentials:
   useSecret: false
 snapshotsEnabled: false

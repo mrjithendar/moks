@@ -56,6 +56,17 @@ subjects: {{- include "moks.readerSubjects" $ | nindent 2 }}
 {{- end }}
 {{- if .Values.velero.enabled }}
 ---
+# Created here too, so moks-portal and the velero app can sync in either order. Never pruned: it
+# holds backups' Secrets and Velero's state.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.velero.namespace }}
+  labels: {{- include "moks.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+---
 # Velero's own status objects, and nothing else in its namespace: never its Secrets.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

@@ -1,6 +1,17 @@
 # Cluster backups to Cloudflare R2
 
-MOKS backs up whole clusters, Minikube or EKS, to Cloudflare R2 and restores them from the portal. Velero does the cluster work: every API object including Secrets, plus PersistentVolume contents through its node agent. MOKS is the control plane.
+MOKS backs up whole clusters, Minikube or EKS, to Cloudflare R2 and restores them from the portal. Velero does the cluster work: every API object including Secrets, plus PersistentVolume contents through its node agent on clusters that support it. MOKS is the control plane.
+
+## What is and is not covered
+
+| Cluster | Objects and Secrets | Volume data |
+|---|---|---|
+| EKS | Yes | Yes |
+| Minikube (mk4) | Yes | **No** |
+
+Velero does not support `hostPath` volumes, and every Minikube volume is one. All 15 volumes on mk4 are hostPath, including every database, so a backup there restores workloads and configuration with **empty volumes**. MOKS shows this on the Backups page and in each plan, and refuses a volume backup on Minikube rather than appearing to take one.
+
+Protect mk4's data separately: enable the `moks-backup` CronJob for the MOKS database, and add a dump for each other database. Moving to `local` volumes would let Velero copy them, but that is a data migration.
 
 ## What protects the data
 
@@ -23,10 +34,9 @@ Store all four in your password manager. Without the encryption key and the repo
 ## Set up
 
 1. Create an R2 bucket and token. Add the four variables to the executor's Secret, and the first three to the API's for the storage test.
-2. Install Velero in each cluster. This is a privileged change, so review it first: `helm upgrade --install velero velero --repo https://vmware-tanzu.github.io/helm-charts --version 12.2.2 -n velero --create-namespace -f deploy/velero/values-r2.yaml`
-3. Set `velero.enabled: true` in the MOKS chart and sync. On an EKS cluster reached remotely, grant the same two Roles to the identities in its connector.
-4. In **Admin > Backup storage**, enter the account, bucket and variable names, then run the test.
-5. In **Operate > Backups**, choose **Connect to R2**, then **Set schedule**, and approve each plan.
+2. Argo CD deploys Velero. Once only, apply its project and app with the MOKS project: `kubectl --context mk4 apply -f deploy/argocd/project.yaml -f deploy/argocd/velero.yaml`. Then sync `velero` and `moks-portal` by hand, without prune, in either order. `velero.enabled: true` in the MOKS chart gives MOKS its access. On EKS, point a copy of the app at `values-r2.yaml`, which adds the privileged node agent. On an EKS cluster reached remotely, grant the same two Roles to the identities in its connector.
+3. In **Admin > Backup storage**, enter the account, bucket and variable names, then run the test.
+4. In **Operate > Backups**, choose **Connect to R2**, then **Set schedule**, and approve each plan.
 
 Each cluster stores under its own prefix, `<prefix>/<environment>`.
 
@@ -48,4 +58,4 @@ Backups default to 3650 days, so nothing is removed automatically unless you cho
 
 ## Not yet proven
 
-Written and checked against Velero's published schemas, but **not run against real Velero or R2**. Prove it on a scratch cluster first. Three things need checking there: R2 with `checksumAlgorithm: ""`, `customerKeyEncryptionSecret` with real backups, and Kopia volume data on R2 with SSE-C set on the location.
+Written and checked against Velero's published schemas, but **not run against real Velero or R2**. Prove it on a scratch cluster first. Check R2 with `checksumAlgorithm: ""` and `customerKeyEncryptionSecret` with real backups, and on EKS, Kopia volume data on R2 with SSE-C set on the location.
