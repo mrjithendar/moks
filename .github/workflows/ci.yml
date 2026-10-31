@@ -1,14 +1,14 @@
 name: moks
 
-# check   -> every push and pull request: backend tests against PostgreSQL, frontend typecheck/build,
+# check   -> pull requests only: backend tests against PostgreSQL, frontend typecheck/build,
 #            Helm lint/render
 # release -> default branch: build the arm64 image once, tag it with the commit and move latest to it.
 #            mk4 runs latest, and new pods pull it when restarted. CI never touches the cluster.
 
 on:
   push:
+    branches: [master]
   pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   check:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -67,7 +68,8 @@ jobs:
 
   release:
     needs: check
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    # check is skipped on a push, and a skipped need would skip this job too, so that case is allowed here.
+    if: ${{ !cancelled() && needs.check.result == 'skipped' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     permissions:

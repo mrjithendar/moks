@@ -76,7 +76,8 @@ function Floating({ anchor, onClose, className, label, role, children, onKeyDown
   useEffect(() => {
     const away = (e: MouseEvent) => { if (!box.current?.contains(e.target as Node) && !anchor?.contains(e.target as Node)) close.current(); };
     const esc = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); close.current(); anchor?.focus(); } };
-    const move = (e: Event) => { if (!box.current?.contains(e.target as Node)) close.current(); };
+    // Beside its trigger it would drift, so it closes. A sheet is fixed to the screen, and a scroll still settling must not close it.
+    const move = (e: Event) => { if (window.innerWidth > 900 && !box.current?.contains(e.target as Node)) close.current(); };
     document.addEventListener("mousedown", away);
     document.addEventListener("keydown", esc, true);
     window.addEventListener("resize", move);
