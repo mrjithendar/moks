@@ -105,7 +105,7 @@ diagnostics:
 terminal:
   enabled: true
   image:
-    digest: ""
+    digest: sha256:b49e760168673e54a20a2c7ed0cbf873058c14fcd6d0dc39b5f81819fbc2ef65   # multi-arch index, built from 97fa1e9
   imagePullSecrets: [ecr-pull]   # created in every namespace by the ecr-refresh CronJob (tools repo)
   profiles:
     - name: mk4-readonly
