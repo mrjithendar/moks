@@ -2,7 +2,7 @@
 image:
   repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
   digest: "latest"
-  pullPolicy: always
+  pullPolicy: Always
 imagePullSecrets: [{name: ecr-pull}]   # refreshed by the ecr-refresh CronJob (tools repo); see docs/OPERATOR_GUIDE.md
 
 # Cluster backups. Velero itself is the Argo CD app in deploy/argocd/velero.yaml.
