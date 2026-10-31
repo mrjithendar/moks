@@ -322,3 +322,26 @@ disk. Backups are encrypted before they leave the cluster, are read back before 
 through `backup_runs`, so an alert fires on the age of the last success: a job that never starts is caught
 as well as one that fails. There is no point-in-time recovery; see [LIMITATIONS.md](LIMITATIONS.md).
 
+
+## Investigation graph
+
+An investigation runs as a LangGraph state machine (`orchestrator/graph.py`):
+
+```
+triage -> logs -> skills -+-> plan <-> act -+-> correlate -> report
+                          |      |          |
+                          +----> rules -----+
+```
+
+With no model, or when one fails, the run takes `rules`, so a report always comes out. Rounds and tool calls stay bounded
+by `max_llm_rounds` and `max_tool_calls`. The graph only decides what happens next: nodes call Investigator methods.
+
+LangChain supplies the interfaces, on top of what MOKS already enforces:
+
+- `llm/lc.py` is a chat model over `budget.complete`, so reservations, limits and metering apply. Vendor packages such as
+  `langchain-openai` are not used, because they would call providers directly.
+- `tools/lc.py` wraps tools around the policy-checked path, with plain JSON Schema so the ToolExecutor stays the only validator.
+- Planning keeps MOKS's own JSON protocol rather than provider function calling, so every provider behaves the same.
+- LangSmith tracing is forced off: it would send prompts holding redacted evidence to a third party. Traces go to OpenTelemetry,
+  with a `node <name>` span for each step.
+- There is no LangGraph checkpointer. The worker reaper already handles a stopped run, and evidence is in PostgreSQL.

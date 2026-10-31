@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from sqlalchemy import func, select, update
 
 from .. import audit
@@ -27,7 +28,7 @@ from ..config import get_settings
 from ..connectors import registry
 from ..db import session_scope
 from ..auth.revocation import CHECK_SECONDS as WATCH_SECONDS, AccessGuard, AccessRevoked
-from ..llm import budget
+from ..llm.lc import MoksChatModel
 from ..llm.providers import LLMError, provider_for
 from ..models import SkillPolicy, Environment, Investigation, InvestigationEvent, LLMConfig, RoleBinding, User
 from ..observability import INVESTIGATION_DURATION, INVESTIGATIONS, INVESTIGATIONS_RUNNING, continue_trace, tracer
@@ -35,7 +36,8 @@ from ..rbac import Binding, P, Principal
 from ..scope import ScopeError, effective_scope
 from ..tools.contracts import ToolContext
 from ..tools.executor import ToolExecutor, ToolOutcome, tools_for_planner
-from . import prompts
+from ..tools.lc import as_tools
+from . import graph, prompts
 from .. import conversations
 from ..diagnosis.logs import last_failure
 from .report import Report, focus, parse_json_object, rules_report, validate_llm_report, verify_causes
@@ -241,55 +243,13 @@ class Investigator:
         self.guard = ctx.guard = AccessGuard(principal_id, environment_id, namespace, P.INVESTIGATION_RUN, ctx)
         await self.guard.check()
 
+        provider = provider_for(llm_cfg) if llm_cfg else None
         async with session_scope() as db:
             executor = ToolExecutor(db, ctx, next_ref=self._next_ref, timeout_seconds=min(45, self.settings.max_duration_seconds))
-
-            # 1. Baseline evidence (always, deterministic)
-            await self._emit("phase", {"phase": "triage", "label": "Triage: finding what is affected"})
-            await self._emit("phase", {"phase": "evidence", "label": "Collecting baseline evidence"})
-            await self._baseline(executor, ctx, namespace, question)
-            namespace = self.focus_namespace or namespace
-            scope_info["namespace"] = namespace
-            ctx.focus_namespace = namespace
+            final = await graph.run(self, executor, ctx, question, namespace, scope_info, provider, llm_cfg, (LLMError, BudgetExceeded))
             await db.commit()
-
-            # 2. Logs, current and previous: often the only place a failure explains itself
-            await self._collect_logs(executor, ctx, namespace, question)
-            await db.commit()
-
-            # 3. SRE skills matching the question and findings run their playbook steps
-            await self._run_skills(executor, ctx, namespace, question)
-            await db.commit()
-
-            # 3. Follow-up evidence: LLM-planned when available, otherwise rule-based
-            provider = provider_for(llm_cfg) if llm_cfg else None
-            if provider:
-                try:
-                    await self._llm_rounds(executor, ctx, provider, llm_cfg, self._with_history(question), scope_info)
-                except (LLMError, BudgetExceeded) as exc:
-                    self.notes.append(f"LLM planning stopped: {getattr(exc, 'message', str(exc))}. Continuing with rule-based follow-ups.")
-                    await self._emit("note", {"message": self.notes[-1]})
-                    await self._rule_followups(executor, ctx, namespace, question)
-            else:
-                await self._rule_followups(executor, ctx, namespace, question)
-            await db.commit()
-
-        # 3. Correlation
-        await self._emit("phase", {"phase": "correlation", "label": "Correlating changes and symptoms"})
-        self._correlate()
-
-        # 4. Hypotheses and report
-        await self._emit("phase", {"phase": "hypotheses", "label": "Forming and checking hypotheses"})
-        self.findings = focus(question, self.findings)
-        report: Report | None = None
-        if provider:
-            try:
-                report = await self._llm_report(provider, llm_cfg, self._with_history(question), scope_info)
-            except (LLMError, BudgetExceeded, ValueError) as exc:
-                self.notes.append(f"LLM report unavailable ({getattr(exc, 'message', str(exc))}); showing the rule-based report.")
-        if report is None:
-            report = rules_report(question, self.findings, self.evidence, self.notes)
-            mode = "deterministic" if not provider else "llm_fallback"
+        namespace, report = final["namespace"], final["report"]
+        mode = final.get("mode") or mode
         await self._emit("phase", {"phase": "verification", "label": "Verifying causes against direct evidence"})
         verify_causes(report, self.findings)
         await self._emit("phase", {"phase": "report", "label": "Writing findings"})
@@ -751,53 +711,58 @@ class Investigator:
         if self.guard is not None:
             await self.guard.check()  # nothing more goes to the provider for someone who lost access
         await self._check_budget(cfg)
-        messages = [{"role": "user", "content": user}]
+        model = MoksChatModel(provider=provider, max_tokens=max_tokens, user_id=self.owner, investigation_id=self.id)
+        messages: list[BaseMessage] = [SystemMessage(content=system), HumanMessage(content=user)]
         last_error: Exception | None = None
         for attempt in range(2):
-            resp = await budget.complete(provider, system, messages, json_mode=True, max_tokens=max_tokens, user_id=self.owner,
-                                         investigation_id=self.id, purpose="investigation")
-            self.tokens_in += resp.tokens_in
-            self.tokens_out += resp.tokens_out
-            self.cost += resp.cost_usd
+            resp = await model.ainvoke(messages)
+            self.tokens_in += resp.usage_metadata["input_tokens"]
+            self.tokens_out += resp.usage_metadata["output_tokens"]
+            self.cost += Decimal(resp.response_metadata["cost_usd"])
             await self._emit("llm_usage", {"tokens_in": self.tokens_in, "tokens_out": self.tokens_out, "cost_usd": str(self.cost)})
             try:
-                return parse_json_object(resp.text)
+                return parse_json_object(str(resp.content))
             except (ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
-                messages = messages + [{"role": "assistant", "content": resp.text[:4000]},
-                                       {"role": "user", "content": "That was not a single valid JSON object. Reply again with only the JSON object."}]
+                messages = messages + [AIMessage(content=str(resp.content)[:4000]),
+                                       HumanMessage(content="That was not a single valid JSON object. Reply again with only the JSON object.")]
         raise LLMError("bad_response", f"model did not return valid JSON ({last_error})")
 
-    async def _llm_rounds(self, executor: ToolExecutor, ctx: ToolContext, provider, cfg: LLMConfig, question: str, scope_info: dict) -> None:
+    async def _plan_round(self, provider, cfg: LLMConfig, question: str, scope_info: dict, round_no: int, ctx: ToolContext) -> dict[str, Any]:
         tools = [t.schema_for_llm() for t in tools_for_planner(ctx)]
-        allowed = {t["name"] for t in tools}
         system = prompts.PLANNER_SYSTEM.replace("{max_calls}", str(MAX_CALLS_PER_ROUND)) + prompts.skills_section(self.skills)
-        for round_no in range(1, self.settings.max_llm_rounds + 1):
-            remaining = self.settings.max_tool_calls - self.tool_calls
-            if remaining <= 0:
-                break
-            await self._emit("phase", {"phase": "planning", "label": f"Planning follow-up evidence (round {round_no})"})
-            plan = await self._llm(provider, cfg, system,
-                                   prompts.planner_user(question, scope_info, tools, self.evidence, self.findings, remaining, self.rejected),
-                                   max_tokens=min(cfg.max_output_tokens, 1200))
-            calls = plan.get("tool_calls") if isinstance(plan.get("tool_calls"), list) else []
-            if not calls:
-                break
-            new = 0
-            for call in calls[:MAX_CALLS_PER_ROUND]:
-                if not isinstance(call, dict):
-                    continue
-                tool, args = str(call.get("tool", ""))[:80], call.get("args") if isinstance(call.get("args"), dict) else {}
-                purpose = str(call.get("purpose", ""))[:120] or None
-                if tool not in allowed:
-                    # Still goes through the executor so the denial is audited and counted.
-                    await self._call(executor, tool, args, purpose)
-                    continue
-                out = await self._call(executor, tool, args, purpose)
-                if out is not None:
-                    new += 1
-            if plan.get("done") is True or new == 0:
-                break
+        await self._emit("phase", {"phase": "planning", "label": f"Planning follow-up evidence (round {round_no})"})
+        return await self._llm(provider, cfg, system, prompts.planner_user(question, scope_info, tools, self.evidence, self.findings, self.settings.max_tool_calls - self.tool_calls, self.rejected),
+                               max_tokens=min(cfg.max_output_tokens, 1200))
+
+    async def _act(self, executor: ToolExecutor, ctx: ToolContext, calls: list) -> int:
+        """Runs what the planner asked for. Returns how many calls were new."""
+        async def call(tool: str, args: dict[str, Any], purpose: str | None) -> ToolOutcome | None:
+            return await self._call(executor, tool, args, purpose)
+
+        tools = as_tools(tools_for_planner(ctx), call)
+        new = 0
+        for item in calls[:MAX_CALLS_PER_ROUND]:
+            if not isinstance(item, dict):
+                continue
+            tool, args = str(item.get("tool", ""))[:80], item.get("args") if isinstance(item.get("args"), dict) else {}
+            purpose = str(item.get("purpose", ""))[:120] or None
+            if tool not in tools:
+                await call(tool, args, purpose)  # still goes through the executor, so the denial is audited and counted
+                continue
+            if await tools[tool].ainvoke({**args, "__purpose": purpose}) is not None:
+                new += 1
+        return new
+
+    async def _write_report(self, provider, cfg: LLMConfig | None, question: str, scope_info: dict) -> tuple[Report, str | None]:
+        await self._emit("phase", {"phase": "hypotheses", "label": "Forming and checking hypotheses"})
+        self.findings = focus(question, self.findings)
+        if provider:
+            try:
+                return await self._llm_report(provider, cfg, self._with_history(question), scope_info), None
+            except (LLMError, BudgetExceeded, ValueError) as exc:
+                self.notes.append(f"LLM report unavailable ({getattr(exc, 'message', str(exc))}); showing the rule-based report.")
+        return rules_report(question, self.findings, self.evidence, self.notes), "deterministic" if not provider else "llm_fallback"
 
     async def _llm_report(self, provider, cfg: LLMConfig, question: str, scope_info: dict) -> Report:
         raw = await self._llm(provider, cfg, prompts.REPORT_SYSTEM + prompts.skills_section(self.skills),

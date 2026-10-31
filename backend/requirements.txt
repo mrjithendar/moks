@@ -9,6 +9,8 @@ pydantic==2.14.2
 pydantic-settings==2.16.2
 httpx==0.28.1
 anthropic==2.3.0
+langchain-core==1.7.3
+langgraph==1.2.19
 kubernetes_asyncio==36.1.0
 Authlib==1.9.1
 argon2-cffi==25.1.0
