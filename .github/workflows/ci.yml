@@ -70,7 +70,7 @@ jobs:
   # The diagnostic image on both architectures, its vulnerability scan, and real isolation checks on
   # kind, which runs the same network plugin as mk4. Runs when something the terminal depends on changes.
   terminal:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
