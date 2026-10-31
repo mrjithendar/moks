@@ -104,7 +104,7 @@ jobs:
           exit-code: "1"
           trivyignores: deploy/terminal/.trivyignore
       - uses: helm/kind-action@v1
-        with: {cluster_name: kind}
+        with: {cluster_name: kind, config: deploy/terminal/kind-isolation.yaml}
       - name: Isolation on a real cluster
         env:
           IMAGE: moks-terminal:test

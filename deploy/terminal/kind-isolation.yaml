@@ -1,0 +1,7 @@
+# The cluster scripts/terminal-isolation-test.sh runs on. NetworkPolicy never applies between a pod and
+# its own node, so proving a node is blocked takes a second node. Sessions land on the worker.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker

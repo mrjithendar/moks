@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Proves terminal isolation on a real cluster: a kind cluster with kindnet, the network plugin mk4 runs.
+# Proves terminal isolation on a real cluster: a kind cluster with kindnet, the network plugin mk4 runs,
+# and two nodes (deploy/terminal/kind-isolation.yaml).
 # It applies the chart's terminal resources, starts a session pod as the gateway would, and runs
 # moks-verify-isolation inside it. Never point this at a shared cluster: KUBECONFIG must be kind's.
 #   IMAGE=moks-terminal:test scripts/terminal-isolation-test.sh
@@ -39,6 +40,8 @@ s = types.SimpleNamespace(id="test", owner_id="ci", pod_name="moks-term-test", p
 print(json.dumps(pod_manifest(s)))
 PY
 kubectl -n moks-terminals wait pod/moks-term-test --for=condition=Ready --timeout=120s
+own_node="$(kubectl -n moks-terminals get pod moks-term-test -o jsonpath='{.status.hostIP}')"
+[[ "$own_node" != "$node_ip" ]] || { echo "FAIL  the session runs on $node_ip, so that node cannot prove anything: NetworkPolicy never applies to a pod's own node"; exit 1; }
 
 # The same token request the gateway makes, bound to the pod.
 token="$(kubectl -n moks-terminals create token moks-terminal-session --bound-object-kind Pod --bound-object-name moks-term-test --duration 15m)"
@@ -57,6 +60,16 @@ kubectl -n moks-terminals exec moks-term-test -- env \
   moks-verify-isolation
 if kubectl -n moks-terminals exec moks-term-test -- kubectl get pods -n moks >/dev/null; then echo "ok    the session can read what it was granted"; else echo "FAIL  the session cannot read what it was granted"; exit 1; fi
 if kubectl -n moks-terminals exec moks-term-test -- kubectl get pods -n kube-system >/dev/null 2>&1; then echo "FAIL  read outside its namespaces"; exit 1; else echo "ok    the session cannot read other namespaces"; fi
+
+# NetworkPolicy cannot close a pod's own node, so its kubelet is reachable. Its own authorization must refuse.
+check_kubelet() {  # label [curl arguments]
+  local label="$1" code
+  shift
+  code="$(kubectl -n moks-terminals exec moks-term-test -- curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "$@" "https://$own_node:10250/pods" || true)"
+  if [[ "$code" == 401 || "$code" == 403 ]]; then echo "ok    its own node's kubelet refuses $label (HTTP $code)"; else echo "FAIL  its own node's kubelet answered $label with HTTP $code"; exit 1; fi
+}
+check_kubelet "an anonymous request"
+check_kubelet "the session's token" -H "Authorization: Bearer $token"
 
 # Restricted Pod Security must refuse what a session pod must never be.
 if kubectl -n moks-terminals run root-attempt --image="$IMAGE" --overrides='{"spec":{"hostNetwork":true}}' 2>/dev/null; then

@@ -153,6 +153,7 @@ Every line must read `ok`, or `skip` with a reason. **Do not open terminals to o
 ## Limitations
 
 - **Never yet run for real.** See [TESTING.md](TESTING.md#web-terminal). The image has not been built, and no pod has run on a cluster.
+- **A session can reach its own node.** NetworkPolicy never applies between a pod and the node it runs on, so that node's kubelet and NodePorts answer a shell, with no way to close that here. The kubelet's own authorization is the control: mk4 has anonymous access off and webhook authorization on, and CI checks that it refuses a session. Other nodes stay blocked.
 - **Public HTTPS and DNS are open** once AWS is allowed, as above. A session could send what it can read to any public host.
 - **Read-only depends on the role.** A wrongly widened role is a wrongly widened terminal. MOKS checks Kubernetes write access at start, and cannot check IAM the same way.
 - **ViewOnlyAccess is narrow.** Some read commands will be refused. That is its intent, and widening it is a decision.
