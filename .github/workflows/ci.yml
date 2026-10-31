@@ -2,7 +2,7 @@ name: moks
 
 # check   -> pull requests only: backend tests against PostgreSQL, frontend typecheck/build,
 #            Helm lint/render
-# terminal -> pull requests only: diagnostic image build, scan and isolation test on kind
+# terminal -> pull requests and pushes: diagnostic image build, scan and isolation test on kind
 # release -> default branch: build the arm64 image once, tag it with the commit and move latest to it.
 #            mk4 runs latest, and new pods pull it when restarted. CI never touches the cluster.
 
@@ -70,7 +70,7 @@ jobs:
   # The diagnostic image on both architectures, its vulnerability scan, and real isolation checks on
   # kind, which runs the same network plugin as mk4. Runs when something the terminal depends on changes.
   terminal:
-    if: github.event_name == 'pull_request' && github.event_name == 'push'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
