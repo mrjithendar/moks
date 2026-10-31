@@ -249,3 +249,108 @@ async def test_losing_admin_before_execution_stops_a_waived_plan(client):
             b.role, b.environment, b.namespace = "operator", env, "shop"
     done = await _run_executor(FakeWriter("ok"))
     assert done.status != "succeeded" and DEPLOYMENTS[("shop", "checkout")]["replicas"] == 2
+
+
+# ---- force approve ---------------------------------------------------------------------------
+
+async def _force(client, plan, h, reason="checkout is down and the approver is unreachable"):
+    return await client.post(f"/moks/api/actions/plans/{plan['id']}/force-approve", json={"plan_hash": plan["plan_hash"], "reason": reason}, headers=h)
+
+
+async def _audit(action):
+    async with session_scope() as db:
+        return (await db.execute(select(AuditEvent).where(AuditEvent.action == action).order_by(AuditEvent.id))).scalars().all()
+
+
+async def _expire(pid, status):
+    from moks.actions.service import compute_hash
+    from moks.models import Environment
+    async with session_scope() as db:
+        row = await db.get(ActionPlan, uuid.UUID(pid))
+        row.expires_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=3)
+        row.status = status
+        row.plan_hash = compute_hash(row, (await db.get(Environment, row.environment_id)).name)
+        return row.plan_hash
+
+
+async def test_an_admin_can_force_approve_someone_elses_plan_with_a_reason(client):
+    env, op, ap = await _setup(client)
+    plan = (await _plan(client, await login(client, op), env)).json()
+    h = await login(client, await _admin(env))
+    r = await _force(client, plan, h)
+    assert r.status_code == 200 and r.json()["status"] == "approved"
+    assert "Force approved: checkout is down" in r.json()["approvals"][0]["comment"]
+    entry = (await _audit("action.force_approve"))[-1]
+    assert entry.decision == "allow" and entry.details["reason"].startswith("checkout") and entry.details["previous"]["status"] == "pending"
+    assert (await client.post(f"/moks/api/actions/plans/{plan['id']}/execute", json={"plan_hash": plan["plan_hash"]}, headers=await login(client, op))).status_code == 200
+    assert (await _run_executor(FakeWriter("ok"))).status == "succeeded"
+
+
+@pytest.mark.parametrize("status", ["pending", "expired"])
+async def test_force_approve_revives_a_timed_out_plan_with_a_new_hash(client, status):
+    env, op, ap = await _setup(client)
+    plan = (await _plan(client, await login(client, op), env)).json()
+    plan["plan_hash"] = old = await _expire(plan["id"], status)
+    h = await login(client, await _admin(env))
+    out = (await _force(client, plan, h)).json()
+    assert out["status"] == "approved" and out["plan_hash"] != old
+    assert datetime.fromisoformat(out["expires_at"]) > datetime.now(timezone.utc)
+    previous = (await _audit("action.force_approve"))[-1].details["previous"]
+    assert previous["hash"] == old and previous["status"] == status
+    stale = await client.post(f"/moks/api/actions/plans/{plan['id']}/execute", json={"plan_hash": old}, headers=h)
+    assert stale.status_code == 409
+    assert (await client.post(f"/moks/api/actions/plans/{plan['id']}/execute", json={"plan_hash": out["plan_hash"]}, headers=h)).status_code == 200
+    assert (await _run_executor(FakeWriter("ok"))).status == "succeeded"
+
+
+async def test_force_approve_is_refused_to_everyone_but_a_global_admin_and_the_attempt_is_audited(client):
+    env, op, ap = await _setup(client)
+    plan = (await _plan(client, await login(client, op), env)).json()
+    email = f"nsadmin-{uuid.uuid4().hex[:6]}@x.io"
+    await make_user(email, [f"admin:{env}:shop"])
+    for who in (ap, email):
+        assert (await _force(client, plan, await login(client, who))).status_code == 403
+    assert (await client.get(f"/moks/api/actions/plans/{plan['id']}", headers=await login(client, ap))).json()["status"] == "pending"
+    assert [a.decision for a in await _audit("action.force_approve")][-2:] == ["deny", "deny"]
+
+
+async def test_force_approve_needs_a_real_reason_and_the_reviewed_plan(client):
+    env, op, ap = await _setup(client)
+    plan = (await _plan(client, await login(client, op), env)).json()
+    h = await login(client, await _admin(env))
+    assert (await _force(client, plan, h, reason="          ")).status_code == 422
+    assert (await _force(client, {**plan, "plan_hash": "0" * 64}, h)).status_code == 409
+
+
+@pytest.mark.parametrize("status", ["rejected", "succeeded", "cancelled"])
+async def test_force_approve_cannot_reopen_a_finished_plan(client, status):
+    env, op, ap = await _setup(client)
+    plan = (await _plan(client, await login(client, op), env)).json()
+    async with session_scope() as db:
+        (await db.get(ActionPlan, uuid.UUID(plan["id"]))).status = status
+    assert (await _force(client, plan, await login(client, await _admin(env)))).status_code == 409
+
+
+async def test_a_forced_approval_dies_with_the_admin_role(client):
+    env, op, ap = await _setup(client)
+    plan = (await _plan(client, await login(client, op), env)).json()
+    email = await _admin(env)
+    await _force(client, plan, await login(client, email))
+    assert (await client.post(f"/moks/api/actions/plans/{plan['id']}/execute", json={"plan_hash": plan["plan_hash"]}, headers=await login(client, op))).status_code == 200
+    from moks.models import User
+    async with session_scope() as db:
+        uid = (await db.execute(select(User.id).where(User.email == email))).scalar_one()
+        for b in (await db.execute(select(RoleBinding).where(RoleBinding.user_id == uid))).scalars():
+            b.role, b.environment, b.namespace = "approver", env, "shop"  # may still approve, but is no longer an admin
+    assert (await _run_executor(FakeWriter("ok"))).status != "succeeded"
+    assert DEPLOYMENTS[("shop", "checkout")]["replicas"] == 2
+
+
+async def test_force_approve_does_not_skip_the_live_object_check(client):
+    env, op, ap = await _setup(client)
+    plan = (await _plan(client, await login(client, op), env)).json()
+    await _force(client, plan, await login(client, await _admin(env)))
+    assert (await client.post(f"/moks/api/actions/plans/{plan['id']}/execute", json={"plan_hash": plan["plan_hash"]}, headers=await login(client, op))).status_code == 200
+    DEPLOYMENTS[("shop", "checkout")]["resourceVersion"] = "999"  # someone else changed it
+    assert (await _run_executor(FakeWriter("ok"))).status != "succeeded"
+    assert DEPLOYMENTS[("shop", "checkout")]["replicas"] == 2

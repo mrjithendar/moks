@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import hashlib
 import json
 import re
@@ -44,6 +45,7 @@ CREDENTIAL_KEYS = ("access_key_id", "secret_access_key", "sse_key", "repo_passwo
 DONE = {"Completed", "PartiallyFailed", "Failed", "FailedValidation"}
 NS_PATTERN = re.compile(r"^(\*|[a-z0-9*?]([-a-z0-9*?]{0,61}[a-z0-9*?])?)$")
 STALE_HOURS = 26
+MAX_LISTED = 5000
 KEEP_DAYS = 3650  # nothing is removed automatically unless someone chooses a shorter retention
 
 
@@ -201,6 +203,57 @@ def backup_row(b: dict) -> dict[str, Any]:
             "failure": st.get("failureReason") or "; ".join(st.get("validationErrors") or []) or None}
 
 
+def backup_detail(b: dict) -> dict[str, Any]:
+    """Everything Velero records about one backup, for the details view."""
+    spec, st, meta = b.get("spec") or {}, b.get("status") or {}, b.get("metadata") or {}
+    start, end = _parse(st.get("startTimestamp")), _parse(st.get("completionTimestamp"))
+    return {**backup_row(b), "created": meta.get("creationTimestamp"), "duration_seconds": round((end - start).total_seconds()) if start and end else None,
+            "storage_location": spec.get("storageLocation"), "ttl": spec.get("ttl"), "format_version": st.get("formatVersion"), "velero_labels": meta.get("labels") or {},
+            "excluded_namespaces": spec.get("excludedNamespaces") or [], "included_resources": spec.get("includedResources") or ["*"],
+            "excluded_resources": spec.get("excludedResources") or [], "cluster_resources": spec.get("includeClusterResources"),
+            "label_selector": spec.get("labelSelector"), "snapshot_volumes": spec.get("snapshotVolumes"),
+            "volume_snapshots": {"attempted": st.get("volumeSnapshotsAttempted") or 0, "completed": st.get("volumeSnapshotsCompleted") or 0},
+            "fs_backups": {"attempted": st.get("backupItemOperationsAttempted") or 0, "completed": st.get("backupItemOperationsCompleted") or 0,
+                           "failed": st.get("backupItemOperationsFailed") or 0}}
+
+
+def summarize_contents(listing: dict[str, list[str]]) -> dict[str, Any]:
+    """Velero's resource list: {"apps/v1/Deployment": ["namespace/name", ...]}. Names only."""
+    kinds: dict[str, int] = {}
+    namespaces: dict[str, dict[str, int]] = {}
+    items: list[dict[str, str]] = []
+    for api, names in sorted(listing.items()):
+        kind = api.rsplit("/", 1)[-1]
+        kinds[kind] = kinds.get(kind, 0) + len(names)
+        for full in names:
+            ns, _, name = full.rpartition("/")
+            group = namespaces.setdefault(ns or "(cluster)", {})
+            group[kind] = group.get(kind, 0) + 1
+            items.append({"kind": kind, "namespace": ns, "name": name})
+    return {"total": len(items), "kinds": [{"kind": k, "count": n} for k, n in sorted(kinds.items(), key=lambda x: (-x[1], x[0]))],
+            "namespaces": [{"namespace": n, "count": sum(k.values()), "kinds": k} for n, k in sorted(namespaces.items())],
+            "items": items[:MAX_LISTED], "truncated": len(items) > MAX_LISTED}
+
+
+def contents(store: BackupStore, env_name: str, name: str) -> dict[str, Any]:
+    """Reads what Velero wrote beside the backup. Object names only, never object data. Blocking."""
+    refs = store.credentials or {}
+    args = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": load_key(resolve_credential(refs.get("sse_key")) or "")}
+    s3 = _s3_client(store)
+    base = f"{env_prefix(store, env_name)}/backups/{name}/{name}"
+
+    def read(suffix: str) -> Any:
+        return json.loads(gzip.decompress(s3.get_object(Bucket=store.bucket, Key=base + suffix, **args)["Body"].read()))
+
+    out = summarize_contents(read("-resource-list.json.gz"))
+    try:
+        results = read("-results.gz")
+        out["errors"], out["warnings"] = results.get("errors") or {}, results.get("warnings") or {}
+    except Exception:
+        out["errors"], out["warnings"] = {}, {}  # older or running backups have no results file
+    return out
+
+
 def restore_row(r: dict) -> dict[str, Any]:
     spec, st, meta = r.get("spec") or {}, r.get("status") or {}, r.get("metadata") or {}
     return {"name": meta.get("name"), "backup": spec.get("backupName"), "phase": st.get("phase") or "New", "started": st.get("startTimestamp"),
@@ -252,7 +305,7 @@ def findings(state: dict[str, Any], now: datetime | None = None) -> list[dict[st
         if state.get("volumes_supported", True) and not any(b["volumes"] for b in good):
             add("warn", "no_volumes", "No completed backup includes PersistentVolume data.")
     if not state.get("volumes_supported", True):
-        add("warn", "volumes_not_covered", "Volume data is not backed up here: Velero does not support the hostPath volumes this cluster uses. Back up databases separately.")
+        add("warn", "volumes_not_covered", "Velero does not copy volumes here, because this cluster uses hostPath. Database contents are covered by the database backups on this page; other volume data is not backed up.")
     if not state["schedules"]:
         add("warn", "no_schedule", "No backup schedule exists, so backups only run when someone starts one.")
     for s in state["schedules"]:

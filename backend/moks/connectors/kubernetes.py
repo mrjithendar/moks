@@ -325,7 +325,7 @@ class KubernetesConnector:
         from kubernetes_asyncio import client
 
         api = await self._client()
-        fns = {"Deployment": client.AppsV1Api(api).read_namespaced_deployment, "Service": client.CoreV1Api(api).read_namespaced_service,
+        fns = {"Deployment": client.AppsV1Api(api).read_namespaced_deployment, "StatefulSet": client.AppsV1Api(api).read_namespaced_stateful_set, "Service": client.CoreV1Api(api).read_namespaced_service,
                "HorizontalPodAutoscaler": client.AutoscalingV2Api(api).read_namespaced_horizontal_pod_autoscaler, "Pod": client.CoreV1Api(api).read_namespaced_pod}
         if kind not in fns:
             raise ConnectorError("bad_request", f"unsupported kind {kind}")

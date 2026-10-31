@@ -1,15 +1,23 @@
-"""Diagnostic sessions (catalog-only commands, SSRF guard, approval for elevated, TTL cleanup) and evaluation runs."""
+"""Diagnostic sessions (catalog-only commands, SSRF guard, no approval, quick checks, TTL cleanup) and evaluation runs."""
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import text
 
 from moks.actions import executor as ex
 from moks.db import session_scope
 from moks.diagnostics import catalog
-from moks.models import DiagnosticSession
+from moks.models import ActionPlan, DiagnosticSession
 from tests.conftest import login, make_env, make_user
 from tests.fakes import FakeWriter
+
+
+@pytest.fixture(autouse=True)
+async def no_leftover_plans():
+    yield
+    async with session_scope() as db:  # sessions queue themselves, and the next test's executor would claim them
+        await db.execute(text("UPDATE action_plans SET status = 'cancelled' WHERE status IN ('queued', 'executing')"))
 
 
 def test_command_templates_validate_arguments():
@@ -48,8 +56,7 @@ async def test_session_lifecycle_with_cleanup(client, monkeypatch):
     s = (await client.post("/moks/api/diagnostics/sessions", json={"environment": name, "image": "python", "packages": ["httpie"],
                                                                   "ttl_minutes": 15, "reason": "DNS flapping for checkout"}, headers=h)).json()
     assert s["status"] == "requested" and s["plan"]["requires_approval"] is False and not s["elevated"]
-    q = await client.post(f"/moks/api/actions/plans/{s['plan']['id']}/execute", json={"plan_hash": s["plan"]["plan_hash"]}, headers=h)
-    assert q.json()["status"] == "queued"
+    assert s["plan"]["status"] == "queued"  # no second step
     w = FakeWriter()
 
     async def factory(env, connector_id=None):
@@ -78,18 +85,88 @@ async def test_session_lifecycle_with_cleanup(client, monkeypatch):
     assert (await client.get(f"/moks/api/diagnostics/sessions/{s['id']}")).json()["status"] == "expired"
 
 
-async def test_elevated_or_production_sessions_need_approval(client):
-    name, op, ap = await _env(prod=False)
+@pytest.mark.parametrize("prod,body", [(True, {"image": "netshoot"}), (False, {"image": "python", "packages": ["bind-tools"]}), (True, {"image": "python", "packages": ["bind-tools"]})])
+async def test_sessions_need_no_approval_even_in_production_or_elevated(client, prod, body):
+    name, op, ap = await _env(prod=prod)
+    s = (await client.post("/moks/api/diagnostics/sessions", json={"environment": name, "reason": "checking the network", **body}, headers=await login(client, op))).json()
+    assert s["plan"]["requires_approval"] is False and s["plan"]["status"] == "queued"
+    w = FakeWriter()
+
+    async def factory(env, connector_id=None):
+        return w
+    ex.writer_factory = factory
+    await ex.execute_plan(await ex.claim_plan("t"))
+    async with session_scope() as db:
+        assert (await db.get(ActionPlan, uuid.UUID(s["plan"]["id"]))).status == "succeeded"
+    audit = await _audited("diagnostic.request")
+    assert audit[-1].details["elevated"] is bool(body.get("packages"))
+
+
+async def _audited(action):
+    from sqlalchemy import select
+
+    from moks.models import AuditEvent
+    async with session_scope() as db:
+        return (await db.execute(select(AuditEvent).where(AuditEvent.action == action).order_by(AuditEvent.id))).scalars().all()
+
+
+async def test_someone_who_cannot_execute_leaves_the_session_waiting(client):
+    name, op, ap = await _env()
+    viewer = f"req-{uuid.uuid4().hex[:6]}@example.com"
+    await make_user(viewer, [f"operator:{name}:shop"])  # may request here, but not execute in the diagnostics namespace
+    s = (await client.post("/moks/api/diagnostics/sessions", json={"environment": name, "image": "netshoot", "reason": "from a narrow binding"}, headers=await login(client, viewer))).json()
+    assert s["plan"]["status"] == "pending"
+
+
+async def test_a_pod_that_cannot_be_created_fails_the_session_with_the_reason(client):
+    from moks.connectors.base import ConnectorError
+    from moks.diagnostics import service as diag
+
+    class Refused(FakeWriter):
+        async def create_pod(self, ns, manifest):
+            raise ConnectorError("forbidden", "quota exceeded")
+    name, op, _ = await _env()
+    s = (await client.post("/moks/api/diagnostics/sessions", json={"environment": name, "image": "netshoot", "reason": "quota check"}, headers=await login(client, op))).json()
+    async with session_scope() as db:
+        plan = await db.get(ActionPlan, uuid.UUID(s["plan"]["id"]))
+    out = await diag.start(plan, Refused())
+    assert not out["ok"]
+    async with session_scope() as db:
+        row = await db.get(DiagnosticSession, uuid.UUID(s["id"]))
+        assert row.status == "failed" and "quota exceeded" in row.error
+
+
+async def test_quick_check_queues_ordinary_audited_commands(client):
+    name, op, _ = await _env()
     h = await login(client, op)
-    s = (await client.post("/moks/api/diagnostics/sessions", json={"environment": name, "image": "python", "packages": ["bind-tools"],
-                                                                  "reason": "need dig as root"}, headers=h)).json()
-    assert s["elevated"] and s["plan"]["requires_approval"]
-    r = await client.post(f"/moks/api/actions/plans/{s['plan']['id']}/execute", json={"plan_hash": s["plan"]["plan_hash"]}, headers=h)
-    assert r.status_code == 409
-    prod, op2, _ = await _env(prod=True)
-    h2 = await login(client, op2)
-    s2 = (await client.post("/moks/api/diagnostics/sessions", json={"environment": prod, "image": "netshoot", "reason": "prod network check"}, headers=h2)).json()
-    assert s2["plan"]["requires_approval"] and not s2["elevated"]
+    s = (await client.post("/moks/api/diagnostics/sessions", json={"environment": name, "image": "netshoot", "reason": "reach checkout"}, headers=h)).json()
+    async with session_scope() as db:
+        (await db.get(DiagnosticSession, uuid.UUID(s["id"]))).status = "ready"
+    out = (await client.post(f"/moks/api/diagnostics/sessions/{s['id']}/check", json={"target": "https://checkout.shop/health"}, headers=h)).json()
+    assert [c["tool"] for c in out["commands"]] == ["dns_lookup", "tcp_check", "tls_expiry", "http_check"]
+    assert all(c["status"] == "queued" for c in out["commands"])
+    assert (await client.post(f"/moks/api/diagnostics/sessions/{s['id']}/check", json={"target": "http://169.254.169.254/"}, headers=h)).status_code == 422
+
+
+def test_quick_check_fits_the_target_and_the_image():
+    tools = lambda image, target: [t for t, _ in catalog.quick_check(image, target)]  # noqa: E731
+    assert tools("netshoot", "db.shop:5432") == ["dns_lookup", "tcp_check", "http_check"]
+    assert tools("netshoot", "10.0.0.1:443") == ["tcp_check", "tls_expiry", "http_check"]
+    assert tools("curl", "https://a.example/") == ["http_check"] and tools("python", "https://a.example/") == ["http_check_py"]
+
+
+@pytest.mark.parametrize("tool,code,output,expected", [
+    ("tcp_check", 1, "connect: Connection refused", "nothing listens"), ("tcp_check", 1, "Operation timed out", "NetworkPolicy"),
+    ("tcp_check", 0, "open", "accepts"), ("dns_lookup", 0, "", "does not resolve"), ("http_check", 0, "status=503 remote=1.1.1.1:80", "failing"),
+    ("http_check", 0, "status=403 remote=1.1.1.1:80", "refused this request"), ("http_check", 0, "status=200 remote=1.1.1.1:80", "answered 200"),
+])
+def test_results_are_explained(tool, code, output, expected):
+    assert expected in catalog.interpret(tool, code, output)
+
+
+def test_nothing_is_claimed_without_evidence():
+    assert catalog.interpret("tcp_check", 2, "odd failure") is None and catalog.interpret("http_get", 0, "x") is None
+    assert catalog.interpret("tcp_check", None, "") is None
 
 
 async def test_lab_evaluation_scores_rules_mode():

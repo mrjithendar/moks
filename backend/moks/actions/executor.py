@@ -28,18 +28,18 @@ import os
 import socket
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, NamedTuple
 
 from sqlalchemy import func, select, text
 
-from .. import audit, velero, versions
+from .. import audit, dbbackup, velero, versions
 from ..config import get_settings
 from ..connectors import registry
 from ..connectors.base import ConnectorError
 from ..db import session_scope
 from ..incidents import add_event
-from ..models import ActionPlan, Connector, Environment
+from ..models import ActionPlan, Connector, DatabaseBackup, DatabaseBackupSchedule, Environment
 from ..observability import ACTIONS, tracer
 from .catalog import CATALOG, check_patch, get_path, patch_leaves, paths_patch
 from .service import PlanError, verify_for_execution
@@ -456,6 +456,35 @@ async def _execute_velero(fence: Fence, writer, snap: dict, identity: dict | Non
     return "succeeded" if result["validation"]["ok"] else "failed"
 
 
+async def _execute_database(fence: Fence, writer, snap: dict, identity: dict | None, timeout: int, result: dict) -> str:
+    """Records the work: the dump can run for much longer than a plan, so the executor loop runs it
+    beside the queue and the Backups page follows it, as with Velero."""
+    if identity and await writer.cluster_uid() != identity.get("cluster_uid"):
+        raise ConnectorError("conflict", "the write target is not the cluster this plan was approved for")
+    params, ns, name, kind = snap["params"], snap["namespace"], snap["target_name"], snap["target_kind"]
+    await fence.checkpoint("intent")
+    target = {"environment_id": snap["env"].id, "namespace": ns, "workload": name, "workload_kind": kind, "engine": params["engine"]}
+    async with session_scope() as db:
+        if snap["action"] == "database_backup":
+            row = DatabaseBackup(**target, status="queued", trigger="manual", plan_id=fence.plan_id)
+            db.add(row)
+            await db.flush()
+            result["steps"].append({"step": "queued", "backup_id": str(row.id)})
+        else:
+            at = datetime.now(timezone.utc)
+            sched = (await db.execute(select(DatabaseBackupSchedule).where(DatabaseBackupSchedule.environment_id == snap["env"].id, DatabaseBackupSchedule.namespace == ns,
+                                                                           DatabaseBackupSchedule.workload == name))).scalars().first()
+            if sched is None:
+                sched = DatabaseBackupSchedule(**target, interval_hours=params["interval_hours"], next_run_at=at)
+                db.add(sched)
+            sched.interval_hours, sched.paused, sched.plan_id = params["interval_hours"], params.get("paused", False), fence.plan_id
+            sched.next_run_at = min(sched.next_run_at, at + timedelta(hours=params["interval_hours"]))
+            result["steps"].append({"step": "schedule", "interval_hours": params["interval_hours"], "paused": params.get("paused", False)})
+    await fence.checkpoint("applied")
+    result["validation"] = {"ok": True, "reason": None}
+    return "succeeded"
+
+
 async def _perform(fence: Fence, snapshot: dict, identity: dict | None, env, timeout: int, result: dict) -> str:
     plan_id = fence.plan_id
     params, writer = snapshot["params"], None
@@ -489,7 +518,7 @@ async def _perform(fence: Fence, snapshot: dict, identity: dict | None, env, tim
             result["validation"] = {"ok": bool(pr.get("number")), "pull_request": pr.get("url")}
             return "succeeded" if pr.get("number") else "failed"
         writer = await writer_factory(env, (identity or {}).get("connector_id"))
-        run = _execute_velero if snapshot["action"] in velero.ACTIONS else _execute_object
+        run = _execute_velero if snapshot["action"] in velero.ACTIONS else _execute_database if snapshot["action"].startswith("database_") else _execute_object
         return await run(fence, writer, snapshot, identity, timeout, result)
     finally:
         if writer is not None:
@@ -658,6 +687,7 @@ async def run_executor(stop: asyncio.Event | None = None) -> None:
                 await execute_plan(claim)
                 continue
             await diag.tick()
+            await dbbackup.tick()
         except Exception:
             log.exception("executor loop error", extra={"event": "executor_loop_error"})
         try:

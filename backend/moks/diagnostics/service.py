@@ -1,7 +1,7 @@
 """Diagnostic sessions: disposable, TTL-bound pods in the diagnostics namespace.
 
-Request -> action plan `diagnostic_session` (approval required in production and for elevated
-sessions) -> executor starts the pod -> catalog packages install inside it -> users run catalog
+Request -> action plan `diagnostic_session` (no approval, queued at once when the requester may
+execute) -> executor starts the pod -> catalog packages install inside it -> users run catalog
 commands -> TTL expiry or termination deletes the pod. Every step is audited.
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from .. import audit
 from ..config import get_settings
+from ..connectors.base import ConnectorError
 from ..db import session_scope
 from ..models import ActionPlan, DiagnosticCommand, DiagnosticSession, Environment
 from ..rbac import P, Principal
@@ -55,7 +56,7 @@ def pod_manifest(sess: DiagnosticSession, ns: str) -> dict:
 
 
 async def request(db, principal: Principal, env: Environment, image_key: str, packages: list[str], ttl_minutes: int, reason: str) -> tuple[DiagnosticSession, ActionPlan]:
-    from ..actions.service import PlanError, compute_hash
+    from ..actions.service import PlanError, compute_hash, start_if_allowed
 
     if image_key not in catalog.IMAGES:
         raise PlanError(400, f"unknown image {image_key!r}; choose from {', '.join(catalog.IMAGES)}")
@@ -83,7 +84,7 @@ async def request(db, principal: Principal, env: Environment, image_key: str, pa
                       preconditions=[f"namespace {ns} exists with its NetworkPolicy and quota"],
                       validation=["pod reaches Running", "packages install successfully" if packages else "no packages requested"],
                       rollback="Terminate the session; the pod is deleted (also automatically at TTL).",
-                      requires_approval=env.is_production or elevated, requested_by=uuid.UUID(principal.user_id),
+                      requires_approval=False, requested_by=uuid.UUID(principal.user_id),
                       expires_at=now + timedelta(minutes=env.plan_ttl_minutes), status="pending", plan_hash="", auto_recover=False, hash_version=2)
     db.add(plan)
     await db.flush()
@@ -92,6 +93,7 @@ async def request(db, principal: Principal, env: Environment, image_key: str, pa
     await audit.record(db, action="diagnostic.request", actor_id=principal.user_id, actor_email=principal.email, resource_type="diagnostic_session",
                        resource_id=str(sess.id), environment=env.name, namespace=ns, decision="allow",
                        details={"image": sess.image, "packages": packages, "elevated": elevated, "ttl_minutes": ttl_minutes})
+    await start_if_allowed(db, principal, env, plan)
     return sess, plan
 
 
@@ -103,7 +105,13 @@ async def start(plan: ActionPlan, writer) -> dict:
         sess.expires_at = sess.started_at + timedelta(minutes=sess.ttl_minutes)
         manifest = pod_manifest(sess, sess.pod_namespace)
         sess_id, ns, packages, image_key = sess.id, sess.pod_namespace, list(sess.packages), sess.image_key
-    name = await writer.create_pod(ns, manifest)
+    try:
+        name = await writer.create_pod(ns, manifest)
+    except ConnectorError as exc:
+        async with session_scope() as db:
+            sess = await db.get(DiagnosticSession, sess_id)
+            sess.status, sess.error = "failed", f"the pod could not be created: {exc.message}"[:500]
+        return {"ok": False, "pod": None, "phase": "not created", "installs": []}
     phase = "Pending"
     for _ in range(60):
         phase = await writer.pod_phase(ns, name)

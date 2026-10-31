@@ -17,6 +17,10 @@ spec:
     - server: https://kubernetes.default.svc
       namespace: moks-lab              # executor RoleBinding; add every namespace listed in executor.namespaces
     - server: https://kubernetes.default.svc
+      namespace: jithendar          # Role for database backups (databaseBackups.namespaces)
+    - server: https://kubernetes.default.svc
+      namespace: roboshop-ai        # Role for database backups (databaseBackups.namespaces)
+    - server: https://kubernetes.default.svc
       namespace: velero                # Roles for MOKS to use Velero, when velero.enabled is true
   clusterResourceWhitelist:
     - {group: "", kind: Namespace}

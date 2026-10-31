@@ -32,6 +32,7 @@ from ..scope import ScopeError, effective_scope
 from .catalog import CATALOG, check_policy, describe, needs_approval
 
 HASH_VERSION = 2
+FORCED = "Force approved: "  # marks the approval, which stays valid only while its author is an admin
 
 
 class PlanError(Exception):
@@ -204,6 +205,44 @@ async def decide(db: AsyncSession, principal: Principal, plan_id: uuid.UUID, app
     return plan
 
 
+async def force_approve(db: AsyncSession, principal: Principal, plan_id: uuid.UUID, reason: str, presented_hash: str) -> ActionPlan:
+    """A global admin's override: approves any pending plan and brings back an expired one, with a
+    written reason. It only replaces the approval step. The plan keeps its content, runs once, needs
+    an explicit Execute, and the executor re-checks policy and the live object before acting."""
+    plan = await _locked(db, plan_id)
+    env = await db.get(Environment, plan.environment_id)
+    if not is_admin(principal):
+        POLICY_DENIALS.labels("force_approve").inc()
+        await audit.record(db, action="action.force_approve", actor_id=principal.user_id, actor_email=principal.email,
+                           resource_type="action_plan", resource_id=str(plan.id), environment=env.name, namespace=plan.namespace,
+                           decision="deny", details={"reason": reason[:500]})
+        raise PlanError(403, "only a global administrator can force approve a plan")
+    _require(principal, P.ACTION_APPROVE, env, plan.namespace)
+    if plan.status not in ("pending", "expired"):
+        raise PlanError(409, f"plan is {plan.status}; only pending or expired plans can be force approved")
+    if plan.hash_version != HASH_VERSION:
+        raise PlanError(409, "plan was hashed by an older version; create a new plan")
+    if presented_hash != plan.plan_hash or compute_hash(plan, env.name) != plan.plan_hash:
+        POLICY_DENIALS.labels("plan_hash").inc()
+        raise PlanError(409, "the plan you reviewed differs from the stored plan (hash mismatch); reload and review again")
+    previous = {"status": plan.status, "hash": plan.plan_hash, "expires_at": plan.expires_at.isoformat()}
+    if _expired(plan):  # the expiry is hashed, so a new window means a new hash
+        plan.expires_at = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(minutes=env.plan_ttl_minutes)
+        plan.plan_hash = compute_hash(plan, env.name)
+    db.add(Approval(plan_id=plan.id, approver_id=uuid.UUID(principal.user_id), decision="approve", plan_hash=plan.plan_hash,
+                    comment=f"{FORCED}{reason}"[:2000]))
+    plan.status = "approved"
+    APPROVALS.labels("force_approve").inc()
+    await audit.record(db, action="action.force_approve", actor_id=principal.user_id, actor_email=principal.email,
+                       resource_type="action_plan", resource_id=str(plan.id), environment=env.name, namespace=plan.namespace,
+                       decision="allow", details={"hash": plan.plan_hash, "previous": previous, "expires_at": plan.expires_at.isoformat(),
+                                                  "reason": reason[:500], "self_approved": str(plan.requested_by) == principal.user_id})
+    if plan.incident_id:
+        await add_event(db, plan.incident_id, "approval", {"text": f"Plan {plan.action} force approved by an administrator",
+                                                           "plan_id": str(plan.id)}, principal.user_id)
+    return plan
+
+
 async def queue(db: AsyncSession, principal: Principal, plan_id: uuid.UUID, presented_hash: str) -> ActionPlan:
     plan = await _locked(db, plan_id)
     env = await db.get(Environment, plan.environment_id)
@@ -225,6 +264,14 @@ async def queue(db: AsyncSession, principal: Principal, plan_id: uuid.UUID, pres
     await audit.record(db, action="action.queue", actor_id=principal.user_id, actor_email=principal.email, resource_type="action_plan",
                        resource_id=str(plan.id), environment=env.name, namespace=plan.namespace, decision="allow", details={"hash": plan.plan_hash})
     return plan
+
+
+async def start_if_allowed(db: AsyncSession, principal: Principal, env: Environment, plan: ActionPlan) -> ActionPlan:
+    """For work with no approval step: queue it at once for someone who may execute it. Anyone else
+    leaves it pending for someone who can."""
+    if plan.requires_approval or not principal.can(P.ACTION_EXECUTE, env.name, plan.namespace):
+        return plan
+    return await queue(db, principal, plan.id, plan.plan_hash)
 
 
 async def cancel(db: AsyncSession, principal: Principal, plan_id: uuid.UUID) -> ActionPlan:
@@ -262,7 +309,7 @@ async def verify_for_execution(db: AsyncSession, plan: ActionPlan, env: Environm
             raise
         except Exception as exc:
             raise PlanError(422, f"parameters no longer valid: {exc}") from None
-    required = (env.is_production or bool(plan.params.get("elevated"))) if diagnostic else needs_approval(spec, env)  # type: ignore[arg-type]
+    required = not diagnostic and needs_approval(spec, env)  # type: ignore[arg-type]
     try:
         requester = await principal_of(db, plan.requested_by)
         _require(requester, P.ACTION_REQUEST, env, plan.namespace)
@@ -284,7 +331,8 @@ async def verify_for_execution(db: AsyncSession, plan: ActionPlan, env: Environm
         for a in approvals:
             try:
                 approver = await principal_of(db, a.approver_id)
-                if a.plan_hash != plan.plan_hash or (a.approver_id == plan.requested_by and not is_admin(approver)):
+                own_or_forced = a.approver_id == plan.requested_by or a.comment.startswith(FORCED)
+                if a.plan_hash != plan.plan_hash or (own_or_forced and not is_admin(approver)):
                     continue
                 _require(approver, P.ACTION_APPROVE, env, plan.namespace)
                 valid.append(a)

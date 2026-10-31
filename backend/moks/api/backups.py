@@ -12,16 +12,17 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import audit, velero
+from .. import audit, dbbackup, velero
 from ..actions import service
 from ..auth.deps import deny, get_auth, needs
 from ..auth.sessions import AuthContext
 from ..connectors import registry
 from ..connectors.base import ConnectorError, describe_credential_ref, resolve_credential
 from ..db import get_db
-from ..models import BackupStore, Environment
+from ..models import BackupStore, DatabaseBackup, DatabaseBackupSchedule, Environment
 from ..rbac import P
 from .common import env_or_404
 
@@ -157,10 +158,12 @@ async def status(environment: str, request: Request, ctx: AuthContext = Depends(
         "configured": True, "bucket": store.bucket, "prefix": velero.env_prefix(store, env.name), "fingerprint": velero.fingerprint(store), "endpoint": velero.endpoint(store)}}
 
 
-async def _plan(db: AsyncSession, ctx: AuthContext, env: Environment, action: str, kind: str, name: str, params: dict, reason: str) -> dict[str, Any]:
+async def _plan(db: AsyncSession, ctx: AuthContext, env: Environment, action: str, kind: str, name: str, params: dict, reason: str, namespace: str = "-") -> dict[str, Any]:
     try:
-        plan = await service.create_plan(db, ctx.principal, env, namespace="-", action=action, target_name=name, target_kind=kind, params=params,
+        plan = await service.create_plan(db, ctx.principal, env, namespace=namespace, action=action, target_name=name, target_kind=kind, params=params,
                                          reason=reason, evidence=[], auto_recover=False)
+        if action != "velero_restore":  # a restore is always reviewed before it runs
+            await service.start_if_allowed(db, ctx.principal, env, plan)
     except service.PlanError as exc:
         raise HTTPException(exc.status, exc.message) from None
     return {"plan_id": str(plan.id), "requires_approval": plan.requires_approval}
@@ -207,3 +210,90 @@ async def restore(environment: str, body: RestoreIn, ctx: AuthContext = Depends(
     return await _plan(db, ctx, env, "velero_restore", "Restore", body.backup, {
         **_scoped(env, body.included_namespaces, velero.restore_excluded()), "existing_resource_policy": body.existing_resource_policy,
         "restore_volumes": body.restore_volumes and velero.supports_volumes(env), "pre_restore_backup": body.pre_restore_backup}, body.reason)
+
+
+@router.get("/{environment}/items/{name}")
+async def details(environment: str, name: str, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """Metadata of one cluster backup, and what is inside it: names and counts, never object data."""
+    env = await _env(request, db, ctx, environment)
+    if not NAME.match(name):
+        raise HTTPException(422, "invalid backup name")
+    connectors, _ = await registry.for_environment(db, env.id)
+    k8s = connectors.get("kubernetes")
+    if k8s is None:
+        raise HTTPException(409, "No kubernetes connector in this environment")
+    try:
+        detail = velero.backup_detail(await k8s[1].velero_get("backups", name))
+    except ConnectorError as exc:
+        raise HTTPException(404 if exc.kind == "not_found" else 502, exc.message) from None
+    store = await velero.get_store(db)
+    if store is None or detail["phase"] not in ("Completed", "PartiallyFailed"):
+        return {**detail, "contents": None, "contents_note": "The list of contents exists once the backup has finished." if store else "R2 is not configured."}
+    try:
+        return {**detail, "contents": await asyncio.to_thread(velero.contents, store, env.name, name), "contents_note": None}
+    except Exception as exc:  # the metadata above is still worth showing
+        return {**detail, "contents": None, "contents_note": f"The list of contents could not be read from R2 ({type(exc).__name__})."}
+
+
+class DatabaseTarget(Reason):
+    namespace: str = Field(max_length=253)
+    workload: str = Field(max_length=253)
+    kind: Literal["StatefulSet", "Deployment"]
+
+
+class DatabaseScheduleIn(DatabaseTarget):
+    interval_hours: int = Field(default=24, ge=1, le=720)
+    paused: bool = False
+
+
+async def _database(db: AsyncSession, env: Environment, body: DatabaseTarget) -> str:
+    """The engine comes from what is running, so a request cannot point a dump at anything else."""
+    connectors, _ = await registry.for_environment(db, env.id)
+    k8s = connectors.get("kubernetes")
+    if k8s is None:
+        raise HTTPException(409, "No kubernetes connector in this environment")
+    if await velero.get_store(db) is None:
+        raise HTTPException(409, "An admin must save the R2 settings first")
+    try:
+        targets, _ = await dbbackup.discover(k8s[1], env)
+    except ConnectorError as exc:
+        raise HTTPException(502, exc.message) from None
+    match = next((t for t in targets if (t["namespace"], t["workload"], t["kind"]) == (body.namespace, body.workload, body.kind)), None)
+    if match is None:
+        raise HTTPException(404, f"{body.kind} {body.namespace}/{body.workload} is not a database MOKS can back up here")
+    if not match["enabled"]:
+        raise HTTPException(409, f"Add {body.namespace} to databaseBackups.namespaces first")
+    return match["engine"]
+
+
+@router.get("/{environment}/databases")
+async def databases(environment: str, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    env = await _env(request, db, ctx, environment)
+    connectors, _ = await registry.for_environment(db, env.id)
+    k8s = connectors.get("kubernetes")
+    if k8s is None:
+        raise HTTPException(409, "No kubernetes connector in this environment")
+    try:
+        targets, skipped = await dbbackup.discover(k8s[1], env)
+    except ConnectorError as exc:
+        raise HTTPException(502, exc.message) from None
+    rows = (await db.execute(select(DatabaseBackup).where(DatabaseBackup.environment_id == env.id).order_by(DatabaseBackup.created_at.desc()).limit(200))).scalars().all()
+    plans = (await db.execute(select(DatabaseBackupSchedule).where(DatabaseBackupSchedule.environment_id == env.id))).scalars().all()
+    backups = [dbbackup.row_out(r) for r in rows]
+    schedules = [{"namespace": s.namespace, "workload": s.workload, "interval_hours": s.interval_hours, "paused": s.paused, "next_run_at": s.next_run_at.isoformat()} for s in plans]
+    return {"targets": targets, "not_covered": skipped, "backups": backups, "schedules": schedules, "findings": dbbackup.findings(targets, backups, schedules)}
+
+
+@router.post("/{environment}/databases/backup", status_code=201)
+async def database_backup(environment: str, body: DatabaseTarget, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    env = await env_or_404(db, environment)
+    engine = await _database(db, env, body)
+    return await _plan(db, ctx, env, "database_backup", body.kind, body.workload, {"engine": engine}, body.reason, body.namespace)
+
+
+@router.post("/{environment}/databases/schedule", status_code=201)
+async def database_schedule(environment: str, body: DatabaseScheduleIn, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    env = await env_or_404(db, environment)
+    engine = await _database(db, env, body)
+    return await _plan(db, ctx, env, "database_schedule", body.kind, body.workload,
+                       {"engine": engine, "interval_hours": body.interval_hours, "paused": body.paused}, body.reason, body.namespace)

@@ -17,3 +17,8 @@ output "bedrock_model_for_moks" {
   description = "Model ID to enter in Administration → LLM providers (provider bedrock). Null when Bedrock is disabled."
   value       = var.runtime_user_enabled && var.bedrock_enabled ? var.bedrock_inference_profile_id : null
 }
+
+output "opensearch_url_for_moks" {
+  description = "Set as rag.opensearch.url in the Helm values, with rag.backend opensearch. Null when no domain is configured."
+  value       = local.opensearch_enabled ? "https://${aws_opensearch_domain.moks[0].endpoint}" : null
+}

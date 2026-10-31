@@ -281,7 +281,7 @@ const LLM_PRESETS: Record<string, Preset> = {
   openai: { label: "OpenAI", provider: "openai", key: "MOKS_CRED_OPENAI_API_KEY", hint: "Use a model name from your OpenAI account." },
   google: { label: "Google AI (Gemini)", provider: "gemini", key: "MOKS_CRED_GEMINI_API_KEY", hint: "Uses the Gemini API with an API key." },
   azure: { label: "Azure OpenAI", provider: "azure_openai", endpoint: "https://YOUR-RESOURCE.openai.azure.com", key: "MOKS_CRED_AZURE_OPENAI_API_KEY", hint: "Model is your deployment name." },
-  bedrock: { label: "Amazon Bedrock", provider: "bedrock", models: ["us.amazon.nova-2-lite-v1:0"], hint: "Uses the pod's AWS identity, or the keys from scripts/create-runtime-key.sh." },
+  bedrock: { label: "Amazon Bedrock", provider: "bedrock", models: ["anthropic.claude-opus-5-5", "anthropic.claude-sonnet-5-5", "anthropic.claude-haiku-5-5", "us.amazon.nova-2-lite-v1:0"], hint: "Uses the pod's AWS identity, or the keys from scripts/create-runtime-key.sh. Claude models need model access in your account and the bedrock-mantle:CreateInference permission. Enter prices from your AWS pricing." },
   mistral: { label: "Mistral", provider: "openai", endpoint: "https://api.mistral.ai/v1", key: "MOKS_CRED_MISTRAL_API_KEY", hint: "OpenAI-compatible API." },
   groq: { label: "Groq", provider: "openai", endpoint: "https://api.groq.com/openai/v1", key: "MOKS_CRED_GROQ_API_KEY", hint: "OpenAI-compatible API." },
   deepseek: { label: "DeepSeek", provider: "openai", endpoint: "https://api.deepseek.com/v1", key: "MOKS_CRED_DEEPSEEK_API_KEY", hint: "OpenAI-compatible API." },

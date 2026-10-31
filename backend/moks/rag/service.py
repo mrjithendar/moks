@@ -53,7 +53,8 @@ def opensearch() -> OpenSearchBackend:
     global _opensearch
     if _opensearch is None:
         s = get_settings()
-        _opensearch = OpenSearchBackend(s.opensearch_url, s.opensearch_username, s.opensearch_password, s.opensearch_verify_tls)
+        _opensearch = OpenSearchBackend(s.opensearch_url, s.opensearch_username, s.opensearch_password, s.opensearch_verify_tls,
+                                        aws_region=s.opensearch_aws_region)
     return _opensearch
 
 

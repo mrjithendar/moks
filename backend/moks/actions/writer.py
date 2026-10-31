@@ -8,6 +8,7 @@ made (optimistic concurrency), so a resource that changed after review is not to
 from __future__ import annotations
 
 import asyncio
+import json
 import copy
 from datetime import datetime, timezone
 from typing import Any
@@ -230,6 +231,59 @@ class KubernetesWriter:
             if exc.kind != "not_found":
                 raise
 
+    async def database_pod(self, ns: str, kind: str, name: str) -> dict[str, str]:
+        """A ready pod of a database workload, and the container running the database."""
+        from .. import dbbackup
+
+        apps = await self._apps()
+        api = await self.read._client()
+        read = apps.read_namespaced_stateful_set if kind == "StatefulSet" else apps.read_namespaced_deployment
+        w = api.sanitize_for_serialization(await self._call(f"get {kind} {ns}/{name}", read, name, ns))
+        labels = (w["spec"]["selector"].get("matchLabels") or {}).items()
+        for p in await self.read.raw_pods(ns):
+            ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in (p.get("status") or {}).get("conditions") or [])
+            if not ready or p["metadata"].get("deletionTimestamp") or any((p["metadata"].get("labels") or {}).get(k) != v for k, v in labels):
+                continue
+            for c in p["spec"]["containers"]:
+                if dbbackup.engine_of(c.get("image") or ""):
+                    return {"name": p["metadata"]["name"], "container": c["name"], "image": c["image"]}
+        raise ConnectorError("conflict", f"{kind} {ns}/{name} has no ready database pod")
+
+    async def exec_stream(self, ns: str, pod: str, container: str, argv: list[str], sink, timeout: int) -> tuple[int | None, str]:
+        """Runs a fixed command and hands its stdout to sink as it arrives. Returns the exit code, None
+        when the stream ended without one, and the end of stderr."""
+        from kubernetes_asyncio import client
+        from kubernetes_asyncio.stream import WsApiClient
+
+        cfg = (await self.read._client()).configuration
+        async with WsApiClient(configuration=cfg) as ws:
+            api = client.CoreV1Api(api_client=ws)
+            try:
+                resp = await asyncio.wait_for(api.connect_get_namespaced_pod_exec(
+                    pod, ns, command=argv, container=container, stderr=True, stdout=True, stdin=False, tty=False, _preload_content=False), 15)
+            except Exception as exc:
+                raise _api_error(exc, f"exec in {ns}/{pod}") from None
+            err, code = bytearray(), None
+            try:
+                async with asyncio.timeout(timeout):
+                    while True:
+                        msg = await resp.receive()
+                        if msg.type not in (1, 2):  # aiohttp WSMsgType TEXT/BINARY
+                            break
+                        data = msg.data if isinstance(msg.data, (bytes, bytearray)) else msg.data.encode()
+                        channel, payload = data[0], bytes(data[1:])
+                        if channel == 1:
+                            await sink(payload)
+                        elif channel == 2:
+                            err = (err + payload)[-4000:]
+                        elif channel == 3:
+                            code = _exit_code(payload)
+            except TimeoutError:
+                err.extend(f"\n[timed out after {timeout}s]".encode())
+            finally:
+                await resp.close()
+        return code, err.decode("utf-8", "replace")
+
     async def exec(self, ns: str, pod: str, argv: list[str], timeout: int = 30, max_bytes: int = 64_000) -> tuple[int | None, str]:
         """Run argv (no shell) in a diagnostic pod; returns (exit code, combined output, truncated)."""
         self._diag_ns(ns)
@@ -267,6 +321,13 @@ class KubernetesWriter:
             finally:
                 await resp.close()
         return code, out.decode("utf-8", "replace")
+
+
+def _exit_code(payload: bytes) -> int:
+    status = json.loads(payload.decode() or "{}")
+    if status.get("status") == "Success":
+        return 0
+    return int(next((c.get("message") for c in (status.get("details") or {}).get("causes", []) if c.get("reason") == "ExitCode"), 1))
 
 
 def summarize(pods: list[dict]) -> list[dict]:

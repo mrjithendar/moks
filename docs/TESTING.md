@@ -130,9 +130,13 @@ Index coverage at the same time, as active documents against qualifying files: `
 | Audit | append-only triggers, chain verification, tamper detection after a superuser bypass, redacted details |
 | Retrieval access controls | `test_rag.py::test_retrieval_respects_access_scope` (namespace-scoped, glob and no-binding users), deletion propagation, secret exclusion/redaction |
 | Prompt injection in documents | `test_rag.py::test_prompt_injection_in_documents_cannot_trigger_actions` (a retrieved runbook demanding scale-to-zero; the request is denied and audited) |
+| Database backups and backup details | `test_database_backups.py` (no approval, encrypted upload proven, bad or cut dumps fail, secrets redacted, schedules, targets limited to real databases, stream framing, details view) |
+| Force approve | `test_actions.py` (global admin only, refused attempts audited, reason required, hash bound, expired plans revived with a new hash, finished plans stay closed, role loss voids it, changed object still stops the executor) |
+| Amazon OpenSearch Service signing | `test_rag_aws.py` (signature recomputed over the exact JSON and bulk bodies, tampering detected, missing credentials, plain HTTP refused, basic auth unchanged) |
+| Claude on Bedrock | `test_llm_providers.py` (model routing, no sampling or fallback parameters, refusal, missing credentials, endpoint from region) |
 | Approval expiry, replay, parameter changes | `test_actions.py` (self-approval refused except for admins, hash mismatch, expiry, replay, parameters tampered after approval, revoked approver, resource changed after review, policy limits, forbidden patch fields) |
 | Remediation validation and failure recovery | `test_actions.py::test_validation_failure_triggers_automatic_recovery`, `test_full_flow_with_separation_of_duties` |
-| Diagnostics | `test_diagnostics_evals.py` (catalog-only commands, SSRF guard, approval for elevated/production, TTL cleanup) |
+| Diagnostics | `test_diagnostics_evals.py` (catalog-only commands, SSRF guard, no approval, quick checks, explained results, failed starts, TTL cleanup) |
 | Alerts | `test_phase4_alerts.py` (webhook auth, dedup, cooldown, hourly cap, opt-in, deny lists, poller scope, incident report, postmortem into knowledge) |
 | Phase 2 connectors and FinOps | `test_phase2_connectors.py` (Grafana, Git never guesses, EKS token, Cost Explorer cache/cap, allocation and rightsizing math, finops permission) |
 | SRE skills | `test_skills.py` (load, validation, custom override, selection, executor-checked steps, allowlisted suggestions) |

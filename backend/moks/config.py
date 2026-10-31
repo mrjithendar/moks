@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     opensearch_username: str = ""
     opensearch_password: str = Field(default="", repr=False)
     opensearch_verify_tls: bool = True
+    # Amazon OpenSearch Service: sign requests with the AWS identity (SigV4) instead of a password.
+    opensearch_aws_region: str = ""
+    # Database backups: namespaces the executor may dump from (it needs pods/exec there).
+    database_backup_namespaces: str = ""
+    database_backup_dir: str = "/backup-work"
+    database_backup_timeout_seconds: int = 1800
     rag_max_upload_bytes: int = 2_000_000
     rag_chunk_tokens: int = 350
     rag_chunk_overlap_tokens: int = 30

@@ -122,6 +122,11 @@ on each connector.
   user `moks-mk4-runtime` (allowed to invoke one inference profile only) and writes it into
   `moks-secrets`. Then add provider `bedrock`, region `us-east-1` and model
   `us.amazon.nova-2-lite-v1:0`. On EKS use IRSA or Pod Identity instead.
+- Claude on Bedrock: set `bedrock_claude_enabled = true` in Terraform (adds
+  `bedrock-mantle:CreateInference`), enable the model in the Bedrock console, then add provider
+  `bedrock` with a model such as `anthropic.claude-opus-5-5`. IDs of that form use the Messages API;
+  versioned IDs and other vendors stay on Converse. Bedrock has no embedding model from Claude, so keep
+  a separate embedding configuration. Enter prices yourself, because regional endpoints cost more.
 - Ollama: set the endpoint, for example `http://ollama.ollama:11434`, and allow it in
   `networkPolicy.inCluster`.
 
@@ -183,7 +188,7 @@ The API's init container runs migration `0002` automatically. Take a backup firs
    and point the webhook at `https://jithendar.com/moks/api/alerts/webhook/mk4` with header
    `Authorization: Bearer <token>`.
 6. **Diagnostic sessions:** the chart creates `moks-diagnostics` (quota, limits, egress policy).
-   Request sessions under **Diagnostics**; on mk4 (production) each needs an approval.
+   Start sessions under **Diagnostics**. They need no approval. **Quick check** tests DNS, the port, the certificate and HTTP for one target.
 7. **SRE skills:** 14 built-in skills are active. Add your own through `customSkills` in the values
    ([SKILLS.md](SKILLS.md)).
 8. **Evaluation:** **Evaluation → Run lab** (rules mode) should score 1.0. Run it again in LLM mode
@@ -191,6 +196,17 @@ The API's init container runs migration `0002` automatically. Take a backup firs
 9. **LLM:** configure providers under **LLM providers**. The mk4 seed adds none. Without an active chat
    model, investigations and **Analyze with AI** use rule-based reports. Set input and output prices there
    so FinOps can show cost as well as tokens. An inactive provider can be deleted; its usage history stays.
+
+## Using Amazon OpenSearch Service
+
+This keeps BM25 and k-NN search in a managed domain instead of a pod. Requests are signed with the AWS
+identity MOKS already has, so no search password is stored. Managed domains are supported;
+OpenSearch Serverless is not.
+
+1. Set `opensearch_domain_name` in Terraform and apply. A domain bills for every hour it exists.
+2. Set `rag.backend: opensearch`, `rag.opensearch.url` to `terraform output -raw opensearch_url_for_moks` and
+   `rag.opensearch.awsRegion`. The chart then deploys no OpenSearch pod. `networkPolicy.internetEgress` must stay on.
+3. Run a reindex, because a new backend starts empty. PostgreSQL stays the source of truth for documents and access.
 
 ## Using Pinecone for vectors
 

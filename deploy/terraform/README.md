@@ -10,6 +10,8 @@ This module creates everything MOKS needs in AWS account `881026659929` (us-east
 | IAM role `moks-github-ci` | Assumable only by `master` of this repository, matched on GitHub's immutable subject `repo:mrjithendar@20453233/moks@1439332847:ref:refs/heads/master` (`github_oidc_subject_prefix`); can push to `moks` only |
 | IAM user `/moks/moks-mk4-runtime` | Identity for MOKS pods on mk4, created **without an access key** |
 | User policy `invoke-selected-bedrock-profile` | `bedrock:InvokeModel` (which also covers Converse) on one inference profile and its model through that profile only |
+| User policy `invoke-claude-on-bedrock` (optional) | `bedrock-mantle:CreateInference` in `aws_region`, for current Claude models; off until `bedrock_claude_enabled = true` |
+| OpenSearch domain (optional) | Single-node knowledge search that only the runtime user can call, with signed requests; off while `opensearch_domain_name = ""`. **Billed hourly** |
 | User policy `read-allowed-log-groups` | Phase 2 CloudWatch Logs Insights on listed log groups; off while `cloudwatch_log_group_arns = []` |
 
 State: `s3://jithendardharmapuri/terraform/moks.tfstate`, the same bucket as
@@ -39,7 +41,8 @@ Commit `.terraform.lock.hcl` with the module. `*.tfplan`, state and `.terraform/
    region `us-east-1`, and model `terraform output -raw bedrock_model_for_moks`
    (`us.amazon.nova-2-lite-v1:0`), then Test and Activate. Model access must be enabled for the
    account in the Bedrock console. To use another model, change both `bedrock_inference_profile_id`
-   and `bedrock_model_id` and re-apply.
+   and `bedrock_model_id` and re-apply. For current Claude models, set `bedrock_claude_enabled = true`
+   and use a model such as `anthropic.claude-opus-5-5`.
 
 ## Image pulls on mk4
 

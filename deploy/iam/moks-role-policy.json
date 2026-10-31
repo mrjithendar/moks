@@ -11,6 +11,18 @@
       ]
     },
     {
+      "Sid": "BedrockClaudeMessagesApi",
+      "Effect": "Allow",
+      "Action": ["bedrock-mantle:CreateInference"],
+      "Resource": "arn:aws:bedrock-mantle:us-east-1:<account>:project/*"
+    },
+    {
+      "Sid": "AmazonOpenSearchServiceKnowledgeIndex",
+      "Effect": "Allow",
+      "Action": ["es:ESHttpGet", "es:ESHttpHead", "es:ESHttpPost", "es:ESHttpPut", "es:ESHttpDelete"],
+      "Resource": "arn:aws:es:us-east-1:<account>:domain/<domain>/*"
+    },
+    {
       "Sid": "Phase2CloudWatchLogsReadAllowedGroups",
       "Effect": "Allow",
       "Action": ["logs:StartQuery", "logs:GetQueryResults", "logs:StopQuery", "logs:DescribeLogGroups", "logs:FilterLogEvents"],

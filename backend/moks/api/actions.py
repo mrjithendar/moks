@@ -5,7 +5,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +40,12 @@ class DecisionIn(BaseModel):
     comment: str = Field(default="", max_length=2000)
 
 
+class ForceApproveIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    plan_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reason: str = Field(min_length=10, max_length=1900)
+
+
 def _err(exc: service.PlanError) -> HTTPException:
     return HTTPException(exc.status, exc.message)
 
@@ -56,11 +62,13 @@ async def _out(db: AsyncSession, plan: ActionPlan) -> dict:
 @router.get("/catalog")
 async def catalog(ctx: AuthContext = Depends(get_auth)) -> list[dict]:
     return [{"action": a.name, "title": a.title, "target_kinds": a.target_kinds, "operation": a.operation,
-             "params": a.params.model_json_schema(), "approval_outside_production": a.approval_outside_production} for a in CATALOG.values() if not a.cluster_wide]
+             "params": a.params.model_json_schema(), "approval_outside_production": a.approval_outside_production} for a in CATALOG.values() if not a.cluster_wide and not a.name.startswith("database_")]
 
 
 @router.post("/plans", status_code=201)
 async def create(body: PlanIn, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    if body.action.startswith("database_"):
+        raise HTTPException(400, "Start database backups from the Backups page, which checks the target is a database")
     env = await env_or_404(db, body.environment)
     try:
         plan = await service.create_plan(db, ctx.principal, env, namespace=body.namespace, action=body.action, target_name=body.target_name,
@@ -109,6 +117,16 @@ async def _decide(pid, body, ctx, db, approve: bool) -> dict:
 @router.post("/plans/{pid}/approve")
 async def approve(pid: uuid.UUID, body: DecisionIn, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     return await _decide(pid, body, ctx, db, True)
+
+
+@router.post("/plans/{pid}/force-approve")
+async def force_approve(pid: uuid.UUID, body: ForceApproveIn, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    try:
+        plan = await service.force_approve(db, ctx.principal, pid, body.reason, body.plan_hash)
+    except service.PlanError as exc:
+        await db.commit()  # keep the audit of a refused attempt
+        raise _err(exc) from None
+    return await _out(db, plan)
 
 
 @router.post("/plans/{pid}/reject")

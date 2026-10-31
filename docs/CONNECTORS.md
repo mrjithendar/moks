@@ -95,7 +95,7 @@ in Loki until they are added there. Pod logs through the Kubernetes API still wo
 |---|---|---|
 | `openai` | `https://api.openai.com/v1` or any OpenAI-compatible `/chat/completions` | `env:MOKS_CRED_OPENAI_API_KEY` |
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta` | `env:MOKS_CRED_GEMINI_API_KEY` (sent as `x-goog-api-key`) |
-| `bedrock` | Converse API in `region` | none stored: IRSA/Pod Identity, or a mounted profile |
+| `bedrock` | Converse API in `region`; Messages API on `bedrock-mantle` for `anthropic.claude-*` IDs without a version suffix | none stored: IRSA/Pod Identity, or a mounted profile |
 | `ollama` | required, e.g. `http://ollama.ollama:11434` | optional bearer |
 
 Chat and embedding configurations are separate, with one active configuration per purpose.

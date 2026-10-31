@@ -93,8 +93,9 @@ async def _run_plan(client, t, pid, writer):
         ha = await login(client, t[2])
         assert (await client.post(f"/moks/api/actions/plans/{pid}/approve", json={"plan_hash": p["plan_hash"]}, headers=ha)).status_code == 200
         h = await login(client, t[1])
-    r = await client.post(f"/moks/api/actions/plans/{pid}/execute", json={"plan_hash": p["plan_hash"]}, headers=h)
-    assert r.status_code == 200, r.text
+    if p["status"] != "queued":  # backups start by themselves; a restore waits for this step
+        r = await client.post(f"/moks/api/actions/plans/{pid}/execute", json={"plan_hash": p["plan_hash"]}, headers=h)
+        assert r.status_code == 200, r.text
 
     async def factory(env, connector_id=None):
         return writer

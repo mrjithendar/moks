@@ -230,24 +230,50 @@ class AnthropicProvider(Provider):
                 else:
                     data = await client.messages.create(**args)
         except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
-            raise LLMError("auth", f"anthropic rejected the credentials (HTTP {exc.status_code})") from None
+            raise LLMError("auth", f"{self.name} rejected the credentials (HTTP {exc.status_code})") from None
         except anthropic.RateLimitError:
-            raise LLMError("rate_limited", "anthropic rate limited the request (HTTP 429)") from None
+            raise LLMError("rate_limited", f"{self.name} rate limited the request (HTTP 429)") from None
         except anthropic.APITimeoutError:
-            raise LLMError("timeout", f"anthropic did not answer within {self.cfg.timeout_seconds}s") from None
+            raise LLMError("timeout", f"{self.name} did not answer within {self.cfg.timeout_seconds}s") from None
         except anthropic.APIConnectionError as exc:
-            raise LLMError("unavailable", f"cannot reach anthropic ({type(exc).__name__})") from None
+            raise LLMError("unavailable", f"cannot reach {self.name} ({type(exc).__name__})") from None
         except anthropic.APIStatusError as exc:
-            raise LLMError("unavailable" if exc.status_code >= 500 else "bad_response", f"anthropic returned HTTP {exc.status_code}: {str(exc.message)[:300]}") from None
+            raise LLMError("unavailable" if exc.status_code >= 500 else "bad_response", f"{self.name} returned HTTP {exc.status_code}: {str(exc.message)[:300]}") from None
         if data.stop_reason == "refusal":
-            raise LLMError("refused", "anthropic declined this request (safety classifier)")
+            raise LLMError("refused", f"{self.name} declined this request (safety classifier)")
         text = "".join(b.text for b in data.content if b.type == "text")
         if not text:
-            raise LLMError("bad_response", f"anthropic returned no text (stop reason {data.stop_reason})")
+            raise LLMError("bad_response", f"{self.name} returned no text (stop reason {data.stop_reason})")
         return LLMResponse(text, int(data.usage.input_tokens or 0), int(data.usage.output_tokens or 0), self.name, self.cfg.model)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         raise LLMError("config", "Anthropic has no embedding API; use another provider for the embedding model")
+
+
+class BedrockClaudeProvider(AnthropicProvider):
+    """Current Claude models on Amazon Bedrock, through the Messages API of the official SDK. These
+    IDs (anthropic.claude-opus-5-5) are not served by Converse, and Converse's temperature is refused
+    by these models. Credentials come from the AWS default chain, as for BedrockProvider. Bedrock has
+    no server-side fallback, so a declined request fails with kind "refused"."""
+
+    name = "bedrock"
+
+    def _client(self):
+        from anthropic import AsyncAnthropicBedrockMantle
+
+        return AsyncAnthropicBedrockMantle(aws_region=self.cfg.region or "us-east-1", base_url=self.cfg.endpoint or None,
+                                           timeout=float(self.cfg.timeout_seconds))
+
+    async def complete(self, system, messages, *, json_mode, max_tokens, temperature=0.1):
+        try:
+            return await super().complete(system, messages, json_mode=json_mode, max_tokens=max_tokens, temperature=temperature)
+        except RuntimeError as exc:  # how the SDK reports an empty AWS credential chain
+            if "AWS credentials" not in str(exc):
+                raise
+            raise LLMError("auth", "no AWS credentials available to MOKS (configure IRSA/Pod Identity or a mounted profile)") from None
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        raise LLMError("config", "Claude has no embedding API; use a Titan embedding model for the embedding provider")
 
 
 class GeminiProvider(Provider):
@@ -314,7 +340,7 @@ class OllamaProvider(Provider):
 
 
 class BedrockProvider(Provider):
-    """Amazon Bedrock Converse API. Credentials come from the AWS default chain: IRSA / EKS Pod
+    """Amazon Bedrock Converse API, for every model but current Claude. Credentials come from the AWS default chain: IRSA / EKS Pod
     Identity on EKS, or a mounted profile/short-lived keys on Minikube. Nothing is stored in MOKS."""
 
     name = "bedrock"
@@ -385,6 +411,9 @@ def provider_for(cfg: LLMConfig, transport: httpx.AsyncBaseTransport | None = No
     cls = PROVIDERS.get(cfg.provider)
     if not cls:
         raise LLMError("config", f"unknown provider {cfg.provider!r}")
+    # Versioned IDs (anthropic.claude-...-v1:0, us.anthropic...) stay on Converse, as do Nova and others.
+    if cfg.provider == "bedrock" and cfg.model.startswith("anthropic.claude-") and ":" not in cfg.model:
+        cls = BedrockClaudeProvider
     return cls(cfg, transport)
 
 

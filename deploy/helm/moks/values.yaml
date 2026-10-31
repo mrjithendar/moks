@@ -119,11 +119,15 @@ backup:
 #                (fresh installs; moving an existing alpine database to the Debian image needs dump/restore)
 #   pinecone   - keyword search in the MOKS database, vectors in Pinecone (no extra pods). Needs
 #                MOKS_CRED_PINECONE_API_KEY in the Secret, an active embedding model and a reindex.
-#   opensearch - single-node OpenSearch (BM25 + k-NN), ~2.5 GiB memory, persistent volume
+#   opensearch - BM25 + k-NN. Without rag.opensearch.url: single-node pod, ~2.5 GiB memory, persistent
+#                volume. With it: Amazon OpenSearch Service (deploy/terraform/opensearch.tf), no pod,
+#                requests signed with the pod's AWS identity. Moving backend needs a reindex.
 rag:
   backend: postgres
   pinecone: {cloud: aws, region: us-east-1}
   opensearch:
+    url: ""                # https://<domain endpoint> for Amazon OpenSearch Service; set awsRegion too
+    awsRegion: ""
     image: opensearchproject/opensearch:3.9.0
     heapSize: 1g           # container limit = heap x 2
     storage: 20Gi
@@ -144,6 +148,14 @@ executor:
 velero:
   enabled: false
   namespace: velero
+
+# Database backups from the Backups page (docs/CLUSTER_BACKUPS.md). PostgreSQL and MongoDB. The executor
+# gets pods/exec in these namespaces only; the dump is encrypted as it arrives, and workspace bounds
+# the encrypted size of one dump.
+databaseBackups:
+  enabled: false
+  namespaces: []
+  workspace: 10Gi
 
 # Lets investigations read Argo CD Application status (docs/CONNECTORS.md). Read-only. With
 # rbac.clusterWide false, also list the argocd namespace in rbac.namespaces.

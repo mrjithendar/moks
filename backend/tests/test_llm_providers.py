@@ -223,3 +223,61 @@ async def test_claude_has_no_embeddings_and_says_so():
 def test_an_unknown_provider_is_a_clear_error():
     with pytest.raises(LLMError, match="unknown provider"):
         provider_for(cfg("nope"))
+
+
+# ---- current Claude on Bedrock ---------------------------------------------------------------
+
+def bedrock(model="anthropic.claude-opus-5-5", region="eu-west-1", endpoint=None):
+    row = cfg("bedrock", model, endpoint)
+    row.region = region
+    return row
+
+
+@pytest.mark.parametrize("model,chosen", [
+    ("anthropic.claude-opus-5-5", p.BedrockClaudeProvider), ("anthropic.claude-haiku-5-5", p.BedrockClaudeProvider),
+    ("anthropic.claude-3-5-sonnet-20241022-v2:0", p.BedrockProvider), ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", p.BedrockProvider),
+    ("us.amazon.nova-2-lite-v1:0", p.BedrockProvider),
+])
+def test_only_current_claude_ids_leave_converse(model, chosen):
+    assert type(p.provider_for(bedrock(model))) is chosen
+
+
+async def test_claude_on_bedrock_uses_the_messages_api_with_the_aws_identity(claude, monkeypatch):
+    import anthropic
+    monkeypatch.setattr(anthropic, "AsyncAnthropicBedrockMantle", Claude)
+    Claude.answer = SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text="ok")],
+                                    usage=SimpleNamespace(input_tokens=3, output_tokens=2))
+    out = await p.provider_for(bedrock()).complete("sys", [{"role": "user", "content": "q"}], json_mode=True, max_tokens=100)
+    assert (out.text, out.provider, out.tokens_in) == ("ok", "bedrock", 3)
+    assert Claude.init["aws_region"] == "eu-west-1" and "api_key" not in Claude.init
+    sent = Claude.calls[-1]
+    # Refused by these models, or not offered on Bedrock.
+    assert not sent["beta"] and "temperature" not in sent and "fallbacks" not in sent and "betas" not in sent
+    assert sent["model"] == "anthropic.claude-opus-5-5" and sent["max_tokens"] == p.AnthropicProvider.MIN_TOKENS
+    assert "single JSON object" in sent["system"]
+
+
+async def test_a_refusal_on_bedrock_is_reported_and_not_retried_elsewhere(claude, monkeypatch):
+    import anthropic
+    monkeypatch.setattr(anthropic, "AsyncAnthropicBedrockMantle", Claude)
+    Claude.answer = SimpleNamespace(stop_reason="refusal", content=[], usage=SimpleNamespace(input_tokens=1, output_tokens=0))
+    with pytest.raises(LLMError) as err:
+        await p.provider_for(bedrock()).complete("s", [{"role": "user", "content": "q"}], json_mode=False, max_tokens=10)
+    assert err.value.kind == "refused" and "bedrock" in str(err.value)
+
+
+async def test_missing_aws_credentials_are_an_auth_problem(monkeypatch):
+    import anthropic
+
+    class NoCreds(Claude):
+        def __init__(self, **kw):
+            raise RuntimeError("Could not resolve AWS credentials from session")
+    monkeypatch.setattr(anthropic, "AsyncAnthropicBedrockMantle", NoCreds)
+    with pytest.raises(LLMError) as err:
+        await p.provider_for(bedrock()).complete("s", [{"role": "user", "content": "q"}], json_mode=False, max_tokens=10)
+    assert err.value.kind == "auth"
+
+
+def test_the_real_sdk_builds_the_bedrock_endpoint_from_the_region():
+    client = p.provider_for(bedrock())._client()
+    assert str(client.base_url) == "https://bedrock-mantle.eu-west-1.api.aws/anthropic/"

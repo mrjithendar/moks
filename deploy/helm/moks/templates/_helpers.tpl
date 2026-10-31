@@ -58,6 +58,10 @@ envFrom:
 volumes:
   - name: tmp
     emptyDir: {sizeLimit: 64Mi}
+  {{- if and (eq .component "executor") .root.Values.databaseBackups.enabled }}
+  - name: backup-work
+    emptyDir: {sizeLimit: {{ .root.Values.databaseBackups.workspace }}}
+  {{- end }}
   - name: seed
     configMap: {name: moks-seed}
   {{- if .root.Values.customSkills }}
@@ -74,6 +78,9 @@ volumes:
 {{- $credentials := include "moks.credentialsSecret" . -}}
 volumeMounts:
   - {name: tmp, mountPath: /tmp}
+  {{- if and (eq .component "executor") .root.Values.databaseBackups.enabled }}
+  - {name: backup-work, mountPath: /backup-work}
+  {{- end }}
   - {name: seed, mountPath: /etc/moks, readOnly: true}
   {{- if .root.Values.customSkills }}
   - {name: skills, mountPath: /etc/moks-skills, readOnly: true}

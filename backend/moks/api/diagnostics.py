@@ -35,6 +35,10 @@ class CommandIn(BaseModel):
     args: dict[str, Any] = Field(default_factory=dict)
 
 
+class CheckIn(BaseModel):
+    target: str = Field(min_length=1, max_length=300)
+
+
 @router.get("/catalog")
 async def get_catalog(ctx: AuthContext = Depends(get_auth)) -> dict:
     return {"images": catalog.IMAGES, "packages": catalog.PACKAGES,
@@ -50,7 +54,7 @@ async def _session_out(db: AsyncSession, s: DiagnosticSession) -> dict:
             "created_at": s.created_at.isoformat(), "expires_at": s.expires_at.isoformat() if s.expires_at else None,
             "plan": plan_out(plan, env.name) if plan else None,
             "commands": [{"id": c.id, "tool": c.tool, "args": c.args, "argv": c.argv, "status": c.status, "exit_code": c.exit_code,
-                          "output": c.output, "at": c.created_at.isoformat()} for c in cmds]}
+                          "output": c.output, "at": c.created_at.isoformat(), "finding": catalog.interpret(c.tool, c.exit_code, c.output or "")} for c in cmds]}
 
 
 async def _visible(db: AsyncSession, ctx: AuthContext, sid: uuid.UUID) -> DiagnosticSession:
@@ -82,14 +86,35 @@ async def create(body: SessionIn, ctx: AuthContext = Depends(get_auth), db: Asyn
     return await _session_out(db, sess)
 
 
-@router.post("/sessions/{sid}/commands", status_code=201)
-async def run(sid: uuid.UUID, body: CommandIn, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def _runnable(db: AsyncSession, ctx: AuthContext, sid: uuid.UUID) -> DiagnosticSession:
     s = await _visible(db, ctx, sid)
     env = await db.get(Environment, s.environment_id)
     if not ctx.principal.can(P.ACTION_EXECUTE, env.name, None):
         raise HTTPException(403, f"You need action.execute in {env.name}")
     if s.status != "ready":
         raise HTTPException(409, f"Session is {s.status}")
+    return s
+
+
+@router.post("/sessions/{sid}/check", status_code=201)
+async def quick_check(sid: uuid.UUID, body: CheckIn, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    """DNS, port, certificate and HTTP for one host or URL, as ordinary audited catalog commands."""
+    s = await _runnable(db, ctx, sid)
+    try:
+        planned = [(tool, args, catalog.build_argv(s.image_key, tool, args)) for tool, args in catalog.quick_check(s.image_key, body.target)]
+    except catalog.ArgError as exc:
+        await audit.record(db, action="diagnostic.command", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="diagnostic_session",
+                           resource_id=str(sid), decision="deny", outcome="denied", details={"tool": "quick_check", "target": body.target, "reason": str(exc)})
+        raise HTTPException(422, str(exc)) from None
+    for tool, args, argv in planned:
+        db.add(DiagnosticCommand(session_id=sid, actor_id=ctx.user.id, tool=tool, args=args, argv=argv, status="queued"))
+    await db.flush()
+    return await _session_out(db, s)
+
+
+@router.post("/sessions/{sid}/commands", status_code=201)
+async def run(sid: uuid.UUID, body: CommandIn, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    s = await _runnable(db, ctx, sid)
     try:
         argv = catalog.build_argv(s.image_key, body.tool, body.args)
     except catalog.ArgError as exc:

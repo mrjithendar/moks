@@ -4,7 +4,7 @@ import { api, API, qs } from "../api";
 import { useAuth } from "../auth";
 import { Badge, DataTable, ErrorBox, Loading, PageHead, ScopePicker, StatusBadge, Time, useInterval, useLoad } from "../components";
 import { type Chip, FilterPanel, useUrlFilters } from "../filters";
-import { Empty, Truncate } from "../ui";
+import { Empty, Truncate, useFeedback } from "../ui";
 
 const SEV: Record<string, "bad" | "warn" | "info" | "neutral"> = { sev1: "bad", sev2: "bad", sev3: "warn", sev4: "neutral" };
 const PLAN: Record<string, "ok" | "warn" | "bad" | "info" | "neutral"> = {
@@ -209,7 +209,9 @@ export function PlanView() {
   const plan = useLoad(() => api<any>(`/actions/plans/${id}`), [id]);
   const [comment, setComment] = useState("");
   const [outcome, setOutcome] = useState("not_applied");
+  const [forceReason, setForceReason] = useState("");
   const [error, setError] = useState<unknown>();
+  const { confirm } = useFeedback();
   const p = plan.data;
   useInterval(plan.reload, 2500, !!p && ["queued", "executing"].includes(p.status));
   async function act(path: string, body?: any) {
@@ -218,6 +220,12 @@ export function PlanView() {
   }
   if (!p) return <Loading load={plan} rows={8} />;
   const mine = p.requested_by === me?.email;
+  const overdue = new Date(p.expires_at) <= new Date();
+  const canForce = can("admin.policies") && (p.status === "expired" || (p.status === "pending" && (p.requires_approval || overdue)));
+  async function forceApprove() {
+    if (await confirm({ title: "Force approve this plan?", body: `${p.title} on ${p.target} in ${p.environment}/${p.namespace}. Your reason goes into the audit log.`, action: "Force approve", danger: true }))
+      await act("force-approve", { plan_hash: p.plan_hash, reason: forceReason });
+  }
   return (
     <>
       <PageHead title={`${p.title}: ${p.target}`} sub={<span className="row small"><Badge kind={PLAN[p.status]}>{p.status}</Badge><span className="mono">{p.environment}/{p.namespace}</span><span>expires <Time iso={p.expires_at} /></span></span>} />
@@ -252,6 +260,12 @@ export function PlanView() {
             </>}
             {mine && !can("admin.policies") && p.status === "pending" && p.requires_approval && <div className="small muted">Waiting for someone else to approve (you requested it).</div>}
             {p.status === "pending" && !p.requires_approval && <div className="small muted">No approval needed: an administrator requested this, or this action does not need one. Review it, then execute. This is recorded in the audit log.</div>}
+            {canForce && <details className="stack">
+              <summary>Force approve</summary>
+              <div className="small muted">Administrator override. {p.status === "expired" || overdue ? "This plan's time ran out: it gets a new window. The evidence and the object may have changed since it was written." : "This replaces the normal approval."} Execute is still a separate step, and it stops if the object changed.</div>
+              <textarea aria-label="Reason for force approving" rows={2} value={forceReason} onChange={(e) => setForceReason(e.target.value)} placeholder="Why this cannot wait (required, recorded in the audit log)" />
+              <button className="danger" disabled={forceReason.trim().length < 10} onClick={forceApprove}>Force approve this exact plan</button>
+            </details>}
             {can("action.execute") && (p.status === "approved" || (p.status === "pending" && !p.requires_approval)) &&
               <button onClick={() => act("execute", { plan_hash: p.plan_hash })}>Execute</button>}
             {p.status === "reconciliation_required" && <div className="alert error small stack">
@@ -338,7 +352,7 @@ export function Diagnostics() {
   const pkgs = Object.entries(cat.data?.packages ?? {}).filter(([, p]: any) => p.images.includes(f.image));
   return (
     <>
-      <PageHead title="Diagnostic sessions" sub="Disposable, TTL-bound pods with approved tools. No shell; commands are catalog templates with validated arguments." />
+      <PageHead title="Diagnostic sessions" sub="Disposable, time-limited pods for testing DNS, ports, certificates and HTTP from inside the cluster. No shell; commands are templates with validated arguments." />
       <form className="card stack" onSubmit={submit}>
         <div className="row"><ScopePicker env={env} ns={ns} onEnv={onEnv} onNs={onNs} />
           <label>Image<select value={f.image} onChange={(e) => setF({ ...f, image: e.target.value, packages: [] })}>{Object.entries(cat.data?.images ?? {}).map(([k, v]: any) => <option key={k} value={k}>{k} — {v.description}</option>)}</select></label>
@@ -347,8 +361,8 @@ export function Diagnostics() {
           onChange={(e) => setF({ ...f, packages: e.target.checked ? [...f.packages, k] : f.packages.filter((x) => x !== k) })} /> {p.spec} {p.elevated && <Badge kind="warn">elevated</Badge>}</label>)}</div>}
         <label>Reason<input required minLength={5} value={f.reason} onChange={(e) => setF({ ...f, reason: e.target.value })} /></label>
         <ErrorBox error={error} />
-        <div className="small muted">Production environments and elevated packages need an approved plan before the pod starts.</div>
-        <div className="form-foot"><button>Request session</button></div>
+        <div className="small muted">The pod starts right away, with no approval. Elevated packages run as root inside the pod. Everything is recorded in the audit log.</div>
+        <div className="form-foot"><button>Start session</button></div>
       </form>
       <FilterPanel chips={chips} onClear={clear}>
         <label>Status<select value={d.status} onChange={(e) => set({ status: e.target.value })}><option value="">All</option>{statuses.map((s) => <option key={s}>{s}</option>)}</select></label>
@@ -373,6 +387,7 @@ export function DiagnosticView() {
   const cat = useLoad(() => api<any>("/diagnostics/catalog"), []);
   const [tool, setTool] = useState("");
   const [args, setArgs] = useState<Record<string, string>>({});
+  const [target, setTarget] = useState("");
   const [error, setError] = useState<unknown>();
   const d = s.data;
   useEffect(() => {
@@ -383,6 +398,11 @@ export function DiagnosticView() {
   if (!d) return <Loading load={s} rows={6} />;
   const tools: string[] = cat.data?.images?.[d.image_key]?.tools ?? [];
   const spec = cat.data?.tools?.[tool];
+  async function check(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    try { await api(`/diagnostics/sessions/${id}/check`, { method: "POST", body: { target } }); s.reload(); } catch (err) { setError(err); }
+  }
   async function run(e: FormEvent) {
     e.preventDefault();
     setError(null);
@@ -393,8 +413,15 @@ export function DiagnosticView() {
       <PageHead title={`Diagnostic session ${d.pod ?? ""}`} sub={<span className="row small"><Badge kind={d.status === "ready" ? "ok" : "neutral"}>{d.status}</Badge><span className="mono">{d.image}</span><span>expires <Time iso={d.expires_at} /></span></span>}>
         {["ready", "starting", "requested"].includes(d.status) && <button className="danger" onClick={() => api(`/diagnostics/sessions/${id}/terminate`, { method: "POST" }).then(s.reload)}>Terminate</button>}
       </PageHead>
-      {d.plan && d.status === "requested" && <div className="alert info" style={{ marginBottom: 12 }}>Start is governed by <Link to={`/actions/${d.plan.id}`}>action plan</Link> ({d.plan.status}).</div>}
+      {d.plan && d.status === "requested" && (d.plan.status === "pending"
+        ? <div className="alert info" style={{ marginBottom: 12 }}>Waiting for someone who can execute in this environment to start <Link to={`/actions/${d.plan.id}`}>the session</Link>.</div>
+        : <div className="alert info" style={{ marginBottom: 12 }}>Starting the pod. This usually takes under a minute.</div>)}
       {d.error && <div className="alert error">{d.error}</div>}
+      {d.status === "ready" && can("action.execute") && <form className="card stack" onSubmit={check} style={{ marginBottom: 12 }}>
+        <h2>Quick check</h2>
+        <label>Host, host:port or URL<input required value={target} placeholder="checkout.shop.svc.cluster.local:8080" onChange={(e) => setTarget(e.target.value)} /></label>
+        <div className="row"><button disabled={!target.trim()}>Check it</button><span className="small muted">Runs the DNS, port, certificate and HTTP checks this image supports.</span></div>
+      </form>}
       {d.status === "ready" && can("action.execute") && (
         <form className="card row" onSubmit={run}>
           <label>Tool<select value={tool} onChange={(e) => { setTool(e.target.value); setArgs({}); }}><option value="">choose…</option>{tools.map((t) => <option key={t} value={t}>{t} — {cat.data.tools[t].description}</option>)}</select></label>
@@ -407,6 +434,7 @@ export function DiagnosticView() {
         <h2>Commands</h2>
         {d.commands.map((c: any) => <div key={c.id} style={{ marginBottom: 10 }}>
           <div className="small"><Badge kind={c.status === "done" && c.exit_code === 0 ? "ok" : c.status === "queued" || c.status === "running" ? "info" : "bad"}>{c.status}{c.exit_code != null ? ` (${c.exit_code})` : ""}</Badge> <span className="mono">{c.argv.join(" ")}</span></div>
+          {c.finding && <div className="small"><strong>{c.finding}</strong></div>}
           {c.output && <pre className="logbox">{c.output}</pre>}</div>)}
         {!d.commands.length && <div className="muted small">No commands yet.</div>}
       </div>

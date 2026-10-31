@@ -38,6 +38,22 @@ resource "aws_iam_user_policy" "bedrock" {
   })
 }
 
+# Current Claude models use the Messages API on bedrock-mantle, which has its own IAM namespace.
+resource "aws_iam_user_policy" "bedrock_claude" {
+  count = var.runtime_user_enabled && var.bedrock_claude_enabled ? 1 : 0
+  name  = "invoke-claude-on-bedrock"
+  user  = aws_iam_user.runtime[0].name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "CreateClaudeInference"
+      Effect   = "Allow"
+      Action   = ["bedrock-mantle:CreateInference"]
+      Resource = "arn:${local.partition}:bedrock-mantle:${var.aws_region}:${local.account_id}:project/*"
+    }]
+  })
+}
+
 resource "aws_iam_user_policy" "cloudwatch" {
   count = var.runtime_user_enabled && length(var.cloudwatch_log_group_arns) > 0 ? 1 : 0
   name  = "read-allowed-log-groups"

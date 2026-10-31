@@ -93,6 +93,10 @@ executor:
   enabled: true
   namespaces: [moks-lab]   # add namespaces (e.g. roboshop-ai) only when you want MOKS to act there
 
+databaseBackups:
+  enabled: true
+  namespaces: [moks, jithendar, roboshop-ai]
+
 diagnostics:
   enabled: true
   namespace: moks-diagnostics

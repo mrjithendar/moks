@@ -174,8 +174,9 @@ PostgreSQL accepts only MOKS pods and has no egress.
 
 Session pods run in `moks-diagnostics` with no ServiceAccount token, `activeDeadlineSeconds`, a
 ResourceQuota and LimitRange, and a NetworkPolicy allowing DNS and egress except link-local/metadata
-and the Kubernetes API. They run non-root with all capabilities dropped. **Elevated** sessions
-(root, for catalog OS packages) and all production sessions need an approved plan. Commands are
+and the Kubernetes API. They run non-root with all capabilities dropped. **Elevated** sessions run
+as root inside the pod, for catalog OS packages. No session needs an approval, in any environment:
+it starts at once for anyone who may execute in the diagnostics namespace, and is audited. Commands are
 argv templates from the catalog with validated arguments (hosts, URLs, ports, jq paths). There is
 no shell, metadata and loopback targets are refused, and none of it is exposed to the LLM. Output
 is redacted and audited, and pods are deleted at TTL or termination.
@@ -220,3 +221,21 @@ A global administrator (a role binding on every environment and namespace) can a
 request need no second approval, including in production. This removes separation of duties for that role: one
 administrator account can change production alone. Plans keep their hash, expiry, single execution and explicit Execute step.
 Each waiver is recorded as `action.approval_waived`, and the executor refuses the plan if the requester is no longer an administrator.
+
+### Work that needs no approval
+
+Diagnostic sessions, cluster backups, backup schedules, the R2 connection and database backups need no approval, including in
+production. They still need the requester's RBAC and are audited. Restores still need one. The executor can run `pods/exec`
+in `databaseBackups.namespaces`, limited in the code to the fixed dump commands, which is a wider permission than it had before.
+
+### Force approve
+
+A global administrator can also force approve someone else's pending plan, or an expired one, with a written reason of at
+least 10 characters (`POST /actions/plans/{id}/force-approve`, recorded as `action.force_approve`, refused attempts included). An
+expired plan gets a new expiry window, and because the expiry is hashed, a new plan hash; the audit entry keeps the previous status,
+hash and expiry.
+
+Force approve replaces only the approval. It does not change the plan's content, and rejected, cancelled and finished plans
+stay closed. Execute remains a separate step, and the executor still checks the hash, current policy, the requester and the write
+target. It also refuses the plan if the object's `resourceVersion` changed since the plan was written, so a stale plan stops rather
+than overwriting newer state. A forced approval stops counting when its author is no longer a global administrator.

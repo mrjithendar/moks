@@ -88,7 +88,10 @@ backends does not move vectors: run a reindex afterwards, which pays to embed ev
 **Integrations**
 - Gemini embeddings have been called live from a pod (`gemini-embedding-001`, 3072 dimensions). No
   chat model has answered a live request: Bedrock has no AWS keys on mk4. OpenAI and Ollama were only
-  tested with a scripted server.
+  tested with a scripted server. Claude on Bedrock was checked with the real SDK against a local server only.
+- Database backups have not run on mk4. `pg_dump` and the content listing ran against a local PostgreSQL 17, the exec stream against a simulated one, and the MongoDB commands have run against nothing. Portal restore of databases does not exist.
+- Amazon OpenSearch Service signing was tested against recomputed signatures, not a real domain. The
+  OpenSearch index and query calls have only run against a simulated server. OpenSearch Serverless is not supported.
 - Token counts come from provider responses. Cost is an estimate from prices an admin
   configures; nothing is fetched from a pricing API.
 - Responses stream as structured progress events. The final report arrives whole, not

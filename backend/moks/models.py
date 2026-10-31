@@ -14,6 +14,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
@@ -516,6 +517,47 @@ class BackupRun(Base):
     database_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     tables: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DatabaseBackup(Base):
+    """One dump of one database. `inventory` is what was inside when it was taken."""
+    __tablename__ = "database_backups"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id"))
+    namespace: Mapped[str] = mapped_column(String(253))
+    workload: Mapped[str] = mapped_column(String(253))
+    workload_kind: Mapped[str] = mapped_column(String(40))
+    engine: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20))  # queued | running | success | failed
+    trigger: Mapped[str] = mapped_column(String(20), default="manual")  # manual | schedule
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("action_plans.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    object_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    dump_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    image: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pod: Mapped[str | None] = mapped_column(String(253), nullable=True)
+    inventory: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DatabaseBackupSchedule(Base):
+    __tablename__ = "database_backup_schedules"
+    __table_args__ = (UniqueConstraint("environment_id", "namespace", "workload"),)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id"))
+    namespace: Mapped[str] = mapped_column(String(253))
+    workload: Mapped[str] = mapped_column(String(253))
+    workload_kind: Mapped[str] = mapped_column(String(40))
+    engine: Mapped[str] = mapped_column(String(20))
+    interval_hours: Mapped[int] = mapped_column(Integer)
+    paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("action_plans.id", ondelete="SET NULL"), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class BackupStore(Base):

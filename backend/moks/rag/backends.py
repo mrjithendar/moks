@@ -5,6 +5,7 @@ postgres   - full-text (websearch_to_tsquery, ts_rank_cd) and, when the pgvector
              installed and an embedding index is active, cosine k-NN; fused with RRF.
 opensearch - one index per embedding version (moks-chunks-<version>), BM25 multi_match plus
              knn_vector; fused client-side with RRF so no search pipeline plugin is required.
+             Self-hosted (basic auth) or an Amazon OpenSearch Service domain (SigV4).
 pinecone   - vectors only, one index per embedding version. Keyword search stays in PostgreSQL, which
              holds the text. Pinecone receives vectors, document ids and scope names, never chunk text.
 """
@@ -114,14 +115,58 @@ class PostgresBackend:
             await self.upsert_embeddings(index.id, [(uuid.UUID(r["chunk_id"]), e) for r, e in zip(rows, embeddings)])
 
 
+class SigV4(httpx.Auth):
+    """Signs each request for an Amazon OpenSearch Service domain. Credentials come from the AWS
+    default chain, read per request so that rotated or short-lived ones are picked up."""
+    SERVICE = "es"
+
+    def __init__(self, region: str):
+        self.region = region
+
+    def _credentials(self):
+        import botocore.session
+        from botocore.exceptions import BotoCoreError
+
+        try:
+            found = botocore.session.get_session().get_credentials()
+            frozen = found.get_frozen_credentials() if found else None
+        except BotoCoreError as exc:
+            raise ConnectorError("unavailable", f"cannot read AWS credentials ({type(exc).__name__})", retryable=True) from None
+        if frozen is None or not frozen.access_key:
+            raise ConnectorError("config", "no AWS credentials available to MOKS for OpenSearch")
+        return frozen
+
+    def sign(self, request: httpx.Request, credentials) -> None:
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+
+        signed = {"Host": request.url.netloc.decode()}
+        if "Content-Type" in request.headers:
+            signed["Content-Type"] = request.headers["Content-Type"]
+        aws = AWSRequest(method=request.method, url=str(request.url), data=request.content, headers=signed)
+        SigV4Auth(credentials, self.SERVICE, self.region).add_auth(aws)
+        for header in ("Authorization", "X-Amz-Date", "X-Amz-Security-Token"):
+            if header in aws.headers:
+                request.headers[header] = aws.headers[header]
+
+    async def async_auth_flow(self, request: httpx.Request):
+        await request.aread()
+        self.sign(request, await asyncio.to_thread(self._credentials))
+        yield request
+
+
 class OpenSearchBackend:
     name = "opensearch"
 
     def __init__(self, url: str, username: str = "", password: str = "", verify: bool = True,
-                 transport: httpx.AsyncBaseTransport | None = None):
+                 transport: httpx.AsyncBaseTransport | None = None, aws_region: str = ""):
         if not url:
             raise ConnectorError("config", "MOKS_OPENSEARCH_URL is required for the opensearch backend")
-        auth = (username, password) if username else None
+        if aws_region and username:
+            raise ConnectorError("config", "set MOKS_OPENSEARCH_AWS_REGION or MOKS_OPENSEARCH_USERNAME, not both")
+        if aws_region and not url.startswith("https://"):
+            raise ConnectorError("config", "an Amazon OpenSearch Service endpoint must use https")
+        auth: Any = SigV4(aws_region) if aws_region else (username, password) if username else None
         self.client = httpx.AsyncClient(base_url=url.rstrip("/"), auth=auth, verify=verify, timeout=20, transport=transport)
 
     async def aclose(self) -> None:

@@ -96,6 +96,15 @@ class BackupP(NamespacesP):
     ttl_days: int = Field(default=velero.KEEP_DAYS, ge=1, le=velero.KEEP_DAYS)
 
 
+class DatabaseBackupP(Params):
+    engine: Literal["postgresql", "mongodb"]
+
+
+class DatabaseScheduleP(DatabaseBackupP):
+    interval_hours: int = Field(default=24, ge=1, le=720)
+    paused: bool = False
+
+
 class ScheduleP(BackupP):
     cron: str = Field(pattern=r"^[0-9*/,-]+( [0-9*/,-]+){4}$", max_length=60)
     paused: bool = False
@@ -253,6 +262,7 @@ class ActionDef:
     approval_outside_production: bool
     operation: str
     cluster_wide: bool = False  # reaches every namespace, so only a binding on '*' may use it
+    never_approved: bool = False  # takes a copy and changes no workload: runs without approval, even in production
 
 
 CATALOG: dict[str, ActionDef] = {a.name: a for a in [
@@ -271,18 +281,22 @@ CATALOG: dict[str, ActionDef] = {a.name: a for a in [
     ActionDef("open_pull_request", "Open a draft pull request with a proposed change", ("Repository",), PullRequestP, True,
               "GitHub: create branch, commit file, open draft PR"),
     ActionDef("velero_configure", "Connect this cluster's Velero to Cloudflare R2", ("BackupStorageLocation",), ConfigureP, True,
-              "Write Velero's R2 Secrets (never read) and apply a BackupStorageLocation", cluster_wide=True),
+              "Write Velero's R2 Secrets (never read) and apply a BackupStorageLocation", cluster_wide=True, never_approved=True),
     ActionDef("velero_backup", "Back up this cluster to Cloudflare R2", ("Backup",), BackupP, False,
-              "CREATE velero.io/v1 Backup", cluster_wide=True),
+              "CREATE velero.io/v1 Backup", cluster_wide=True, never_approved=True),
     ActionDef("velero_schedule", "Create or change a backup schedule", ("Schedule",), ScheduleP, True,
-              "CREATE or PATCH velero.io/v1 Schedule", cluster_wide=True),
+              "CREATE or PATCH velero.io/v1 Schedule", cluster_wide=True, never_approved=True),
+    ActionDef("database_backup", "Back up a database to Cloudflare R2", ("StatefulSet", "Deployment"), DatabaseBackupP, False,
+              "EXEC the database's dump tool in its pod, encrypt the output and upload it", never_approved=True),
+    ActionDef("database_schedule", "Create or change a database backup schedule", ("StatefulSet", "Deployment"), DatabaseScheduleP, False,
+              "Record a schedule; the executor runs the same dump at each interval", never_approved=True),
     ActionDef("velero_restore", "Restore this cluster from a backup", ("Restore",), RestoreP, True,
               "CREATE velero.io/v1 Restore", cluster_wide=True),
 ]}
 
 
 def needs_approval(action: ActionDef, env: Environment) -> bool:
-    return env.is_production or action.approval_outside_production
+    return not action.never_approved and (env.is_production or action.approval_outside_production)
 
 
 def check_policy(action: str, params: Params, env: Environment, pre: dict | None, target_kind: str | None = None) -> None:
@@ -357,6 +371,13 @@ def describe(action: str, params: Params, target: str, ns: str, pre: dict | None
     manual = ". If anyone changed those fields meanwhile, MOKS stops and asks for manual reconciliation."
     if action.startswith("velero_"):
         return _describe_velero(action, params, target, pre or {})
+    if action.startswith("database_"):
+        when = "One backup now" if action == "database_backup" else f"A backup every {params.interval_hours} hours"  # type: ignore[attr-defined]
+        return {"impact": f"{when} of {target} in {ns} ({params.engine}). The dump is encrypted and stored in R2 until someone removes it.",  # type: ignore[attr-defined]
+                "blast_radius": "No changes to the database. Dumps add read load while they run.",
+                "preconditions": ["the workload has a ready pod", "the R2 settings exist"],
+                "validation": ["the dump tool exits cleanly", "the stored copy matches when read back"],
+                "rollback": "Nothing to undo. Pause the schedule to stop further backups."}
     if action == "restart_deployment":
         return {"impact": f"Pods of {target} are replaced one by one following its rolling-update strategy ({replicas} replicas).",
                 "blast_radius": f"{replicas} pod(s) of {target} in {ns}; brief capacity dip if maxUnavailable > 0.",

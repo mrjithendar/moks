@@ -66,19 +66,35 @@ def _nonce(counter: int, last: bool) -> bytes:
     return struct.pack(">QI", counter, 1 if last else 0)
 
 
+class Sealer:
+    """Encrypts data as it arrives, for a source that cannot be read ahead. One chunk stays buffered
+    until close(), because only the final chunk carries the end marker."""
+
+    def __init__(self, dst: BinaryIO, key: bytes):
+        salt = os.urandom(16)
+        self.dst, self.aes, self.counter, self.pending = dst, _file_key(key, salt), 0, bytearray()
+        dst.write(MAGIC + salt)
+
+    def _seal(self, part: bytes, last: bool) -> None:
+        sealed = self.aes.encrypt(_nonce(self.counter, last), part, MAGIC)
+        self.dst.write(struct.pack(">I", len(sealed)) + sealed)
+        self.counter += 1
+
+    def feed(self, data: bytes) -> None:
+        self.pending.extend(data)
+        while len(self.pending) > CHUNK:
+            self._seal(bytes(self.pending[:CHUNK]), False)
+            del self.pending[:CHUNK]
+
+    def close(self) -> None:
+        self._seal(bytes(self.pending), True)
+
+
 def encrypt_stream(src: BinaryIO, dst: BinaryIO, key: bytes) -> None:
-    salt = os.urandom(16)
-    aes = _file_key(key, salt)
-    dst.write(MAGIC + salt)
-    current, counter = src.read(CHUNK), 0
-    while True:
-        following = src.read(CHUNK)
-        last = not following
-        sealed = aes.encrypt(_nonce(counter, last), current, MAGIC)
-        dst.write(struct.pack(">I", len(sealed)) + sealed)
-        if last:
-            return
-        current, counter = following, counter + 1
+    sealer = Sealer(dst, key)
+    for part in iter(lambda: src.read(CHUNK), b""):
+        sealer.feed(part)
+    sealer.close()
 
 
 def decrypt_stream(src: BinaryIO, dst: BinaryIO, key: bytes) -> None:
