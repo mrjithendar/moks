@@ -7,6 +7,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
@@ -39,12 +40,12 @@ async def source(tmp_path):
 
 def consistent_dump(name: str, work: Path) -> tuple[Path, dict]:
     dump, manifest = work / "moks.dump", work / "manifest.json"
-    url = f"{_base}/{name}"
-    env = {**os.environ, "MOKS_DUMP_FILE": str(dump), "PGDATABASE": name}
-    for part, var in ((url.split("://")[1].split("@")[0].split(":")[0], "PGUSER"),):
-        env[var] = part
-    env["PGHOST"], env["PGPORT"] = url.split("@")[1].split("/")[0].split(":")
-    subprocess.run(["psql", "-X", "-v", f"manifest={manifest}", "-f", str(SQL)], check=True, capture_output=True, text=True, env=env)
+    url = urlsplit(_base)
+    env = {**os.environ, "MOKS_DUMP_FILE": str(dump), "PGDATABASE": name, "PGHOST": url.hostname, "PGPORT": str(url.port or 5432), "PGUSER": url.username}
+    if url.password:  # the chart supplies this the same way
+        env["PGPASSWORD"] = url.password
+    done = subprocess.run(["psql", "-X", "-v", f"manifest={manifest}", "-f", str(SQL)], capture_output=True, text=True, env=env)
+    assert done.returncode == 0, done.stderr[:500]
     assert not Path(str(dump) + ".failed").exists()
     return dump, json.loads(manifest.read_text())
 
@@ -170,3 +171,9 @@ def test_a_drill_cannot_touch_the_live_database():
     backup.assert_isolated("postgresql://u@h/postgres", "moks", "moks_restore_drill_ab")
 
 
+
+
+def test_a_password_stays_out_of_the_command_line():
+    args, env = backup.pg_restore_command("postgresql://u:s3cret@db.example:5433/postgres", "moks_restore_drill_ab", Path("/tmp/x.dump"))
+    assert "s3cret" not in " ".join(args) and env["PGPASSWORD"] == "s3cret"
+    assert env["PGHOST"] == "db.example" and env["PGPORT"] == "5433" and env["PGDATABASE"] == "moks_restore_drill_ab"

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
+from urllib.parse import urlsplit
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -236,6 +237,17 @@ def assert_isolated(admin_url: str, live_database: str, scratch: str) -> None:
         raise BackupError("the drill's admin connection must not point at the live database")
 
 
+def pg_restore_command(admin_url: str, database: str, dump: Path) -> tuple[list[str], dict[str, str]]:
+    """Connection details go through the environment: a process list must not show a password."""
+    url = urlsplit(admin_url)
+    env = {**os.environ, "PGHOST": url.hostname or "localhost", "PGPORT": str(url.port or 5432), "PGDATABASE": database}
+    if url.username:
+        env["PGUSER"] = url.username
+    if url.password:
+        env["PGPASSWORD"] = url.password
+    return ["pg_restore", "--no-owner", "--no-privileges", "--exit-on-error", f"--dbname={database}", str(dump)], env
+
+
 async def _smoke(db: AsyncSession) -> dict[str, Any]:
     """What the application does first: read accounts and configuration, and prove the audit chain."""
     from . import audit
@@ -289,7 +301,8 @@ async def restore_drill(store: Store, object_key: str, key: bytes, admin_url: st
     await admin.execute(f'CREATE DATABASE "{scratch}"')
     await admin.close()
     try:
-        done = subprocess.run(["pg_restore", "--no-owner", "--no-privileges", "--exit-on-error", f"--dbname={base}/{scratch}", str(plain)], capture_output=True, text=True)
+        args, env = pg_restore_command(admin_url, scratch, plain)
+        done = subprocess.run(args, capture_output=True, text=True, env=env)
         if done.returncode:
             fail(f"restore: {done.stderr[:400]}")
             return report
