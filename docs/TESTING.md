@@ -130,7 +130,7 @@ Index coverage at the same time, as active documents against qualifying files: `
 | Audit | append-only triggers, chain verification, tamper detection after a superuser bypass, redacted details |
 | Retrieval access controls | `test_rag.py::test_retrieval_respects_access_scope` (namespace-scoped, glob and no-binding users), deletion propagation, secret exclusion/redaction |
 | Prompt injection in documents | `test_rag.py::test_prompt_injection_in_documents_cannot_trigger_actions` (a retrieved runbook demanding scale-to-zero; the request is denied and audited) |
-| Approval expiry, replay, parameter changes | `test_actions.py` (self-approval refused, hash mismatch, expiry, replay, parameters tampered after approval, revoked approver, resource changed after review, policy limits, forbidden patch fields) |
+| Approval expiry, replay, parameter changes | `test_actions.py` (self-approval refused except for admins, hash mismatch, expiry, replay, parameters tampered after approval, revoked approver, resource changed after review, policy limits, forbidden patch fields) |
 | Remediation validation and failure recovery | `test_actions.py::test_validation_failure_triggers_automatic_recovery`, `test_full_flow_with_separation_of_duties` |
 | Diagnostics | `test_diagnostics_evals.py` (catalog-only commands, SSRF guard, approval for elevated/production, TTL cleanup) |
 | Alerts | `test_phase4_alerts.py` (webhook auth, dedup, cooldown, hourly cap, opt-in, deny lists, poller scope, incident report, postmortem into knowledge) |

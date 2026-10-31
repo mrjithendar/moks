@@ -105,7 +105,7 @@ def validate_llm_report(raw: dict[str, Any], valid_refs: set[str], notes: list[s
 
 # Findings where the detector reads the fault itself, not a symptom of it. A selector that matches
 # no pods IS the broken selector; a crashloop is a symptom whose cause is still open.
-SELF_EVIDENT = {"crash_log_reason", "service_selector_mismatch", "oomkilled", "image_pull", "unschedulable", "config_ref_missing"}
+SELF_EVIDENT = {"crash_log_reason", "service_selector_mismatch", "oomkilled", "image_pull", "unschedulable", "config_ref_missing", "argocd_source_missing", "argocd_comparison_error", "argocd_sync_failed"}
 
 
 def verify_causes(report: Report, findings: list[dict]) -> None:

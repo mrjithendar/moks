@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { api, ApiError, qs } from "./api";
+import { ActionMenu, CopyButton, Empty, type MenuItem, Skeleton, useIsMobile } from "./ui";
 
 /** A table row that opens something. It stays a row for layout, and keyboards can reach it. */
 export function rowAction(fn: () => void) {
@@ -24,10 +25,75 @@ export function StatusBadge({ status }: { status: string }) {
   return <Badge kind={kind}>{status}</Badge>;
 }
 
-export function ErrorBox({ error }: { error: unknown }) {
+export function ErrorBox({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
   if (!error) return null;
   if (error instanceof ApiError && error.status === 403) return <div className="alert warn" role="alert"><strong>You don't have access to this.</strong> <span className="small">{error.message}</span></div>;
-  return <div className="alert error" role="alert">{error instanceof Error ? error.message : String(error)}</div>;
+  return <div className="alert error row between" role="alert"><span className="grow">{error instanceof Error ? error.message : String(error)}</span>{onRetry && <button type="button" className="ghost small" onClick={onRetry}>Try again</button>}</div>;
+}
+
+export interface Col<T> {
+  key: string; head: string; cell: (row: T) => ReactNode;
+  /** The row's name: first on a phone, and what a keyboard user activates. */
+  primary?: boolean;
+  /** Status shown beside the name on a phone. */
+  status?: boolean;
+  /** Left out of the phone row. The detail view still has it. */
+  wide?: boolean;
+  /** Plain text for the phone's second line. Without it the cell itself is used. */
+  meta?: (row: T) => ReactNode;
+}
+
+/** A table where a table reads well, and a compact list on phones. Both show the same rows, and the
+ *  backend's data stays complete: `wide` columns are for the detail view, never data found nowhere else. */
+export function DataTable<T>({ label, rows, cols, rowKey, onRow, menu, empty }: {
+  label: string; rows: T[]; cols: Col<T>[]; rowKey: (row: T) => string; onRow?: (row: T) => void; menu?: (row: T) => { label: string; items: MenuItem[] }; empty?: ReactNode;
+}) {
+  const phone = useIsMobile(820);
+  if (!rows.length) return <>{empty ?? <Empty title="Nothing here." />}</>;
+  const primary = cols.find((c) => c.primary) ?? cols[0];
+  if (phone) {
+    const status = cols.filter((c) => c.status);
+    const meta = cols.filter((c) => !c.primary && !c.status && !c.wide);
+    return (
+      <ul className="rl" aria-label={label}>
+        {rows.map((r) => {
+          const m = menu?.(r);
+          const inner = <>
+            <span className="rl-top"><span className="rl-name">{primary.cell(r)}</span>{status.map((c) => <span key={c.key} className="rl-status">{c.cell(r)}</span>)}</span>
+            <span className="rl-meta">{meta.map((c) => { const v = (c.meta ?? c.cell)(r); return v === "" || v === null || v === undefined ? null : <span key={c.key}>{v}</span>; })}</span>
+          </>;
+          return (
+            <li key={rowKey(r)} className="rl-row">
+              {onRow ? <button type="button" className="rl-main" onClick={() => onRow(r)}>{inner}</button> : <div className="rl-main">{inner}</div>}
+              {m && <ActionMenu label={m.label} items={m.items} />}
+            </li>
+          );
+        })}
+      </ul>
+    );
+  }
+  return (
+    <div className="table-wrap" role="region" aria-label={label} tabIndex={0}>
+      <table>
+        <thead><tr>{cols.map((c) => <th key={c.key} scope="col">{c.head}</th>)}{menu && <th scope="col"><span className="sr-only">Actions</span></th>}</tr></thead>
+        <tbody>{rows.map((r) => {
+          const m = menu?.(r);
+          return (
+            <tr key={rowKey(r)} className={onRow ? "clickable" : undefined} onClick={onRow ? () => onRow(r) : undefined}>
+              {cols.map((c) => <td key={c.key} className={c.primary ? "td-name" : undefined}>{c === primary && onRow ? <button type="button" className="cell-btn">{c.cell(r)}</button> : c.cell(r)}</td>)}
+              {m && <td className="td-menu"><ActionMenu label={m.label} items={m.items} /></td>}
+            </tr>
+          );
+        })}</tbody>
+      </table>
+    </div>
+  );
+}
+
+/** First load only: a refresh keeps what is on screen. */
+export function Loading({ load, rows }: { load: { data?: unknown; loading: boolean; error?: unknown; reload?: () => void }; rows?: number }) {
+  if (load.error) return <ErrorBox error={load.error} onRetry={load.reload} />;
+  return !load.data && load.loading ? <Skeleton rows={rows} /> : null;
 }
 
 export function ago(iso?: string | null): string {
@@ -225,17 +291,47 @@ export function fmtBytes(v: number): string {
   return `${v.toFixed(v < 10 && i ? 1 : 0)} ${u[i]}`;
 }
 
-export function LogLines({ lines }: { lines: { ts?: string; line: string; labels?: Record<string, string> }[] }) {
-  if (!lines.length) return <div className="empty">No log lines.</div>;
+function LogRow({ l, wrap }: { l: LogLine; wrap: boolean }) {
+  const [open, setOpen] = useState(false);
+  const lvl = levelOf(l);
+  const where = [l.environment, l.labels?.namespace, l.labels?.pod].filter(Boolean).join("/");
   return (
-    <div className="logbox">
-      {lines.map((l, i) => (
-        <div key={i} className={`line ${/\b(error|exception|fatal|panic)\b/i.test(l.line) ? "err" : ""}`}>
-          {l.ts && <span className="ts">{new Date(l.ts).toLocaleTimeString()}</span>}
-          {l.labels?.pod && <span className="ts">{l.labels.pod}</span>}
-          {l.line}
-        </div>
-      ))}
+    <div className={`log-row${lvl === "error" ? " err" : ""}${open ? " open" : ""}`}>
+      <button type="button" className={`log-line${wrap ? " wrap" : ""}`} aria-expanded={open} onClick={() => setOpen(!open)}>
+        {l.ts && <time className="log-ts" dateTime={l.ts}>{new Date(l.ts).toLocaleTimeString()}</time>}
+        {lvl && <span className={`log-lvl ${lvl}`}>{lvl}</span>}
+        {where && <span className="log-src">{where}</span>}
+        <span className="log-text">{l.line}</span>
+      </button>
+      {open && <div className="log-detail">
+        <pre>{l.line}</pre>
+        <dl className="kv small">
+          {l.ts && <><dt>Time</dt><dd>{new Date(l.ts).toLocaleString(undefined, { timeZoneName: "short" })}</dd></>}
+          {Object.entries(l.labels ?? {}).map(([k, v]) => <div key={k} className="kv-row"><dt className="mono">{k}</dt><dd className="mono">{String(v)}</dd></div>)}
+        </dl>
+        <CopyButton text={l.line} label="Copy line" />
+      </div>}
+    </div>
+  );
+}
+
+export interface LogLine { ts?: string; line: string; labels?: Record<string, string>; environment?: string }
+
+export function levelOf(row: LogLine): string {
+  const v = (row.labels?.level ?? /\blevel\W{0,3}(\w+)/i.exec(row.line)?.[1] ?? (/\b(error|exception|fatal|panic)\b/i.test(row.line) ? "error" : "")).toLowerCase();
+  if (/err|fatal|crit|panic/.test(v)) return "error";
+  if (/warn/.test(v)) return "warn";
+  return /info|debug|trace/.test(v) ? v : "";
+}
+
+/** Short lines by default, so a page of logs can be scanned. Opening one shows it whole, wrapped inside its own box. */
+export function LogLines({ lines, label = "Log lines", tall }: { lines: LogLine[]; label?: string; tall?: boolean }) {
+  const [wrap, setWrap] = useState(false);
+  if (!lines.length) return <Empty title="No log lines." />;
+  return (
+    <div className="stack">
+      <div className="row end"><label className="inline small"><input type="checkbox" checked={wrap} onChange={(e) => setWrap(e.target.checked)} /> Wrap lines</label></div>
+      <div className={`logbox${tall ? " tall" : ""}`} role="region" aria-label={label} tabIndex={0}>{lines.map((l, i) => <LogRow key={i} l={l} wrap={wrap} />)}</div>
     </div>
   );
 }

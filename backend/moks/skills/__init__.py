@@ -285,7 +285,12 @@ def select(question: str, finding_kinds: set[str], limit: int = 3) -> list[tuple
         if score:
             ranked.append((sk, score, reasons))
     ranked.sort(key=lambda t: (-t[1], t[0].name))
-    return ranked[:limit]
+    top = ranked[:limit]
+    # Findings outscore words, so a few unhealthy pods could push out the skill the question asks for.
+    asked = next((r for r in ranked if any(why.startswith("question:") for why in r[2])), None)
+    if asked and asked not in top:
+        top[-1] = asked
+    return top
 
 
 def render(value: Any, ctx: dict[str, str]) -> Any:

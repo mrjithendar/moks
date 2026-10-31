@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api, qs } from "../api";
-import { Badge, ErrorBox, LineChart, PageHead, type Scope, Time, useInterval, useLoad, useScopes, rowAction } from "../components";
+import { Badge, ErrorBox, LineChart, Loading, PageHead, type Scope, Time, useInterval, useLoad, useScopes, rowAction } from "../components";
+import { type Chip, FilterPanel, MultiSelect } from "../filters";
+import { Empty, Truncate } from "../ui";
 
 interface Result {
   source: { environments: string[]; connector: string; language: string }; ok: boolean; error?: string; denied?: boolean; namespace?: string | null;
@@ -12,41 +14,7 @@ const WINDOWS = [15, 30, 60, 180, 360, 720, 1440, 10080];
 const windowLabel = (m: number) => (m >= 1440 ? `last ${m / 1440} d` : m >= 60 ? `last ${m / 60} h` : `last ${m} min`);
 const REFRESH = [0, 15, 30, 60, 300];
 
-/** Searchable multi-select dropdown. Nothing selected means all the options. */
-export function MultiSelect({ label, options, value, onChange, allLabel }: { label: string; options: { value: string; label?: string }[]; value: string[]; onChange: (v: string[]) => void; allLabel: string }) {
-  const [q, setQ] = useState("");
-  const [open, setOpen] = useState(false);
-  const box = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const away = (e: MouseEvent) => { if (!box.current?.contains(e.target as Node)) setOpen(false); };
-    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
-    document.addEventListener("mousedown", away);
-    document.addEventListener("keydown", esc);
-    return () => { document.removeEventListener("mousedown", away); document.removeEventListener("keydown", esc); };
-  }, [open]);
-  const shown = options.filter((o) => (o.label ?? o.value).toLowerCase().includes(q.toLowerCase()));
-  const name = (v: string) => options.find((o) => o.value === v)?.label ?? v;
-  const text = !value.length ? allLabel : value.length === 1 ? name(value[0]) : `${value.length} selected`;
-  return (
-    <div className="ms" ref={box}>
-      <span className="ms-label">{label}</span>
-      <button type="button" className="ms-button" aria-haspopup="listbox" aria-expanded={open} aria-label={`${label}: ${text}`} onClick={() => setOpen(!open)}>
-        <span>{text}</span><span aria-hidden>▾</span>
-      </button>
-      {open && <div className="ms-menu" role="listbox" aria-multiselectable aria-label={label}>
-        {options.length > 6 && <input autoFocus aria-label={`Search ${label}`} placeholder="Search…" value={q} onChange={(e) => setQ(e.target.value)} />}
-        <button type="button" role="option" aria-selected={!value.length} className={`ms-option ${!value.length ? "on" : ""}`} onClick={() => { onChange([]); setOpen(false); }}>{allLabel}</button>
-        {shown.slice(0, 200).map((o) => {
-          const on = value.includes(o.value);
-          return <button type="button" role="option" aria-selected={on} key={o.value} className={`ms-option ${on ? "on" : ""}`}
-            onClick={() => onChange(on ? value.filter((v) => v !== o.value) : [...value, o.value])}><span className="ms-check" aria-hidden>{on ? "✓" : ""}</span>{o.label ?? o.value}</button>;
-        })}
-        {!shown.length && <div className="small muted">No matches.</div>}
-      </div>}
-    </div>
-  );
-}
+export { MultiSelect };
 
 function Results({ data, loading, unit }: { data?: Response; loading: boolean; unit?: "bytes" | "ratio" }) {
   const [view, setView] = useState<"chart" | "table">("chart");
@@ -61,7 +29,7 @@ function Results({ data, loading, unit }: { data?: Response; loading: boolean; u
             <span>{ok.length} of {data.results.length} source(s) responded{loading ? " · refreshing…" : ""}</span>
             {data.results.map((r, i) => <Badge key={i} kind={r.ok ? "ok" : "bad"}>{r.source.environments.join(", ")}{r.namespace ? `/${r.namespace}` : ""} · {r.source.connector}</Badge>)}
           </div>
-          <div className="tabs" style={{ margin: 0, border: 0 }}>{(["chart", "table"] as const).map((v) => <button type="button" key={v} className={view === v ? "active" : ""} onClick={() => setView(v)}>{v}</button>)}</div>
+          <div className="tabs flat">{(["chart", "table"] as const).map((v) => <button type="button" key={v} className={view === v ? "active" : ""} onClick={() => setView(v)}>{v}</button>)}</div>
         </div>
         {[...data.errors.map((e) => `${e.environment}: ${e.error}`), ...data.results.filter((r) => !r.ok).map((r) => `${r.source.environments.join(", ")}: ${r.error}`)].map((m, i) => <div key={i} className="alert warn small" style={{ marginTop: 8 }}>{m}</div>)}
       </div>
@@ -74,7 +42,7 @@ function Results({ data, loading, unit }: { data?: Response; loading: boolean; u
               <strong>{r.source.environments.join(", ")}{r.namespace ? ` / ${r.namespace}` : ""}</strong>
               <span className="muted">{r.source.connector} · {r.source.language === "promql" ? "PromQL" : "CloudWatch Metrics"}{r.step ? ` · step ${r.step}s` : ""} · collected <Time iso={r.collected_at} /></span>
             </div>
-            {empty ? <div className="empty">The query ran and returned no series. Check the labels and the time range; this does not show the value is zero.</div> :
+            {empty ? <Empty title="The query ran and returned no series.">Check the labels and the time range. This does not show the value is zero.</Empty> :
               view === "chart" && !instant ? <LineChart series={r.series!} unit={unit} /> : <SeriesTable series={r.series!} />}
             {r.truncated && <div className="small muted">Showing the first {r.series?.length} of {r.total_series} series.</div>}
             {r.warnings?.map((w, n) => <div key={n} className="alert warn small">{w}</div>)}
@@ -143,16 +111,17 @@ export function Metrics() {
   return (
     <>
       <PageHead title="Metrics" sub="Explore metrics through filters, or write PromQL yourself. All authorized environments by default." />
-      <ErrorBox error={sources.error} />
+      <Loading load={sources} />
       <div className="tabs">
         <button className={mode === "explore" ? "active" : ""} onClick={() => setMode("explore")}>Explore</button>
         <button className={mode === "query" ? "active" : ""} onClick={() => setMode("query")}>Query</button>
         {cw.length > 0 && <button className={mode === "cloudwatch" ? "active" : ""} onClick={() => setMode("cloudwatch")}>CloudWatch</button>}
       </div>
-      {mode !== "cloudwatch" && <div className="card filters" style={{ marginBottom: 14 }}>
+      {mode !== "cloudwatch" && <FilterPanel chips={[...envs.map((e) => ({ key: e, label: e, onRemove: () => setEnvs(envs.filter((x) => x !== e)) })), ...(connectors.length ? [{ key: "ds", label: `${connectors.length} data source(s)`, onRemove: () => setPicked([]) }] : [])]}
+        onClear={() => { setEnvs([]); setPicked([]); }} label="Sources">
         <MultiSelect label="Environments" allLabel="All authorized environments" options={options} value={envs} onChange={setEnvs} />
         {dataSources.length > 1 && <MultiSelect label="Data sources" allLabel="All data sources" options={dataSources} value={connectors} onChange={setPicked} />}
-      </div>}
+      </FilterPanel>}
       {mode === "explore" && <Explore environments={names} connectors={connectors} scopes={scopes.data} sources={sources.data} onQuery={(q) => { setQuery(q); setMode("query"); }} />}
       {mode === "query" && <QueryEditor environments={names} connectors={connectors} query={query} onQuery={setQuery} canRaw={raw} />}
       {mode === "cloudwatch" && <CloudWatch envs={cw} namespaces={sources.data?.cloudwatch_namespaces ?? {}} />}
@@ -194,7 +163,9 @@ function Explore({ environments, connectors, scopes, sources, onQuery }: { envir
   const set = (k: keyof typeof f, v: any) => setF({ ...f, [k]: v });
   return (
     <>
-      <div className="card filters">
+      <FilterPanel label="Metric filters" chips={[...(resource ? [{ key: "r", label: resource, onRemove: () => setResource("") }] : []), ...namespaces.map((n): Chip => ({ key: n, label: `namespace ${n}`, onRemove: () => setNamespaces(namespaces.filter((x) => x !== n)) }))]}
+        onClear={() => { setResource(""); setNamespaces([]); }}
+        search={<input type="search" className="grow" aria-label="Search metrics" value={search} onChange={(e) => setSearch(e.target.value)} placeholder={`Search ${catalog.data?.total ?? ""} metrics`} />}>
         <label>Resource type
           <select value={resource} onChange={(e) => setResource(e.target.value)}>
             <option value="">Any</option>
@@ -202,26 +173,25 @@ function Explore({ environments, connectors, scopes, sources, onQuery }: { envir
           </select>
         </label>
         <MultiSelect label="Namespaces" allLabel="All namespaces" options={allNamespaces.map((n) => ({ value: n }))} value={namespaces} onChange={setNamespaces} />
-        <label>Metric<input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={`Search ${catalog.data?.total ?? ""} metrics`} /></label>
-      </div>
-      <ErrorBox error={catalog.error} />
+      </FilterPanel>
+      <ErrorBox error={catalog.error} onRetry={catalog.reload} />
       {catalog.data?.errors?.map((e: any, i: number) => <div key={i} className="alert warn small" style={{ marginTop: 8 }}>{e.environment}: {e.error}</div>)}
       <div className="grid metrics-layout" style={{ marginTop: 14 }}>
         <div className="card metric-list">
           <table>
             <tbody>{items.map((m: any) => (
               <tr key={m.name} className={`clickable ${metric === m.name ? "selected" : ""}`} {...rowAction(() => { setMetric(m.name); setFilters({}); })}>
-                <td className="mono small">{m.name}<div className="muted">{[m.type, m.unit].filter(Boolean).join(" · ")}{m.environments.length > 1 ? ` · ${m.environments.length} environments` : ""}</div></td>
+                <td className="td-name"><Truncate text={m.name} mono /><div className="small muted">{[m.type, m.unit].filter(Boolean).join(" · ")}{m.environments.length > 1 ? ` · ${m.environments.length} environments` : ""}</div></td>
               </tr>
             ))}</tbody>
           </table>
-          {!items.length && !catalog.loading && <div className="empty">No metrics match.</div>}
+          {!items.length && !catalog.loading && <Empty title="No metrics match." />}
           {catalog.data?.total > items.length && <div className="small muted">Showing 200 of {catalog.data.total}. Search to narrow.</div>}
         </div>
         <div>
-          {!metric ? <div className="card empty">Pick a metric to chart it.</div> : <>
+          {!metric ? <div className="card"><Empty title="Pick a metric to chart it." /></div> : <>
             <div className="card stack">
-              <div className="row between"><strong className="mono">{metric}</strong>
+              <div className="row between nowrap"><Truncate text={metric} mono />
                 <button type="button" className="ghost small" onClick={() => { const q = r.data?.results.find((x) => x.query)?.query; if (q) onQuery(q); }} disabled={!r.data}>Open in Query</button></div>
               {info?.help && <div className="small muted">{info.help}</div>}
               <div className="filters">
@@ -391,9 +361,9 @@ function CloudWatch({ envs, namespaces }: { envs: any[]; namespaces: Record<stri
       <ErrorBox error={list.error ?? r.error} />
       <div className="grid metrics-layout" style={{ marginTop: 14 }}>
         <div className="card metric-list"><table><tbody>{list.data?.items.map((m: any, i: number) => (
-          <tr key={i} className="clickable" {...rowAction(() => setPick(m))}><td className="mono small">{m.metric}<div className="muted">{Object.entries(m.dimensions).map(([k, v]) => `${k}=${v}`).join(" ")}</div></td></tr>
+          <tr key={i} className="clickable" {...rowAction(() => setPick(m))}><td className="td-name"><Truncate text={m.metric} mono /><div className="small muted">{Object.entries(m.dimensions).map(([k, v]) => `${k}=${v}`).join(" ")}</div></td></tr>
         ))}</tbody></table>{list.data && !list.data.items.length && <div className="empty">No metrics found.</div>}</div>
-        <div>{pick ? <Results data={r.data} loading={r.busy} /> : <div className="card empty">Pick a metric.</div>}</div>
+        <div>{pick ? <Results data={r.data} loading={r.busy} /> : <div className="card"><Empty title="Pick a metric." /></div>}</div>
       </div>
     </>
   );

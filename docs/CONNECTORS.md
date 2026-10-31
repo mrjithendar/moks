@@ -51,6 +51,14 @@ named targetPorts the pods don't declare, under-replicated workloads, Ingress ba
 exist and recurring Warning events. DNS issues use `k8s_dns_health`, which reads CoreDNS
 pods/endpoints and respects a `kube-system` deny rule.
 
+With `argocd.enabled` in the chart, `k8s_argocd_status` reads Application status from the `argocd`
+namespace (`MOKS_ARGOCD_NAMESPACE`). This is how MOKS sees a failed sync, because the workloads stay
+healthy. Each app gives its sync status, health, last operation, the error Argo CD reports and its
+source paths. Helm parameters and inline values are never copied. If a path is missing and a git
+connector is configured, MOKS searches the file names of up to six allowlisted repositories and
+lists up to three candidates. The tool is read-only and hides apps whose destination namespace is
+outside the user's scope.
+
 ## Prometheus
 
 ```json
@@ -153,6 +161,7 @@ and `phase2.py`.
 | `k8s_nodes` | kubernetes | — | environment-wide | — |
 | `k8s_dns_health` | kubernetes | — | environment-wide | — |
 | `k8s_config_audit` | kubernetes | `namespace`* (≤63) | `namespace` in scope | — |
+| `k8s_argocd_status` | kubernetes | `application` (≤253) | environment-wide; apps filtered to scope | — |
 | `eks_cluster` | kubernetes | — | environment-wide | — |
 | `prom_query` | prometheus | `promql`* (≤2000), `mode` (default range), `minutes` | result filtering / query pinning | metrics.raw_query |
 | `prom_pod_resources` | prometheus | `namespace`* (≤63), `pod_regex` (≤200, default .+), `minutes` | `namespace` in scope | — |

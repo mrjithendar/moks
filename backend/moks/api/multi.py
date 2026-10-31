@@ -13,6 +13,7 @@ import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -72,18 +73,42 @@ async def scopes(request: Request, ctx: AuthContext = Depends(get_auth), db: Asy
     return {"scopes": out}
 
 
+class LogSearch(BaseModel):
+    environment: str = "all"
+    namespace: str = "all"
+    minutes: int | None = Field(default=None, ge=1, le=10080)
+    pod: str | None = None
+    container: str | None = None
+    contains: str | None = None
+    trace_id: str | None = None
+    request_id: str | None = None
+    level: str | None = None
+    limit: int = Field(default=200, ge=1, le=500)
+
+
+@router.post("/logs")
+async def search_logs(body: LogSearch, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """Search text and IDs stay out of URLs and access logs."""
+    filters = {k: v for k, v in body.model_dump(exclude={"environment", "namespace", "minutes"}).items() if v not in (None, "")}
+    return await _read("logs", filters, request, body.environment, body.namespace, body.minutes, ctx, db)
+
+
 @router.get("/{kind}")
 async def multi(kind: str, request: Request, environment: str = "all", namespace: str = "all",
                 minutes: int | None = Query(default=None, ge=1, le=10080),
                 ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    return await _read(kind, dict(request.query_params), request, environment, namespace, minutes, ctx, db)
+
+
+async def _read(kind: str, params: dict[str, Any], request: Request, environment: str, namespace: str, minutes: int | None, ctx: AuthContext, db: AsyncSession) -> dict[str, Any]:
     tool = KINDS.get(kind)
     if tool is None:
         raise HTTPException(404, f"unknown view {kind!r}")
     spec = REGISTRY[tool]
     args: dict[str, Any] = {}
     for name, field in spec.args.model_fields.items():
-        if name in request.query_params and name != "namespace":
-            args[name] = _coerce(field, request.query_params[name])
+        if name in params and name != "namespace":
+            args[name] = _coerce(field, str(params[name]))
     if "minutes" in spec.args.model_fields and minutes:
         args["minutes"] = minutes
     envs = (await db.execute(select(Environment).where(~Environment.name.startswith("eval-")).order_by(Environment.name))).scalars().all()

@@ -1,8 +1,9 @@
 import { Fragment, useState, type FormEvent } from "react";
 import { api, qs } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, PageHead, Time, useLoad, rowAction } from "../components";
-import { useFeedback } from "../ui";
+import { Badge, DataTable, ErrorBox, Loading, PageHead, Time, useLoad } from "../components";
+import { type Chip, FilterPanel } from "../filters";
+import { Drawer, Empty, Truncate, useFeedback } from "../ui";
 
 function useAction() {
   const [error, setError] = useState<unknown>();
@@ -142,17 +143,16 @@ export function Environments() {
     <>
       <PageHead title="Environments" sub="Clusters MOKS can read, and the infrastructure scope it may touch in each (independent of user roles)" />
       <div className="card">
-        <table>
-          <thead><tr><th>Name</th><th>Kind</th><th>Allowed namespaces</th><th>Denied</th><th>Max window</th><th /></tr></thead>
-          <tbody>{list.data?.map((e) => (
-            <tr key={e.name}>
-              <td>{e.display_name} <span className="mono small muted">{e.name}</span> {e.is_production && <Badge kind="warn">production</Badge>}</td>
-              <td>{e.kind}</td><td className="mono small">{e.allowed_namespaces.join(", ")}</td><td className="mono small">{e.denied_namespaces.join(", ")}</td>
-              <td>{e.max_query_window_minutes} min</td>
-              <td><button className="ghost small" onClick={() => { setEditing(e.name); setForm({ ...e, allowed_namespaces: e.allowed_namespaces.join(", "), denied_namespaces: e.denied_namespaces.join(", "), grafana_url: e.grafana_url ?? "" }); }}>Edit</button></td>
-            </tr>
-          ))}</tbody>
-        </table>
+        <Loading load={list} rows={3} />
+        {list.data && <DataTable label="Environments" rows={list.data as any[]} rowKey={(e) => e.name} empty={<Empty title="No environments yet.">Add the first one below.</Empty>}
+          menu={(e) => ({ label: `Actions for ${e.name}`, items: [{ label: "Edit", run: () => { setEditing(e.name); setForm({ ...e, allowed_namespaces: e.allowed_namespaces.join(", "), denied_namespaces: e.denied_namespaces.join(", "), grafana_url: e.grafana_url ?? "" }); } }] })}
+          cols={[
+            { key: "n", head: "Name", primary: true, cell: (e) => <><span className="row tight"><Truncate text={e.display_name} />{e.is_production && <Badge kind="warn">production</Badge>}</span><Truncate text={e.name} mono /></> },
+            { key: "k", head: "Kind", cell: (e) => e.kind },
+            { key: "a", head: "Allowed namespaces", cell: (e) => <Truncate text={e.allowed_namespaces.join(", ")} mono />, meta: (e) => `allowed ${e.allowed_namespaces.join(", ")}` },
+            { key: "d", head: "Denied", cell: (e) => <Truncate text={e.denied_namespaces.join(", ")} mono />, meta: (e) => (e.denied_namespaces.length ? `denied ${e.denied_namespaces.join(", ")}` : "") },
+            { key: "w", head: "Max window", cell: (e) => `${e.max_query_window_minutes} min` },
+          ]} />}
       </div>
       <form className="card stack" style={{ marginTop: 14 }} onSubmit={save}>
         <h2>{editing ? `Edit ${editing}` : "Add environment"}</h2>
@@ -238,24 +238,18 @@ export function Connectors() {
     <>
       <PageHead title="Connectors" sub="Live data sources per environment. Credentials are references to mounted Secrets, never stored here." />
       <div className="card">
-        <table>
-          <thead><tr><th>Environment</th><th>Type</th><th>Name</th><th>Endpoint</th><th>Credential</th><th>Last test</th><th /></tr></thead>
-          <tbody>{list.data?.map((c) => (
-            <tr key={c.id}>
-              <td className="mono small">{c.environment}</td>
-              <td>{c.type} {!c.implemented && <Badge kind="neutral">planned</Badge>} {!c.enabled && <Badge>disabled</Badge>}</td>
-              <td>{c.name}</td>
-              <td className="mono small">{c.config.base_url ?? c.config.mode ?? ""}</td>
-              <td className="mono small">{c.credential}</td>
-              <td className="small">
-                {tests[c.id]?.busy ? "testing…" : c.last_test_ok == null ? <span className="muted">never</span> : <Badge kind={c.last_test_ok ? "ok" : "bad"}>{c.last_test_ok ? "ok" : "failed"}</Badge>}
-                {c.last_test_at && <> <Time iso={c.last_test_at} /></>}
-                {c.last_test_message && <div className="muted">{c.last_test_message}</div>}
-              </td>
-              <td className="row"><button className="small" onClick={() => test(c.id)}>Test</button><button className="ghost small" onClick={() => edit(c)}>Edit</button><button className="ghost small" onClick={() => remove(c.id)}>Delete</button></td>
-            </tr>
-          ))}</tbody>
-        </table>
+        <Loading load={list} rows={4} />
+        {list.data && <DataTable label="Connectors" rows={list.data as any[]} rowKey={(c) => c.id} empty={<Empty title="No connectors yet.">Add one below, then test it.</Empty>}
+          menu={(c) => ({ label: `Actions for ${c.name}`, items: [{ label: "Test", run: () => test(c.id) }, { label: "Edit", run: () => edit(c) }, { label: "Delete", danger: true, run: () => remove(c.id) }] })}
+          cols={[
+            { key: "n", head: "Name", primary: true, cell: (c) => <Truncate text={c.name} /> },
+            { key: "t", head: "Last test", status: true, cell: (c) => <>{tests[c.id]?.busy ? "testing…" : c.last_test_ok == null ? <span className="muted small">never</span> : <Badge kind={c.last_test_ok ? "ok" : "bad"}>{c.last_test_ok ? "ok" : "failed"}</Badge>}</> },
+            { key: "ty", head: "Type", cell: (c) => <>{c.type} {!c.implemented && <Badge kind="neutral">planned</Badge>} {!c.enabled && <Badge>disabled</Badge>}</> },
+            { key: "e", head: "Environment", cell: (c) => <span className="mono small">{c.environment}</span> },
+            { key: "u", head: "Endpoint", cell: (c) => <Truncate text={c.config.base_url ?? c.config.mode ?? ""} mono />, meta: (c) => <Truncate text={c.config.base_url ?? c.config.mode ?? ""} mono /> },
+            { key: "c", head: "Credential", wide: true, cell: (c) => <Truncate text={c.credential ?? ""} mono /> },
+            { key: "m", head: "Test result", cell: (c) => <span className="small">{c.last_test_at && <Time iso={c.last_test_at} />}{c.last_test_message && <span className="muted clamp-2">{c.last_test_message}</span>}</span> },
+          ]} />}
       </div>
       <form className="card stack" style={{ marginTop: 14 }} onSubmit={save}>
         <h2>{editing ? "Edit connector" : "Add connector"}</h2>
@@ -312,25 +306,24 @@ export function LLMProviders() {
     <>
       <PageHead title="LLM providers" sub="Provider-neutral chat model used for planning and reports. Without an active chat model, investigations are rule-based." />
       <div className="card">
-        <table>
-          <thead><tr><th>Name</th><th>Purpose</th><th>Provider / model</th><th>Credential</th><th>Budget (24 h)</th><th>Status</th><th /></tr></thead>
-          <tbody>{list.data?.map((c) => (
-            <tr key={c.id}>
-              <td>{c.name}</td><td>{c.purpose}</td>
-              <td className="mono small">{c.provider} / {c.model}{c.endpoint && <div className="muted">{c.endpoint}</div>}{c.region && <div className="muted">{c.region}</div>}</td>
-              <td className="mono small">{c.credential}</td>
-              <td className="small">${Number(c.spent_last_24h_usd ?? 0).toFixed(4)} of ${c.daily_budget_usd}</td>
-              <td>{c.is_active ? <Badge kind="ok">active</Badge> : <Badge>inactive</Badge>}{tests[c.id] && <div className={`small ${tests[c.id].ok ? "" : "muted"}`}>{tests[c.id].message}</div>}</td>
-              <td className="row">
-                <button className="small" onClick={() => test(c.id)}>Test</button>
-                <button className="ghost small" onClick={async () => { await a.run(() => api(`/admin/llm/${c.id}/activate${qs({ active: !c.is_active })}`, { method: "POST" })); list.reload(); }}>{c.is_active ? "Deactivate" : "Activate"}</button>
-                {!c.is_active && <button className="ghost small" onClick={async () => { if (await ask({ title: `Delete ${c.name}?`, body: "Its usage history is kept.", action: "Delete provider", danger: true })) { await a.run(() => api(`/admin/llm/${c.id}`, { method: "DELETE" })); list.reload(); } }}>Delete</button>}
-                <button className="ghost small" onClick={() => { setEditing(c.id); setForm({ ...c, endpoint: c.endpoint ?? "", region: c.region ?? "us-east-1", credType: c.credential_ref?.type ?? "none", credName: c.credential_ref?.name ?? "" }); }}>Edit</button>
-              </td>
-            </tr>
-          ))}</tbody>
-        </table>
-        {list.data && !list.data.length && <div className="empty">No LLM configured. Investigations use rule-based diagnosis only.</div>}
+        <Loading load={list} rows={3} />
+        {list.data && <DataTable label="LLM providers" rows={list.data as any[]} rowKey={(c) => c.id} empty={<Empty title="No LLM configured.">Investigations use rule-based diagnosis only.</Empty>}
+          menu={(c) => ({ label: `Actions for ${c.name}`, items: [
+            { label: "Test", run: () => test(c.id) },
+            { label: c.is_active ? "Deactivate" : "Activate", run: async () => { await a.run(() => api(`/admin/llm/${c.id}/activate${qs({ active: !c.is_active })}`, { method: "POST" })); list.reload(); } },
+            { label: "Edit", run: () => { setEditing(c.id); setForm({ ...c, endpoint: c.endpoint ?? "", region: c.region ?? "us-east-1", credType: c.credential_ref?.type ?? "none", credName: c.credential_ref?.name ?? "" }); } },
+            ...(!c.is_active ? [{ label: "Delete", danger: true, run: async () => { if (await ask({ title: `Delete ${c.name}?`, body: "Its usage history is kept.", action: "Delete provider", danger: true })) { await a.run(() => api(`/admin/llm/${c.id}`, { method: "DELETE" })); list.reload(); } } }] : []),
+          ] })}
+          cols={[
+            { key: "n", head: "Name", primary: true, cell: (c) => <Truncate text={c.name} /> },
+            { key: "s", head: "Status", status: true, cell: (c) => (c.is_active ? <Badge kind="ok">active</Badge> : <Badge>inactive</Badge>) },
+            { key: "p", head: "Purpose", cell: (c) => c.purpose },
+            { key: "m", head: "Provider / model", cell: (c) => <span className="mono small">{c.provider} / {c.model}{c.region && <span className="muted"> {c.region}</span>}</span> },
+            { key: "e", head: "Endpoint", wide: true, cell: (c) => <Truncate text={c.endpoint ?? ""} mono /> },
+            { key: "c", head: "Credential", wide: true, cell: (c) => <Truncate text={c.credential ?? ""} mono /> },
+            { key: "b", head: "Budget (24 h)", cell: (c) => <span className="small">${Number(c.spent_last_24h_usd ?? 0).toFixed(4)} of ${c.daily_budget_usd}</span> },
+            { key: "t", head: "Test", cell: (c) => (tests[c.id] ? <span className={`small ${tests[c.id].ok ? "" : "muted"}`}>{tests[c.id].message}</span> : "") },
+          ]} />}
       </div>
       <form className="card stack" style={{ marginTop: 14 }} onSubmit={save}>
         <h2>{editing ? "Edit provider" : "Add provider"}</h2>
@@ -383,6 +376,7 @@ export function Users() {
       </div>
       <ErrorBox error={a.error} />
       <div className="card">
+        <div className="table-wrap wide-form" role="region" aria-label="Users and role bindings" tabIndex={0}>
         <table>
           <thead><tr><th>User</th><th>Sign-in</th><th>Bindings</th><th>Grant</th><th /></tr></thead>
           <tbody>{list.data?.map((u) => {
@@ -393,7 +387,7 @@ export function Users() {
                 <td className="small">{u.auth_provider}<div className="muted">last <Time iso={u.last_login_at} /></div></td>
                 <td className="small">{u.bindings.map((b: any) => (
                   <div key={b.id}><Badge kind="info">{b.role}</Badge> <span className="mono">{b.environment}/{b.namespace}</span> <span className="muted">({b.source})</span>
-                    <button className="ghost small" style={{ marginLeft: 4 }} onClick={async () => { await a.run(() => api(`/admin/users/${u.id}/bindings/${b.id}`, { method: "DELETE" })); list.reload(); }}>×</button></div>
+                    <button className="ghost small" aria-label={`Remove ${b.role} on ${b.environment}/${b.namespace} from ${u.email}`} style={{ marginLeft: 4 }} onClick={async () => { await a.run(() => api(`/admin/users/${u.id}/bindings/${b.id}`, { method: "DELETE" })); list.reload(); }}>×</button></div>
                 ))}{!u.bindings.length && <span className="muted">no access</span>}</td>
                 <td>
                   <div className="row">
@@ -408,6 +402,7 @@ export function Users() {
             );
           })}</tbody>
         </table>
+        </div>
       </div>
       {me?.auth_mode !== "oidc" ? (
         <form className="card stack" style={{ marginTop: 14 }} onSubmit={async (e) => { e.preventDefault(); if (await a.run(() => api("/admin/users", { method: "POST", body: { ...nu, password: nu.password || null } }))) { setNu({ email: "", display_name: "", password: "" }); list.reload(); } }}>
@@ -444,7 +439,9 @@ export function Audit() {
   const list = useLoad(() => api<{ events: any[] }>(`/admin/audit${qs({ ...params(applied), limit: PAGE })}`), [applied]);
   const events = [...(list.data?.events ?? []), ...older];
   const [verify, setVerify] = useState<any>();
-  const [open, setOpen] = useState<number | null>(null);
+  const [open, setOpen] = useState<any>(null);
+  const clear = () => { setF(blank); setApplied(blank); setOlder([]); setBefore(undefined); };
+  const chips: Chip[] = (Object.entries(applied) as [keyof typeof blank, string][]).filter(([k, v]) => v && k !== "since" && k !== "until").map(([k, v]) => ({ key: k, label: `${k.replace("q_text", "details")}: ${v}`, onRemove: () => apply({ [k]: "" }) }));
   const apply = (patch: Partial<typeof f>) => { const n = { ...f, ...patch }; setF(n); setApplied(n); setOlder([]); setBefore(undefined); };
   const pick = (key: keyof typeof f, label: string, facet: string, any: string) => (
     <label>{label}
@@ -467,52 +464,56 @@ export function Audit() {
         <button className="ghost" onClick={async () => setVerify(await api("/admin/audit/verify"))}>Verify chain</button>
       </PageHead>
       {verify && <div className={`alert ${verify.ok ? "info" : "error"}`} style={{ marginBottom: 12 }}>{verify.ok ? `Chain intact: ${verify.checked} records verified.` : `Chain broken at record #${verify.broken_at} (after ${verify.checked} checked).`}</div>}
-      <form className="card filters" onSubmit={(e) => { e.preventDefault(); apply({}); }}>
-        {pick("action", "Action", "action", "All actions")}
-        {pick("actor", "Actor", "actor_email", "All actors")}
-        <label>Decision<select value={f.decision} onChange={(e) => apply({ decision: e.target.value })}><option value="">Any</option><option>allow</option><option>deny</option><option>n/a</option></select></label>
-        {pick("outcome", "Outcome", "outcome", "Any")}
-        {pick("environment", "Environment", "environment", "All environments")}
-        {pick("namespace", "Namespace", "namespace", "All namespaces")}
-        <label>Time
-          <select value={f.range} onChange={(e) => apply({ range: e.target.value, since: "", until: "" })}>
-            <option value="">Any time</option>
-            {Object.keys(AUDIT_RANGES).map((r) => <option key={r}>{r}</option>)}
-            <option value="custom">Custom range…</option>
-          </select>
-        </label>
-        {f.range === "custom" && <>
-          <label>From<input type="datetime-local" value={f.since} onChange={(e) => setF({ ...f, since: e.target.value })} /></label>
-          <label>To<input type="datetime-local" value={f.until} onChange={(e) => setF({ ...f, until: e.target.value })} /></label>
-        </>}
-        <label>Resource<input value={f.resource} onChange={(e) => setF({ ...f, resource: e.target.value })} placeholder="tool name, plan id" /></label>
-        <label>Details contain<input value={f.q_text} onChange={(e) => setF({ ...f, q_text: e.target.value })} /></label>
-        <button>Filter</button>
-        <button type="button" className="ghost" onClick={() => { setF(blank); setApplied(blank); setOlder([]); setBefore(undefined); }}>Clear</button>
+      <form onSubmit={(e) => { e.preventDefault(); apply({}); }}>
+        <FilterPanel chips={chips} onClear={clear} onApply={() => apply({})} applying={list.loading} applyLabel="Filter"
+          advanced={<div className="filters">
+            {pick("outcome", "Outcome", "outcome", "Any")}
+            {pick("namespace", "Namespace", "namespace", "All namespaces")}
+            <label>Resource<input value={f.resource} onChange={(e) => setF({ ...f, resource: e.target.value })} placeholder="tool name, plan id" /></label>
+            <label>Details contain<input value={f.q_text} onChange={(e) => setF({ ...f, q_text: e.target.value })} /></label>
+            {f.range === "custom" && <>
+              <label>From<input type="datetime-local" value={f.since} onChange={(e) => setF({ ...f, since: e.target.value })} /></label>
+              <label>To<input type="datetime-local" value={f.until} onChange={(e) => setF({ ...f, until: e.target.value })} /></label>
+            </>}
+          </div>}>
+          {pick("action", "Action", "action", "All actions")}
+          {pick("actor", "Actor", "actor_email", "All actors")}
+          <label>Decision<select value={f.decision} onChange={(e) => apply({ decision: e.target.value })}><option value="">Any</option><option>allow</option><option>deny</option><option>n/a</option></select></label>
+          {pick("environment", "Environment", "environment", "All environments")}
+          <label>Time
+            <select value={f.range} onChange={(e) => apply({ range: e.target.value, since: "", until: "" })}>
+              <option value="">Any time</option>
+              {Object.keys(AUDIT_RANGES).map((r) => <option key={r}>{r}</option>)}
+              <option value="custom">Custom range…</option>
+            </select>
+          </label>
+        </FilterPanel>
       </form>
-      <ErrorBox error={list.error} />
-      <div className="card" style={{ marginTop: 14 }}>
-        <table>
-          <thead><tr><th>#</th><th>Time</th><th>Actor</th><th>Action</th><th>Resource</th><th>Scope</th><th>Decision</th><th>Outcome</th></tr></thead>
-          <tbody>{events.map((e) => (
-            <Fragment key={e.id}>
-              <tr className="clickable" {...rowAction(() => setOpen(open === e.id ? null : e.id))}>
-                <td className="mono small">{e.chain_seq}</td><td className="small">{new Date(e.ts).toLocaleString()}</td>
-                <td className="small">{e.actor_email ?? "system"}</td><td className="mono small">{e.action}</td>
-                <td className="mono small">{[e.resource_type, e.resource_id].filter(Boolean).join(":")}</td>
-                <td className="mono small">{[e.environment, e.namespace].filter(Boolean).join("/")}</td>
-                <td>{e.decision === "deny" ? <Badge kind="bad">deny</Badge> : e.decision === "allow" ? <Badge kind="ok">allow</Badge> : <span className="muted small">—</span>}</td>
-                <td className="small">{e.outcome}</td>
-              </tr>
-              {open === e.id && <tr><td colSpan={8}><pre className="logbox">{JSON.stringify({ details: e.details, ip: e.ip, hash: e.hash }, null, 2)}</pre></td></tr>}
-            </Fragment>
-          ))}</tbody>
-        </table>
-        <div className="row between small muted" style={{ marginTop: 8 }}>
+      <div className="card mt">
+        <Loading load={list} rows={8} />
+        {list.data && <DataTable label="Audit records" rows={events} rowKey={(e) => String(e.id)} onRow={setOpen} empty={<Empty title="No records match." />} cols={[
+          { key: "a", head: "Action", primary: true, cell: (e) => <Truncate text={e.action} mono /> },
+          { key: "d", head: "Decision", status: true, cell: (e) => (e.decision === "deny" ? <Badge kind="bad">deny</Badge> : e.decision === "allow" ? <Badge kind="ok">allow</Badge> : <span className="muted small">—</span>) },
+          { key: "t", head: "Time", cell: (e) => <span className="small nowrap">{new Date(e.ts).toLocaleString()}</span> },
+          { key: "w", head: "Actor", cell: (e) => <Truncate text={e.actor_email ?? "system"} />, meta: (e) => e.actor_email ?? "system" },
+          { key: "r", head: "Resource", cell: (e) => <Truncate text={[e.resource_type, e.resource_id].filter(Boolean).join(":")} mono />, meta: (e) => <Truncate text={[e.resource_type, e.resource_id].filter(Boolean).join(":")} mono /> },
+          { key: "s", head: "Scope", cell: (e) => <Truncate text={[e.environment, e.namespace].filter(Boolean).join("/")} mono />, meta: (e) => [e.environment, e.namespace].filter(Boolean).join("/") },
+          { key: "o", head: "Outcome", wide: true, cell: (e) => <span className="small">{e.outcome}</span> },
+          { key: "n", head: "#", wide: true, cell: (e) => <span className="mono small">{e.chain_seq}</span> },
+        ]} />}
+        <div className="row between small muted mt">
           <span>{events.length} records</span>
           {list.data?.events.length === PAGE && (before === undefined || before === PAGE) && <button className="ghost small" onClick={loadOlder}>Load older</button>}
         </div>
       </div>
+      {open && <Drawer title={`Audit record ${open.chain_seq}`} onClose={() => setOpen(null)}>
+        <dl className="kv small">
+          <dt>Time</dt><dd>{new Date(open.ts).toLocaleString(undefined, { timeZoneName: "short" })}</dd><dt>Actor</dt><dd>{open.actor_email ?? "system"}</dd><dt>Action</dt><dd className="mono">{open.action}</dd>
+          <dt>Resource</dt><dd className="mono">{[open.resource_type, open.resource_id].filter(Boolean).join(":")}</dd><dt>Scope</dt><dd className="mono">{[open.environment, open.namespace].filter(Boolean).join("/") || "—"}</dd>
+          <dt>Decision</dt><dd>{open.decision}</dd><dt>Outcome</dt><dd>{open.outcome}</dd>
+        </dl>
+        <pre className="logbox">{JSON.stringify({ details: open.details, ip: open.ip, hash: open.hash }, null, 2)}</pre>
+      </Drawer>}
     </>
   );
 }

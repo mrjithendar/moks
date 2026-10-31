@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import Field, field_validator
 
 from ..connectors.base import ConnectorError
-from ..connectors.loki import logql_escape, selector_namespaces
+from ..connectors.loki import analyze_logql, logql_escape
 from ..connectors.prometheus import auto_step
 from ..diagnosis.detectors import in_window, is_unhealthy, triage
 from ..rbac import P
@@ -59,6 +59,10 @@ class DeploymentArgs(ToolArgs):
 
 class NoArgs(ToolArgs):
     pass
+
+
+class ArgoArgs(ToolArgs):
+    application: str | None = Field(default=None, pattern=K8S_NAME, max_length=253, description="one Application; omit for all")
 
 
 async def k8s_triage(ctx: ToolContext, a: NamespaceArgs) -> ToolResult:
@@ -115,6 +119,19 @@ async def k8s_backup_status(ctx: ToolContext, a: NoArgs) -> ToolResult:
     data = {**s, "backups": s["backups"][:20], "restores": s["restores"][:10]}
     return ToolResult(f"{len(s['backups'])} backups, {len(s['schedules'])} schedules, {len(s['findings'])} findings" + (f": {bad[0]}" if bad else ""), data,
                       {"api": "GET velero.io backups, restores, schedules, backupstoragelocations"})
+
+
+async def k8s_argocd_status(ctx: ToolContext, a: ArgoArgs) -> ToolResult:
+    """Argo CD Application status, limited to namespaces in scope. Never syncs or changes anything."""
+    from .. import argocd
+
+    git = ctx.connector("git") if ctx.available("git") else None
+    s = await argocd.status(ctx.connector("kubernetes"), ctx.scope.allows, git, a.application)
+    if not s["installed"]:
+        return ToolResult(s["error"], s, {"api": f"GET argoproj.io applications in {argocd.namespace()}"})
+    worst = next((f["title"] for f in s["findings"] if f["severity"] != "low"), None)
+    return ToolResult(f"{s['total']} Argo CD applications, {len(s['problems'])} with problems" + (f": {worst}" if worst else ""), s,
+                      {"api": f"GET argoproj.io applications in {argocd.namespace()}"})
 
 
 async def k8s_list_pods(ctx: ToolContext, a: ListPodsArgs) -> ToolResult:
@@ -523,13 +540,52 @@ async def loki_search(ctx: ToolContext, a: LokiSearchArgs) -> ToolResult:
 
 async def loki_query(ctx: ToolContext, a: LokiQueryArgs) -> ToolResult:
     loki = ctx.connector("loki")
+    shape = analyze_logql(a.logql)
+    if shape.lookback_seconds > ctx.max_window.total_seconds():  # [30d] or offset reads past the window the query asks for
+        raise ScopeError(f"this query looks back further than the {int(ctx.max_window.total_seconds() // 60)} minutes allowed in {ctx.environment.name}")
     if not ctx.scope.unrestricted:
-        pinned = selector_namespaces(a.logql, loki.namespace_label)
-        for ns in pinned:
+        if shape.has_comment:
+            raise ScopeError("remove the # comment: queries limited to a namespace cannot contain comments")
+        for ns in shape.namespaces(loki.namespace_label):
             if ns is None:
                 raise ScopeError(f'every stream selector must pin {loki.namespace_label}="<namespace>" for your scope')
             ctx.scope.require(ns)
     return await _loki_run(ctx, a.logql, a.limit, a.minutes)
+
+
+LABEL_SAFE = re.compile(r"^[A-Za-z0-9._:/@-]{1,120}$")
+LABELS_WITH_VALUES = ("app", "app_kubernetes_io_name", "service", "service_name", "component", "container", "job", "level", "detected_level", "severity", "stream")
+MAX_LABELS = 60
+MAX_VALUES = 30
+
+
+class LokiLabelsArgs(ToolArgs):
+    namespace: str | None = Field(default=None, pattern=K8S_NAME, max_length=63, description="required unless you can read every namespace")
+    pod: str | None = Field(default=None, pattern=r"^[a-z0-9.*\-]{1,253}$")
+    minutes: int | None = Field(default=None, ge=1, le=10080)
+
+
+async def loki_labels(ctx: ToolContext, a: LokiLabelsArgs) -> ToolResult:
+    """Label names and a bounded sample of common label values. Reads no log lines."""
+    loki = ctx.connector("loki")
+    start, end = ctx.window(a.minutes)
+    if a.namespace:
+        ctx.scope.require(a.namespace)
+    elif not ctx.scope.unrestricted:
+        raise ScopeError("choose a namespace: label discovery across namespaces needs access to all of them")
+    matchers = [f'{loki.namespace_label}="{a.namespace}"'] if a.namespace else []
+    if a.pod:
+        matchers.append(f'pod=~"{logql_escape(a.pod.replace("*", ".*"))}"')
+    selector = "{" + ", ".join(matchers) + "}" if matchers else None
+    labels = [n for n in await loki.labels(start, end, selector) if LABEL_SAFE.match(n)][:MAX_LABELS]
+    values: dict[str, list[str]] = {}
+    for name in [loki.namespace_label, *LABELS_WITH_VALUES]:
+        if name in labels and not (name == loki.namespace_label and a.namespace):
+            found = await loki.label_values(name, start, end, selector)
+            if name == loki.namespace_label:
+                found = [v for v in found if ctx.scope.allows(v)]
+            values[name] = [redact(v) for v in found if LABEL_SAFE.match(v)][:MAX_VALUES]  # label values are untrusted: only plain tokens go further
+    return ToolResult(f"{len(labels)} Loki labels", {"labels": labels, "values": values, "namespace_label": loki.namespace_label}, {"api": "GET /loki/api/v1/labels"})
 
 
 TOOLS: list[ToolSpec] = [
@@ -537,6 +593,9 @@ TOOLS: list[ToolSpec] = [
              "kubernetes", NamespaceArgs, k8s_triage),
     ToolSpec("k8s_backup_status", "Cluster backups: Velero location health, recent backups and restores with errors, schedules, and automatic findings. Contains no Secret data.",
              "kubernetes", NoArgs, k8s_backup_status, cluster_scoped=True, namespace_arg=None),
+    ToolSpec("k8s_argocd_status", "Argo CD applications: sync status, health, last sync result, the exact error Argo CD reports, source repositories and paths, and where a missing path now sits in Git. "
+             "Use this for sync failures, Unknown or OutOfSync apps and GitOps questions: workloads stay healthy while Argo CD fails.",
+             "kubernetes", ArgoArgs, k8s_argocd_status, cluster_scoped=True, namespace_arg=None),
     ToolSpec("k8s_list_pods", "List pods with status, readiness, restarts and problem reasons.", "kubernetes", ListPodsArgs, k8s_list_pods),
     ToolSpec("k8s_describe_pod", "Pod details: containers, images, resources, probes, state, last state, env names, events.", "kubernetes", PodArgs, k8s_describe_pod),
     ToolSpec("k8s_pod_logs", "Container logs (tail), optionally from the previous crashed instance.", "kubernetes", PodLogArgs, k8s_pod_logs),
@@ -568,6 +627,7 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("prom_metric", "Chart one metric with label filters, aggregation and rate (query built safely; exact PromQL returned).",
              "prometheus", MetricArgs, prom_metric, namespace_arg=None),
     ToolSpec("loki_query", "Run a bounded LogQL query; selectors must pin a permitted namespace.", "loki", LokiQueryArgs, loki_query, namespace_arg=None),
+    ToolSpec("loki_labels", "Loki label names and common label values in a namespace. Reads no log lines.", "loki", LokiLabelsArgs, loki_labels, namespace_arg=None),
 ]
 
 def _all_tools() -> list[ToolSpec]:

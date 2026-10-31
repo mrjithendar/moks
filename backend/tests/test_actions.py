@@ -186,3 +186,66 @@ def test_writer_exists_only_in_the_executor_process():
 
     with pytest.raises(ConnectorError):
         KubernetesWriter({"mode": "in_cluster"})
+
+
+async def _admin(env):
+    email = f"adm-{uuid.uuid4().hex[:6]}@example.com"
+    await make_user(email, ["admin:*:*"])
+    return email
+
+
+async def test_an_admins_plan_needs_no_second_approval_and_is_recorded(client):
+    from moks.models import AuditEvent
+    env, op, ap = await _setup(client)
+    h = await login(client, await _admin(env))
+    plan = (await _plan(client, h, env)).json()
+    assert plan["requires_approval"] is False and plan["status"] == "pending"
+    assert (await client.post(f"/moks/api/actions/plans/{plan['id']}/execute", json={"plan_hash": "0" * 64}, headers=h)).status_code == 409  # still the reviewed plan
+    assert (await client.post(f"/moks/api/actions/plans/{plan['id']}/execute", json={"plan_hash": plan["plan_hash"]}, headers=h)).json()["status"] == "queued"
+    done = await _run_executor(FakeWriter("ok"))
+    assert done.status == "succeeded", done.result
+    async with session_scope() as db:
+        waived = (await db.execute(select(AuditEvent).where(AuditEvent.action == "action.approval_waived", AuditEvent.resource_id == plan["id"]))).scalars().all()
+    assert len(waived) == 1 and waived[0].details["hash"] == plan["plan_hash"]
+
+
+async def test_a_namespace_admin_binding_is_not_a_global_admin(client):
+    env, op, ap = await _setup(client)
+    email = f"nsadm-{uuid.uuid4().hex[:6]}@example.com"
+    await make_user(email, [f"admin:{env}:shop"])
+    h = await login(client, email)
+    plan = (await _plan(client, h, env)).json()
+    assert plan["requires_approval"] is True
+    assert (await client.post(f"/moks/api/actions/plans/{plan['id']}/approve", json={"plan_hash": plan["plan_hash"]}, headers=h)).status_code == 403
+
+
+async def test_an_admin_can_approve_their_own_older_plan(client):
+    env, op, ap = await _setup(client)
+    email = await _admin(env)
+    h = await login(client, email)
+    plan = (await _plan(client, h, env)).json()
+    async with session_scope() as db:
+        row = await db.get(ActionPlan, uuid.UUID(plan["id"]))
+        row.requires_approval = True  # as it would be if requested before they became an admin
+        from moks.actions.service import compute_hash
+        from moks.models import Environment
+        row.plan_hash = compute_hash(row, (await db.get(Environment, row.environment_id)).name)
+        current = row.plan_hash
+    assert (await client.post(f"/moks/api/actions/plans/{plan['id']}/approve", json={"plan_hash": current}, headers=h)).json()["status"] == "approved"
+    assert (await client.post(f"/moks/api/actions/plans/{plan['id']}/execute", json={"plan_hash": current}, headers=h)).json()["status"] == "queued"
+    assert (await _run_executor(FakeWriter("ok"))).status == "succeeded"
+
+
+async def test_losing_admin_before_execution_stops_a_waived_plan(client):
+    from moks.models import RoleBinding, User
+    env, op, ap = await _setup(client)
+    email = await _admin(env)
+    h = await login(client, email)
+    plan = (await _plan(client, h, env)).json()
+    assert (await client.post(f"/moks/api/actions/plans/{plan['id']}/execute", json={"plan_hash": plan["plan_hash"]}, headers=h)).json()["status"] == "queued"
+    async with session_scope() as db:
+        uid = (await db.execute(select(User.id).where(User.email == email))).scalar_one()
+        for b in (await db.execute(select(RoleBinding).where(RoleBinding.user_id == uid))).scalars():
+            b.role, b.environment, b.namespace = "operator", env, "shop"
+    done = await _run_executor(FakeWriter("ok"))
+    assert done.status != "succeeded" and DEPLOYMENTS[("shop", "checkout")]["replicas"] == 2

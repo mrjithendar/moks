@@ -1,13 +1,14 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
 import { Badge, ErrorBox, Time, useInterval, useLoad } from "../components";
+import { type Chip, FilterPanel, useUrlFilters } from "../filters";
 import { useFollow } from "../follow";
 import { type Ev, type StreamState, useInvestigationEvents } from "../investigationStream";
 import { Markdown } from "../markdown";
 import { useHeaderScope } from "../shell";
-import { Dialog, useFeedback, useIsMobile, useModal } from "../ui";
+import { ActionMenu, Dialog, Empty, Icon, Skeleton, Truncate, useFeedback, useIsMobile, useModal } from "../ui";
 import { EvidenceBody, Report, Timeline } from "./Investigate";
 import { PlanForm } from "./Ops";
 
@@ -41,39 +42,103 @@ export function messageKind(m: { role: string; investigation_id?: string | null;
 
 // ---- Conversation list -----------------------------------------------------------------------
 
+const SEVERITY: Record<string, "bad" | "warn" | "neutral"> = { sev1: "bad", sev2: "bad", sev3: "warn", sev4: "neutral" };
+const STATES: Record<string, string> = { running: "Running", completed: "Completed", failed: "Failed", cancelled: "Cancelled" };
+const stateOf = (c: any) => (c.running ? "running" : c.status ?? "");
+const INBOX = { environment: "", state: "", unread: false, deleted: false, sort: "recent" };
+
+function shortTime(iso: string) {
+  const d = new Date(iso), now = new Date();
+  if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleDateString(undefined, d.getFullYear() === now.getFullYear() ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" });
+}
+
+function InboxRow({ c, current, search, onChange, onDelete }: { c: any; current?: string; search: string; onChange: () => void; onDelete: (c: any) => void }) {
+  const { toast } = useFeedback();
+  const state = stateOf(c);
+  const items = [
+    !c.deleted && !c.deleted_view ? { label: c.unread ? "Mark as read" : "Mark as unread", run: () => { api(`/conversations/${c.id}/read`, { method: "POST", body: { unread: !c.unread } }).then(onChange, (e) => toast(e.message, "bad")); } } : null,
+    { label: "Copy link", run: () => { navigator.clipboard?.writeText(`${window.location.origin}${import.meta.env.BASE_URL}conversations/${c.id}`).then(() => toast("Link copied"), () => toast("The browser refused to copy", "bad")); } },
+    c.can_manage && !c.deleted_view ? { label: "Delete", danger: true, run: () => onDelete(c) } : null,
+  ].filter((x): x is NonNullable<typeof x> => !!x);
+  return (
+    <li className={`inbox-row${c.id === current ? " active" : ""}${c.unread ? " unread" : ""}`}>
+      <Link to={{ pathname: `/conversations/${c.id}`, search }} className="inbox-main" aria-current={c.id === current ? "page" : undefined}>
+        <span className="inbox-top">
+          {c.unread && <span className="inbox-dot" aria-hidden="true" />}{c.unread && <span className="sr-only">Unread: </span>}
+          <Truncate text={c.title} />
+          <time className="inbox-time" dateTime={c.updated_at} title={new Date(c.updated_at).toLocaleString(undefined, { timeZoneName: "short" })}>{shortTime(c.updated_at)}</time>
+        </span>
+        {c.preview && <span className="inbox-preview">{c.preview}</span>}
+        <span className="inbox-meta">
+          <span className="mono trunc">{c.environment}/{c.namespace}</span>
+          {c.severity && <Badge kind={SEVERITY[c.severity] ?? "neutral"}>{c.severity}</Badge>}
+          {state && state !== "completed" && <Badge kind={state === "failed" ? "bad" : state === "running" ? "info" : "warn"}>{STATES[state] ?? state}</Badge>}
+        </span>
+      </Link>
+      <ActionMenu label={`Actions for ${c.title}`} items={items} />
+    </li>
+  );
+}
+
 function ConversationList({ current }: { current?: string }) {
   const { can } = useAuth();
-  const [deleted, setDeleted] = useState(false);
-  const [search, setSearch] = useState("");
-  const list = useLoad(() => api<any[]>(`/conversations${deleted ? "?deleted=true" : ""}`), [deleted]);
+  const { confirm, toast } = useFeedback();
+  const nav = useNavigate();
+  const loc = useLocation();
+  const Heading = current ? "h2" : "h1"; // with a conversation open, its subject is the page's heading
+  const [f, set, clear] = useUrlFilters(INBOX);
+  const [search, setSearch] = useState(""); // what someone searches for stays out of the URL
+  const list = useLoad(() => api<any[]>(`/conversations?limit=200${f.deleted ? "&deleted=true" : ""}`), [f.deleted]);
   useInterval(() => { if (!list.loading) list.reload(); }, 15000);
   const needle = search.trim().toLowerCase();
-  const rows = (list.data ?? []).filter((c) => !needle || `${c.title} ${c.environment} ${c.namespace} ${c.owner}`.toLowerCase().includes(needle));
+  const all = (list.data ?? []).map((c) => ({ ...c, deleted_view: f.deleted }));
+  const rows = all.filter((c) => (!needle || `${c.title} ${c.preview} ${c.environment} ${c.namespace} ${c.owner}`.toLowerCase().includes(needle))
+    && (!f.environment || c.environment === f.environment) && (!f.state || stateOf(c) === f.state) && (!f.unread || c.unread));
+  if (f.sort === "oldest") rows.reverse();
+  if (f.sort === "subject") rows.sort((a, b) => a.title.localeCompare(b.title));
+  const envs = [...new Set((list.data ?? []).map((c) => c.environment as string))].sort();
+
+  // The list is hidden, not unmounted, on phones: the browser forgets its scroll offset, so keep it here.
+  const scroller = useRef<HTMLUListElement>(null);
+  const offset = useRef(0);
+  useLayoutEffect(() => { if (!current && scroller.current) scroller.current.scrollTop = offset.current; }, [current]);
+
+  async function remove(c: any) {
+    if (!await confirm({ title: "Delete this conversation?", body: "It is hidden from everyone, and you can restore it from Show deleted.", action: "Delete conversation", danger: true })) return;
+    try {
+      await api(`/conversations/${c.id}`, { method: "DELETE" });
+      list.reload();
+      if (c.id === current) nav({ pathname: "/investigations", search: loc.search });
+    } catch (e) { toast(e instanceof Error ? e.message : String(e), "bad"); }
+  }
+  const chips: Chip[] = [
+    ...(f.environment ? [{ key: "e", label: f.environment, onRemove: () => set({ environment: "" }) }] : []),
+    ...(f.state ? [{ key: "s", label: STATES[f.state] ?? f.state, onRemove: () => set({ state: "" }) }] : []),
+    ...(f.unread ? [{ key: "u", label: "Unread", onRemove: () => set({ unread: false }) }] : []),
+    ...(f.deleted ? [{ key: "d", label: "Deleted", onRemove: () => set({ deleted: false }) }] : []),
+  ];
   return (
     <section className="ws-list" aria-label="Conversations">
       <div className="ws-list-head">
-        <div className="row between"><h2 style={{ margin: 0 }}>Conversations</h2>
-          {can("investigation.run") && <Link className="btn" to="/investigate">New</Link>}</div>
-        <input type="search" aria-label="Search conversations" placeholder="Search" value={search} onChange={(e) => setSearch(e.target.value)} />
-        <label className="inline"><input type="checkbox" checked={deleted} onChange={(e) => setDeleted(e.target.checked)} /> Show deleted</label>
+        <div className="row between nowrap"><Heading className="inbox-title">Conversations</Heading>
+          {can("investigation.run") && <Link className="btn" to="/investigate"><Icon name="plus" size={16} /> New investigation</Link>}</div>
+        <FilterPanel chips={chips} onClear={clear} label="Filters"
+          search={<input type="search" className="grow" aria-label="Search conversations" placeholder="Search subject, preview, scope" value={search} onChange={(e) => setSearch(e.target.value)} />}
+          advanced={<div className="filters">
+            <label>Environment<select value={f.environment} onChange={(e) => set({ environment: e.target.value })}><option value="">All</option>{envs.map((e) => <option key={e}>{e}</option>)}</select></label>
+            <label>Status<select value={f.state} onChange={(e) => set({ state: e.target.value })}><option value="">Any</option>{Object.entries(STATES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select></label>
+            <label>Sort<select value={f.sort} onChange={(e) => set({ sort: e.target.value })}><option value="recent">Newest first</option><option value="oldest">Oldest first</option><option value="subject">Subject</option></select></label>
+            <label className="inline"><input type="checkbox" checked={f.unread} onChange={(e) => set({ unread: e.target.checked })} /> Unread only</label>
+            <label className="inline"><input type="checkbox" checked={f.deleted} onChange={(e) => set({ deleted: e.target.checked })} /> Show deleted</label>
+          </div>} />
       </div>
-      <ErrorBox error={list.error} />
-      {list.loading && !list.data && <div className="empty">Loading…</div>}
-      <ul className="ws-list-items">
-        {rows.map((c) => (
-          <li key={c.id}>
-            <Link to={`/conversations/${c.id}`} className={`ws-item${c.id === current ? " active" : ""}`} aria-current={c.id === current ? "page" : undefined}>
-              <div className="ws-item-title">{c.title}</div>
-              <div className="small muted row" style={{ gap: 6 }}>
-                <span className="mono">{c.environment}/{c.namespace}</span>
-                {c.running && <Badge kind="info">running</Badge>}
-                <Time iso={c.updated_at} />
-              </div>
-            </Link>
-          </li>
-        ))}
+      <ErrorBox error={list.error} onRetry={list.reload} />
+      {list.loading && !list.data && <div className="inbox-pad"><Skeleton rows={6} label="Loading conversations" /></div>}
+      <ul className="ws-list-items" ref={scroller} onScroll={(e) => { if (!current || e.currentTarget.offsetParent) offset.current = e.currentTarget.scrollTop; }}>
+        {rows.map((c) => <InboxRow key={c.id} c={c} current={current} search={loc.search} onChange={list.reload} onDelete={remove} />)}
+        {list.data && !rows.length && <li><Empty title={needle || chips.length ? "No conversations match." : "No conversations yet."}>{needle || chips.length ? "Change the search or clear the filters." : "Start a new investigation and it appears here."}</Empty></li>}
       </ul>
-      {list.data && !rows.length && <div className="empty">{needle ? "No match." : deleted ? "Nothing deleted." : "No conversations yet."}</div>}
     </section>
   );
 }
@@ -83,9 +148,9 @@ function ConversationList({ current }: { current?: string }) {
 interface PanelState { investigation: string; ref?: string }
 
 function EvidencePanel({ panel, onRef, onClose }: { panel: PanelState; onRef: (r?: string) => void; onClose: () => void }) {
-  const mobile = useIsMobile();
+  const mobile = useIsMobile(1180);
   const box = useRef<HTMLElement>(null);
-  useModal(box, mobile, onClose); // a sheet on phones; beside the conversation elsewhere
+  useModal(box, mobile, onClose); // a sheet where three columns would be squeezed; beside the conversation elsewhere
   useEffect(() => {
     if (mobile) return;
     const key = (e: globalThis.KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -99,17 +164,17 @@ function EvidencePanel({ panel, onRef, onClose }: { panel: PanelState; onRef: (r
   return (
     <aside ref={box} className="ws-evidence" aria-label="Evidence" tabIndex={-1} {...(mobile ? { role: "dialog", "aria-modal": true } : {})}>
       <div className="ws-evidence-head">
-        {open ? <button type="button" className="ghost small" onClick={() => onRef(undefined)}>All evidence</button> : <strong>Evidence ({evidence.length})</strong>}
+        {open ? <button type="button" className="ghost small" onClick={() => onRef(undefined)}>All evidence</button> : <h2>Evidence ({evidence.length})</h2>}
         <button type="button" className="ghost small" onClick={onClose}>Close</button>
       </div>
       <div className="ws-evidence-body">
         <ErrorBox error={inv.error} />
-        {!data && !inv.error && <div className="empty">Loading…</div>}
-        {data && !open && !evidence.length && <div className="empty">No evidence collected yet.</div>}
+        {!data && !inv.error && <Skeleton rows={4} label="Loading evidence" />}
+        {data && !open && !evidence.length && <Empty title="No evidence collected yet." />}
         {!open && evidence.map((e) => (
           <button type="button" key={e.ref} className="ev-row" onClick={() => onRef(e.ref)}>
             <div className="row" style={{ gap: 6 }}><span className="cite" style={{ marginLeft: 0 }}>{e.ref}</span><span className="mono small">{e.tool}</span>{!e.ok && <Badge kind="bad">failed</Badge>}</div>
-            <div className="small muted">{e.summary}</div>
+            <div className="small muted clamp-2">{e.summary}</div>
           </button>
         ))}
         {open && <EvidenceBody e={open} grafana={data.grafana_url} />}
@@ -129,12 +194,8 @@ function MessageActions({ m, conversation, onChange }: { m: any; conversation: s
   async function remove() {
     if (await confirm({ title: "Delete this message?", body: "It is hidden from everyone and from MOKS, and can be restored.", action: "Delete message", danger: true })) act("", "DELETE");
   }
-  return (
-    <span className="msg-actions">
-      {m.can_delete && <button type="button" className="ghost small" onClick={remove} aria-label="Delete message">Delete</button>}
-      {m.can_restore && <button type="button" className="ghost small" onClick={() => act("/restore", "POST")}>Restore</button>}
-    </span>
-  );
+  const items = [...(m.can_delete ? [{ label: "Delete message", danger: true, run: remove }] : []), ...(m.can_restore ? [{ label: "Restore message", run: () => act("/restore", "POST") }] : [])];
+  return <span className="msg-actions"><ActionMenu label={`Actions for the message from ${m.author ?? "MOKS"}`} items={items} /></span>;
 }
 
 function Actions({ actions }: { actions: any[] }) {
@@ -170,25 +231,16 @@ function AssistantDetail({ id, onCite, onPropose }: { id: string; onCite: (inv: 
   );
 }
 
-function RunningTurn({ id, onChange, onActivity }: { id: string; onChange: () => void; onActivity: () => void }) {
+function RunningTurn({ id, onChange, onActivity, stopping }: { id: string; onChange: () => void; onActivity: () => void; stopping: boolean }) {
   const { events, stream } = useInvestigationEvents(id, onChange);
-  const [stopping, setStopping] = useState(false);
-  const [error, setError] = useState<unknown>();
   const label = progressLabel(events);
   useEffect(() => { onActivity(); }, [events.length, onActivity]);
-  async function stop() {
-    setStopping(true);
-    setError(null);
-    try { await api(`/investigations/${id}/cancel`, { method: "POST" }); } catch (e) { setError(e); setStopping(false); }
-  }
   return (
     <div className="msg moks">
-      <div className="msg-meta"><span>MOKS</span></div>
+      <div className="msg-meta"><span className="msg-who">MOKS</span></div>
       <div className="msg-body stack">
-        <div className="progress"><span className="spin" aria-hidden="true" /><span>{stopping ? "Stopping" : label}…</span>
-          <button type="button" className="ghost small" onClick={stop} disabled={stopping}>Stop</button></div>
+        <div className="progress"><span className="spin" aria-hidden="true" /><span>{stopping ? "Stopping" : label}…</span></div>
         {STREAM[stream] && <div className="small muted">{STREAM[stream]}</div>}
-        <ErrorBox error={error} />
         <details><summary className="small">Tool activity ({events.filter((e) => e.type === "tool_call").length})</summary><Timeline events={events} /></details>
       </div>
     </div>
@@ -205,8 +257,8 @@ const Turn = memo(function Turn({ m, status, conversation, latest, onChange, onC
   return (
     <article className={`msg ${kind}${m.deleted ? " deleted" : ""}`}>
       <div className="msg-meta">
-        <span>{kind === "moks" ? "MOKS" : m.author ?? "unknown"}</span>
-        {kind === "note" && <Badge>note</Badge>}
+        <span className="msg-who">{kind === "moks" ? "MOKS" : m.author ?? "unknown"}</span>
+        <span className="msg-kind">{kind === "note" ? "Note to collaborators" : kind === "engineer" ? "Asked MOKS" : kind === "moks" ? "Report" : "System"}</span>
         <Time iso={m.created_at} />
         <MessageActions m={m} conversation={conversation} onChange={onChange} />
       </div>
@@ -223,8 +275,9 @@ const Turn = memo(function Turn({ m, status, conversation, latest, onChange, onC
 
 export function draftKey(id: string) { return `moks.draft.${id}`; }
 
-/** Keeps the draft through failures and across conversations. Enter sends unless an input method is composing. */
-export function Composer({ id, canAsk, running, onSend }: { id: string; canAsk: boolean; running: boolean; onSend: (text: string, ask: boolean) => Promise<void> }) {
+/** Keeps the draft through failures and across conversations. It stays in this tab's sessionStorage only,
+ *  and clearLocalWork removes it on sign-out. Enter sends unless an input method is composing. */
+export function Composer({ id, canAsk, running, stopping, onSend, onStop }: { id: string; canAsk: boolean; running: boolean; stopping?: boolean; onSend: (text: string, ask: boolean) => Promise<void>; onStop?: () => void }) {
   const [text, setText] = useState(() => sessionStorage.getItem(draftKey(id)) ?? "");
   const [note, setNote] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -271,6 +324,7 @@ export function Composer({ id, canAsk, running, onSend }: { id: string; canAsk: 
         <div className="composer-row">
           <textarea ref={area} rows={1} maxLength={2000} value={text} aria-label="Message" onChange={(e) => change(e.target.value)} onKeyDown={key}
             placeholder={asNote ? "Write a note for the others" : "Ask a follow-up"} />
+          {running && onStop && <button type="button" className="ghost" disabled={stopping} onClick={onStop}>{stopping ? "Stopping…" : "Stop"}</button>}
           <button disabled={!ready}>{busy ? "Sending…" : asNote ? "Post" : "Send"}</button>
         </div>
         <div className="row between small muted">
@@ -316,6 +370,9 @@ function Conversation({ id }: { id: string }) {
   const [people, setPeople] = useState(false);
   const [person, setPerson] = useState("");
   const [peopleError, setPeopleError] = useState<unknown>();
+  const [stopping, setStopping] = useState(false);
+  const [stopError, setStopError] = useState<unknown>();
+  const loc = useLocation();
   const [propose, setPropose] = useState<{ inv: any; r: any } | null>(null);
   const [limit, setLimit] = useState(PAGE);
   const [status, setStatus] = useState("");
@@ -328,6 +385,10 @@ function Conversation({ id }: { id: string }) {
   useHeaderScope(d ? { environment: d.environment, namespace: d.namespace, production } : null);
 
   const count = d?.messages.length ?? 0;
+  useEffect(() => { // only after this person has had the conversation open with these messages
+    if (count && !d?.deleted && !document.hidden) api(`/conversations/${id}/read`, { method: "POST", body: {} }).catch(() => {});
+  }, [id, count, d?.deleted]);
+  useEffect(() => { if (!running) setStopping(false); }, [running]);
   const started = useRef(false);
   useLayoutEffect(() => {
     if (!count) return;
@@ -354,7 +415,7 @@ function Conversation({ id }: { id: string }) {
     jump();
   }, [id, load, jump]);
 
-  if (!d) return error ? <div className="ws-conv" style={{ padding: 16 }}><ErrorBox error={error} /><Link to="/investigations">Back to conversations</Link></div> : <div className="ws-conv empty">Loading…</div>;
+  if (!d) return error ? <div className="ws-conv ws-pad"><ErrorBox error={error} onRetry={load} /><Link to="/investigations">Back to inbox</Link></div> : <div className="ws-conv ws-pad"><Skeleton rows={6} label="Loading conversation" /></div>;
 
   const shown = d.messages.slice(-limit);
   const hidden = d.messages.length - shown.length;
@@ -373,44 +434,53 @@ function Conversation({ id }: { id: string }) {
     setPeopleError(null);
     try { await api(`/conversations/${id}/participants`, { method: "POST", body: { email: person } }); setPerson(""); load(); } catch (err) { setPeopleError(err); }
   }
+  async function stop() {
+    setStopping(true);
+    setStopError(null);
+    try { await Promise.all(active.map((m: any) => api(`/investigations/${m.investigation_id}/cancel`, { method: "POST" }))); }
+    catch (err) { setStopError(err); setStopping(false); }
+  }
 
   const firstEvidence = [...d.messages].reverse().find((m: any) => m.investigation_id)?.investigation_id;
+  const menu = [
+    { label: `People (${d.participants.length})`, run: () => setPeople(true) },
+    ...(d.can_manage && !d.deleted ? [{ label: "Delete conversation", danger: true, run: removeConversation }] : []),
+    ...(d.can_manage && d.deleted ? [{ label: "Restore conversation", run: async () => { await api(`/conversations/${id}/restore`, { method: "POST" }); load(); } }] : []),
+  ];
   return (
     <>
       <section className="ws-conv" aria-label={d.title}>
         <div className="ws-head">
-          <Link to="/investigations" className="btn ghost ws-back" aria-label="Back to conversations">Conversations</Link>
+          <Link to={{ pathname: "/investigations", search: loc.search }} className="btn ghost ws-back" aria-label="Back to inbox"><Icon name="back" size={20} /></Link>
           <div className="ws-title">
-            <h1 title={d.title}>{d.title}</h1>
-            <div className="small muted row" style={{ gap: 6 }}><span className="mono">{d.environment}/{d.namespace}</span><span>started by {d.owner}</span>
+            <h1 className="trunc" title={d.title}>{d.title}</h1>
+            <div className="ws-sub small muted"><span className="mono trunc">{d.environment}/{d.namespace}</span>
               {running && <Badge kind="info">working</Badge>}{d.deleted && <Badge kind="warn">deleted</Badge>}</div>
           </div>
-          <div className="row" style={{ gap: 6 }}>
-            <button type="button" className="ghost small" aria-expanded={people} onClick={() => setPeople(!people)}>People ({d.participants.length})</button>
-            {firstEvidence && <button type="button" className="ghost small" aria-expanded={!!panel} onClick={() => setPanel(panel ? null : { investigation: firstEvidence })}>Evidence</button>}
-            {d.can_manage && !d.deleted && <button type="button" className="ghost small" onClick={removeConversation}>Delete</button>}
-            {d.can_manage && d.deleted && <button type="button" className="small" onClick={async () => { await api(`/conversations/${id}/restore`, { method: "POST" }); load(); }}>Restore</button>}
-          </div>
+          {firstEvidence && <button type="button" className="ghost small" aria-expanded={!!panel} onClick={() => setPanel(panel ? null : { investigation: firstEvidence })}>Evidence</button>}
+          <ActionMenu label={`Actions for ${d.title}`} items={menu} />
         </div>
-        {people && (
-          <div className="ws-people stack">
-            <div className="row small">{d.participants.map((p: any) => <Badge key={p.email} kind={p.owner ? "info" : "neutral"}>{p.email}</Badge>)}</div>
-            {!d.deleted && (d.is_participant || can("admin.policies")) && <form className="row" onSubmit={addPerson}>
-              <input type="email" required aria-label="Add a person by email" value={person} onChange={(e) => setPerson(e.target.value)} placeholder="teammate@example.com" />
-              <button className="ghost small">Add</button></form>}
+        {people && <Dialog title="People in this conversation" onClose={() => setPeople(false)}>
+          <div className="stack">
+            <p className="small muted">Started by {d.owner}.</p>
+            <ul className="people">{d.participants.map((p: any) => <li key={p.email}><Truncate text={p.email} /> {p.owner && <Badge kind="info">owner</Badge>}</li>)}</ul>
+            {!d.deleted && (d.is_participant || can("admin.policies")) && <form className="row nowrap" onSubmit={addPerson}>
+              <input type="email" className="grow" required aria-label="Add a person by email" value={person} onChange={(e) => setPerson(e.target.value)} placeholder="teammate@example.com" />
+              <button className="ghost">Add</button></form>}
             <ErrorBox error={peopleError} />
           </div>
-        )}
+        </Dialog>}
         {stale && <div className="alert warn small">Cannot refresh this conversation. What you see may be out of date. Retrying.</div>}
         <div className="ws-scroll" ref={scroller}>
           <div className="ws-messages" ref={content}>
             {hidden > 0 && <button type="button" className="ghost small" style={{ alignSelf: "center" }} onClick={() => { earlier.current = scroller.current?.scrollHeight ?? 0; setLimit(limit + PAGE); }}>Show {Math.min(hidden, PAGE)} earlier messages</button>}
             {shown.map((m: any) => <Turn key={m.id} m={m} status={m.investigation_id ? d.statuses[m.investigation_id] : undefined} conversation={id} latest={m.id === lastAnswer} onChange={load} onCite={onCite} onPropose={onPropose} />)}
-            {active.map((m: any) => <RunningTurn key={m.investigation_id} id={m.investigation_id} onChange={load} onActivity={notify} />)}
+            {active.map((m: any) => <RunningTurn key={m.investigation_id} id={m.investigation_id} onChange={load} onActivity={notify} stopping={stopping} />)}
           </div>
           {fresh && <button type="button" className="ws-new" onClick={jump}>New activity</button>}
         </div>
-        {!d.deleted && <Composer key={id} id={id} canAsk={d.can_ask} running={running} onSend={onSend} />}
+        <ErrorBox error={stopError} />
+        {!d.deleted && <Composer key={id} id={id} canAsk={d.can_ask} running={running} stopping={stopping} onSend={onSend} onStop={active.length ? stop : undefined} />}
         <div className="sr-only" role="status" aria-live="polite">{status}</div>
       </section>
       {panel && <EvidencePanel panel={panel} onRef={(ref) => setPanel({ ...panel, ref })} onClose={() => setPanel(null)} />}
@@ -437,7 +507,7 @@ export function Workspace() {
   return (
     <div className={`ws${id ? " has-conv" : ""}`} data-workspace>
       <ConversationList current={id} />
-      {id ? <Conversation key={id} id={id} /> : <div className="ws-empty ws-conv-empty"><h1 className="sr-only">Conversations</h1><div>Choose a conversation, or start a new investigation.</div></div>}
+      {id ? <Conversation key={id} id={id} /> : <div className="ws-empty ws-conv-empty"><Empty title="Choose a conversation">Or start a new investigation.</Empty></div>}
     </div>
   );
 }

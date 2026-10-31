@@ -174,7 +174,7 @@ The API's init container runs migration `0002` automatically. Take a backup firs
 4. **Remediation:** the executor acts only in `executor.namespaces` (default `[moks-lab]`). To let
    MOKS act elsewhere, add the namespace there **and** to the AppProject destinations. Set the
    environment's policy under **Environments** (`max_replicas`, scale-to-zero, plan TTL).
-   `mk4` is marked production, so every action needs a second person with the approver role:
+   `mk4` is marked production, so every action needs a second person with the approver role, unless a global administrator requests it (recorded as `action.approval_waived`):
    `moks grant <approver-email> approver:mk4:*`.
 5. **Alerts:** to investigate firing Prometheus alerts automatically, tick
    *investigate firing alerts automatically* on the environment; the worker polls every 60 s. For
@@ -258,7 +258,7 @@ the plan's page (needs the Approver role).
 for Deployments. **Services → Manage…** edits the selector or session affinity. Opening a pod offers
 **Delete pod**, for pods a controller would replace, and a rollout restart of its Deployment.
 
-Each option creates an action plan, so the usual review applies: production plans need a second person,
+Each option creates an action plan, so the usual review applies: production plans need a second person unless an administrator requests them,
 and nothing changes until it is executed. Execution only works in the namespaces listed in
 `executor.namespaces`, which on mk4 is `moks-lab`. Add a namespace there to manage it. StatefulSets and
 DaemonSets can be viewed and investigated but have no actions yet.
@@ -436,3 +436,10 @@ image digest (step 4). Roll back data by restoring the backup.
 | Knowledge search empty | **Runbooks & knowledge → Sources**: last sync status/error; `kubectl -n moks logs deploy/moks-worker` |
 | OpenSearch pod restarting | Needs ~2 GiB; check node memory and `rag.opensearch.nodeName` pinning. `AccessDeniedException` on `data/nodes`: set `rag.opensearch.fixVolumePermissions: true` |
 | SSE updates only arrive at the end | Something buffers the response: do not attach compress or buffering middleware to the MOKS router |
+
+## Logs and LogQL
+
+**Logs → LogQL** queries one Loki data source. Choose the scope, describe what you want under **Generate LogQL with AI**, review
+the draft in the editor, and press **Run**. Nothing runs until you do. It needs an active chat model under LLM providers and
+uses the same daily budget as investigations. Scoped users must choose a namespace. Syntax checking uses Loki's
+`/loki/api/v1/format_query`; on a Loki without it, the draft says it was not syntax checked.

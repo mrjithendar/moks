@@ -199,7 +199,7 @@ flowchart LR
 - **Actions (Phase 3):** plans carry exact targets, the API operation, reason and evidence, impact
   and blast radius, preconditions, validation, rollback and expiry. They are bound by SHA-256 to
   environment, namespace, action, target, parameters, requester, expiry and the target's
-  `resourceVersion`. There is no self-approval, and approvals are re-checked at execution.
+  `resourceVersion`. Only a global administrator can self-approve, and an administrator's plans need no second approval (audited as `action.approval_waived`, re-checked at execution). Approvals are re-checked at execution.
   Execution is at most once, with optimistic concurrency, rollout validation, and automatic
   restore of the captured pre-state on failure.
 - **Diagnostic sessions (Phase 3):** an image catalog (netshoot, curl, python), pinned package

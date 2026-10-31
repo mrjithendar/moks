@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, LineChart, LogLines, PageHead, SourceRef, StatusBadge, Time, fmtBytes, useLoad } from "../components";
+import { Badge, ErrorBox, LineChart, LogLines, PageHead, SourceRef, StatusBadge, fmtBytes, useLoad } from "../components";
 import { type Ev, useInvestigationEvents } from "../investigationStream";
 import { Markdown } from "../markdown";
-import { CopyButton, Dialog, useModal } from "../ui";
+import { CopyButton, Dialog, Drawer, Truncate } from "../ui";
 import { proposalPlan } from "./Conversations";
 import { PlanForm } from "./Ops";
 
@@ -229,17 +229,12 @@ export function InvestigationView() {
               </div>
               <div className="card">
                 <h2>Evidence ({evidence.length})</h2>
-                <table>
-                  <tbody>
-                    {evidence.map((e) => (
-                      <tr key={e.ref}>
-                        <td className="mono small"><button type="button" className="cite" style={{ marginLeft: 0 }} onClick={() => setOpen(e.ref)}>{e.ref}</button></td>
-                        <td><div className="mono small">{e.tool}</div><div className="small muted">{e.summary}</div></td>
-                        <td>{e.ok ? <Badge kind="ok">ok</Badge> : <Badge kind="bad">failed</Badge>}<div className="small muted"><Time iso={e.collected_at} /></div></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                {evidence.map((e) => (
+                  <button type="button" key={e.ref} className="ev-row" onClick={() => setOpen(e.ref)}>
+                    <div className="row tight"><span className="cite nocite">{e.ref}</span><Truncate text={e.tool} mono />{e.ok ? <Badge kind="ok">ok</Badge> : <Badge kind="bad">failed</Badge>}</div>
+                    <div className="small muted clamp-2">{e.summary}</div>
+                  </button>
+                ))}
               </div>
             </div>
           </div>
@@ -380,14 +375,7 @@ export function EvidenceBody({ e, grafana }: { e: any; grafana?: string | null }
 }
 
 export function EvidenceDrawer({ e, onClose, grafana }: { e: any; onClose: () => void; grafana?: string | null }) {
-  const ref = useRef<HTMLDivElement>(null);
-  useModal(ref, true, onClose);
-  return (
-    <div ref={ref} className="drawer" role="dialog" aria-modal="true" aria-label={`Evidence ${e.ref}`} tabIndex={-1}>
-      <div className="row end"><button type="button" className="ghost small" onClick={onClose}>Close</button></div>
-      <EvidenceBody e={e} grafana={grafana} />
-    </div>
-  );
+  return <Drawer title={`Evidence ${e.ref}`} onClose={onClose}><EvidenceBody e={e} grafana={grafana} /></Drawer>;
 }
 
 export function EvidenceData({ tool, data }: { tool: string; data: any }) {

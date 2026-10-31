@@ -145,6 +145,11 @@ velero:
   enabled: false
   namespace: velero
 
+# Lets investigations read Argo CD Application status (docs/CONNECTORS.md). Read-only. With
+# rbac.clusterWide false, also list the argocd namespace in rbac.namespaces.
+argocd:
+  enabled: false
+
 # Disposable diagnostic session pods (no service account token, quota, egress-only network policy).
 diagnostics:
   enabled: true

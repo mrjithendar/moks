@@ -64,6 +64,13 @@ class FakeKubernetes:
         self.config = config
 
     velero: dict[str, list[dict]] = {}
+    argocd: list[dict] = []
+    argocd_error: Exception | None = None
+
+    async def argocd_list(self):
+        if self.argocd_error:
+            raise self.argocd_error
+        return self.argocd
 
     async def velero_list(self, plural):
         return self.velero.get(plural, [])

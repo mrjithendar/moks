@@ -169,3 +169,74 @@ describe("scroll following", () => {
     expect(t.result.current.fresh).toBe(false);
   });
 });
+
+describe("inbox", () => {
+  const row = (id: string, title: string, extra: any = {}) => conv(id, title, { preview: `preview of ${title}`, status: "completed", unread: false, ...extra });
+
+  it("shows subject, preview and unread state, and only says unread when the API does", async () => {
+    state.conversations = { a: row("a", "Checkout down", { unread: true }), b: row("b", "Second") };
+    app("/investigations");
+    await screen.findByText("Checkout down");
+    expect(screen.getByText("preview of Checkout down")).toBeTruthy();
+    expect(screen.getByText("Unread:")).toBeTruthy();
+    expect(screen.getAllByText("Unread:")).toHaveLength(1);
+  });
+
+  it("keeps filters and search when opening a conversation and going back", async () => {
+    state.conversations = { a: row("a", "Checkout down"), b: row("b", "Payments slow", { environment: "eks" }) };
+    app("/investigations?environment=mk4");
+    await screen.findByText("Checkout down");
+    expect(screen.queryByText("Payments slow")).toBeNull();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search conversations" }), { target: { value: "check" } });
+    fireEvent.click(screen.getByRole("link", { name: /Checkout down/ }));
+    await screen.findByText("answer a");
+    expect((screen.getByRole("link", { name: "Back to inbox" }) as HTMLAnchorElement).getAttribute("href")).toBe("/investigations?environment=mk4");
+    fireEvent.click(screen.getByRole("link", { name: "Back to inbox" }));
+    await screen.findByText("Choose a conversation");
+    expect((screen.getByRole("searchbox", { name: "Search conversations" }) as HTMLInputElement).value).toBe("check");
+    expect(screen.queryByText("Payments slow")).toBeNull();
+  });
+
+  it("marks a conversation read once it is open", async () => {
+    const { api } = await import("../api");
+    app("/conversations/a");
+    await screen.findByText("answer a");
+    await waitFor(() => expect((api as any).mock.calls.some(([p]: [string]) => p === "/conversations/a/read")).toBe(true));
+  });
+
+  it("offers row actions in a named menu", async () => {
+    state.conversations = { a: row("a", "Checkout down") };
+    app("/investigations");
+    await screen.findByText("Checkout down");
+    fireEvent.click(screen.getByRole("button", { name: "Actions for Checkout down" }));
+    expect(screen.getByRole("menuitem", { name: "Mark as unread" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Delete" })).toBeTruthy();
+  });
+});
+
+describe("drafts", () => {
+  it("clearLocalWork removes drafts and leaves other tabs' keys alone", async () => {
+    const { clearLocalWork } = await import("../api");
+    sessionStorage.setItem(draftKey("a"), "secret plan");
+    sessionStorage.setItem("moks.logql", '{namespace="shop"}');
+    sessionStorage.setItem("other.app", "keep");
+    clearLocalWork();
+    expect(sessionStorage.getItem(draftKey("a"))).toBeNull();
+    expect(sessionStorage.getItem("moks.logql")).toBeNull();
+    expect(sessionStorage.getItem("other.app")).toBe("keep");
+  });
+});
+
+describe("composer controls", () => {
+  it("offers Stop while MOKS works and keeps the text when sending fails", async () => {
+    const stop = vi.fn();
+    const send = vi.fn(async () => { throw new Error("boom"); });
+    render(<Composer id="z" canAsk running stopping={false} onSend={send} onStop={stop} />);
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(stop).toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "try this" } });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Send" })); });
+    expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe("try this");
+    expect(screen.getByRole("alert").textContent).toContain("boom");
+  });
+});

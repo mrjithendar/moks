@@ -57,7 +57,7 @@ ROLE_DESCRIPTIONS = {
     "investigator": "Run read-only investigations, live reads, knowledge and FinOps queries; manage incidents.",
     "operator": "Request and execute permitted operational actions and diagnostic sessions.",
     "approver": "Approve or reject action plans within the assigned scope (never their own).",
-    "admin": "Manage users, connectors, LLM providers and policies.",
+    "admin": "Manage users, connectors, LLM providers and policies. Their own action plans need no second approval.",
 }
 
 # Permissions that only make sense globally: a binding grants them only when both its

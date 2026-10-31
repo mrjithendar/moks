@@ -9,6 +9,12 @@ export function setCsrf(token: string | null) {
   csrfToken = token;
 }
 
+/** Drafts, unsent queries and search text live only in this tab's sessionStorage, under "moks.". They
+ *  go when the tab closes, and on sign-out or an expired session, so a shared browser keeps nothing. */
+export function clearLocalWork() {
+  for (const key of Object.keys(sessionStorage)) if (key.startsWith("moks.")) sessionStorage.removeItem(key);
+}
+
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -31,6 +37,7 @@ export async function api<T = any>(path: string, opts: { method?: string; body?:
   });
   if (res.status === 401 && !path.startsWith("/auth/")) {
     const next = encodeURIComponent(window.location.pathname + window.location.search);
+    clearLocalWork();
     window.location.assign(`${BASE}/login?next=${next}`);
     throw new ApiError(401, "Not signed in");
   }

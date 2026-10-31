@@ -358,6 +358,10 @@ class Investigator:
         else:
             self.rejected.append({"tool": tool, "args": args, "reason": out.error, "kind": out.error_kind})
         await self._emit("tool_result", {k: v for k, v in record.items() if k != "data"} | {"duration_ms": out.duration_ms})
+        if tool == "k8s_argocd_status" and out.ok and isinstance(out.data, dict):
+            # Pods are fine when Argo CD fails, so these never come from triage. Filtering one app can repeat a finding.
+            known = {(f["kind"], tuple(f.get("resources", []))) for f in self.findings}
+            self.findings.extend({**f, "evidence": [out.evidence_ref]} for f in out.data.get("findings", []) if (f["kind"], tuple(f["resources"])) not in known)
         return out
 
     async def _focus(self, ctx: ToolContext, question: str) -> tuple[str | None, str]:

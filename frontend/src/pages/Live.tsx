@@ -1,8 +1,10 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, qs } from "../api";
 import { useAuth } from "../auth";
-import { Badge, EnvNsFilter, ErrorBox, LineChart, LogLines, PageHead, PartialErrors, type Multi, type Scope, SourceRef, Time, useInterval, useLoad, useScopes, rowAction } from "../components";
+import { Badge, type Col, DataTable, EnvNsFilter, ErrorBox, Loading, PageHead, PartialErrors, type Multi, type Scope, SourceRef, Time, useLoad, useScopes } from "../components";
+import { type Chip, FilterPanel, useUrlFilters } from "../filters";
+import { CopyButton, Drawer, Empty, Identifier, type MenuItem, Skeleton, Truncate } from "../ui";
 import { EvidenceData } from "./Investigate";
 import { PlanForm } from "./Ops";
 
@@ -32,69 +34,87 @@ function deploymentActions(w: any): { label: string; action: string; params: any
 function ManageDrawer({ m, onClose }: { m: Manage; onClose: () => void }) {
   const nav = useNavigate();
   return (
-    <div className="drawer" role="dialog" aria-label={m.title}>
-      <div className="row between"><h2>{m.title}</h2><button className="ghost small" onClick={onClose}>Close</button></div>
-      <p className="small muted">In {m.env}/{m.ns}. This creates an action plan: MOKS shows the impact and validation first, production plans need a second person's approval, and nothing changes until it is executed.</p>
+    <Drawer title={m.title} onClose={onClose}>
+      <p className="small muted">In {m.env}/{m.ns}. This creates an action plan: MOKS shows the impact and validation first, production plans need a second person's approval unless an administrator requests them, and nothing changes until it is executed.</p>
       <PlanForm env={m.env} ns={m.ns} initial={m.initial} onDone={(id) => nav(`/actions/${id}`)} />
-    </div>
+    </Drawer>
   );
 }
 
+const EXPLORER = { tab: "pods", env: "all", ns: "all", q: "", only: false };
+
 export function Explorer() {
   const scopes = useScopes();
-  const [tab, setTab] = useState<Tab>("pods");
-  const [filter, setFilter] = useState("");
-  const [env, setEnv] = useState("all");
-  const [ns, setNs] = useState("all");
+  const [f, set, clear] = useUrlFilters(EXPLORER);
+  const tab = (TABS as readonly string[]).includes(f.tab) ? f.tab as Tab : "pods";
   return (
     <>
       <PageHead title="Kubernetes explorer" sub="Live, read-only view of every environment and namespace in your scope" />
-      <div className="tabs">{TABS.map((t) => <button key={t} className={t === tab ? "active" : ""} onClick={() => setTab(t)}>{t}</button>)}</div>
-      <ErrorBox error={scopes.error} />
-      <ExplorerTab key={tab} tab={tab} scopes={scopes.data} env={env} ns={ns} onEnv={setEnv} onNs={setNs} initialText={filter} onShowPods={(name) => { setFilter(name); setTab("pods"); }} />
+      <div className="tabs">{TABS.map((t) => <button key={t} className={t === tab ? "active" : ""} onClick={() => set({ tab: t, only: false })}>{t}</button>)}</div>
+      <ErrorBox error={scopes.error} onRetry={scopes.reload} />
+      <ExplorerTab key={tab} tab={tab} scopes={scopes.data} f={f} set={set} clear={clear} onShowPods={(name) => set({ q: name, tab: "pods" })} />
     </>
   );
 }
 
-function ExplorerTab({ tab, scopes, env, ns, onEnv, onNs, initialText, onShowPods }: { tab: Tab; scopes?: Scope[]; env: string; ns: string; onEnv: (e: string) => void; onNs: (n: string) => void; initialText: string; onShowPods: (name: string) => void }) {
+function ExplorerTab({ tab, scopes, f, set, clear, onShowPods }: { tab: Tab; scopes?: Scope[]; f: typeof EXPLORER; set: (p: Partial<typeof EXPLORER>) => void; clear: () => void; onShowPods: (name: string) => void }) {
   const { can } = useAuth();
   const canManage = can("action.request");
+  const nav = useNavigate();
   const [manage, setManage] = useState<Manage | null>(null);
-  const [text, setText] = useState(tab === "pods" ? initialText : "");
-  const [only, setOnly] = useState(false);
   const [pod, setPod] = useState<any>(null);
-  const r = useLoad(() => api<Multi>(`/multi/${tab}${qs({ environment: env, namespace: tab === "nodes" ? undefined : ns, warnings_only: tab === "events" ? false : undefined })}`), [tab, env, ns]);
+  const r = useLoad(() => api<Multi>(`/multi/${tab}${qs({ environment: f.env, namespace: tab === "nodes" ? undefined : f.ns, warnings_only: tab === "events" ? false : undefined })}`), [tab, f.env, f.ns]);
   const rows = useMemo(() => {
     const items = r.data?.items ?? [];
     const flat = tab === "ingresses" ? items.flatMap((i: any) => i.rules.map((x: any) => ({ name: i.name, environment: i.environment, namespace: i.namespace, ...x }))) : items;
-    return flat.filter((x: any) => has(x, text) && (!only || isProblem(tab, x)));
-  }, [r.data, tab, text, only]);
-  const scopeCols = ["environment", "namespace"];
+    return flat.filter((x: any) => has(x, f.q) && (!f.only || isProblem(tab, x)));
+  }, [r.data, tab, f.q, f.only]);
+  const problem = PROBLEM_LABEL[tab];
+  const chips: Chip[] = [
+    ...(f.env !== "all" ? [{ key: "e", label: f.env, onRemove: () => set({ env: "all", ns: "all" }) }] : []),
+    ...(f.ns !== "all" && tab !== "nodes" ? [{ key: "n", label: `namespace ${f.ns}`, onRemove: () => set({ ns: "all" }) }] : []),
+    ...(f.q ? [{ key: "q", label: `matches ${f.q}`, onRemove: () => set({ q: "" }) }] : []),
+    ...(f.only && problem ? [{ key: "o", label: problem, onRemove: () => set({ only: false }) }] : []),
+  ];
+  const investigate = (env: string, ns: string, q: string) => nav(`/investigate?env=${env}&ns=${ns}&q=${encodeURIComponent(q)}`);
   return (
     <>
-      <form className="card filters" onSubmit={(e) => e.preventDefault()}>
-        <EnvNsFilter scopes={scopes} env={env} ns={ns} onEnv={onEnv} onNs={onNs} noNamespace={tab === "nodes"} />
-        <label>Filter<input value={text} onChange={(e) => setText(e.target.value)} placeholder="name, image, reason…" /></label>
-        {PROBLEM_LABEL[tab] && <label className="inline"><input type="checkbox" checked={only} onChange={(e) => setOnly(e.target.checked)} /> {PROBLEM_LABEL[tab]}</label>}
-        <button type="button" className="ghost" onClick={r.reload} disabled={r.loading}>{r.loading ? "Loading…" : "Refresh"}</button>
-      </form>
-      <ErrorBox error={r.error} />
+      <FilterPanel chips={chips} onClear={clear}
+        search={<input type="search" className="grow" aria-label="Filter rows" value={f.q} onChange={(e) => set({ q: e.target.value })} placeholder="name, image, reason…" />}
+        actions={<button type="button" className="ghost" onClick={r.reload} disabled={r.loading}>{r.loading ? "Loading…" : "Refresh"}</button>}>
+        <EnvNsFilter scopes={scopes} env={f.env} ns={f.ns} onEnv={(env) => set({ env })} onNs={(ns) => set({ ns })} noNamespace={tab === "nodes"} />
+        {problem && <label className="inline"><input type="checkbox" checked={f.only} onChange={(e) => set({ only: e.target.checked })} /> {problem}</label>}
+      </FilterPanel>
+      <Loading load={r} rows={8} />
       {r.data && (
-        <div className="card" style={{ marginTop: 14 }}>
-          <div className="row between small muted" style={{ marginBottom: 8 }}>
+        <div className="card mt">
+          <div className="row between small muted list-head">
             <span>{rows.length} of {tab === "ingresses" ? "all" : r.data.items.length} {tab} across {r.data.environments.length} environment(s)</span>
             <span>collected <Time iso={r.data.collected_at} /></span>
           </div>
           <PartialErrors errors={r.data.errors} />
-          <div className="table-wrap">
-            {tab === "pods" && <PodTable pods={rows} onOpen={setPod} />}
-            {tab === "workloads" && <WorkloadTable rows={rows} canManage={canManage} onManage={setManage} onShowPods={onShowPods} />}
-            {tab === "services" && <ServiceTable rows={rows} canManage={canManage} onManage={setManage} />}
-            {tab === "events" && <Generic rows={rows} cols={[...scopeCols, "type", "reason", "object", "message", "count", "lastSeen"]} />}
-            {tab === "ingresses" && <Generic rows={rows} cols={[...scopeCols, "name", "host", "path", "service", "port"]} />}
-            {tab === "nodes" && <Generic rows={rows} cols={["environment", "name", "ready", "pressure", "unschedulable", "taints", "allocatable", "kubelet"]} />}
-            {tab === "config-audit" && <ConfigAudit rows={rows} missing={r.data.missing_references ?? []} />}
-          </div>
+          {tab === "pods" && <PodTable pods={rows} onOpen={setPod} onInvestigate={(p) => investigate(p.environment, p.namespace, `Why is pod ${p.name} unhealthy?`)} />}
+          {tab === "workloads" && <WorkloadTable rows={rows} canManage={canManage} onManage={setManage} onShowPods={onShowPods} />}
+          {tab === "services" && <ServiceTable rows={rows} canManage={canManage} onManage={setManage} />}
+          {tab === "events" && <EventTable rows={rows} />}
+          {tab === "ingresses" && <DataTable label="Ingresses" rows={rows} rowKey={(x: any) => `${x.environment}${x.namespace}${x.name}${x.host}${x.path}`} cols={[
+            { key: "name", head: "Name", primary: true, cell: (x: any) => <Identifier name={x.name} /> },
+            { key: "host", head: "Host", cell: (x: any) => <Truncate text={x.host ?? "—"} mono />, meta: (x: any) => `${x.host ?? ""}${x.path ?? ""}` },
+            { key: "path", head: "Path", wide: true, cell: (x: any) => <span className="mono small">{x.path ?? "—"}</span> },
+            { key: "backend", head: "Service", cell: (x: any) => <span className="mono small">{x.service}:{x.port}</span> },
+            ...scopeCols<any>(),
+          ]} />}
+          {tab === "nodes" && <DataTable label="Nodes" rows={rows} rowKey={(x: any) => x.environment + x.name} cols={[
+            { key: "name", head: "Name", primary: true, cell: (x: any) => <Identifier name={x.name} /> },
+            { key: "ready", head: "Ready", status: true, cell: (x: any) => <Badge kind={x.ready && x.ready !== "False" ? "ok" : "bad"}>{String(x.ready)}</Badge> },
+            { key: "env", head: "Environment", cell: (x: any) => x.environment },
+            { key: "pressure", head: "Pressure", cell: (x: any) => show(x.pressure), meta: (x: any) => (x.pressure?.length ? show(x.pressure) : "") },
+            { key: "unschedulable", head: "Unschedulable", cell: (x: any) => show(x.unschedulable), meta: (x: any) => (x.unschedulable ? "unschedulable" : "") },
+            { key: "taints", head: "Taints", wide: true, cell: (x: any) => show(x.taints) },
+            { key: "allocatable", head: "Allocatable", wide: true, cell: (x: any) => show(x.allocatable) },
+            { key: "kubelet", head: "Kubelet", cell: (x: any) => show(x.kubelet) },
+          ]} />}
+          {tab === "config-audit" && <ConfigAudit rows={rows} missing={r.data.missing_references ?? []} />}
         </div>
       )}
       {pod && <PodDrawer env={pod.environment} ns={pod.namespace} pod={pod.name} owner={pod.owner} canManage={canManage} onManage={(m) => { setPod(null); setManage(m); }} onClose={() => setPod(null)} />}
@@ -103,38 +123,33 @@ function ExplorerTab({ tab, scopes, env, ns, onEnv, onNs, initialText, onShowPod
   );
 }
 
-function ManageMenu({ label, options, onPick }: { label: string; options: { label: string; run: () => void }[]; onPick?: () => void }) {
-  return (
-    <select aria-label={`Manage ${label}`} className="manage" value="" onClick={(e) => e.stopPropagation()}
-      onChange={(e) => { options.find((o) => o.label === e.target.value)?.run(); onPick?.(); }}>
-      <option value="">Manage…</option>
-      {options.map((o) => <option key={o.label}>{o.label}</option>)}
-    </select>
-  );
+function scopeCols<T extends { environment: string; namespace: string }>(): Col<T>[] {
+  return [
+    { key: "environment", head: "Environment", cell: (x) => x.environment },
+    { key: "namespace", head: "Namespace", cell: (x) => <Truncate text={x.namespace} mono />, meta: (x) => x.namespace },
+  ];
 }
 
 function WorkloadTable({ rows, canManage, onManage, onShowPods }: { rows: any[]; canManage: boolean; onManage: (m: Manage) => void; onShowPods: (name: string) => void }) {
   const nav = useNavigate();
-  if (!rows.length) return <div className="empty">Nothing here.</div>;
   return (
-    <table>
-      <thead><tr><th>Environment</th><th>Namespace</th><th>Kind</th><th>Name</th><th>Ready</th><th>Revision</th><th>Images</th><th>Age</th><th /></tr></thead>
-      <tbody>{rows.map((w) => {
-        const ask = () => nav(`/investigate?env=${w.environment}&ns=${w.namespace}&q=${encodeURIComponent(`Why is ${w.kind} ${w.name} unhealthy?`)}`);
-        const options = [{ label: "View pods", run: () => onShowPods(w.name) }, { label: "Investigate", run: ask }];
-        if (canManage && w.kind === "Deployment") {
-          options.push(...deploymentActions(w).map((a) => ({ label: a.label, run: () => onManage({ title: `${a.label}: ${w.name}`, env: w.environment, ns: w.namespace, initial: { action: a.action, target_kind: "Deployment", target_name: w.name, params: a.params } }) })));
-        }
-        return (
-          <tr key={w.environment + w.namespace + w.kind + w.name}>
-            <td className="small">{w.environment}</td><td className="mono small">{w.namespace}</td><td className="small">{w.kind}</td><td className="mono small">{w.name}</td>
-            <td><Badge kind={(w.ready ?? 0) >= (w.desired ?? 0) ? "ok" : "warn"}>{w.ready ?? 0}/{w.desired ?? 0}</Badge></td>
-            <td className="small">{w.revision ?? "—"}</td><td className="small mono">{(w.images ?? []).join(", ")}</td><td className="small">{w.age}</td>
-            <td><ManageMenu label={w.name} options={options} /></td>
-          </tr>
-        );
-      })}</tbody>
-    </table>
+    <DataTable label="Workloads" rows={rows} rowKey={(w) => w.environment + w.namespace + w.kind + w.name}
+      empty={<Empty title="No workloads match." />}
+      menu={(w) => {
+        const items: MenuItem[] = [{ label: "Copy name", run: () => { navigator.clipboard?.writeText(w.name); } }, { label: "View pods", run: () => onShowPods(w.name) },
+          { label: "Investigate", run: () => nav(`/investigate?env=${w.environment}&ns=${w.namespace}&q=${encodeURIComponent(`Why is ${w.kind} ${w.name} unhealthy?`)}`) }];
+        if (canManage && w.kind === "Deployment") items.push(...deploymentActions(w).map((a) => ({ label: a.label, run: () => onManage({ title: `${a.label}: ${w.name}`, env: w.environment, ns: w.namespace, initial: { action: a.action, target_kind: "Deployment", target_name: w.name, params: a.params } }) })));
+        return { label: `Actions for ${w.name}`, items };
+      }}
+      cols={[
+        { key: "name", head: "Name", primary: true, cell: (w) => <Identifier name={w.name} /> },
+        { key: "ready", head: "Ready", status: true, cell: (w) => <Badge kind={(w.ready ?? 0) >= (w.desired ?? 0) ? "ok" : "warn"}>{w.ready ?? 0}/{w.desired ?? 0}</Badge> },
+        { key: "kind", head: "Kind", cell: (w) => w.kind },
+        ...scopeCols<any>(),
+        { key: "revision", head: "Revision", wide: true, cell: (w) => w.revision ?? "—" },
+        { key: "images", head: "Images", wide: true, cell: (w) => <Truncate text={(w.images ?? []).join(", ")} mono /> },
+        { key: "age", head: "Age", cell: (w) => w.age },
+      ]} />
   );
 }
 
@@ -147,23 +162,41 @@ function isProblem(tab: Tab, x: any): boolean {
   return true;
 }
 
-function PodTable({ pods, onOpen }: { pods: any[]; onOpen: (p: any) => void }) {
-  if (!pods.length) return <div className="empty">No pods match.</div>;
+function PodTable({ pods, onOpen, onInvestigate }: { pods: any[]; onOpen: (p: any) => void; onInvestigate: (p: any) => void }) {
+  const problems = (p: any) => p.problems.map((x: any) => `${x.reason ?? x.state}${x.exitCode != null ? ` (${x.exitCode})` : ""}`).join(", ");
   return (
-    <table>
-      <thead><tr><th>Environment</th><th>Namespace</th><th>Pod</th><th>Phase</th><th>Ready</th><th>Restarts</th><th>Problems</th><th>Node</th><th>Age</th></tr></thead>
-      <tbody>{pods.map((p) => (
-        <tr key={p.environment + p.namespace + p.name} className="clickable" {...rowAction(() => onOpen(p))}>
-          <td className="small">{p.environment}</td><td className="mono small">{p.namespace}</td>
-          <td className="mono small">{p.name}</td>
-          <td><Badge kind={p.phase === "Running" ? "ok" : p.phase === "Succeeded" ? "neutral" : "warn"}>{p.phase}</Badge></td>
-          <td>{p.ready}</td>
-          <td>{p.restarts > 0 ? <Badge kind="warn">{p.restarts}</Badge> : 0}</td>
-          <td className="small">{p.problems.map((x: any) => `${x.reason ?? x.state}${x.exitCode != null ? ` (${x.exitCode})` : ""}`).join(", ")}</td>
-          <td className="small muted">{p.node}</td><td className="small">{p.age}</td>
-        </tr>
-      ))}</tbody>
-    </table>
+    <DataTable label="Pods" rows={pods} onRow={onOpen} rowKey={(p) => p.environment + p.namespace + p.name}
+      empty={<Empty title="No pods match.">Clear a filter or choose another namespace.</Empty>}
+      menu={(p) => ({ label: `Actions for pod ${p.name}`, items: [
+        { label: "Copy name", run: () => { navigator.clipboard?.writeText(p.name); } },
+        { label: "View details and full name", run: () => onOpen(p) },
+        { label: "Investigate", run: () => onInvestigate(p) },
+      ] })}
+      cols={[
+        { key: "pod", head: "Pod", primary: true, cell: (p) => <Truncate text={p.name} mono /> },
+        { key: "phase", head: "Phase", status: true, cell: (p) => <Badge kind={p.phase === "Running" ? "ok" : p.phase === "Succeeded" ? "neutral" : "warn"}>{p.phase}</Badge> },
+        ...scopeCols<any>().slice(1),
+        { key: "ready", head: "Ready", cell: (p) => p.ready, meta: (p) => `${p.ready} ready` },
+        { key: "restarts", head: "Restarts", cell: (p) => (p.restarts > 0 ? <Badge kind="warn">{p.restarts}</Badge> : 0), meta: (p) => (p.restarts > 0 ? <Badge kind="warn">{p.restarts} restarts</Badge> : "") },
+        { key: "problems", head: "Problems", cell: (p) => <Truncate text={problems(p)} />, meta: (p) => problems(p) },
+        { key: "env", head: "Environment", wide: true, cell: (p) => p.environment },
+        { key: "node", head: "Node", wide: true, cell: (p) => <span className="small muted">{p.node}</span> },
+        { key: "age", head: "Age", wide: true, cell: (p) => p.age },
+      ]} />
+  );
+}
+
+function EventTable({ rows }: { rows: any[] }) {
+  return (
+    <DataTable label="Events" rows={rows} rowKey={(x) => `${x.environment}${x.namespace}${x.object}${x.reason}${x.lastSeen}`} empty={<Empty title="No events match." />} cols={[
+      { key: "reason", head: "Reason", primary: true, cell: (x) => x.reason },
+      { key: "type", head: "Type", status: true, cell: (x) => <Badge kind={x.type === "Warning" ? "warn" : "neutral"}>{x.type}</Badge> },
+      { key: "object", head: "Object", cell: (x) => <Truncate text={show(x.object)} mono />, meta: (x) => show(x.object) },
+      { key: "message", head: "Message", cell: (x) => <Truncate text={x.message ?? ""} lines={2} />, meta: (x) => <Truncate text={x.message ?? ""} lines={2} /> },
+      ...scopeCols<any>().slice(1),
+      { key: "count", head: "Count", wide: true, cell: (x) => x.count },
+      { key: "last", head: "Last seen", cell: (x) => x.lastSeen },
+    ]} />
   );
 }
 
@@ -171,52 +204,49 @@ function ConfigAudit({ rows, missing }: { rows: any[]; missing: any[] }) {
   return (
     <div className="stack">
       {missing.length > 0 && <div className="alert error small">{missing.map((m, i) => <div key={i}><span className="mono">{m.environment}/{m.namespace}</span> {m.object}: missing {m.kind} {m.name}{m.key ? ` key ${m.key}` : ""}</div>)}</div>}
-      {!rows.length ? <div className="empty">No workloads match.</div> : (
-        <table>
-          <thead><tr><th>Environment</th><th>Namespace</th><th>Workload</th><th>Issues</th><th>ConfigMaps / Secrets referenced</th></tr></thead>
-          <tbody>{rows.map((w) => (
-            <tr key={w.environment + w.namespace + w.workload}>
-              <td className="small">{w.environment}</td><td className="mono small">{w.namespace}</td><td className="mono small">{w.workload}</td>
-              <td className="small">{w.issues.map((i: any, n: number) => <div key={n}><Badge kind={i.severity === "high" ? "bad" : i.severity === "medium" ? "warn" : "neutral"}>{i.severity}</Badge> {i.detail}</div>)}{!w.issues.length && <span className="muted">none</span>}</td>
-              <td className="small mono">{[...(w.references?.configmaps ?? []), ...(w.references?.secrets ?? [])].join(", ") || "—"}</td>
-            </tr>
-          ))}</tbody>
-        </table>
-      )}
+      <DataTable label="Configuration audit" rows={rows} rowKey={(w) => w.environment + w.namespace + w.workload} empty={<Empty title="No workloads match." />} cols={[
+        { key: "workload", head: "Workload", primary: true, cell: (w) => <Identifier name={w.workload} /> },
+        ...scopeCols<any>(),
+        { key: "issues", head: "Issues", cell: (w) => <span className="small stack tight">{w.issues.map((i: any, n: number) => <span key={n}><Badge kind={i.severity === "high" ? "bad" : i.severity === "medium" ? "warn" : "neutral"}>{i.severity}</Badge> {i.detail}</span>)}{!w.issues.length && <span className="muted">no issues</span>}</span> },
+        { key: "refs", head: "ConfigMaps / Secrets referenced", wide: true, cell: (w) => <span className="small mono">{[...(w.references?.configmaps ?? []), ...(w.references?.secrets ?? [])].join(", ") || "—"}</span> },
+      ]} />
     </div>
   );
 }
 
+const show = (v: any) => (v == null ? "—" : typeof v === "object" ? (Array.isArray(v) ? v.join(", ") : Object.entries(v).map(([k, x]) => `${k}=${x}`).join(" ")) : String(v));
+
 function ServiceTable({ rows, canManage, onManage }: { rows: any[]; canManage: boolean; onManage: (m: Manage) => void }) {
+  const selector = (s: any) => Object.entries(s.selector).map(([k, v]) => `${k}=${v}`).join(", ");
   return (
-    <table>
-      <thead><tr><th>Environment</th><th>Namespace</th><th>Service</th><th>Selector</th><th>Ports</th><th>Ready endpoints</th><th>Matching pods</th><th /></tr></thead>
-      <tbody>{rows.map((s) => (
-        <tr key={s.environment + s.namespace + s.name}>
-          <td className="small">{s.environment}</td><td className="mono small">{s.namespace}</td>
-          <td className="mono small">{s.name}</td>
-          <td className="mono small">{Object.entries(s.selector).map(([k, v]) => `${k}=${v}`).join(", ") || <span className="muted">none</span>}</td>
-          <td className="small">{s.ports.map((p: any) => `${p.port}→${p.targetPort}`).join(", ")}</td>
-          <td>{Object.keys(s.selector).length ? <Badge kind={s.endpoints.ready ? "ok" : "bad"}>{s.endpoints.ready}</Badge> : "—"}{s.endpoints.notReady > 0 && <Badge kind="warn">{s.endpoints.notReady} not ready</Badge>}</td>
-          <td className="small">{s.matchingPodCount}{s.nearMissPods?.length > 0 && <div className="muted">near miss: {s.nearMissPods.map((n: any) => n.pod).join(", ")}</div>}</td>
-          <td>{canManage && <ManageMenu label={s.name} options={[{ label: "Edit selector", run: () => onManage({ title: `Edit selector: ${s.name}`, env: s.environment, ns: s.namespace,
-            initial: { action: "apply_config_patch", target_kind: "Service", target_name: s.name, params: { patch: { spec: { selector: s.selector } } } } }) },
-            { label: "Session affinity", run: () => onManage({ title: `Session affinity: ${s.name}`, env: s.environment, ns: s.namespace,
-              initial: { action: "apply_config_patch", target_kind: "Service", target_name: s.name, params: { patch: { spec: { sessionAffinity: "ClientIP" } } } } }) }]} />}</td>
-        </tr>
-      ))}</tbody>
-    </table>
+    <DataTable label="Services" rows={rows} rowKey={(s) => s.environment + s.namespace + s.name} empty={<Empty title="No services match." />}
+      menu={(s) => ({ label: `Actions for service ${s.name}`, items: [
+        { label: "Copy name", run: () => { navigator.clipboard?.writeText(s.name); } },
+        ...(canManage ? [
+          { label: "Edit selector", run: () => onManage({ title: `Edit selector: ${s.name}`, env: s.environment, ns: s.namespace, initial: { action: "apply_config_patch", target_kind: "Service", target_name: s.name, params: { patch: { spec: { selector: s.selector } } } } }) },
+          { label: "Session affinity", run: () => onManage({ title: `Session affinity: ${s.name}`, env: s.environment, ns: s.namespace, initial: { action: "apply_config_patch", target_kind: "Service", target_name: s.name, params: { patch: { spec: { sessionAffinity: "ClientIP" } } } } }) },
+        ] : []),
+      ] })}
+      cols={[
+        { key: "name", head: "Service", primary: true, cell: (s) => <Identifier name={s.name} /> },
+        { key: "ready", head: "Ready endpoints", status: true, cell: (s) => <>{Object.keys(s.selector).length ? <Badge kind={s.endpoints.ready ? "ok" : "bad"}>{s.endpoints.ready}</Badge> : "—"}{s.endpoints.notReady > 0 && <Badge kind="warn">{s.endpoints.notReady} not ready</Badge>}</> },
+        ...scopeCols<any>(),
+        { key: "selector", head: "Selector", wide: true, cell: (s) => <Truncate text={selector(s) || "none"} mono /> },
+        { key: "ports", head: "Ports", cell: (s) => s.ports.map((p: any) => `${p.port}→${p.targetPort}`).join(", ") },
+        { key: "matching", head: "Matching pods", wide: true, cell: (s) => <>{s.matchingPodCount}{s.nearMissPods?.length > 0 && <div className="small muted">near miss: {s.nearMissPods.map((n: any) => n.pod).join(", ")}</div>}</> },
+      ]} />
   );
 }
 
 function Generic({ rows, cols }: { rows: any[]; cols: string[] }) {
-  if (!rows.length) return <div className="empty">Nothing here.</div>;
-  const show = (v: any) => (v == null ? "—" : typeof v === "object" ? (Array.isArray(v) ? v.join(", ") : Object.entries(v).map(([k, x]) => `${k}=${x}`).join(" ")) : String(v));
+  if (!rows.length) return <Empty title="Nothing here." />;
   return (
-    <table>
-      <thead><tr>{cols.map((c) => <th key={c}>{c}</th>)}</tr></thead>
-      <tbody>{rows.map((r, i) => <tr key={i}>{cols.map((c) => <td key={c} className="small">{show(r[c])}</td>)}</tr>)}</tbody>
-    </table>
+    <div className="table-wrap" role="region" aria-label={cols.join(", ")} tabIndex={0}>
+      <table>
+        <thead><tr>{cols.map((c) => <th key={c} scope="col">{c}</th>)}</tr></thead>
+        <tbody>{rows.map((r, i) => <tr key={i}>{cols.map((c) => <td key={c} className="small">{show(r[c])}</td>)}</tr>)}</tbody>
+      </table>
+    </div>
   );
 }
 
@@ -229,9 +259,9 @@ function PodDrawer({ env, ns, pod, owner, canManage, onManage, onClose }: { env:
     return api(`/explore/${env}/logs${qs({ namespace: ns, pod, previous: view === "previous", tail_lines: 300 })}`);
   }, [env, ns, pod, view]);
   return (
-    <div className="drawer" role="dialog" aria-label={pod}>
-      <div className="row between"><h2 className="mono">{pod}</h2><button className="ghost small" onClick={onClose}>Close</button></div>
-      {canManage && owner && <div className="row" style={{ marginBottom: 10 }}>
+    <Drawer title={pod} heading={<span className="mono name-full">{pod}</span>} onClose={onClose}>
+      <div className="row between small muted list-head"><span className="mono">{env}/{ns}</span><CopyButton text={pod} label="Copy name" /></div>
+      {canManage && owner && <div className="row list-head">
         <button className="ghost small" onClick={() => onManage({ title: `Delete pod: ${pod}`, env, ns, initial: { action: "delete_pod", target_kind: "Pod", target_name: pod, params: {} } })}>Delete pod (replaced by {owner})</button>
         {deployment && <button className="ghost small" onClick={() => onManage({ title: `Rollout restart: ${deployment}`, env, ns, initial: { action: "restart_deployment", target_kind: "Deployment", target_name: deployment, params: {} } })}>Rollout restart {deployment}</button>}
       </div>}
@@ -239,7 +269,7 @@ function PodDrawer({ env, ns, pod, owner, canManage, onManage, onClose }: { env:
         <button key={v} className={v === view ? "active" : ""} onClick={() => setView(v)}>{v === "previous" ? "previous logs" : v}</button>
       ))}</div>
       <ErrorBox error={r.error} />
-      {r.loading && <div className="muted">Loading…</div>}
+      {r.loading && <Skeleton rows={6} />}
       {r.data && !r.loading && (
         <>
           <div className="small muted" style={{ marginBottom: 8 }}>{r.data.summary} · collected <Time iso={r.data.collected_at} /></div>
@@ -248,7 +278,7 @@ function PodDrawer({ env, ns, pod, owner, canManage, onManage, onClose }: { env:
           <div style={{ marginTop: 12 }}><Link to={`/investigate?env=${env}&ns=${ns}&q=${encodeURIComponent(`Why is pod ${pod} unhealthy?`)}`}>Investigate this pod →</Link></div>
         </>
       )}
-    </div>
+    </Drawer>
   );
 }
 
@@ -275,120 +305,5 @@ function Describe({ d }: { d: any }) {
       <h3>Events</h3>
       <Generic rows={d.events} cols={["type", "reason", "message", "count", "lastSeen"]} />
     </div>
-  );
-}
-
-const windowLabel = (m: number) => `last ${m >= 60 ? `${m / 60} h` : `${m} min`}`;
-
-// ---- Logs -------------------------------------------------------------------------------------
-
-const LEVELS = ["error", "warn", "info", "debug"];
-
-function levelOf(row: any): string {
-  const v = (row.labels?.level ?? /\blevel\W{0,3}(\w+)/i.exec(row.line)?.[1] ?? "").toLowerCase();
-  if (/err|fatal|crit|panic/.test(v)) return "error";
-  if (/warn/.test(v)) return "warn";
-  return /info|debug|trace/.test(v) ? v : "";
-}
-
-export function Logs() {
-  const scopes = useScopes();
-  const blank = { environment: "all", namespace: "all", pod: "", container: "", level: "", contains: "", trace_id: "", request_id: "", minutes: 60, limit: 200 };
-  const [f, setF] = useState(blank);
-  const [applied, setApplied] = useState(blank);
-  const [live, setLive] = useState(false);
-  const [open, setOpen] = useState<number | null>(null);
-  const r = useLoad(() => api<Multi>(`/multi/logs${qs(applied)}`), [applied]);
-  useInterval(() => { if (!r.loading) r.reload(); }, 5000, live);
-  const apply = (patch: Partial<typeof f>) => { const n = { ...f, ...patch }; setF(n); setApplied(n); setOpen(null); };
-  const set = (k: keyof typeof f) => (e: { target: { value: string } }) => setF({ ...f, [k]: e.target.value });
-  const counts = (key: (row: any) => string) => {
-    const c: Record<string, number> = {};
-    for (const row of r.data?.items ?? []) { const k = key(row); if (k) c[k] = (c[k] ?? 0) + 1; }
-    return Object.entries(c).sort((a, b) => b[1] - a[1]);
-  };
-  return (
-    <>
-      <PageHead title="Logs" sub="Logs from every environment and namespace, newest first. Narrow them with the filters.">
-        <label className="inline"><input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} /> Refresh every 5 s</label>
-      </PageHead>
-      <ErrorBox error={scopes.error} />
-      <form className="card filters" onSubmit={(e) => { e.preventDefault(); apply({}); }}>
-        <EnvNsFilter scopes={scopes.data} env={f.environment} ns={f.namespace} onEnv={(e) => apply({ environment: e, namespace: "all" })} onNs={(n) => apply({ namespace: n })} />
-        <label>Level
-          <select aria-label="Log level" value={f.level} onChange={(e) => apply({ level: e.target.value })}><option value="">Any level</option>{LEVELS.map((l) => <option key={l}>{l}</option>)}</select>
-        </label>
-        <label>Pod<input value={f.pod} onChange={set("pod")} placeholder="checkout-*" /></label>
-        <label>Container<input value={f.container} onChange={set("container")} /></label>
-        <label>Contains<input value={f.contains} onChange={set("contains")} placeholder="timeout" /></label>
-        <label>Trace ID<input className="mono" value={f.trace_id} onChange={set("trace_id")} /></label>
-        <label>Request ID<input className="mono" value={f.request_id} onChange={set("request_id")} /></label>
-        <label>Time<select value={f.minutes} onChange={(e) => apply({ minutes: Number(e.target.value) })}>{[15, 60, 180, 360, 1440].map((m) => <option key={m} value={m}>{windowLabel(m)}</option>)}</select></label>
-        <label>Lines<select value={f.limit} onChange={(e) => apply({ limit: Number(e.target.value) })}>{[50, 200, 500].map((m) => <option key={m}>{m}</option>)}</select></label>
-        <button disabled={r.loading}>{r.loading && !live ? "Searching…" : "Search"}</button>
-        <button type="button" className="ghost" onClick={() => { setF(blank); setApplied(blank); }}>Clear</button>
-      </form>
-      <ErrorBox error={r.error} />
-      {r.data && (
-        <div className="card stack" style={{ marginTop: 14 }}>
-          <div className="row between small muted">
-            <span>{r.data.items.length} lines · {counts((x) => x.environment).map(([k, n]) => `${k}: ${n}`).join(", ")}</span>
-            <span className="row">{counts(levelOf).map(([k, n]) => <button type="button" key={k} className="ghost small" onClick={() => apply({ level: k })}>{k} {n}</button>)}</span>
-          </div>
-          <PartialErrors errors={r.data.errors} />
-          {!r.data.items.length ? <div className="empty">No log lines match.</div> : (
-            <div className="logbox" style={{ maxHeight: 620 }}>
-              {r.data.items.map((l: any, i: number) => {
-                const lvl = levelOf(l);
-                const where = [l.environment, l.labels?.namespace, l.labels?.pod].filter(Boolean).join("/");
-                return (
-                  <div key={i} className={`line clickable ${lvl === "error" ? "err" : ""} ${open === i ? "open" : ""}`} {...rowAction(() => setOpen(open === i ? null : i))}>
-                    {l.ts && <span className="ts">{new Date(l.ts).toLocaleTimeString()}</span>}
-                    <span className={`lvl ${lvl}`}>{lvl}</span><span className="ts">{where}</span>{l.line}
-                    {open === i && <div className="small muted" style={{ marginTop: 4 }}>{l.ts && <div>{new Date(l.ts).toLocaleString()}</div>}{Object.entries(l.labels ?? {}).map(([k, v]) => <div key={k}>{k}={String(v)}</div>)}</div>}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-          {Object.entries(r.data.queries).slice(0, 3).map(([k, q]) => <div key={k} className="small muted">{k}: <code>{q}</code></div>)}
-        </div>
-      )}
-      <RawLogQL scopes={scopes.data} />
-    </>
-  );
-}
-
-function RawLogQL({ scopes }: { scopes?: Scope[] }) {
-  const [env, setEnv] = useState("");
-  const [q, setQ] = useState("");
-  const [res, setRes] = useState<Result | null>(null);
-  const [error, setError] = useState<unknown>();
-  const target = env || scopes?.[0]?.environment || "";
-  async function run(e: FormEvent) {
-    e.preventDefault();
-    setError(null);
-    try {
-      setRes(await api<Result>(`/explore/${target}/logql${qs({ logql: q, limit: 200, minutes: 60 })}`));
-    } catch (err) {
-      setError(err);
-    }
-  }
-  return (
-    <details className="card block" style={{ marginTop: 14 }}>
-      <summary>Write LogQL</summary>
-      <form className="stack" style={{ marginTop: 10 }} onSubmit={run}>
-        <textarea aria-label="LogQL query" rows={2} className="mono" value={q} onChange={(e) => setQ(e.target.value)} placeholder='{namespace="default"} |= "error"' />
-        <div className="filters">
-          <label>Environment<select value={target} onChange={(e) => setEnv(e.target.value)}>{scopes?.map((s) => <option key={s.environment} value={s.environment}>{s.display_name}</option>)}</select></label>
-          <button disabled={!q || !target}>Run</button>
-        </div>
-      </form>
-      <ErrorBox error={error} />
-      {res && <div className="stack" style={{ marginTop: 10 }}>
-        <SourceRef source={res.source} />
-        {res.data.lines ? <LogLines lines={res.data.lines} /> : <LineChart series={res.data.series ?? []} />}
-      </div>}
-    </details>
   );
 }

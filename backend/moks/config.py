@@ -87,6 +87,7 @@ class Settings(BaseSettings):
     database_volume_gib: int = 10  # capacity of the database volume, for the size alert
     diagnostics_namespace: str = "moks-diagnostics"
     velero_namespace: str = "velero"
+    argocd_namespace: str = "argocd"
     build_commit: str = "dev"  # baked into the image at build time
     llm_user_daily_budget_usd: float | None = None      # None: no per-person limit
     llm_investigation_budget_usd: float | None = None   # None: no per-investigation limit

@@ -2,8 +2,8 @@ import { useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, PageHead, Time, useInterval, useLoad, type Env } from "../components";
-import { Dialog } from "../ui";
+import { Badge, DataTable, ErrorBox, Loading, PageHead, Time, useInterval, useLoad, type Env } from "../components";
+import { Dialog, Empty, Identifier } from "../ui";
 
 const PHASE: Record<string, "ok" | "warn" | "bad" | "info"> = { Completed: "ok", PartiallyFailed: "warn", Failed: "bad", FailedValidation: "bad", InProgress: "info" };
 const REFS = [["access_key_id", "Variable holding the R2 access key id"], ["secret_access_key", "Variable holding the R2 secret access key"], ["sse_key", "Variable holding the encryption key (32 bytes, base64)"], ["repo_password", "Variable holding the volume repository password"]];
@@ -63,7 +63,8 @@ export function Backups() {
       <PageHead title="Backups" sub="Cluster objects including Secrets, and volume data where the cluster supports it, stored encrypted in Cloudflare R2 by Velero.">
         <label>Environment<select value={env} onChange={(e) => setPicked(e.target.value)}>{envs.data?.map((e) => <option key={e.name} value={e.name}>{e.display_name}{e.is_production ? " (production)" : ""}</option>)}</select></label>
       </PageHead>
-      <ErrorBox error={s.error ?? envs.error} />
+      <Loading load={s} rows={5} />
+      <ErrorBox error={envs.error} />
       {d && <div className="stack">
         {d.findings.map((f: any) => <div key={f.code} className={`alert ${f.severity === "bad" ? "error" : "warn"}`}>{f.text}</div>)}
         {!d.findings.length && <div className="alert info">No problems found. A backup is only proven by a test restore.</div>}
@@ -75,23 +76,31 @@ export function Backups() {
           {can("investigation.run") && <a className="btn ghost" href={`${import.meta.env.BASE_URL}investigate?env=${env}&ns=*&q=${q}`}>Ask MOKS to review</a>}
         </div>
         <div className="card"><h2>Backups ({d.backups.length})</h2>
-          {d.backups.length ? <div className="table-wrap"><table>
-            <thead><tr><th>Name</th><th>Status</th><th>Started</th><th>Expires</th><th>Items</th><th>Volumes</th><th>Errors</th><th /></tr></thead>
-            <tbody>{d.backups.map((b: any) => <tr key={b.name}>
-              <td className="mono small">{b.name}{b.failure && <div className="muted">{b.failure}</div>}</td>
-              <td><Badge kind={PHASE[b.phase] ?? "neutral"}>{b.phase}</Badge></td>
-              <td><Time iso={b.started} /></td><td><Time iso={b.expires} /></td>
-              <td>{b.items ?? "—"}{b.items_total ? ` / ${b.items_total}` : ""}</td><td>{b.volumes ? "yes" : "no"}</td><td>{b.errors} / {b.warnings} warnings</td>
-              <td>{can("action.request") && ["Completed", "PartiallyFailed"].includes(b.phase) && <PlanButton env={env} path="restore" label="Restore" title={`Restore ${b.name}`} ghost
+          <DataTable label="Backups" rows={d.backups as any[]} rowKey={(b) => b.name} empty={<Empty title="No backups in this cluster yet.">Back up now, or set a schedule.</Empty>} cols={[
+            { key: "n", head: "Name", primary: true, cell: (b) => <><Identifier name={b.name} />{b.failure && <span className="small muted">{b.failure}</span>}</> },
+            { key: "p", head: "Status", status: true, cell: (b) => <Badge kind={PHASE[b.phase] ?? "neutral"}>{b.phase}</Badge> },
+            { key: "s", head: "Started", cell: (b) => <Time iso={b.started} /> },
+            { key: "x", head: "Expires", wide: true, cell: (b) => <Time iso={b.expires} /> },
+            { key: "i", head: "Items", cell: (b) => <>{b.items ?? "—"}{b.items_total ? ` / ${b.items_total}` : ""}</>, meta: (b) => `${b.items ?? "—"} items` },
+            { key: "v", head: "Volumes", wide: true, cell: (b) => (b.volumes ? "yes" : "no") },
+            { key: "e", head: "Errors", cell: (b) => `${b.errors} / ${b.warnings} warnings`, meta: (b) => `${b.errors} errors, ${b.warnings} warnings` },
+            { key: "a", head: "Restore", cell: (b) => (can("action.request") && ["Completed", "PartiallyFailed"].includes(b.phase) ? <PlanButton env={env} path="restore" label="Restore" title={`Restore ${b.name}`} ghost
                 fields={<>{scope}<label>If an object already exists<select value={policy} onChange={(e) => setPolicy(e.target.value)}><option value="none">Keep what is there (safe)</option><option value="update">Overwrite it with the backup</option></select></label>
                   <label className="inline"><input type="checkbox" checked={pre} onChange={(e) => setPre(e.target.checked)} /> Take a backup first</label></>}
-                build={() => ({ backup: b.name, included_namespaces: namespaces, existing_resource_policy: policy, pre_restore_backup: pre, restore_volumes: true })} />}</td>
-            </tr>)}</tbody></table></div> : <div className="empty">No backups in this cluster yet.</div>}
+                build={() => ({ backup: b.name, included_namespaces: namespaces, existing_resource_policy: policy, pre_restore_backup: pre, restore_volumes: true })} /> : "") },
+          ]} />
         </div>
-        {d.schedules.length > 0 && <div className="card"><h2>Schedules</h2><div className="table-wrap"><table><thead><tr><th>Name</th><th>Cron</th><th>Last backup</th><th>State</th></tr></thead>
-          <tbody>{d.schedules.map((x: any) => <tr key={x.name}><td className="mono small">{x.name}</td><td className="mono small">{x.cron}</td><td><Time iso={x.last_backup} /></td><td>{x.paused ? <Badge kind="warn">paused</Badge> : <Badge kind="ok">active</Badge>}</td></tr>)}</tbody></table></div></div>}
-        {d.restores.length > 0 && <div className="card"><h2>Restores</h2><div className="table-wrap"><table><thead><tr><th>Name</th><th>Backup</th><th>Status</th><th>Started</th><th>Errors</th></tr></thead>
-          <tbody>{d.restores.map((r: any) => <tr key={r.name}><td className="mono small">{r.name}</td><td className="mono small">{r.backup}</td><td><Badge kind={PHASE[r.phase] ?? "neutral"}>{r.phase}</Badge></td><td><Time iso={r.started} /></td><td>{r.errors} / {r.warnings} warnings</td></tr>)}</tbody></table></div></div>}
+        {d.schedules.length > 0 && <div className="card"><h2>Schedules</h2><DataTable label="Schedules" rows={d.schedules as any[]} rowKey={(x) => x.name} cols={[
+          { key: "n", head: "Name", primary: true, cell: (x) => <Identifier name={x.name} /> },
+          { key: "st", head: "State", status: true, cell: (x) => (x.paused ? <Badge kind="warn">paused</Badge> : <Badge kind="ok">active</Badge>) },
+          { key: "c", head: "Cron", cell: (x) => <span className="mono small">{x.cron}</span> },
+          { key: "l", head: "Last backup", cell: (x) => <Time iso={x.last_backup} /> }]} /></div>}
+        {d.restores.length > 0 && <div className="card"><h2>Restores</h2><DataTable label="Restores" rows={d.restores as any[]} rowKey={(r) => r.name} cols={[
+          { key: "n", head: "Name", primary: true, cell: (r) => <Identifier name={r.name} /> },
+          { key: "p", head: "Status", status: true, cell: (r) => <Badge kind={PHASE[r.phase] ?? "neutral"}>{r.phase}</Badge> },
+          { key: "b", head: "Backup", cell: (r) => <Identifier name={r.backup} what="backup name" /> },
+          { key: "s", head: "Started", cell: (r) => <Time iso={r.started} /> },
+          { key: "e", head: "Errors", cell: (r) => `${r.errors} / ${r.warnings} warnings` }]} /></div>}
       </div>}
     </>
   );

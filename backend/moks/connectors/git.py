@@ -182,6 +182,12 @@ class GitConnector:
         return {"repo": repo, "path": path, "ref": ref_used, "blob": sha, "text": redact(text),
                 "url": self.provider.blob_url(repo, path, ref_used)}
 
+    async def list_paths(self, repo: str, ref: str | None = None) -> list[str]:
+        """File paths only, never contents."""
+        self.check_repo(repo)
+        _, tree = await self.provider.tree(repo, ref)
+        return [t["path"] for t in tree]
+
     async def recent_commits(self, repo: str, path: str | None, since: datetime | None, limit: int) -> list[dict]:
         self.check_repo(repo)
         return await self.provider.commits(repo, path, since, limit)

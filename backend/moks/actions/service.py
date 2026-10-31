@@ -5,8 +5,10 @@ target, parameters, requester, expiry, approval requirement, automatic recovery,
 resourceVersion and UID, and the connector, write target and cluster it was planned against. Any
 difference (edited parameters, different target, a resource that changed, a replayed approval for
 another plan) fails the hash or a precondition. Plans expire. A plan executes at
-most once (status transitions under SELECT ... FOR UPDATE). The requester can never approve their
-own plan. All of this is re-verified by the executor immediately before it acts.
+most once (status transitions under SELECT ... FOR UPDATE). A requester cannot approve their own plan
+unless they are a global administrator, whose plans need no second approval: that is recorded as
+action.approval_waived, and administrator status is checked again at execution. All of this is
+re-verified by the executor immediately before it acts.
 """
 from __future__ import annotations
 
@@ -137,7 +139,7 @@ async def create_plan(db: AsyncSession, principal: Principal, env: Environment, 
                       params=parsed.model_dump(exclude_none=True), reason=reason, evidence=evidence[:30],
                       expected_impact=text["impact"], blast_radius=text["blast_radius"], preconditions=text["preconditions"],
                       validation=text["validation"], rollback=text["rollback"], auto_recover=auto_recover, pre_state=pre,
-                      requires_approval=needs_approval(spec, env), requested_by=uuid.UUID(principal.user_id),
+                      requires_approval=needs_approval(spec, env) and not is_admin(principal), requested_by=uuid.UUID(principal.user_id),
                       expires_at=now + timedelta(minutes=env.plan_ttl_minutes), incident_id=incident_id,
                       investigation_id=investigation_id, status="pending", plan_hash="", hash_version=HASH_VERSION, target_identity=identity)
     db.add(plan)
@@ -147,6 +149,9 @@ async def create_plan(db: AsyncSession, principal: Principal, env: Environment, 
                        resource_id=str(plan.id), environment=env.name, namespace=namespace, decision="allow",
                        details={"action": action, "target": f"{target_kind}/{target_name}", "params": plan.params, "hash": plan.plan_hash,
                                 "requires_approval": plan.requires_approval})
+    if needs_approval(spec, env) and is_admin(principal):
+        await audit.record(db, action="action.approval_waived", actor_id=principal.user_id, actor_email=principal.email, resource_type="action_plan",
+                           resource_id=str(plan.id), environment=env.name, namespace=namespace, decision="allow", details={"hash": plan.plan_hash, "reason": "requested by an administrator"})
     if incident_id:
         await add_event(db, incident_id, "action", {"text": f"Action plan {action} on {target_kind}/{target_name} proposed", "plan_id": str(plan.id)},
                         principal.user_id)
@@ -164,6 +169,11 @@ def _expired(plan: ActionPlan) -> bool:
     return datetime.now(timezone.utc) >= plan.expires_at
 
 
+def is_admin(principal: Principal) -> bool:
+    """A global administrator. ADMIN_POLICIES only counts on a binding for every environment and namespace."""
+    return principal.can(P.ADMIN_POLICIES, "*", "*")
+
+
 async def decide(db: AsyncSession, principal: Principal, plan_id: uuid.UUID, approve: bool, comment: str, presented_hash: str) -> ActionPlan:
     plan = await _locked(db, plan_id)
     env = await db.get(Environment, plan.environment_id)
@@ -172,7 +182,8 @@ async def decide(db: AsyncSession, principal: Principal, plan_id: uuid.UUID, app
     if _expired(plan):
         plan.status = "expired"
         raise PlanError(409, "plan expired; create a new one")
-    if str(plan.requested_by) == principal.user_id:
+    own = str(plan.requested_by) == principal.user_id
+    if own and not is_admin(principal):
         POLICY_DENIALS.labels("self_approval").inc()
         raise PlanError(403, "you cannot approve or reject your own plan")
     _require(principal, P.ACTION_APPROVE, env, plan.namespace)
@@ -186,7 +197,7 @@ async def decide(db: AsyncSession, principal: Principal, plan_id: uuid.UUID, app
     APPROVALS.labels("approve" if approve else "reject").inc()
     await audit.record(db, action="action.approve" if approve else "action.reject", actor_id=principal.user_id, actor_email=principal.email,
                        resource_type="action_plan", resource_id=str(plan.id), environment=env.name, namespace=plan.namespace,
-                       decision="allow", details={"hash": plan.plan_hash, "comment": comment[:500]})
+                       decision="allow", details={"hash": plan.plan_hash, "comment": comment[:500], "self_approved": own})
     if plan.incident_id:
         await add_event(db, plan.incident_id, "approval", {"text": f"Plan {plan.action} {'approved' if approve else 'rejected'}",
                                                            "plan_id": str(plan.id)}, principal.user_id)
@@ -252,12 +263,13 @@ async def verify_for_execution(db: AsyncSession, plan: ActionPlan, env: Environm
         except Exception as exc:
             raise PlanError(422, f"parameters no longer valid: {exc}") from None
     required = (env.is_production or bool(plan.params.get("elevated"))) if diagnostic else needs_approval(spec, env)  # type: ignore[arg-type]
-    if required and not plan.requires_approval:
-        raise PlanError(409, "this plan now needs an approval (environment or action policy changed); create a new plan")
     try:
-        _require(await principal_of(db, plan.requested_by), P.ACTION_REQUEST, env, plan.namespace)
+        requester = await principal_of(db, plan.requested_by)
+        _require(requester, P.ACTION_REQUEST, env, plan.namespace)
     except PlanError as exc:
         raise PlanError(403, f"requester may no longer request this action: {exc.message}") from None
+    if required and not plan.requires_approval and not is_admin(requester):
+        raise PlanError(409, "this plan now needs an approval (environment or action policy changed, or the requester is no longer an administrator); create a new plan")
     executor = await principal_of(db, plan.executed_by)
     _require(executor, P.ACTION_EXECUTE, env, plan.namespace)
     if plan.target_identity:
@@ -270,10 +282,11 @@ async def verify_for_execution(db: AsyncSession, plan: ActionPlan, env: Environm
         approvals = (await db.execute(select(Approval).where(Approval.plan_id == plan.id, Approval.decision == "approve"))).scalars().all()
         valid = []
         for a in approvals:
-            if a.plan_hash != plan.plan_hash or a.approver_id == plan.requested_by:
-                continue
             try:
-                _require(await principal_of(db, a.approver_id), P.ACTION_APPROVE, env, plan.namespace)
+                approver = await principal_of(db, a.approver_id)
+                if a.plan_hash != plan.plan_hash or (a.approver_id == plan.requested_by and not is_admin(approver)):
+                    continue
+                _require(approver, P.ACTION_APPROVE, env, plan.namespace)
                 valid.append(a)
             except PlanError:
                 continue  # approver lost the permission since approving

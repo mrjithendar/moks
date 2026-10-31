@@ -89,3 +89,16 @@ describe("RBAC visibility", () => {
     expect(titleFor("/admin/users").group).toBe("Admin");
   });
 });
+
+describe("/moks deep links", () => {
+  it("opens a nested route under the base path with its menu available", () => {
+    render(<MemoryRouter basename="/moks" initialEntries={["/moks/explorer?tab=pods&env=mk4"]}><Layout><Routes><Route path="*" element={<p>explorer page</p>} /></Routes></Layout></MemoryRouter>);
+    expect(screen.getByText("explorer page")).toBeTruthy();
+    open();
+    expect(within(screen.getByRole("dialog", { name: "Navigation" })).getByRole("link", { name: "Overview" }).getAttribute("href")).toBe("/moks");
+  });
+  it("names every destination the header needs, with or without a conversation open", () => {
+    expect(titleFor("/conversations/abc").label).toBe("Conversations");
+    expect(titleFor("/logs").label).toBe("Logs");
+  });
+});

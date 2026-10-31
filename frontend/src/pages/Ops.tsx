@@ -2,7 +2,9 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, API, qs } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, PageHead, ScopePicker, StatusBadge, Time, useInterval, useLoad } from "../components";
+import { Badge, DataTable, ErrorBox, Loading, PageHead, ScopePicker, StatusBadge, Time, useInterval, useLoad } from "../components";
+import { type Chip, FilterPanel, useUrlFilters } from "../filters";
+import { Empty, Truncate } from "../ui";
 
 const SEV: Record<string, "bad" | "warn" | "info" | "neutral"> = { sev1: "bad", sev2: "bad", sev3: "warn", sev4: "neutral" };
 const PLAN: Record<string, "ok" | "warn" | "bad" | "info" | "neutral"> = {
@@ -14,8 +16,14 @@ const PLAN: Record<string, "ok" | "warn" | "bad" | "info" | "neutral"> = {
 export function Incidents() {
   const { can } = useAuth();
   const nav = useNavigate();
-  const [status, setStatus] = useState("");
-  const list = useLoad(() => api<any[]>(`/incidents${qs({ status })}`), [status]);
+  const [f, set, clear] = useUrlFilters({ status: "", severity: "", environment: "", q: "" });
+  const list = useLoad(() => api<any[]>(`/incidents${qs({ status: f.status })}`), [f.status]);
+  const rows = (list.data ?? []).filter((i) => (!f.severity || i.severity === f.severity) && (!f.environment || i.environment === f.environment) && (!f.q || i.title.toLowerCase().includes(f.q.toLowerCase())));
+  const envs = [...new Set((list.data ?? []).map((i) => i.environment as string))].sort();
+  const chips: Chip[] = [
+    ...(f.status ? [{ key: "st", label: f.status, onRemove: () => set({ status: "" }) }] : []), ...(f.severity ? [{ key: "sv", label: f.severity, onRemove: () => set({ severity: "" }) }] : []),
+    ...(f.environment ? [{ key: "e", label: f.environment, onRemove: () => set({ environment: "" }) }] : []), ...(f.q ? [{ key: "q", label: `title has ${f.q}`, onRemove: () => set({ q: "" }) }] : []),
+  ];
   const alerts = useLoad(() => api<any[]>("/alerts/events"), []);
   const [env, setEnv] = useState("");
   const [ns, setNs] = useState("");
@@ -32,21 +40,23 @@ export function Incidents() {
   }
   return (
     <>
-      <PageHead title="Incidents" sub="Incident workspaces: timeline, evidence, hypotheses, actions and validation">
-        <select aria-label="Filter by status" value={status} onChange={(e) => setStatus(e.target.value)}><option value="">all</option>{["open", "mitigated", "resolved", "closed"].map((s) => <option key={s}>{s}</option>)}</select>
-      </PageHead>
-      <div className="card">
-        <table>
-          <thead><tr><th>Incident</th><th>Severity</th><th>Status</th><th>Scope</th><th>Source</th><th>Updated</th></tr></thead>
-          <tbody>{list.data?.map((i) => (
-            <tr key={i.id}>
-              <td><Link to={`/incidents/${i.id}`}>{i.title}</Link>{i.postmortem_status !== "none" && <span className="small muted"> · postmortem {i.postmortem_status}</span>}</td>
-              <td><Badge kind={SEV[i.severity]}>{i.severity}</Badge></td><td><Badge kind={i.status === "open" ? "bad" : i.status === "mitigated" ? "warn" : "ok"}>{i.status}</Badge></td>
-              <td className="mono small">{i.environment}/{i.namespace}</td><td className="small">{i.source}</td><td><Time iso={i.updated_at} /></td>
-            </tr>
-          ))}</tbody>
-        </table>
-        {list.data && !list.data.length && <div className="empty">No incidents.</div>}
+      <PageHead title="Incidents" sub="Incident workspaces: timeline, evidence, hypotheses, actions and validation" />
+      <FilterPanel chips={chips} onClear={clear}
+        search={<input type="search" className="grow" aria-label="Search incidents" value={f.q} onChange={(e) => set({ q: e.target.value })} placeholder="Search titles" />}>
+        <label>Status<select aria-label="Filter by status" value={f.status} onChange={(e) => set({ status: e.target.value })}><option value="">All</option>{["open", "mitigated", "resolved", "closed"].map((s) => <option key={s}>{s}</option>)}</select></label>
+        <label>Severity<select value={f.severity} onChange={(e) => set({ severity: e.target.value })}><option value="">All</option>{Object.keys(SEV).map((s) => <option key={s}>{s}</option>)}</select></label>
+        <label>Environment<select value={f.environment} onChange={(e) => set({ environment: e.target.value })}><option value="">All</option>{envs.map((e) => <option key={e}>{e}</option>)}</select></label>
+      </FilterPanel>
+      <div className="card mt">
+        <Loading load={list} rows={5} />
+        {list.data && <DataTable label="Incidents" rows={rows} rowKey={(i) => i.id} empty={<Empty title={chips.length ? "No incidents match." : "No incidents."}>{chips.length ? "Clear a filter to see more." : "Open one below, or enable detection on an environment."}</Empty>} cols={[
+          { key: "t", head: "Incident", primary: true, cell: (i) => <><Link className="clamp-2" title={i.title} to={`/incidents/${i.id}`}>{i.title}</Link>{i.postmortem_status !== "none" && <span className="small muted">postmortem {i.postmortem_status}</span>}</> },
+          { key: "sev", head: "Severity", status: true, cell: (i) => <Badge kind={SEV[i.severity]}>{i.severity}</Badge> },
+          { key: "st", head: "Status", status: true, cell: (i) => <Badge kind={i.status === "open" ? "bad" : i.status === "mitigated" ? "warn" : "ok"}>{i.status}</Badge> },
+          { key: "scope", head: "Scope", cell: (i) => <Truncate text={`${i.environment}/${i.namespace}`} mono />, meta: (i) => `${i.environment}/${i.namespace}` },
+          { key: "src", head: "Source", wide: true, cell: (i) => i.source },
+          { key: "at", head: "Updated", cell: (i) => <Time iso={i.updated_at} /> },
+        ]} />}
       </div>
       {can("incident.write") && (
         <form className="card stack" style={{ marginTop: 14 }} onSubmit={create}>
@@ -58,23 +68,19 @@ export function Incidents() {
           <label>Title<input required minLength={3} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="Checkout returning 502s" /></label>
           <label>Summary<textarea rows={2} value={form.summary} onChange={(e) => setForm({ ...form, summary: e.target.value })} /></label>
           <ErrorBox error={error} />
-          <div><button>Open incident</button></div>
+          <div className="form-foot"><button>Open incident</button></div>
         </form>
       )}
       <div className="card" style={{ marginTop: 14 }}>
         <h2>Recent alerts</h2>
-        <table>
-          <thead><tr><th>Alert</th><th>Status</th><th>Decision</th><th>Scope</th><th>Received</th></tr></thead>
-          <tbody>{alerts.data?.slice(0, 30).map((a) => (
-            <tr key={a.id}>
-              <td>{a.alertname}<div className="small muted">{a.annotations?.summary}</div></td>
-              <td><Badge kind={a.status === "firing" ? "bad" : "ok"}>{a.status}</Badge></td>
-              <td className="small">{a.decision}{a.incident_id && <> · <Link to={`/incidents/${a.incident_id}`}>incident</Link></>}{a.investigation_id && <> · <Link to={`/investigations/${a.investigation_id}`}>investigation</Link></>}</td>
-              <td className="mono small">{a.environment}/{a.labels?.namespace ?? "*"}</td><td><Time iso={a.received_at} /></td>
-            </tr>
-          ))}</tbody>
-        </table>
-        {alerts.data && !alerts.data.length && <div className="empty">No alerts received. Enable auto-investigate on an environment or point Alertmanager/Grafana at the webhook.</div>}
+        {alerts.data && <DataTable label="Recent alerts" rows={alerts.data.slice(0, 30)} rowKey={(a) => a.id}
+          empty={<Empty title="No alerts received.">Enable auto-investigate on an environment or point Alertmanager or Grafana at the webhook.</Empty>} cols={[
+          { key: "a", head: "Alert", primary: true, cell: (a) => <><Truncate text={a.alertname} />{a.annotations?.summary && <span className="small muted clamp-2">{a.annotations.summary}</span>}</> },
+          { key: "st", head: "Status", status: true, cell: (a) => <Badge kind={a.status === "firing" ? "bad" : "ok"}>{a.status}</Badge> },
+          { key: "d", head: "Decision", cell: (a) => <span className="small">{a.decision}{a.incident_id && <> · <Link to={`/incidents/${a.incident_id}`}>incident</Link></>}{a.investigation_id && <> · <Link to={`/investigations/${a.investigation_id}`}>investigation</Link></>}</span> },
+          { key: "s", head: "Scope", cell: (a) => <Truncate text={`${a.environment}/${a.labels?.namespace ?? "*"}`} mono />, meta: (a) => `${a.environment}/${a.labels?.namespace ?? "*"}` },
+          { key: "at", head: "Received", cell: (a) => <Time iso={a.received_at} /> },
+        ]} />}
       </div>
     </>
   );
@@ -94,19 +100,19 @@ export function IncidentView() {
     setError(null);
     try { await fn(); inc.reload(); } catch (e) { setError(e); }
   }
-  if (!d) return <ErrorBox error={inc.error} />;
+  if (!d) return <Loading load={inc} rows={8} />;
   const write = can("incident.write");
   return (
     <>
       <PageHead title={d.title} sub={<span className="row small"><Badge kind={SEV[d.severity]}>{d.severity}</Badge><Badge>{d.status}</Badge><span className="mono">{d.environment}/{d.namespace}</span><span>source {d.source}</span><span>opened <Time iso={d.created_at} /></span></span>}>
-        <a className="btn" href={`${API}/incidents/${id}/handover.md`} target="_blank" rel="noreferrer">Handover</a>
-        <a className="btn" href={`${API}/incidents/${id}/report.md`} target="_blank" rel="noreferrer">Report (Markdown)</a>
+        <a className="btn ghost" href={`${API}/incidents/${id}/handover.md`} target="_blank" rel="noreferrer">Handover</a>
+        <a className="btn ghost" href={`${API}/incidents/${id}/report.md`} target="_blank" rel="noreferrer">Report (Markdown)</a>
         {write && <select aria-label="Incident status" value={d.status} onChange={(e) => act(() => api(`/incidents/${id}`, { method: "PATCH", body: { status: e.target.value } }))}>
           {["open", "mitigated", "resolved", "closed"].map((s) => <option key={s}>{s}</option>)}</select>}
         <Link className="btn" to={`/investigate?env=${d.environment}&ns=${d.namespace === "*" ? "" : d.namespace}&incident=${id}&q=${encodeURIComponent(d.title)}`}>Investigate</Link>
       </PageHead>
       <ErrorBox error={error} />
-      <div className="grid" style={{ gridTemplateColumns: "minmax(0, 3fr) minmax(300px, 2fr)", alignItems: "start" }}>
+      <div className="grid split-3-2">
         <div className="stack">
           {d.summary && <div className="card"><h2>Summary</h2><p style={{ margin: 0 }}>{d.summary}</p></div>}
           {write && <div className="card filters"><label>Assigned to<input defaultValue={d.commander ?? ""} type="email" placeholder="engineer@example.com"
@@ -186,16 +192,14 @@ export function Actions() {
 }
 
 function PlanTable({ rows }: { rows: any[] }) {
-  if (!rows.length) return <div className="empty">Nothing here.</div>;
   return (
-    <table>
-      <thead><tr><th>Action</th><th>Target</th><th>Status</th><th>Requested by</th><th>Expires</th></tr></thead>
-      <tbody>{rows.map((p) => (
-        <tr key={p.id}><td><Link to={`/actions/${p.id}`}>{p.title}</Link></td><td className="mono small">{p.environment}/{p.namespace} {p.target}</td>
-          <td><Badge kind={PLAN[p.status]}>{p.status}</Badge>{p.requires_approval && <Badge kind="neutral">approval</Badge>}</td>
-          <td className="small">{p.requested_by ?? "—"}</td><td><Time iso={p.expires_at} /></td></tr>
-      ))}</tbody>
-    </table>
+    <DataTable label="Action plans" rows={rows} rowKey={(p) => p.id} empty={<Empty title="Nothing here." />} cols={[
+      { key: "a", head: "Action", primary: true, cell: (p) => <Link className="clamp-2" title={p.title} to={`/actions/${p.id}`}>{p.title}</Link> },
+      { key: "st", head: "Status", status: true, cell: (p) => <><Badge kind={PLAN[p.status]}>{p.status}</Badge>{p.requires_approval && <Badge kind="neutral">approval</Badge>}</> },
+      { key: "t", head: "Target", cell: (p) => <Truncate text={`${p.environment}/${p.namespace} ${p.target}`} mono />, meta: (p) => `${p.environment}/${p.namespace} ${p.target}` },
+      { key: "by", head: "Requested by", cell: (p) => p.requested_by ?? "—" },
+      { key: "exp", head: "Expires", cell: (p) => <Time iso={p.expires_at} /> },
+    ]} />
   );
 }
 
@@ -212,7 +216,7 @@ export function PlanView() {
     setError(null);
     try { await api(`/actions/plans/${id}/${path}`, { method: "POST", body }); plan.reload(); } catch (e) { setError(e); }
   }
-  if (!p) return <ErrorBox error={plan.error} />;
+  if (!p) return <Loading load={plan} rows={8} />;
   const mine = p.requested_by === me?.email;
   return (
     <>
@@ -241,12 +245,13 @@ export function PlanView() {
           <div className="card stack">
             <h2>Decision</h2>
             {p.approvals.map((a: any, i: number) => <div key={i} className="small"><Badge kind={a.decision === "approve" ? "ok" : "bad"}>{a.decision}</Badge> {a.approver} <Time iso={a.at} /> {a.comment && `— ${a.comment}`}</div>)}
-            {p.status === "pending" && p.requires_approval && can("action.approve") && !mine && <>
+            {p.status === "pending" && p.requires_approval && can("action.approve") && (!mine || can("admin.policies")) && <>
               <textarea aria-label="Comment" rows={2} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Comment (optional)" />
               <div className="row"><button onClick={() => act("approve", { plan_hash: p.plan_hash, comment })}>Approve this exact plan</button>
                 <button className="danger" onClick={() => act("reject", { plan_hash: p.plan_hash, comment })}>Reject</button></div>
             </>}
-            {mine && p.status === "pending" && p.requires_approval && <div className="small muted">Waiting for someone else to approve (you requested it).</div>}
+            {mine && !can("admin.policies") && p.status === "pending" && p.requires_approval && <div className="small muted">Waiting for someone else to approve (you requested it).</div>}
+            {p.status === "pending" && !p.requires_approval && <div className="small muted">No approval needed: an administrator requested this, or this action does not need one. Review it, then execute. This is recorded in the audit log.</div>}
             {can("action.execute") && (p.status === "approved" || (p.status === "pending" && !p.requires_approval)) &&
               <button onClick={() => act("execute", { plan_hash: p.plan_hash })}>Execute</button>}
             {p.status === "reconciliation_required" && <div className="alert error small stack">
@@ -305,7 +310,7 @@ export function PlanForm({ env, ns, initial, onDone }: { env: string; ns: string
       <label>Reason and supporting evidence<textarea rows={2} required minLength={5} value={f.reason} onChange={(e) => setF({ ...f, reason: e.target.value })} /></label>
       <ErrorBox error={error} />
       <div className="small muted">MOKS reads the live object, records its resourceVersion, and builds the impact, preconditions, validation and rollback for review.</div>
-      <div><button>Create plan</button></div>
+      <div className="form-foot"><button>Create plan</button></div>
     </form>
   );
 }
@@ -326,6 +331,10 @@ export function Diagnostics() {
     e.preventDefault();
     try { const s = await api<any>("/diagnostics/sessions", { method: "POST", body: { ...f, environment: env } }); nav(`/diagnostics/${s.id}`); } catch (err) { setError(err); }
   }
+  const [d, set, clear] = useUrlFilters({ status: "" });
+  const statuses = [...new Set((list.data ?? []).map((s) => s.status as string))].sort();
+  const sessions = (list.data ?? []).filter((s) => !d.status || s.status === d.status);
+  const chips: Chip[] = d.status ? [{ key: "s", label: d.status, onRemove: () => set({ status: "" }) }] : [];
   const pkgs = Object.entries(cat.data?.packages ?? {}).filter(([, p]: any) => p.images.includes(f.image));
   return (
     <>
@@ -339,12 +348,19 @@ export function Diagnostics() {
         <label>Reason<input required minLength={5} value={f.reason} onChange={(e) => setF({ ...f, reason: e.target.value })} /></label>
         <ErrorBox error={error} />
         <div className="small muted">Production environments and elevated packages need an approved plan before the pod starts.</div>
-        <div><button>Request session</button></div>
+        <div className="form-foot"><button>Request session</button></div>
       </form>
-      <div className="card" style={{ marginTop: 14 }}>
-        <table><thead><tr><th>Session</th><th>Image</th><th>Status</th><th>Expires</th></tr></thead>
-          <tbody>{list.data?.map((s) => <tr key={s.id}><td><Link to={`/diagnostics/${s.id}`}>{s.reason}</Link></td><td className="mono small">{s.image}</td>
-            <td><Badge kind={s.status === "ready" ? "ok" : s.status === "failed" ? "bad" : "neutral"}>{s.status}</Badge></td><td><Time iso={s.expires_at} /></td></tr>)}</tbody></table>
+      <FilterPanel chips={chips} onClear={clear}>
+        <label>Status<select value={d.status} onChange={(e) => set({ status: e.target.value })}><option value="">All</option>{statuses.map((s) => <option key={s}>{s}</option>)}</select></label>
+      </FilterPanel>
+      <div className="card mt">
+        <Loading load={list} rows={4} />
+        {list.data && <DataTable label="Diagnostic sessions" rows={sessions} rowKey={(s) => s.id} empty={<Empty title={chips.length ? "No sessions match." : "No diagnostic sessions yet."} />} cols={[
+          { key: "r", head: "Session", primary: true, cell: (s) => <Link className="clamp-2" title={s.reason} to={`/diagnostics/${s.id}`}>{s.reason}</Link> },
+          { key: "st", head: "Status", status: true, cell: (s) => <Badge kind={s.status === "ready" ? "ok" : s.status === "failed" ? "bad" : "neutral"}>{s.status}</Badge> },
+          { key: "i", head: "Image", cell: (s) => <Truncate text={s.image} mono />, meta: (s) => s.image },
+          { key: "x", head: "Expires", cell: (s) => <Time iso={s.expires_at} /> },
+        ]} />}
       </div>
     </>
   );
@@ -364,7 +380,7 @@ export function DiagnosticView() {
     const t = setInterval(s.reload, 3000);
     return () => clearInterval(t);
   }, [d, s.reload]);
-  if (!d) return <ErrorBox error={s.error} />;
+  if (!d) return <Loading load={s} rows={6} />;
   const tools: string[] = cat.data?.images?.[d.image_key]?.tools ?? [];
   const spec = cat.data?.tools?.[tool];
   async function run(e: FormEvent) {

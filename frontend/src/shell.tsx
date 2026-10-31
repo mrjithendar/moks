@@ -116,10 +116,12 @@ function useViewportHeight() {
   useEffect(() => {
     const vv = window.visualViewport;
     if (!vv) return;
-    const set = () => document.documentElement.style.setProperty("--vvh", `${vv.height}px`);
+    const root = document.documentElement.style;
+    const set = () => { root.setProperty("--vvh", `${vv.height}px`); root.setProperty("--vvt", `${vv.offsetTop}px`); }; // iOS moves the viewport instead of resizing it
     set();
     vv.addEventListener("resize", set);
-    return () => vv.removeEventListener("resize", set);
+    vv.addEventListener("scroll", set);
+    return () => { vv.removeEventListener("resize", set); vv.removeEventListener("scroll", set); };
   }, []);
 }
 

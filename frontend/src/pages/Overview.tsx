@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, PageHead, StatusBadge, Time, useInterval, useLoad } from "../components";
+import { Badge, DataTable, ErrorBox, Loading, PageHead, Stat, StatusBadge, Time, useInterval, useLoad } from "../components";
+import { Empty, Identifier, Skeleton, Truncate } from "../ui";
 
 const REFRESH_MS = 5000;
 
@@ -24,7 +25,7 @@ export default function Overview() {
       <PageHead title="Overview" sub="Live environment health, connector status and recent investigations">
         <label className="inline"><input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} /> Refresh every 5 s</label>
       </PageHead>
-      <ErrorBox error={ov.error} />
+      <Loading load={ov} rows={4} />
       {backups.data?.overdue && (
         <div className="alert error" style={{ marginBottom: 14 }}>
           {backups.data.last_success_at ? <>The last good database backup finished <Time iso={backups.data.last_success_at} />.</> : "No database backup has ever succeeded."}
@@ -38,24 +39,19 @@ export default function Overview() {
       )}
       <div className="grid cols-2">
         {ov.data?.environments.map((e) => <EnvCard key={e.name} env={e} live={live} />)}
-        {ov.data && !ov.data.environments.length && <div className="card empty">No environments are visible to you.</div>}
+        {ov.data && !ov.data.environments.length && <div className="card"><Empty title="No environments are visible to you.">Ask an administrator for a role in one.</Empty></div>}
       </div>
       <div className="card" style={{ marginTop: 14 }}>
         <div className="row between"><h2>Recent investigations</h2><Link to="/investigations">All investigations →</Link></div>
-        <table>
-          <thead><tr><th>Question</th><th>Scope</th><th>Status</th><th>Started</th></tr></thead>
-          <tbody>
-            {recent.data?.map((i) => (
-              <tr key={i.id}>
-                <td><Link to={`/investigations/${i.id}`}>{i.question}</Link></td>
-                <td className="mono small">{i.environment}/{i.namespace}</td>
-                <td><StatusBadge status={i.status} /></td>
-                <td><Time iso={i.created_at} /></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {recent.data && !recent.data.length && <div className="empty">No investigations yet. <Link to="/investigate">Start one.</Link></div>}
+        {recent.loading && !recent.data && <Skeleton rows={4} />}
+        {recent.data && <DataTable label="Recent investigations" rows={recent.data} rowKey={(i) => i.id}
+          empty={<Empty title="No investigations yet."><Link to="/investigate">Start one.</Link></Empty>}
+          cols={[
+            { key: "q", head: "Question", primary: true, cell: (i) => <Link className="clamp-2" title={i.question} to={`/investigations/${i.id}`}>{i.question}</Link> },
+            { key: "status", head: "Status", status: true, cell: (i) => <StatusBadge status={i.status} /> },
+            { key: "scope", head: "Scope", cell: (i) => <Truncate text={`${i.environment}/${i.namespace}`} mono />, meta: (i) => `${i.environment}/${i.namespace}` },
+            { key: "at", head: "Started", cell: (i) => <Time iso={i.created_at} /> },
+          ]} />}
       </div>
     </>
   );
@@ -113,28 +109,22 @@ function EnvCard({ env, live }: { env: EnvOverview; live: boolean }) {
         </div>
       </div>
       <ErrorBox error={error} />
-      {!health && !error && <div className="small muted">Checking live health…</div>}
+      {!health && !error && <Skeleton rows={2} label="Checking live health" />}
       {health && (
         <div className="stack">
-          <div className="row">
-            {nodesReady && <div><div className="stat">{nodesReady}</div><div className="small muted">nodes ready</div></div>}
-            <div style={{ marginLeft: 20 }}><div className="stat">{health.unhealthy_pods.length}</div><div className="small muted">pods needing attention (last hour)</div></div>
-            {firing !== null && <div style={{ marginLeft: 20 }}><div className="stat">{firing}</div><div className="small muted">firing alerts</div></div>}
-            <div className="right small muted">collected <Time iso={health.collected_at} /></div>
+          <div className="stat-row">
+            {nodesReady && <Stat value={nodesReady} label="nodes ready" />}
+            <Stat value={health.unhealthy_pods.length} label="pods needing attention (last hour)" />
+            {firing !== null && <Stat value={firing} label="firing alerts" />}
           </div>
-          {health.unhealthy_pods.length > 0 && (
-            <table>
-              <thead><tr><th>Pod</th><th>Ready</th><th>Restarts</th><th>Problem</th></tr></thead>
-              <tbody>
-                {health.unhealthy_pods.slice(0, 8).map((p: any) => (
-                  <tr key={p.namespace + p.name}>
-                    <td className="mono small">{p.namespace}/{p.name}</td><td>{p.ready}</td><td>{p.restarts}</td>
-                    <td className="small">{p.problems.map((x: any) => x.reason).filter(Boolean).join(", ") || p.phase}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
+          <div className="small muted">collected <Time iso={health.collected_at} /></div>
+          {health.unhealthy_pods.length > 0 && <DataTable label={`Pods needing attention in ${env.display_name}`} rows={health.unhealthy_pods.slice(0, 8)} rowKey={(p: any) => p.namespace + p.name} cols={[
+            { key: "pod", head: "Pod", primary: true, cell: (p: any) => <Identifier name={p.name} /> },
+            { key: "ns", head: "Namespace", cell: (p: any) => <Truncate text={p.namespace} mono />, meta: (p: any) => p.namespace },
+            { key: "ready", head: "Ready", cell: (p: any) => p.ready, meta: (p: any) => `${p.ready} ready` },
+            { key: "restarts", head: "Restarts", cell: (p: any) => p.restarts, meta: (p: any) => `${p.restarts} restarts` },
+            { key: "problem", head: "Problem", cell: (p: any) => p.problems.map((x: any) => x.reason).filter(Boolean).join(", ") || p.phase },
+          ]} />}
           {Object.keys(health.errors).length > 0 && (
             <div className="alert warn small">Partial data: {Object.entries(health.errors).map(([k, v]) => `${k}: ${v}`).join("; ")}</div>
           )}

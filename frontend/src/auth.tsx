@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
-import { api, ApiError, BASE, setCsrf } from "./api";
+import { api, ApiError, BASE, clearLocalWork, setCsrf } from "./api";
 
 export interface Me {
   id: string;
@@ -43,6 +43,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const r = await api<{ redirect: string }>("/auth/logout", { method: "POST" }).catch(() => ({ redirect: `${BASE}/login` }));
     setCsrf(null);
     setMe(null);
+    clearLocalWork();
     window.location.assign(r.redirect);
   }, []);
 

@@ -23,7 +23,7 @@ See [TESTING.md](TESTING.md#live-status-2026-10-30) for the evidence behind each
 - **Detection:** no Grafana alert source; Prometheus alerts, Kubernetes state, Loki and CloudWatch alarms only.
 - **Skills:** `evaluation` entries describe intended coverage. The cases are tests in `backend/tests`; the
   evaluation runner does not read them. Some skills reference metrics that vary by deployment.
-- **Argo CD:** no connector. Drift compares Git with the cluster.
+- **Argo CD:** read-only, through the Kubernetes connector. MOKS reads Application status but cannot sync, refresh or see diffs, and suggests where a missing path moved without knowing which candidate is right. Apps outside the reader's namespaces are hidden.
 
 ## Conversations and logs
 

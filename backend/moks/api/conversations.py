@@ -6,6 +6,7 @@ investigation.run, and runs as the person asking. Deleting needs the author (mes
 """
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -13,17 +14,27 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import distinct_on, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import audit, conversations
 from ..auth.deps import get_auth
 from ..auth.sessions import AuthContext
 from ..db import get_db
-from ..models import Conversation, ConversationMessage, ConversationParticipant, Environment, Investigation, User
+from ..models import Conversation, ConversationMessage, ConversationParticipant, ConversationRead, Environment, Incident, Investigation, User
 from ..rbac import P
 from .investigations import TERMINAL, CreateIn, start_investigation
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+
+PREVIEW = 160
+
+
+def _preview(text: str) -> str:
+    """One plain line for the inbox: the React view renders text, so this only removes Markdown punctuation."""
+    plain = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    plain = re.sub(r"[#*_`>|]+", " ", plain)
+    return " ".join(plain.split())[:PREVIEW]
 
 
 async def _load(db: AsyncSession, ctx: AuthContext, cid: uuid.UUID, deleted: bool = False) -> tuple[Conversation, Environment]:
@@ -71,11 +82,42 @@ async def list_conversations(deleted: bool = False, limit: int = Query(100, ge=1
          .where(Conversation.deleted_at.is_not(None) if deleted else Conversation.deleted_at.is_(None)).order_by(Conversation.updated_at.desc()).limit(limit * 3))
     rows = [(c, e, o) for c, e, o in (await db.execute(q)).all() if ctx.principal.can(P.INVESTIGATION_READ, e, c.namespace) and (not deleted or _may_manage(ctx, c))][:limit]
     ids = [c.id for c, _, _ in rows]
+    me = ctx.user.id
+    joined = set((await db.execute(select(ConversationParticipant.conversation_id).where(ConversationParticipant.conversation_id.in_(ids), ConversationParticipant.user_id == me))).scalars())
     counts = dict((await db.execute(select(ConversationParticipant.conversation_id, func.count()).where(ConversationParticipant.conversation_id.in_(ids)).group_by(ConversationParticipant.conversation_id))).all())
     msgs = dict((await db.execute(select(ConversationMessage.conversation_id, func.count()).where(ConversationMessage.conversation_id.in_(ids), ConversationMessage.deleted_at.is_(None)).group_by(ConversationMessage.conversation_id))).all())
-    running = set((await db.execute(select(Investigation.conversation_id).where(Investigation.conversation_id.in_(ids), Investigation.status.not_in(TERMINAL)))).scalars())
+    last = {r.conversation_id: r for r in (await db.execute(select(ConversationMessage.conversation_id, ConversationMessage.role, func.left(ConversationMessage.content, PREVIEW * 2).label("content"))
+            .where(ConversationMessage.conversation_id.in_(ids), ConversationMessage.deleted_at.is_(None)).ext(distinct_on(ConversationMessage.conversation_id))
+            .order_by(ConversationMessage.conversation_id, ConversationMessage.created_at.desc()))).all()}
+    others = dict((await db.execute(select(ConversationMessage.conversation_id, func.max(ConversationMessage.created_at)).where(ConversationMessage.conversation_id.in_(ids), ConversationMessage.deleted_at.is_(None),
+                  ConversationMessage.author_id.is_distinct_from(me)).group_by(ConversationMessage.conversation_id))).all())
+    reads = dict((await db.execute(select(ConversationRead.conversation_id, ConversationRead.read_at).where(ConversationRead.conversation_id.in_(ids), ConversationRead.user_id == me))).all())
+    latest = {r.conversation_id: r for r in (await db.execute(select(Investigation.conversation_id, Investigation.status, Incident.severity).join(Incident, Incident.id == Investigation.incident_id, isouter=True)
+              .where(Investigation.conversation_id.in_(ids)).ext(distinct_on(Investigation.conversation_id)).order_by(Investigation.conversation_id, Investigation.created_at.desc()))).all()}
+
+    def unread(cid: uuid.UUID) -> bool:
+        if cid not in others or (cid not in reads and cid not in joined):
+            return False  # read state exists for people in the conversation, and for anyone who opened it
+        return cid not in reads or others[cid] > reads[cid]
+
     return [{"id": str(c.id), "title": c.title, "environment": e, "namespace": c.namespace, "owner": o, "updated_at": c.updated_at.isoformat(), "participants": counts.get(c.id, 0),
-             "messages": msgs.get(c.id, 0), "running": c.id in running} for c, e, o in rows]
+             "messages": msgs.get(c.id, 0), "running": latest[c.id].status not in TERMINAL if c.id in latest else False, "status": latest[c.id].status if c.id in latest else None,
+             "severity": latest[c.id].severity if c.id in latest else None, "preview": _preview(last[c.id].content) if c.id in last else "", "last_role": last[c.id].role if c.id in last else None,
+             "unread": unread(c.id), "can_manage": _may_manage(ctx, c)} for c, e, o in rows]
+
+
+class ReadIn(BaseModel):
+    unread: bool = False
+
+
+@router.post("/{cid}/read")
+async def mark_read(cid: uuid.UUID, body: ReadIn, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, bool]:
+    """Per person. Not audited: it is the reader's own bookmark, and every open would otherwise be an entry."""
+    await _load(db, ctx, cid)
+    at = datetime.fromtimestamp(0, timezone.utc) if body.unread else datetime.now(timezone.utc)
+    await db.execute(insert(ConversationRead).values(conversation_id=cid, user_id=ctx.user.id, read_at=at)
+                     .on_conflict_do_update(index_elements=["conversation_id", "user_id"], set_={"read_at": at}))
+    return {"unread": body.unread}
 
 
 @router.get("/{cid}")

@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from .. import velero
+from .. import argocd, velero
 from ..redaction import redact
 from .base import ConnectorError, resolve_credential_path
 
@@ -165,6 +165,13 @@ class KubernetesConnector:
     async def velero_get(self, plural: str, name: str) -> dict:
         custom = await self.custom()
         return await self._call(f"get velero {plural}/{name}", custom.get_namespaced_custom_object, velero.GROUP, velero.VERSION, velero.namespace(), plural, name)
+
+    # ---- Argo CD (Application status; the moks.argocd row keeps no Helm parameters or values) ---
+
+    async def argocd_list(self) -> list[dict]:
+        custom = await self.custom()
+        items, _ = await self._list("list argo cd applications", custom.list_namespaced_custom_object, argocd.GROUP, argocd.VERSION, argocd.namespace(), argocd.PLURAL)
+        return items
 
     # ---- Discovery ----------------------------------------------------------------------
 

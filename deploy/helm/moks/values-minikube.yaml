@@ -10,6 +10,10 @@ imagePullSecrets: [{name: ecr-pull}]   # refreshed by the ecr-refresh CronJob (t
 velero:
   enabled: true
 
+# Investigations read Argo CD's sync status and errors.
+argocd:
+  enabled: true
+
 publicUrl: https://jithendar.com/moks
 basePath: /moks
 

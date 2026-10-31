@@ -2,6 +2,7 @@ import { lazy, Suspense, type ComponentType, type ReactNode } from "react";
 import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useAuth } from "./auth";
 import { Layout } from "./shell";
+import { Skeleton } from "./ui";
 import Login from "./pages/Login";
 
 // Each area loads on first use, so first paint does not pay for pages never opened.
@@ -18,7 +19,8 @@ const Backups = page(backups, "Backups"), BackupStorage = page(backups, "BackupS
 const Workspace = lazy(() => import("./pages/Conversations").then((m) => ({ default: m.Workspace })));
 const InvestigationView = page(investigate, "InvestigationView"), NewInvestigation = page(investigate, "NewInvestigation");
 const Evals = page(insights, "Evals"), FinOps = page(insights, "FinOps"), Knowledge = page(insights, "Knowledge"), Skills = page(insights, "Skills");
-const Explorer = page(live, "Explorer"), Logs = page(live, "Logs");
+const Explorer = page(live, "Explorer");
+const Logs = lazy(() => import("./pages/Logs").then((m) => ({ default: m.Logs })));
 const Detections = lazy(() => import("./pages/Detections").then((m) => ({ default: m.Detections })));
 const Metrics = lazy(() => import("./pages/Metrics").then((m) => ({ default: m.Metrics })));
 const Actions = page(ops, "Actions"), DiagnosticView = page(ops, "DiagnosticView"), Diagnostics = page(ops, "Diagnostics"), IncidentView = page(ops, "IncidentView"), Incidents = page(ops, "Incidents"), PlanView = page(ops, "PlanView");
@@ -34,12 +36,12 @@ function Need({ any, children }: { any: string[]; children: ReactNode }) {
 export default function App() {
   const { me, loading } = useAuth();
   const loc = useLocation();
-  if (loading) return <div className="empty">Loading…</div>;
+  if (loading) return <div className="boot"><Skeleton rows={4} /></div>;
   if (loc.pathname === "/login") return <Login />;
   if (!me) return <Navigate to={`/login?next=${encodeURIComponent(import.meta.env.BASE_URL.replace(/\/$/, "") + loc.pathname + loc.search)}`} replace />;
   return (
     <Layout>
-      <Suspense fallback={<div className="empty">Loading…</div>}>
+      <Suspense fallback={<Skeleton rows={6} />}>
       <Routes>
         <Route path="/" element={<Overview />} />
         <Route path="/investigate" element={<NewInvestigation />} />

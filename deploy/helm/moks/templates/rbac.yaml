@@ -32,6 +32,12 @@ rules:
   - apiGroups: [metrics.k8s.io]
     resources: [pods, nodes]
     verbs: [get, list]
+  {{- if .Values.argocd.enabled }}
+  # Sync status and errors. Read here, not with a Role in argocd, so project moks needs no destination there.
+  - apiGroups: [argoproj.io]
+    resources: [applications]
+    verbs: [get, list]
+  {{- end }}
 ---
 {{- if .Values.rbac.clusterWide }}
 apiVersion: rbac.authorization.k8s.io/v1

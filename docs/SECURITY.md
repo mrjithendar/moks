@@ -34,7 +34,7 @@ DENY`, `nosniff`, `Referrer-Policy: same-origin`, and `Cache-Control: no-store` 
 | viewer | `overview.read`, `investigation.read` |
 | investigator | viewer + `investigation.run`, `explorer.read`, `metrics.raw_query`, `finops.read`, `incident.write` |
 | operator | investigator + `action.request`, `action.execute` |
-| approver | viewer + `action.approve`, `finops.read` (never their own plans) |
+| approver | viewer + `action.approve`, `finops.read` (never their own plans; only a global admin may approve their own, and an admin's plans need no second approval) |
 | admin | everything, including `admin.users`, `admin.connectors`, `admin.llm`, `admin.policies`, `audit.read` |
 
 A binding is `role : environment-pattern : namespace-pattern` (glob). Some rules are deliberate:
@@ -196,3 +196,27 @@ reaches the model only as untrusted data, and a test shows a runbook that says "
 cannot cause an action. **Skills** are the opposite: trusted, reviewed instructions from the image
 or a ConfigMap, validated at load to use only read-only tools and allowlisted action hints
 ([SKILLS.md](SKILLS.md)).
+
+## LogQL scope and AI query drafts
+
+Scope is checked on tokens, not with a pattern over the text. `moks/connectors/loki.py` reads strings, `#` comments and
+selectors the way Loki's lexer does, so a comment cannot hide a selector. For anyone without every namespace, each selector
+must pin the namespace with `=`, comments are refused, and a value with an escape does not count as pinned. Ranges and
+`offset` cannot look back further than the environment's query window. This runs on every execution, whoever wrote the query.
+
+"Generate LogQL with AI" only fills the editor. It checks access first, then sends the model the request and a bounded list
+of label names and plain-token values for that scope. It never sends credentials or log lines. A draft that leaves the chosen
+namespace, contains a comment, looks back too far or fails Loki's parser is discarded and the reason is shown. Log search text
+and LogQL go in request bodies, not URLs.
+
+## What stays in the browser
+
+Conversation drafts, unsent LogQL and log search text are kept in `sessionStorage` under `moks.`. They end with the tab, and
+are cleared on sign-out and when a session expires. Shareable filter state in the URL never includes search text or IDs.
+
+## Administrator approval
+
+A global administrator (a role binding on every environment and namespace) can approve their own plans, and plans they
+request need no second approval, including in production. This removes separation of duties for that role: one
+administrator account can change production alone. Plans keep their hash, expiry, single execution and explicit Execute step.
+Each waiver is recorded as `action.approval_waived`, and the executor refuses the plan if the requester is no longer an administrator.
