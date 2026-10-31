@@ -38,7 +38,7 @@ from ..tools.executor import ToolExecutor, ToolOutcome, tools_for_planner
 from . import prompts
 from .. import conversations
 from ..diagnosis.logs import last_failure
-from .report import Report, parse_json_object, rules_report, validate_llm_report, verify_causes
+from .report import Report, focus, parse_json_object, rules_report, validate_llm_report, verify_causes
 
 log = logging.getLogger("moks.orchestrator")
 
@@ -264,6 +264,7 @@ class Investigator:
 
         # 4. Hypotheses and report
         await self._emit("phase", {"phase": "hypotheses", "label": "Forming and checking hypotheses"})
+        self.findings = focus(question, self.findings)
         report: Report | None = None
         if provider:
             try:
@@ -484,6 +485,10 @@ class Investigator:
                     await self._call(executor, "loki_logs", {"namespace": ns, "pod": pod, "level": "error", "limit": 100}, f"earlier errors of {name} in Loki")
 
     def _crash_reason(self, ns: str, pod: str, container: str, last: dict, out: ToolOutcome) -> None:
+        if last.get("reason") == "Unknown":
+            # The runtime lost the container, usually in a node restart. The last error line in its log did not cause that.
+            self.notes.append(f"{pod}/{container} stopped with reason Unknown (exit {last.get('exitCode')}), which points to a node or runtime restart, not an application failure.")
+            return
         line = last_failure(out.data.get("lines") or [])
         if not line:
             return

@@ -1,5 +1,6 @@
 """Argo CD status: messages here are the real ones from mk4, so parsing is tested against what Argo sends."""
 import uuid
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -164,6 +165,31 @@ def test_unhealthy_pods_do_not_push_out_the_skill_the_question_asks_for():
     many = {"crashloop", "oomkilled", "service_selector_mismatch", "service_no_ready_endpoints", "workload_unavailable", "image_pull", "unschedulable"}
     chosen = [s.name for s, _, _ in skills.select("why are argocd applications sync failing", many)]
     assert len(chosen) == 3 and "gitops-drift-argocd" in chosen
+
+
+def test_an_argo_question_leads_with_argo_even_beside_worse_pod_findings():
+    pod = {"kind": "oomkilled", "severity": "high", "title": "controller was OOMKilled", "detail": "old", "resources": ["pod/x"], "evidence": ["E1"]}
+    argo = [{**argocd.finding(argocd.app_row(a)), "evidence": ["E2"]} for a in (FAILING, CHART)]
+    report = rules_report("Why are 7 argocd applications' syncs failing?", [pod, *argo], [], [])
+    assert report.summary.startswith("Argo CD reports problems with 2 applications: frontend, cert-manager. 2 read a path")
+    assert "frontend" in report.observed_facts[0].statement and "OOMKilled" not in report.summary
+
+
+def test_other_questions_keep_their_order():
+    pod = {"kind": "oomkilled", "severity": "high", "title": "t", "detail": "d", "resources": ["pod/x"]}
+    argo = argocd.finding(argocd.app_row(FAILING))
+    report = rules_report("why is checkout slow", [pod, argo], [], [])
+    assert "Most severe: t." in report.summary
+
+
+def test_a_runtime_kill_is_not_blamed_on_the_last_log_line():
+    run = Investigator.__new__(Investigator)
+    run.findings, run.notes = [], []
+    logged = SimpleNamespace(data={"lines": ['level=error msg="services/frontend: app path does not exist"']}, evidence_ref="E8")
+    run._crash_reason("argocd", "repo-server", "repo-server", {"reason": "Unknown", "exitCode": 255}, logged)
+    assert run.findings == [] and "node or runtime restart" in run.notes[0]
+    run._crash_reason("argocd", "repo-server", "repo-server", {"reason": "Error", "exitCode": 1}, logged)
+    assert run.findings[0]["kind"] == "crash_log_reason"
 
 
 def test_a_detected_failure_is_a_verified_cause_in_the_report():

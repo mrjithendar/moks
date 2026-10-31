@@ -105,7 +105,13 @@ def validate_llm_report(raw: dict[str, Any], valid_refs: set[str], notes: list[s
 
 # Findings where the detector reads the fault itself, not a symptom of it. A selector that matches
 # no pods IS the broken selector; a crashloop is a symptom whose cause is still open.
+ARGO_QUESTION = re.compile(r"(?i)\b(argo|gitops|syncs?\b)")
 SELF_EVIDENT = {"crash_log_reason", "service_selector_mismatch", "oomkilled", "image_pull", "unschedulable", "config_ref_missing", "argocd_source_missing", "argocd_comparison_error", "argocd_sync_failed"}
+
+
+def focus(question: str, findings: list[dict]) -> list[dict]:
+    """A question about Argo CD is answered by Argo CD's findings, even when pods score as more severe."""
+    return sorted(findings, key=lambda f: not f["kind"].startswith("argocd_")) if ARGO_QUESTION.search(question) else findings
 
 
 def verify_causes(report: Report, findings: list[dict]) -> None:
@@ -128,6 +134,7 @@ def rules_report(question: str, findings: list[dict], evidence: list[dict], note
     causes: list[Cause] = []
     steps: list[str] = []
     remediation: list[Remediation] = []
+    findings = focus(question, findings)
     for f in findings[:12]:
         refs = f.get("evidence", [])
         facts.append(Fact(statement=f"{f['title']}. {f['detail']}", evidence=refs))
@@ -152,7 +159,13 @@ def rules_report(question: str, findings: list[dict], evidence: list[dict], note
     ok = [e for e in evidence if e["ok"]]
     summary = (f"{len(findings)} problem(s) detected from {len(ok)} successful evidence queries."
                if findings else f"No Kubernetes-level problems detected in {len(ok)} successful evidence queries.")
-    if findings:
+    argo = [f["resources"][0].partition("/")[2] for f in findings if f["kind"].startswith("argocd_")]
+    if argo and ARGO_QUESTION.search(question):
+        gone = sum(f["kind"] == "argocd_source_missing" for f in findings)
+        summary = f"Argo CD reports problems with {len(argo)} applications: {', '.join(argo)}."
+        if gone:
+            summary += f" {gone} read a path that no longer exists in Git, so Argo CD cannot build their manifests."
+    elif findings:
         summary += f" Most severe: {findings[0]['title']}."
     return Report(summary=summary, observed_facts=facts, suspected_causes=causes, missing_evidence=missing,
                   next_steps=steps[:10], proposed_remediation=remediation[:5], generated_by="rules", notes=notes)
