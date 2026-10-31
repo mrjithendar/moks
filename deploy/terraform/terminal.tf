@@ -35,16 +35,26 @@ resource "aws_iam_role" "terminal" {
   max_session_duration = 3600
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "OnlyTheGatewayAndNamedForASession"
-      Effect    = "Allow"
-      Principal = { AWS = local.terminal_gateway_arns }
-      Action    = ["sts:AssumeRole", "sts:SetSourceIdentity"]
-      Condition = {
-        StringLike = { "sts:RoleSessionName" = ["moks-term-*", "moks-audit-*"] }
-        Null       = { "sts:SourceIdentity" = "false" } # every session names the person who opened it
-      }
-    }]
+    Statement = [
+      {
+        Sid       = "OnlyTheGatewayAndNamedForASession"
+        Effect    = "Allow"
+        Principal = { AWS = local.terminal_gateway_arns }
+        Action    = "sts:AssumeRole"
+        Condition = {
+          StringLike = { "sts:RoleSessionName" = ["moks-term-*", "moks-audit-*"] }
+          Null       = { "sts:SourceIdentity" = "false" } # every session names the person who opened it
+        }
+      },
+      {
+        # Its own statement: sts:RoleSessionName does not exist on this action, so sharing the one above never matches.
+        Sid       = "EverySessionNamesThePerson"
+        Effect    = "Allow"
+        Principal = { AWS = local.terminal_gateway_arns }
+        Action    = "sts:SetSourceIdentity"
+        Condition = { Null = { "sts:SourceIdentity" = "false" } }
+      },
+    ]
   })
 }
 
