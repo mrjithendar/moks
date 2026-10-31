@@ -22,14 +22,14 @@ terraform apply moks.tfplan
 gh variable set AWS_ROLE_ARN --repo mrjithendar/moks --body "$(terraform output -raw ci_role_arn)"
 ```
 
-This creates the immutable `moks` ECR repository and a CI role that GitHub Actions assumes over
+This creates the `moks` ECR repository and a CI role that GitHub Actions assumes over
 OIDC, so there are no stored access keys and only `master` can push. It also creates an IAM user
 for MOKS's Bedrock calls; that user has no key yet (step 8). Details are in
 [../deploy/terraform/README.md](../deploy/terraform/README.md), including how to check that
 mk4's `ecr-refresh` identity may pull the new repository.
 
 CI (`.github/workflows/ci.yml`) tests every push, then on `master` builds the arm64 image and
-pushes an image tagged with its commit, and tags in ECR are immutable. It
+pushes an image tagged with its commit and `latest`. It
 never touches the cluster. Commit and push this repository (`github.com/mrjithendar/moks`) and
 wait for the `release` job, whose summary prints the commit and image digest.
 
@@ -59,7 +59,7 @@ It refuses to overwrite existing Secrets. Add provider credentials later as `MOK
 
 ## 4. Roll out a new image
 
-CI tags each image with its commit and opens a pull request that pins its digest. Merging that pull request and syncing Argo CD by hand is the rollout, and reverting it is the rollback. See [RELEASES.md](RELEASES.md).
+CI tags each image with its commit and moves `latest` to it. mk4 runs `latest`, so restarting the MOKS pods is the rollout, and pointing `latest` back at an earlier commit is the rollback. See [RELEASES.md](RELEASES.md).
 
 ## 5. Argo CD project and application
 
@@ -417,8 +417,8 @@ It is not encrypted, so delete it when you are done.
 ## Upgrades and rollback
 
 Migrations run in the API's init container under an advisory lock and are forward-only. Take a
-backup before upgrading across a migration. Roll back the application by pinning the previous
-image digest (step 4). Roll back data by restoring the backup.
+backup before upgrading across a migration. Roll back the application by pointing `latest` at the
+previous commit (step 4). Roll back data by restoring the backup.
 
 ## Troubleshooting
 
@@ -443,3 +443,15 @@ image digest (step 4). Roll back data by restoring the backup.
 the draft in the editor, and press **Run**. Nothing runs until you do. It needs an active chat model under LLM providers and
 uses the same daily budget as investigations. Scoped users must choose a namespace. Syntax checking uses Loki's
 `/loki/api/v1/format_query`; on a Loki without it, the draft says it was not syntax checked.
+
+## Rolling out knowledge and skill governance (migration 0021)
+
+1. Take and verify a database backup. The migration is additive and forward-only.
+2. Deploy. No new settings are required. `MOKS_SKILLS_AUTOSCAN=0` stops processes publishing built-ins at start.
+3. The first start publishes generation 1. Check **SRE skills** shows every process current.
+4. The next sync re-reads every GitHub document, because older documents are on pipeline 0. With an embedding model this
+   re-embeds them, against the embedding budget. Documents already indexed stay searchable meanwhile.
+5. Review sources marked shared globally, and set owners and review intervals.
+6. Custom skills are not published automatically: publish them from **SRE skills**. Until then their built-ins or nothing run.
+
+To roll back the image, follow docs/RELEASES.md: the schema stays and older builds ignore the new columns.

@@ -1,22 +1,36 @@
 # Releases
 
-An image is built once, tagged with its commit, and deployed by digest. Git holds the digest, so what runs is reviewable and a rollback is a revert.
+An image is built once and tagged with its commit, and CI moves `latest` to it. mk4 always runs `latest` with `pullPolicy: Always`, and that setting does not change between releases.
+
+Git does not record which build is running. Check it with `/api/health`.
 
 ## Release
 
-1. A merge to `master` passes CI, and CI builds one image tagged with the commit SHA. ECR tags are immutable.
-2. CI opens a pull request named `Release <sha>` that changes `image.digest` in `values-minikube.yaml`.
-3. Review it, including any migration it brings, and merge it.
-4. Sync the `moks-portal` app in Argo CD by hand, without prune. Pods roll only because the digest changed.
-5. Check the running build: `curl https://jithendar.com/moks/api/health` shows the commit, and the profile menu warns if components differ.
+1. A merge to `master` passes CI. CI builds one image, tags it with the commit SHA and moves `latest` to it. If CI fails, `latest` does not move.
+2. Check any migration the release brings. Migrations run when the new API pods start.
+3. Restart the pods, which pull `latest`:
 
-No `kubectl rollout restart` is involved, and the chart refuses `image.tag: latest` and any `image.digest` that is not a full `sha256:` digest.
+   ```bash
+   kubectl --context mk4 -n moks rollout restart deploy/moks-api deploy/moks-worker deploy/moks-executor
+   ```
 
-Merging a release does not start another build: pushes that change only `values-minikube.yaml` skip CI, so a change to that file alone needs no new image. If Actions may not create pull requests, the build still succeeds and its summary says to open the pull request by hand from `release/<sha>`.
+4. Check the running build: `curl https://jithendar.com/moks/api/health` shows the commit, and the profile menu warns if components differ.
+
+An Argo CD sync does not start a release. The manifests do not change between builds, so `moks-portal` stays Synced and no pod restarts. Sync it only when the chart changes, by hand and without prune.
+
+A pod that restarts for any other reason, such as a node restart, also pulls `latest`. It can run a newer build than the others until the rest are restarted, and a sync that changes a pod template rolls that component onto the newest build too.
 
 ## Roll back
 
-Revert the release commit, merge, and sync. That restores the previous digest, which ECR still holds (the newest `image_retention_count` images are kept).
+Point `latest` back at an earlier commit, then restart as in step 3:
+
+```bash
+COMMIT=<commit-sha>
+MANIFEST="$(aws ecr batch-get-image --region us-east-1 --repository-name moks --image-ids imageTag=$COMMIT --query 'images[0].imageManifest' --output text)"
+aws ecr put-image --region us-east-1 --repository-name moks --image-tag latest --image-manifest "$MANIFEST"
+```
+
+The next successful `master` build moves `latest` forward again. Revert the bad commit first if it would break again.
 
 The schema stays where it is, because migrations are forward-only. That is safe when releases follow the rule below.
 
@@ -33,7 +47,3 @@ Never rename or drop something in the same release that stops using it. `moks wa
 ## Local development
 
 Nothing here needs a registry: `dev/run-local.sh` runs from source and reports commit `dev`. To try a local image on Minikube, build with `--build-arg GIT_COMMIT=$(git rev-parse HEAD)` and install with `--set image.repository=moks,image.tag=$(git rev-parse --short HEAD),image.digest=`. The tag `latest` is refused.
-
-## First rollout of this workflow
-
-`values-minikube.yaml` pins the digest mk4 was running when this was written, so syncing it changes no code. Apply the Terraform change for immutable tags before the next release: the old `:latest` tag cannot be pushed again afterwards, and CI no longer does.

@@ -1,6 +1,6 @@
 # Dependabot version updates. Pull requests run the `check` job in ci.yml (backend tests against
 # PostgreSQL, frontend typecheck/test/build, Helm and Terraform validation). Merging to master
-# releases an image; scripts/set-image.sh + an Argo CD sync still roll it out.
+# releases an image; a restart of the MOKS pods rolls it out (docs/RELEASES.md).
 #
 # Minor and patch updates are grouped to keep the PR count down; majors arrive one PR each.
 # Security updates are not grouped and are not held back by the cooldown.
@@ -100,7 +100,7 @@ updates:
       # Major PostgreSQL upgrades need a dump/restore of the data volume (docs/OPERATOR_GUIDE.md).
       - dependency-name: postgres
         update-types: ["version-update:semver-major"]
-      # The MOKS image is built by CI and pinned by digest with scripts/set-image.sh.
+      # The MOKS image is built by CI and runs as latest.
       - dependency-name: "*/moks"
 
   # Demo lab manifests (nginx-unprivileged, busybox, python)

@@ -2,9 +2,9 @@
 
 image:
   repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
-  # Pin a digest for releases (sha256:...); tag is used only when digest is empty.
+  # mk4 runs tag latest. A digest (sha256:...), if set, replaces the tag.
   digest: ""
-  tag: ""               # a commit SHA for local installs; production pins digest
+  tag: ""
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 

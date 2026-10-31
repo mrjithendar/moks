@@ -23,7 +23,9 @@ category: application
 version: '2'
 evaluation:
 - fixture: dependency-latency
-  expect: the lab's expected finding
+  expect:
+    selected: true
+    note: "the lab's expected finding"
 ---
 # Latency regression
 

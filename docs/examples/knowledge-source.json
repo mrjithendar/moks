@@ -1,0 +1,21 @@
+{
+  "name": "payments-runbooks",
+  "type": "github",
+  "repository": "acme/payments-runbooks",
+  "ref": "main",
+  "include": ["runbooks/**", "docs/**/*.md"],
+  "exclude": ["docs/drafts/**"],
+  "services": {"runbooks/checkout/": "checkout", "runbooks/ledger/": "ledger"},
+  "scope_environment": "prod",
+  "scope_namespace": "payments",
+  "team": "payments-sre",
+  "owner": "payments-sre@acme.example",
+  "classification": "internal",
+  "applies_to": {"services": ["checkout", "ledger"], "resources": ["Deployment", "Service"]},
+  "authority": 1,
+  "review_interval_days": 90,
+  "stale_after_days": 7,
+  "stale_policy": "flag",
+  "sync_interval_minutes": 1440,
+  "credential_ref": {"type": "env", "name": "MOKS_CRED_GITHUB_TOKEN"}
+}

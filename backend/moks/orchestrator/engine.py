@@ -94,7 +94,11 @@ class Investigator:
         self.calls_seen: set[str] = set()
         self.rejected: list[dict[str, Any]] = []
         self._window: tuple[datetime, datetime] | None = None
-        self.skills: list = []  # (Skill, score, reasons) selected for this investigation
+        self.skills: list = []  # (Skill, score, reasons) selected for this investigation; these copies are the pin
+        self.skill_runs: list[dict] = []  # what each did: steps run and skipped, evidence, checks
+        self.skill_rejected: list[dict] = []
+        self.skill_generation: int | None = None
+        self.requested_skill: str | None = None
         self.focus_namespace: str | None = None
 
     async def _emit(self, type_: str, payload: dict[str, Any]) -> None:
@@ -177,6 +181,7 @@ class Investigator:
             await db.execute(update(Investigation).where(Investigation.id == self.id).values(
                 status=status, report=report, error=error, finished_at=datetime.now(timezone.utc),
                 tool_calls=self.tool_calls, tokens_in=self.tokens_in, tokens_out=self.tokens_out, cost_usd=self.cost,
+                skill_generation=self.skill_generation, skill_pins=self.skill_runs,
             ))
             inv = await db.get(Investigation, self.id)
             await conversations.record_reply(db, inv, (report or {}).get("summary") or error or "No report was produced.")
@@ -202,6 +207,7 @@ class Investigator:
                 connectors, conn_errors = await registry.for_environment(db, env.id)
             llm_cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none() if self.use_llm else None
             question, namespace, t_from, t_to = inv.question, inv.namespace, inv.time_from, inv.time_to
+            self.requested_skill = inv.requested_skill
             principal_id, environment_id = inv.created_by, inv.environment_id
             self.owner = principal_id
             if inv.conversation_id:
@@ -235,6 +241,7 @@ class Investigator:
             await self._baseline(executor, ctx, namespace, question)
             namespace = self.focus_namespace or namespace
             scope_info["namespace"] = namespace
+            ctx.focus_namespace = namespace
             await db.commit()
 
             # 2. Logs, current and previous: often the only place a failure explains itself
@@ -283,8 +290,13 @@ class Investigator:
         payload["relationships"] = self._relationships()
         payload["primary_resource"] = self._primary_resource()
         payload["findings"] = self.findings
-        payload["skills"] = [{"name": sk.name, "description": sk.meta.description, "reasons": why} for sk, _, why in self.skills]
-        payload["skill_actions"] = self._skill_actions(namespace)
+        self._contracts()
+        payload["skills"] = [{"name": sk.name, "version": sk.meta.version, "digest": sk.digest, "description": sk.meta.description, "reasons": why} for sk, _, why in self.skills]
+        payload["skill_runs"] = self.skill_runs
+        payload["skill_rejected"] = self.skill_rejected
+        payload["skill_generation"] = self.skill_generation
+        payload["skill_actions"] = await self._skill_actions(namespace, env_name)
+        payload["notes"] = list(dict.fromkeys([*(payload.get("notes") or []), *self.notes]))
         await self._finish("completed", payload, None)
         await self._emit("report", {"report": payload})
         return mode
@@ -537,56 +549,167 @@ class Investigator:
             for name in named:
                 await self._call(executor, "k8s_pod_logs", {"namespace": namespace, "pod": name, "tail_lines": 120}, "application log lines")
 
+    async def _eligible(self, ctx: ToolContext) -> tuple[dict, dict]:
+        """Which skills may run here, decided before ranking: an unavailable skill must not take a
+        place from one that can run. Returns skill name to readiness, and the refused with reasons."""
+        from .. import skills as skill_lib
+        from ..skills import readiness as rd
+        from ..skills import registry
+
+        await registry.refresh()
+        async with session_scope() as db:
+            view = await registry.policy(db)
+        prom = ctx.connectors.get("prometheus")
+        metrics, complete = (None, False)
+        wants = any(sk.meta.telemetry for sk in skill_lib.library().skills.values())
+        if wants and prom:
+            metrics, complete = await rd.metric_names(str(prom[0].id) if prom[0] is not None else ctx.environment.name, prom[1])
+        ok, refused = {}, {}
+        for sk in skill_lib.library().skills.values():
+            allowed, why = registry.allowed(sk, ctx.environment.name, view)
+            if not allowed:
+                refused[sk.name] = why
+                continue
+            state = rd.readiness(sk, set(ctx.connectors), metrics, complete, lambda p: ctx.principal.can(P(p), ctx.environment.name, "*"))
+            if state["state"] == "unavailable":
+                refused[sk.name] = "; ".join(state["reasons"]) or "unavailable here"
+                continue
+            ok[sk.name] = state
+        return ok, refused
+
+    async def _still_allowed(self, sk, env_name: str) -> str | None:
+        """Why a pinned skill must stop now, if it must. Replacing a version does not stop it: only a
+        decision against the skill does."""
+        from ..skills import registry
+
+        async with session_scope() as db:
+            view = await registry.policy(db)
+        ok, why = registry.allowed(sk, env_name, view)
+        return None if ok else why
+
+    def _repository(self, ctx: ToolContext) -> str:
+        git = ctx.connectors.get("git")
+        repos = getattr(git[1], "repositories", None) if git else None
+        return repos[0] if repos and len(repos) == 1 else ""  # with several, guessing would compare the wrong one
+
     async def _run_skills(self, executor: ToolExecutor, ctx: ToolContext, namespace: str, question: str) -> None:
         from .. import skills as skill_lib
+        from ..skills.registry import snapshot
         from ..tools.builtin import REGISTRY
 
         kinds = {f["kind"] for f in self.findings}
-        async with session_scope() as db:
-            off = set((await db.execute(select(SkillPolicy.name).where(SkillPolicy.enabled.is_(False)))).scalars())
-        chosen = []
-        for entry in skill_lib.select(question, kinds):
-            sk = entry[0]
-            state = skill_lib.availability(sk, set(ctx.connectors), None)
-            if sk.name in off:
-                continue
-            if not state["available"]:
-                self.notes.append(f"Skill {sk.name} skipped: {'; '.join(state['reasons'])}.")
-                continue
-            chosen.append(entry)
+        ready, refused = await self._eligible(ctx)
+        self.skill_generation = snapshot()["generation"]
+        resources = {str(r).split("/", 1)[0].capitalize() for f in self.findings for r in f.get("resources") or []}
+        if self.requested_skill and self.requested_skill in refused:
+            self.notes.append(f"Skill {self.requested_skill} was asked for but cannot run: {refused[self.requested_skill]}.")
+        chosen = skill_lib.select(question, kinds, eligible=lambda sk: sk.name in ready, requested=self.requested_skill, resources=resources)
+        rejected = [{"skill": n, "reason": why} for n, why in sorted(refused.items()) if n in {s.name for s, _, _ in skill_lib.select(question, kinds, limit=6)}]
+        for r in rejected:
+            self.notes.append(f"Skill {r['skill']} not used: {r['reason']}.")
         self.skills = chosen
+        self.skill_rejected = rejected
         if not self.skills:
             return
-        await self._emit("skills", {"skills": [{"name": sk.name, "reasons": why} for sk, _, why in self.skills]})
+        self.skill_runs = [{"skill": sk.name, "version": sk.meta.version, "digest": sk.digest, "reasons": why, "readiness": ready[sk.name]["state"], "steps": [], "stopped": None}
+                           for sk, _, why in self.skills]
+        await self._emit("skills", {"skills": [{"name": sk.name, "version": sk.meta.version, "reasons": why} for sk, _, why in self.skills]})
         trace = TRACE_ID.search(question)
         base = {"namespace": "" if namespace == "*" else namespace, "question": question[:200],
-                "trace_id": trace.group(0).lower() if trace else ""}
+                "trace_id": trace.group(0).lower() if trace else "", "repository": self._repository(ctx)}
         budget = max(0, self.settings.max_tool_calls - self.tool_calls - 4)  # leave room for follow-ups
-        for sk, _, _ in self.skills:
+        # What was asked for runs first, and each skill gets a share, so findings about something else cannot use it all.
+        asked = lambda pair: not any(w.startswith(("chosen", "question:")) for w in pair[0][2])
+        ordered = sorted(zip(self.skills, self.skill_runs), key=asked)
+        for position, ((sk, _, _), run) in enumerate(ordered):
             await self._emit("phase", {"phase": "skill", "label": f"Running skill {sk.name}"})
+            share = max(1, budget // (len(ordered) - position))
+            budget -= share
             for step in sk.meta.steps:
+                record = {"tool": step.tool, "purpose": step.purpose, "required": step.required, "status": "skipped", "reason": None, "evidence": [], "errors": []}
+                run["steps"].append(record)
+                stop = await self._still_allowed(sk, ctx.environment.name)
+                if stop:
+                    run["stopped"] = stop
+                    record["reason"] = f"skill stopped: {stop}"
+                    continue
                 spec = REGISTRY[step.tool]
                 if not all(ctx.available(c) for c in (spec.connector_type, *spec.also_requires)):
-                    continue  # connector not configured here: the skill degrades gracefully
+                    record["reason"] = f"no {spec.connector_type} connector here"
+                    continue
                 if spec.cluster_scoped and not ctx.scope.cluster_wide:
+                    record["reason"] = "needs access to all namespaces"
                     continue
                 if step.when_question and not re.search(step.when_question, question, re.I):
+                    record["reason"] = "the question does not call for it"
                     continue
-                for c in skill_lib.contexts_for(step, self.findings, base):
+                contexts = skill_lib.contexts_for(step, self.findings, base)
+                if not contexts:
+                    record["reason"] = f"no matching {step.for_each}"
+                    continue
+                for c in contexts:
                     args = skill_lib.render(step.args, c)
-                    if args is None or budget <= 0:
-                        continue  # a needed variable (e.g. deployment of a StatefulSet pod) is unknown
+                    if args is None:
+                        missing = sorted(v for v in skill_lib.template_vars(step.args) if not c.get(v))
+                        record["reason"] = f"needs {', '.join(missing)}, which this run did not find"
+                        continue
+                    if share <= 0:
+                        record["reason"] = "tool budget used up"
+                        run["budget_exhausted"] = True
+                        continue
+                    seen = len(self.evidence)
                     out = await self._call(executor, step.tool, args, f"[{sk.name}] {step.purpose or step.tool}")
-                    if out is not None:
-                        budget -= 1
+                    if out is None:
+                        record["reason"] = record["reason"] or "already collected, or the tool budget is used up"
+                        if any(e["tool"] == step.tool and e["args"] == args for e in self.evidence):
+                            record.update(status="executed", reason="already collected in this run")
+                            record["evidence"] += [e["ref"] for e in self.evidence if e["tool"] == step.tool and e["args"] == args]
+                        continue
+                    share -= 1
+                    record["status"] = "executed" if out.ok else "failed"
+                    record["evidence"] += [e["ref"] for e in self.evidence[seen:]]
+                    if not out.ok:
+                        record["errors"].append((out.error or out.summary or "failed")[:200])
+                    else:
+                        record["reason"] = None
+            budget += max(share, 0)  # what one skill did not need goes to the next
 
-    def _skill_actions(self, namespace: str) -> list[dict]:
+    def _contracts(self) -> None:
+        """Holds each skill to what it declared. A plain-text item stays labeled guidance only."""
+        kinds = {f["kind"] for f in self.findings}
+        for (sk, _, _), run in zip(self.skills, self.skill_runs):
+            checks = []
+            for item in sk.meta.evidence_required:
+                if isinstance(item, str):
+                    checks.append({"field": "evidence_required", "text": item, "status": "guidance_only"})
+                elif item.when_finding and item.when_finding not in kinds:
+                    checks.append({"field": "evidence_required", "text": item.label or item.tool, "status": "not_applicable"})
+                else:
+                    n = sum(1 for e in self.evidence if e["tool"] == item.tool and e["ok"])
+                    checks.append({"field": "evidence_required", "text": item.label or f"{item.tool}: at least {item.min_ok}", "status": "passed" if n >= item.min_ok else "failed", "observed": n})
+            for item in sk.meta.verification:
+                if isinstance(item, str):
+                    checks.append({"field": "verification", "text": item, "status": "guidance_only"})
+                else:
+                    present = item.finding in kinds
+                    checks.append({"field": "verification", "text": item.label or f"{item.finding} {item.expect}", "status": "passed" if present == (item.expect == "present") else "failed"})
+            checks += [{"field": "recovery_validation", "text": x, "status": "guidance_only"} for x in sk.meta.recovery_validation]
+            run["checks"] = checks
+            gaps = [f"step {s['tool']} {s['status']}: {s['reason'] or '; '.join(s['errors'])}" for s in run["steps"] if s["required"] and s["status"] != "executed"]
+            gaps += [f"check failed: {c['text']}" for c in checks if c["status"] == "failed"]
+            run["gaps"] = gaps
+            for g in gaps[:4]:
+                self.notes.append(f"Skill {sk.name}: {g}.")
+
+    async def _skill_actions(self, namespace: str, env_name: str) -> list[dict]:
         """Deterministic, allowlisted remediation suggestions from skills whose `when` matched a finding.
         Suggestions only: turning one into an action plan still needs review (and approval in production)."""
         from .. import skills as skill_lib
 
         out, seen = [], set()
         for sk, _, _ in self.skills:
+            if await self._still_allowed(sk, env_name):
+                continue
             for r in sk.meta.remediation:
                 for f in [f for f in self.findings if f["kind"] == r.when][:3]:
                     ctx = skill_lib.contexts_for(skill_lib.StepSpec(tool="k8s_events", for_each=f"finding.{r.when}"), [f], {"namespace": namespace})

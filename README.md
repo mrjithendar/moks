@@ -41,7 +41,7 @@ deploy/rbac, iam  Kubernetes RBAC and AWS IAM examples
 deploy/grafana    Dashboard JSON and Prometheus scrape job
 lab/              Four reproducible incidents with expected evidence and fixes
 dev/              Local run script and seed
-scripts/          create-secrets, set-image, backup
+scripts/          create-secrets, backup
 docs/             Architecture, security/RBAC, connectors, operator guide, testing, limitations
 ```
 

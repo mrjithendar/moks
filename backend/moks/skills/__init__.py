@@ -23,12 +23,14 @@ A skill is a directory containing SKILL.md: YAML frontmatter followed by Markdow
     # Markdown runbook: what to check, how to interpret it, what not to conclude.
 
 Trust model: skills are operator-authored and loaded only from the image (moks/skills/builtin) and
-MOKS_SKILLS_DIR (a reviewed ConfigMap), never from retrieved documents or tool output. Steps may
+MOKS_SKILLS_DIR (a reviewed ConfigMap), never from retrieved documents or tool output, even a document
+that looks exactly like this file. registry.py publishes them; validate.py decides what may be. Steps may
 only name registered read-only tools; every call still goes through the ToolExecutor (RBAC, scope,
 bounds, audit). Remediation hints may only name allowlisted actions and never execute anything.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -41,7 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 log = logging.getLogger("moks.skills")
 BUILTIN = Path(__file__).parent / "builtin"
-VARS = {"namespace", "pod", "workload", "deployment", "service", "question", "resource", "trace_id"}
+VARS = {"namespace", "pod", "workload", "deployment", "service", "question", "resource", "trace_id", "repository"}
 _VAR = re.compile(r"\{([a-z_]+)\}")
 
 
@@ -53,6 +55,7 @@ class StepSpec(BaseModel):
     limit: int = Field(default=1, ge=1, le=5)
     purpose: str | None = Field(default=None, max_length=120)
     when_question: str | None = Field(default=None, max_length=200, description="regex; run only if the question matches")
+    required: bool = False  # skipping it is reported as a gap in the skill's result
 
 
 class RemediationSpec(BaseModel):
@@ -120,10 +123,36 @@ class Hypothesis(BaseModel):
     refutes: str = Field(default="", max_length=300)
 
 
+class EvidenceCheck(BaseModel):
+    """Checked: at least min_ok successful calls of this tool in the run."""
+    model_config = ConfigDict(extra="forbid")
+    tool: str
+    min_ok: int = Field(default=1, ge=1, le=20)
+    when_finding: str | None = Field(default=None, pattern=r"^[a-z_]+$")  # only applies when this finding exists
+    label: str = Field(default="", max_length=200)
+
+
+class VerificationCheck(BaseModel):
+    """Checked against the run's findings."""
+    model_config = ConfigDict(extra="forbid")
+    finding: str = Field(pattern=r"^[a-z_]+$")
+    expect: Literal["present", "absent"] = "present"
+    label: str = Field(default="", max_length=200)
+
+
+class EvalExpect(BaseModel):
+    """Machine-checkable: evals/skills.py runs these against the named fixture."""
+    model_config = ConfigDict(extra="forbid")
+    selected: bool = True
+    tools: list[str] = Field(default_factory=list)  # must be planned, in this order
+    findings: list[str] = Field(default_factory=list)
+    note: str = Field(default="", max_length=200)
+
+
 class EvalCase(BaseModel):
     model_config = ConfigDict(extra="forbid")
     fixture: str = Field(max_length=200)
-    expect: str = Field(max_length=200)
+    expect: EvalExpect = Field(default_factory=EvalExpect)
 
 
 class SkillMeta(BaseModel):
@@ -143,9 +172,12 @@ class SkillMeta(BaseModel):
     detection: list[DetectionSpec] = Field(default_factory=list, max_length=6)
     queries: dict[str, QueryTemplate] = Field(default_factory=dict, max_length=12)
     hypotheses: list[Hypothesis] = Field(default_factory=list, max_length=8)
-    evidence_required: list[str] = Field(default_factory=list, max_length=10)
-    verification: list[str] = Field(default_factory=list, max_length=8)
-    recovery_validation: list[str] = Field(default_factory=list, max_length=8)
+    evidence_required: list[EvidenceCheck | str] = Field(default_factory=list, max_length=10)  # a plain string is guidance only
+    verification: list[VerificationCheck | str] = Field(default_factory=list, max_length=8)    # a plain string is guidance only
+    recovery_validation: list[str] = Field(default_factory=list, max_length=8)  # guidance only: the action plan's own validation is what runs
+    environments: list[str] = Field(default_factory=lambda: ["*"], max_length=20)
+    permissions: list[str] = Field(default_factory=list, max_length=8)
+    overrides_builtin: bool = False  # a custom skill must say so to replace a built-in of the same name
     runbooks: list[str] = Field(default_factory=list, max_length=8)
     evaluation: list[EvalCase] = Field(default_factory=list, max_length=8)
 
@@ -167,7 +199,7 @@ class SkillMeta(BaseModel):
                 raise ValueError(f"unknown tool {s.tool!r}")
             if not spec.read_only or spec.privileged:
                 raise ValueError(f"{s.tool} is not a read-only tool; skills cannot mutate")
-            unknown = {v for val in s.args.values() if isinstance(val, str) for v in _VAR.findall(val)} - VARS
+            unknown = template_vars(s.args) - VARS
             if unknown:
                 raise ValueError(f"unknown template variables in {s.tool}: {sorted(unknown)}")
         return steps
@@ -190,6 +222,9 @@ class Skill:
     path: str
     source: str  # builtin | custom
     keyword_res: list[re.Pattern] = field(default_factory=list)
+    digest: str = ""  # SHA-256 of the SKILL.md text: this exact version
+    text: str = ""
+    state: str = "published"  # what a library holds has been published, or is a local bootstrap of the image
 
     @property
     def name(self) -> str:
@@ -200,6 +235,9 @@ class Skill:
 class SkillLibrary:
     skills: dict[str, Skill]
     errors: list[dict[str, str]]
+    generation: int | None = None  # None: read from disk, before any generation exists
+    digest: str | None = None
+    error: str | None = None  # why this process could not move to the newest generation
 
 
 def parse(text: str, path: str, source: str) -> Skill:
@@ -219,7 +257,7 @@ def parse(text: str, path: str, source: str) -> Skill:
     if len(body) > 12_000:
         raise ValueError("guidance body longer than 12,000 characters")
     kws = [re.compile(rf"(?i)\b{re.escape(k)}\w*") for k in meta.triggers.keywords]
-    return Skill(meta, body, path, source, kws)
+    return Skill(meta, body, path, source, kws, hashlib.sha256(text.encode()).hexdigest(), text)
 
 
 def availability(sk: "Skill", connectors: set[str], metrics: set[str] | None) -> dict[str, Any]:
@@ -245,7 +283,13 @@ def load(extra_dir: str | None = None) -> SkillLibrary:
                 sk = parse(f.read_text(encoding="utf-8"), str(f), source)
                 if sk.name in skills and source == "builtin":
                     raise ValueError(f"duplicate skill name {sk.name}")
-                skills[sk.name] = sk  # custom skills may override built-ins by name
+                if sk.name in skills and skills[sk.name].source == "builtin" and not sk.meta.overrides_builtin:
+                    raise ValueError(f"{sk.name} would replace a built-in; set overrides_builtin: true to do that on purpose")
+                rules = {r.id: o.name for o in skills.values() if o.name != sk.name for r in o.meta.detection}
+                clash = next((r.id for r in sk.meta.detection if r.id in rules), None)
+                if clash:
+                    raise ValueError(f"detection rule {clash} is already declared by {rules[clash]}")
+                skills[sk.name] = sk
             except (ValueError, OSError) as exc:
                 errors.append({"path": str(f), "error": str(exc)})
                 log.warning("skill rejected", extra={"event": "skill_rejected", "errorType": "ValueError"})
@@ -268,12 +312,29 @@ def reload() -> SkillLibrary:
     return _library
 
 
-def select(question: str, finding_kinds: set[str], limit: int = 3) -> list[tuple[Skill, int, list[str]]]:
-    """Rank skills by evidence: matching detector findings weigh more than question keywords."""
+def replace_library(lib: SkillLibrary) -> None:
+    global _library
+    _library = lib
+
+
+RESOURCE_WORDS = {"Pod": "pod", "Deployment": "deployment", "Service": "service", "Ingress": "ingress", "Node": "node", "PersistentVolumeClaim": "pvc", "HPA": "hpa", "StatefulSet": "statefulset"}
+
+
+def select(question: str, finding_kinds: set[str], limit: int = 3, eligible=None, requested: str | None = None, resources: set[str] | None = None) -> list[tuple[Skill, int, list[str]]]:
+    """Rank skills by evidence: matching detector findings weigh more than question keywords. Only
+    eligible skills are ranked, so one that cannot run never takes a place from one that can. Keeps
+    `reasons` plain so a report can say why each was chosen."""
     ranked = []
+    q = question.lower()
+    resources = resources or set()
     for sk in library().skills.values():
+        if eligible is not None and not eligible(sk):
+            continue
         reasons = []
         score = 0
+        if sk.name == requested:
+            score += 100
+            reasons.append("chosen by the operator")
         hit_kinds = sorted(finding_kinds & set(sk.meta.triggers.findings))
         if hit_kinds:
             score += 3 * len(hit_kinds)
@@ -283,6 +344,10 @@ def select(question: str, finding_kinds: set[str], limit: int = 3) -> list[tuple
             score += len(words)
             reasons.append("question: " + ", ".join(words))
         if score:
+            hit = [t for t in sk.meta.resource_types if t in resources or RESOURCE_WORDS.get(t, t.lower()) in q]
+            if hit:
+                score += 1
+                reasons.append("resource: " + ", ".join(sorted(hit)[:3]))
             ranked.append((sk, score, reasons))
     ranked.sort(key=lambda t: (-t[1], t[0].name))
     top = ranked[:limit]
@@ -291,6 +356,17 @@ def select(question: str, finding_kinds: set[str], limit: int = 3) -> list[tuple
     if asked and asked not in top:
         top[-1] = asked
     return top
+
+
+def template_vars(value: Any) -> set[str]:
+    """Every {var} in a value, through dictionaries and lists."""
+    if isinstance(value, str):
+        return set(_VAR.findall(value))
+    if isinstance(value, dict):
+        return {v for x in [*value.keys(), *value.values()] for v in template_vars(x)}
+    if isinstance(value, list):
+        return {v for x in value for v in template_vars(x)}
+    return set()
 
 
 def render(value: Any, ctx: dict[str, str]) -> Any:
@@ -308,6 +384,9 @@ def render(value: Any, ctx: dict[str, str]) -> Any:
                 return None
             out[k] = r
         return out
+    if isinstance(value, list):
+        items = [render(v, ctx) for v in value]
+        return None if any(i is None for i in items) else items
     return value
 
 

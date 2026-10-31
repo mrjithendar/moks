@@ -28,7 +28,9 @@ hypotheses:
   refutes: 'All targets are: look at Prometheus.'
 evaluation:
 - fixture: telemetry-outage
-  expect: no false recovery
+  expect:
+    selected: true
+    note: 'no false recovery'
 detection:
 - id: scrape-target-down
   kind: prometheus

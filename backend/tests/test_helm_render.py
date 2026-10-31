@@ -90,11 +90,11 @@ def test_minikube_keeps_one_worker_with_reserved_capacity():
     assert "detection=2" in env["MOKS_WORKER_CAPACITY"] and "moks-worker-detection" not in by
 
 
-def test_production_runs_a_digest_and_latest_is_refused():
-    by = dict(pods(render("values-minikube.yaml")))
-    assert "@sha256:" in by["moks-api"]["containers"][0]["image"]
-    done = subprocess.run(["helm", "template", "moks", str(CHART), "--set", "image.tag=latest", "--set", "image.digest="], capture_output=True, text=True)
-    assert done.returncode != 0 and "mutable" in done.stderr
+def test_mk4_always_pulls_latest():
+    for name, pod in pods(render("values-minikube.yaml")):
+        for c in pod["containers"]:
+            if c["image"].split("/")[-1].startswith("moks"):
+                assert c["image"].endswith("/moks:latest") and c["imagePullPolicy"] == "Always", name
 
 
 def test_the_chart_ships_the_consistent_dump():

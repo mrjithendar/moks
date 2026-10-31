@@ -43,7 +43,9 @@ hypotheses:
   refutes: Caller has headroom.
 evaluation:
 - fixture: dependency-latency
-  expect: latency tied to the inventory rollout, marked as timing correlation
+  expect:
+    selected: true
+    note: 'latency tied to the inventory rollout, marked as timing correlation'
 detection:
 - id: dependency-timeouts
   kind: loki

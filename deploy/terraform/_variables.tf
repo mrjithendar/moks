@@ -10,7 +10,7 @@ variable "repository_name" {
 }
 
 variable "image_retention_count" {
-  description = "Superseded (untagged) images to keep for rollback by digest. Older ones expire."
+  description = "Images to keep for rollback. Older ones expire."
   type        = number
   default     = 30
   validation {

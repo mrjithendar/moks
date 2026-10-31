@@ -50,7 +50,9 @@ detection:
   title: Service has no ready endpoints
 evaluation:
 - fixture: broken-selector
-  expect: the lab's expected finding
+  expect:
+    selected: true
+    note: "the lab's expected finding"
 ---
 # 5xx routing triage
 

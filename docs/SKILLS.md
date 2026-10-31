@@ -135,3 +135,58 @@ detection:
 
 A skill that needs a connector an environment lacks is skipped, and the report and the Skills page say why.
 
+
+## Registry and generations
+
+A skill's stable ID is its `name`. Each exact file is an immutable version, named by the SHA-256 of its text, and a
+version number cannot be reused for different content. States: `draft` (failed validation), `validated`, `published`,
+`deprecated`, `disabled`.
+
+A **generation** is the exact set of versions everyone runs. Git stays the review step:
+
+- Built-ins ship in the image, so a new one publishes automatically when a process starts.
+- Custom skills in `MOKS_SKILLS_DIR` are registered and wait on the Skills page for an administrator. Replacing a
+  built-in needs `overrides_builtin: true` in the file and "allow override" in policy.
+- Rollback creates a new generation pointing at an earlier published version. A later scan does not undo it.
+
+API, worker and detection processes follow the active generation from PostgreSQL within about 30 seconds and report
+what they run (`GET /skills/generation`, shown on the Skills page). A process that cannot load a generation keeps its
+last valid one and reports why. A set with a duplicate detection rule is never activated.
+
+Each investigation records the generation and each skill's version and digest. Each detection run does too.
+
+## One policy
+
+`registry.allowed` answers for selection, every step, detection scheduling, dry runs and remediation suggestions: the
+version must be published, the skill enabled, and the environment in both its `environments` and any policy limit.
+
+**Active runs.** Disabling a skill stops it at its next step. Steps already run stay as evidence, the rest are recorded
+as skipped, and it proposes no actions. Detection stops at the next tick, and open incidents stay open, because silence
+from a disabled rule proves nothing. Replacing a skill does not affect a run in progress: it finishes on its pinned version.
+
+## Readiness
+
+`ready`, `partial` (some steps cannot run), `unavailable`, or `unknown` (something could not be checked). Unknown telemetry
+is never reported as present, and a capped metric list cannot prove a metric is absent. Eligibility is decided before
+ranking, so an unavailable skill cannot take a place from one that can run. Operators can name a skill with `skill` when
+starting an investigation. No semantic selection is used: nothing has shown it would improve on these rules.
+
+## Validation at publication
+
+Registered read-only tools, argument names, types and required arguments, template variables through dictionaries and lists,
+regular expressions, remediation actions and parameters, evidence and verification contracts, and detection rules.
+
+## What is enforced
+
+| Field | Enforced |
+| --- | --- |
+| `evidence_required: {tool, min_ok, when_finding}` | Yes: checked after the run, failures shown in the report |
+| `verification: {finding, expect}` | Yes, against the run's findings |
+| `steps[].required` | Yes: a skipped required step is a reported gap |
+| plain-text `evidence_required` or `verification` | No: labeled guidance only |
+| `recovery_validation` | No: guidance only. The action plan's own validation is what runs |
+
+Every run records selection reasons, each step as executed, failed or skipped with a reason, tool errors, evidence
+references, check results, and budget exhaustion. Skills get a fair share of the tool budget, and what was asked for runs first.
+
+Example: [examples/checkout-502-triage/SKILL.md](examples/checkout-502-triage/SKILL.md).

@@ -9,11 +9,10 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 {{- define "moks.image" -}}
 {{- if .Values.image.digest -}}
-{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (toString .Values.image.digest)) -}}{{- fail "image.digest must be sha256:<64 hex characters> (scripts/set-image.sh)" -}}{{- end -}}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (toString .Values.image.digest)) -}}{{- fail "image.digest must be sha256:<64 hex characters>; to follow a tag, leave it empty and set image.tag" -}}{{- end -}}
 {{ .Values.image.repository }}@{{ .Values.image.digest }}
 {{- else -}}
-{{- if eq (toString .Values.image.tag) "latest" -}}{{- fail "image.tag latest is mutable: pin image.digest (scripts/set-image.sh)" -}}{{- end -}}
-{{ .Values.image.repository }}:{{ required "image.digest or image.tag is required (scripts/set-image.sh pins the digest)" .Values.image.tag }}
+{{ .Values.image.repository }}:{{ required "image.digest or image.tag is required" .Values.image.tag }}
 {{- end -}}
 {{- end -}}
 

@@ -152,7 +152,7 @@ async def _seed(path: str, upsert: bool) -> None:
         for ks in data.get("knowledge_sources", []):
             row = (await db.execute(select(KnowledgeSource).where(KnowledgeSource.name == ks["name"]))).scalar_one_or_none()
             if row is None:
-                db.add(KnowledgeSource(**ks))
+                db.add(KnowledgeSource(**{"shared_globally": ks.get("scope_environment", "*") == "*" and ks.get("scope_namespace", "*") == "*", **ks}))
                 print(f"knowledge source {ks['name']}: created (first sync is scheduled by the worker)")
             elif upsert:
                 for k, v in ks.items():

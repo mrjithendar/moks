@@ -39,6 +39,24 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
        "connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'")
 
 
+async def _follow_skills(stop: asyncio.Event) -> None:
+    """Registers the image's skills, then follows the active generation and reports what this process runs."""
+    from . import versions
+    from .skills import registry as skill_registry
+
+    try:
+        if skill_registry.scan_on_start():
+            await skill_registry.scan()
+    except Exception as exc:
+        log.warning("skill scan failed", extra={"event": "skill_scan_failed", "errorType": type(exc).__name__})
+    while not stop.is_set():
+        try:
+            await versions.report("api")
+        except Exception as exc:
+            log.warning("component report failed", extra={"event": "component_report_failed", "errorType": type(exc).__name__})
+        await asyncio.sleep(30)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     s = get_settings()
@@ -49,9 +67,11 @@ async def lifespan(app: FastAPI):
         from .orchestrator.worker import run_worker
 
         worker_task = asyncio.create_task(run_worker(stop))
+    heartbeat = asyncio.create_task(_follow_skills(stop))
     log.info("api started", extra={"event": "api_started"})
     yield
     stop.set()
+    heartbeat.cancel()
     if worker_task:
         await asyncio.wait([worker_task], timeout=10)
     await registry.close_all()

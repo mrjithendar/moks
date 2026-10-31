@@ -49,7 +49,9 @@ detection:
   title: Container OOMKilled
 evaluation:
 - fixture: oomkilled
-  expect: the lab's expected finding
+  expect:
+    selected: true
+    note: "the lab's expected finding"
 ---
 # OOMKilled triage
 

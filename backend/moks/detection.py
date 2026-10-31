@@ -36,6 +36,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import audit, skills
 from .connectors import registry
+from .skills.registry import allowed as registry_allowed
+from .skills.registry import policy as skill_policy
+from .skills.registry import refresh as refresh_skills
 from .connectors.base import ConnectorError
 from .db import session_scope
 from .incidents import add_event
@@ -102,6 +105,12 @@ class Rule:
 
 def all_rules() -> list[Rule]:
     return [Rule(d, sk) for sk in skills.library().skills.values() for d in sk.meta.detection]
+
+
+def blocked(rule: Rule, env: Environment, view) -> str | None:
+    """A rule runs only while its skill may run: the same answer investigations get."""
+    ok, why = registry_allowed(rule.skill, env.name, view)
+    return None if ok else why
 
 
 def effective(rule: Rule, policy: DetectionPolicy | None) -> skills.DetectionSpec:
@@ -305,7 +314,7 @@ async def _open_incident(db: AsyncSession, env: Environment, rule: Rule, spec, s
     reason = f"{spec.severity} set by rule {rule.id} (skill {rule.skill.name} v{rule.version}): {st.consecutive} consecutive checks at {spec.interval_minutes} min intervals."
     inc = Incident(title=_title(rule, spec, sig), severity=spec.severity, status="open", environment_id=env.id, namespace=sig.namespace or "*",
                    summary=sig.detail[:2000], source="detection", fingerprint=st.fingerprint, created_by=AUTOMATION_USER_ID, rule_id=rule.id,
-                   rule_version=rule.version, skill=rule.skill.name, resource=sig.resource[:300], first_observed_at=st.first_seen, last_observed_at=now,
+                   rule_version=rule.version, skill=rule.skill.name, skill_digest=rule.skill.digest, resource=sig.resource[:300], first_observed_at=st.first_seen, last_observed_at=now,
                    detection_count=st.consecutive, owner_team=spec.owner or rule.skill.meta.owner, severity_reason=reason,
                    runbook=", ".join(rule.skill.meta.runbooks) or f"skill {rule.skill.name}")
     try:
@@ -445,7 +454,13 @@ async def tick(env_id: uuid.UUID) -> dict[str, Any]:
             return {"skipped": "detection is off for this environment"}
         policies = {p.rule_id: p for p in (await db.execute(select(DetectionPolicy))).scalars()}
         runs = {r.rule_id: r for r in (await db.execute(select(DetectionRun).where(DetectionRun.environment_id == env_id))).scalars()}
+        view = await skill_policy(db)
+        environment = env
+    lib = await refresh_skills()
     for rule in all_rules():
+        if blocked(rule, environment, view):
+            out["blocked"] = out.get("blocked", 0) + 1
+            continue
         policy = policies.get(rule.id)
         try:
             spec = effective(rule, policy)
@@ -459,7 +474,8 @@ async def tick(env_id: uuid.UUID) -> dict[str, Any]:
             env = await db.get(Environment, env_id)
             check = await evaluate(db, env, spec, cursor=run.cursor if run else 0)
             tally = await apply(db, env, rule, spec, check, now)
-            await db.merge(DetectionRun(rule_id=rule.id, environment_id=env_id, last_run_at=now, last_status=check.status, last_reason=check.reason, cursor=check.next_cursor))
+            await db.merge(DetectionRun(rule_id=rule.id, environment_id=env_id, last_run_at=now, last_status=check.status, last_reason=check.reason, cursor=check.next_cursor,
+                                        skill=rule.skill.name, skill_version=rule.version, skill_digest=rule.skill.digest, skill_generation=lib.generation))
         out["checked"] += 1
         out["unknown"] += check.status == "unknown"
         for k, v in tally.items():
@@ -470,6 +486,10 @@ async def tick(env_id: uuid.UUID) -> dict[str, Any]:
 async def dry_run(db: AsyncSession, env: Environment, rule: Rule, policy: DetectionPolicy | None, principal) -> dict[str, Any]:
     """Runs the check with the caller's own access, so a rule can be tried before detection is
     turned on. Writes nothing and notifies no one."""
+    why = blocked(rule, env, await skill_policy(db))
+    if why:
+        return {"rule": rule.id, "version": rule.version, "environment": env.name, "status": "blocked", "reason": f"skill {rule.skill.name}: {why}", "partial": False, "preview": [],
+                "auto_investigate": False, "note": "A blocked rule does not run, in a dry run or on schedule."}
     spec = effective(rule, policy)
     now = datetime.now(timezone.utc)
     check = await evaluate(db, env, spec, principal)
@@ -482,5 +502,5 @@ async def dry_run(db: AsyncSession, env: Environment, rule: Rule, policy: Detect
         window = await _suppressed(db, env.id, rule.id, sig.namespace, now)
         preview.append({"resource": sig.resource, "namespace": sig.namespace, "detail": sig.detail, "title": _title(rule, spec, sig), "severity": spec.severity,
                         "would": decide(st, spec, active=active is not None, reopen=closed is not None, suppressed=window is not None), "evidence": sig.evidence})
-    return {"rule": rule.id, "version": rule.version, "environment": env.name, "status": check.status, "reason": check.reason, "partial": not check.complete,
+    return {"rule": rule.id, "version": rule.version, "digest": rule.skill.digest, "environment": env.name, "status": check.status, "reason": check.reason, "partial": not check.complete,
             "preview": preview, "auto_investigate": spec.auto_investigate, "note": "An incident never authorizes a change; remediation stays behind action plans and approvals."}

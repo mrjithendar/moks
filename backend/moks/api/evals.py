@@ -44,5 +44,5 @@ async def start(body: RunIn, ctx: AuthContext = Depends(needs(P.ADMIN_POLICIES))
 async def runs(ctx: AuthContext = Depends(needs(P.ADMIN_POLICIES)), db: AsyncSession = Depends(get_db, scope="function")) -> list[dict]:
     rows = (await db.execute(select(EvalRun).order_by(EvalRun.created_at.desc()).limit(50))).scalars().all()
     return [{"id": str(r.id), "dataset": r.dataset, "mode": r.mode, "status": r.status, "score": float(r.score) if r.score is not None else None,
-             "results": r.results, "created_at": r.created_at.isoformat(), "finished_at": r.finished_at.isoformat() if r.finished_at else None}
+             "results": r.results, "kind": r.kind, "gates": r.gates, "versions": r.versions, "created_at": r.created_at.isoformat(), "finished_at": r.finished_at.isoformat() if r.finished_at else None}
             for r in rows]
