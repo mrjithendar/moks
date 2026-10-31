@@ -2,7 +2,7 @@
 image:
   repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
   # Updated by the release pull request CI opens. Roll back by reverting that commit (docs/RELEASES.md).
-  digest: "sha256:ba0f21369d1651bbe55d2fdffa3444a9b9e7e57d864699479fa967edad1750e2"
+  digest: "sha256:243fc08114f2ef818c75177b0548542b7ced7757251eaf22b822d26071f50180"
   pullPolicy: IfNotPresent   # a digest never changes, so a cached copy is always correct
 imagePullSecrets: [{name: ecr-pull}]   # refreshed by the ecr-refresh CronJob (tools repo); see docs/OPERATOR_GUIDE.md
 
