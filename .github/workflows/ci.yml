@@ -96,7 +96,7 @@ jobs:
             tmux -u new-session -d -s moks && sleep 1 && tmux send-keys -t moks "echo still-$((40+2))" Enter && sleep 1
             tmux capture-pane -p -t moks | grep -q still-42 && tmux has-session -t moks'
       - name: Scan
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25   # v0.36.0
         with:
           image-ref: moks-terminal:test
           severity: CRITICAL,HIGH
