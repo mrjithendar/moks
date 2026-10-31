@@ -103,7 +103,7 @@ diagnostics:
 
 # Web terminal (docs/TERMINAL.md). enabled: true fails to render until image.digest is set, so set both together.
 terminal:
-  enabled: false
+  enabled: true
   image:
     digest: ""
   imagePullSecrets: [ecr-pull]   # created in every namespace by the ecr-refresh CronJob (tools repo)
