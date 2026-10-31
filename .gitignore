@@ -17,3 +17,5 @@ frontend/dist/
 kubeconfig*
 !deploy/secrets/*.example.yaml
 .DS_Store
+
+moks-secrets.yaml
