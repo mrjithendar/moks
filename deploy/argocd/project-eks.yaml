@@ -30,6 +30,8 @@ spec:
     - {group: "", kind: Pod}           # two are what show the portal's pods, logs and events
     - {group: apps, kind: StatefulSet}
     - {group: networking.istio.io, kind: VirtualService}
+    - {group: security.istio.io, kind: PeerAuthentication}
+    - {group: security.istio.io, kind: AuthorizationPolicy}
     - {group: networking.k8s.io, kind: NetworkPolicy}
     - {group: policy, kind: PodDisruptionBudget}
     - {group: rbac.authorization.k8s.io, kind: Role}

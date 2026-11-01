@@ -96,9 +96,13 @@ the addresses the NLB allows (`tools/eks/platform/istio-ingressgateway.yaml`).
 
 Differences from mk4: no Loki, Grafana, Argo CD connector or Velero, Prometheus has mesh metrics only,
 RAG is keyword-only, and the terminal is off because this cluster does not enforce NetworkPolicy.
-Enforcement is also what keeps other pods from reaching the API port, so until it is on, any pod in
-the cluster can reach MOKS directly and set `X-Forwarded-*` headers. Releases work as in
-[RELEASES.md](RELEASES.md), with `--context roboshop-demo`.
+Releases work as in [RELEASES.md](RELEASES.md), with `--context roboshop-demo`.
+
+Every pod in `moks` has a sidecar and PeerAuthentication is STRICT. Port 8080 accepts only the ingress
+gateway and PostgreSQL only the `moks` namespace, so these rules are what protect both ports while
+NetworkPolicy is off. The sidecar needs `NET_ADMIN`, so the namespace's enforced pod security level is
+`privileged`. Changing the labels means applying `application-eks.yaml` again before the sync, and pods
+get sidecars only when they restart. Nothing scrapes port 9464 here; a scraper would need an ALLOW rule.
 
 ## 6. First administrator
 

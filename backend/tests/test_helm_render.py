@@ -106,8 +106,32 @@ def test_istio_sends_terminal_traffic_to_the_gateway_first():
     assert first["route"][0]["destination"]["host"] == "moks-terminal.moks.svc.cluster.local"
 
 
-def test_minikube_renders_no_virtualservice():
-    assert not any(d["kind"] == "VirtualService" for d in render("values-minikube.yaml"))
+def test_minikube_renders_no_mesh_objects():
+    kinds = {d["kind"] for d in render("values-minikube.yaml")}
+    assert not kinds & {"VirtualService", "PeerAuthentication", "AuthorizationPolicy"}
+
+
+def test_eks_is_strict_and_denies_by_default():
+    docs = render("values-eks.yaml")
+    assert next(d for d in docs if d["kind"] == "PeerAuthentication")["spec"]["mtls"]["mode"] == "STRICT"
+    policies = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "AuthorizationPolicy"}
+    assert policies["allow-nothing"] == {}
+    api, db = policies["moks"]["rules"][0], policies["moks-postgres"]["rules"][0]
+    assert api["from"][0]["source"]["principals"] == ["cluster.local/ns/istio-ingress/sa/istio-ingressgateway"]
+    assert api["to"][0]["operation"]["ports"] == ["8080"]
+    assert db["from"][0]["source"]["namespaces"] == ["moks"] and db["to"][0]["operation"]["ports"] == ["5432"]
+
+
+def test_meshed_postgres_can_reach_istiod_when_policy_is_enforced():
+    docs = render("values-eks.yaml")
+    egress = next(d for d in docs if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "moks-postgres")["spec"]["egress"]
+    assert {"port": 15012, "protocol": "TCP"} in egress[1]["ports"]
+    assert next(d for d in render("values-minikube.yaml") if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "moks-postgres")["spec"]["egress"] == []
+
+
+def test_mtls_needs_a_gateway_identity():
+    with pytest.raises(subprocess.CalledProcessError):
+        render("values-eks.yaml", "istio.gatewayPrincipal=")
 
 
 def test_minikube_keeps_one_worker_with_reserved_capacity():

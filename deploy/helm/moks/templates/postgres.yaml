@@ -79,7 +79,13 @@ metadata:
   labels: {{- include "moks.labels" . | nindent 4 }}
 spec:
   selector: {app: moks-postgres}
-  ports: [{name: postgres, port: 5432, targetPort: postgres}]
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      {{- if .Values.istio.mtls }}
+      appProtocol: tcp   # plain TCP to the sidecars, with no protocol sniffing
+      {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -92,6 +98,16 @@ spec:
   ingress:
     - from: [{podSelector: {matchLabels: {app: moks}}}]
       ports: [{port: 5432, protocol: TCP}]
+  {{- if .Values.istio.mtls }}
+  egress:                # the sidecar's configuration and certificates, from istiod
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: istio-system}}}]
+      ports: [{port: 15012, protocol: TCP}]
+  {{- else }}
   egress: []
+  {{- end }}
 {{- end }}
 {{- end }}

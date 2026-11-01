@@ -1,0 +1,60 @@
+{{- if .Values.istio.mtls }}
+# STRICT: every pod in the namespace has a sidecar, and nothing outside the mesh can connect. No
+# DestinationRule is needed: auto mTLS is the default. Sidecars come from the namespace label
+# istio-injection (deploy/argocd/application-eks.yaml), which diagnostic sessions do not have.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  mtls:
+    mode: STRICT
+---
+# Denies every request that no ALLOW policy below permits. Kubelet probes are unaffected: the sidecar
+# answers them on its own port, and PostgreSQL uses exec probes.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-nothing
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec: {}
+---
+# The API and terminal gateway take traffic from the ingress gateway only: components share
+# PostgreSQL and never call each other.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: moks
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {app: moks}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: [{{ required "istio.gatewayPrincipal is required with istio.mtls" .Values.istio.gatewayPrincipal }}]
+      to:
+        - operation:
+            ports: ["8080"]
+{{- if .Values.postgres.bundled }}
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: moks-postgres
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {app: moks-postgres}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: [{{ .Release.Namespace }}]
+      to:
+        - operation:
+            ports: ["5432"]
+{{- end }}
+{{- end }}

@@ -92,6 +92,9 @@ istio:
   enabled: false
   gateway: ""              # <namespace>/<name>
   host: ""
+  # STRICT mTLS and deny-by-default policies. Needs istio-injection on the namespace.
+  mtls: false
+  gatewayPrincipal: ""     # cluster.local/ns/<namespace>/sa/<ingress gateway ServiceAccount>
 
 postgres:
   bundled: true            # false: point MOKS_DATABASE_URL at an external database (e.g. RDS)

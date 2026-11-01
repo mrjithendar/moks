@@ -31,5 +31,8 @@ spec:
     managedNamespaceMetadata:
       labels:
         app.kubernetes.io/part-of: moks
-        pod-security.kubernetes.io/enforce: baseline
+        istio-injection: enabled
+        # istio-init needs NET_ADMIN to redirect traffic, which baseline refuses, and this cluster
+        # has no Istio CNI. The chart's own containers still drop all capabilities.
+        pod-security.kubernetes.io/enforce: privileged
         pod-security.kubernetes.io/warn: restricted

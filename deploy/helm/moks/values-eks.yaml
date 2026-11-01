@@ -42,10 +42,11 @@ seed:
       type: github
       config: {repository: mrjithendar/moks, include: ["docs/**", "lab/**", "backend/moks/skills/**"], sync_interval_minutes: 360}
 
-# Half the chart's CPU requests: the nodes have about 440m unrequested between them, and the
-# defaults would leave a pod Pending. Limits stay, so idle headroom is still used.
+# Half the chart's CPU requests, on nodes with about 440m unrequested between them. A meshed pod
+# costs 70m (50m plus a 20m sidecar), and two API replicas would leave no room for the extra pod a
+# rollout starts, so it would hang. Limits stay, so idle headroom is still used.
 api:
-  replicas: 2
+  replicas: 1
   resources:
     requests: {cpu: 50m}
 worker:
@@ -60,6 +61,8 @@ istio:
   enabled: true
   gateway: istio-ingress/public   # tools/eks/roboshop-demo/ingress
   host: eks.jithendar.com
+  mtls: true
+  gatewayPrincipal: cluster.local/ns/istio-ingress/sa/istio-ingressgateway
 
 postgres:
   bundled: true         # on the default gp3-encrypted StorageClass, which retains the volume
@@ -97,4 +100,4 @@ networkPolicy:
     ports: [443]
   inCluster:
     - namespace: istio-system
-      ports: [80]
+      ports: [80, 15012]   # kiali-prometheus, istiod for the sidecars
