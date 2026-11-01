@@ -97,6 +97,12 @@ variable "terminal_eks_cluster_arns" {
   default     = []
 }
 
+variable "eks_runtime_cluster_name" {
+  description = "EKS cluster whose moks ServiceAccount gets the Bedrock role through Pod Identity. Empty creates nothing."
+  type        = string
+  default     = ""
+}
+
 variable "bedrock_claude_enabled" {
   description = "Let the runtime user call current Claude models (anthropic.claude-opus-5-5 and so on) on Bedrock."
   type        = bool
