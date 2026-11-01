@@ -116,7 +116,7 @@ def test_eks_routes_through_istio_without_traefik():
     docs = render("values-eks.yaml")
     route = next(d for d in docs if d["kind"] == "VirtualService")
     assert route["spec"]["gateways"] == ["istio-ingress/public"] and route["spec"]["hosts"] == ["eks.jithendar.com"]
-    assert [r["name"] for r in route["spec"]["http"]] == ["portal"]
+    assert [r["name"] for r in route["spec"]["http"]] == ["terminal", "portal"]
     assert not any(d["kind"] in ("Ingress", "Middleware") for d in docs)
 
 

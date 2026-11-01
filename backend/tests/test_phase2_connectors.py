@@ -12,6 +12,8 @@ from moks.connectors.base import ConnectorError
 from moks.connectors.finops import AwsCostConnector, CostModelConnector, allocate, parse_cpu, parse_mem, rightsize
 from moks.connectors.git import GitConnector
 from moks.connectors.grafana import GrafanaConnector
+from moks.tools import phase2
+from moks.tools.phase2 import finops_rightsizing
 
 NOW = datetime.now(timezone.utc)
 SESSION = boto3.session.Session(aws_access_key_id="AKIAEXAMPLEEXAMPLE00", aws_secret_access_key="x" * 40, region_name="us-east-1")
@@ -133,3 +135,52 @@ async def test_finops_tools_need_finops_permission(client):
     await login(client, f"v-{name}@example.com")
     r = await client.get(f"/moks/api/finops/{name}/k8s/allocation", params={"namespace": "shop"})
     assert r.status_code == 403
+
+
+def _pod(name: str, container: str = "app"):
+    return {"metadata": {"name": name, "namespace": "shop"}, "status": {"phase": "Running"},
+            "spec": {"containers": [{"name": container, "resources": {"requests": {"cpu": "1", "memory": "1Gi"}}}]}}
+
+
+async def _rightsizing(monkeypatch, usage: dict):
+    async def namespaces(ctx, ns):
+        return ["shop"]
+
+    async def pods(ctx, names, ns):
+        return {"shop": [_pod("a-1"), _pod("b-1")]}, {}
+
+    async def fetch(ctx, names, days):
+        return usage, {}, []
+
+    async def prices(ctx):
+        return 0.03, 0.004, "model", 1.0
+
+    for name, fn in (("_namespaces", namespaces), ("_pods_by_namespace", pods), ("_usage", fetch), ("_prices", prices)):
+        monkeypatch.setattr(phase2, name, fn)
+    return await finops_rightsizing(None, phase2.AllocArgs(namespace="shop", days=7))
+
+
+async def test_rightsizing_refuses_to_treat_missing_usage_as_zero(monkeypatch):
+    with pytest.raises(ConnectorError) as err:
+        await _rightsizing(monkeypatch, {"cpu_p95": {}, "mem_max": {}, "samples": {}})
+    assert "cadvisor" in err.value.message
+
+
+async def test_rightsizing_skips_only_the_containers_without_usage(monkeypatch):
+    key = ("shop", "a-1", "app")
+    r = await _rightsizing(monkeypatch, {"cpu_p95": {key: 0.1}, "mem_max": {key: 200 * 1024**2}, "samples": {key: 672}})
+    assert [x["workload"] for x in r.data["recommendations"]] == ["Pod/a-1"]
+    assert r.data["recommendations"][0]["confidence"] == "high"
+    assert r.data["unmeasured"] == ["shop/Pod/b-1/app"]
+
+
+async def test_rightsizing_marks_a_few_hours_of_data_as_low_confidence(monkeypatch):
+    key = ("shop", "a-1", "app")
+    r = await _rightsizing(monkeypatch, {"cpu_p95": {key: 0.1}, "mem_max": {key: 200 * 1024**2}, "samples": {key: 24}})  # 6 h of 7 d at a 15 m step
+    assert r.data["recommendations"][0]["confidence"] == "low" and r.data["recommendations"][0]["coverage"] < 0.1
+
+
+def test_team_comes_from_the_first_label_a_pod_carries():
+    pod = {"metadata": {"labels": {"owner": "payments", "app.kubernetes.io/part-of": "shop"}}}
+    assert phase2._team_of(pod, ["team", "owner", "app.kubernetes.io/part-of"]) == "payments"
+    assert phase2._team_of({"metadata": {}}, ["team"]) == "unassigned"

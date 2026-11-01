@@ -29,11 +29,21 @@ seed:
         - type: kubernetes
           name: in-cluster
           config: {mode: in_cluster, timeout_seconds: 15, executor: {mode: in_cluster}}
-        # Mesh metrics only, 6 h retention, from tools/eks-argocd/platform/kiali-prometheus.yaml. The
-        # prometheus-agent in monitoring cannot be queried, and this cluster has no Loki.
+        # Mesh, kube-state and cAdvisor metrics, 31 d retention, from tools deploy/eks/helm-values/kiali-prometheus.yaml.
+        # The prometheus-agent in monitoring cannot be queried.
         - type: prometheus
           name: prometheus
           config: {base_url: "http://kiali-prometheus-server.istio-system.svc.cluster.local", timeout_seconds: 15}
+        # mk4's Loki through its read-only Traefik route: it holds mk4 logs, not this cluster's, and has
+        # no cluster label. The connector adds /loki/api/v1 itself. tools: observability/loki/README.md.
+        - type: loki
+          name: loki
+          config: {base_url: "https://jithendar.com", timeout_seconds: 20, auth: basic, username: moks}
+          credential_ref: {type: env, name: MOKS_CRED_LOKI_PASSWORD}   # same password as mk4's loki-read-auth
+        # 2 t4g.large on demand in us-east-1 ($0.0672/h). Reserved or Savings Plan prices are lower.
+        - type: cost_model
+          name: cost-model
+          config: {monthly_cost_usd: 98, cpu_share: 0.5, currency: USD, storage_gib_month_usd: 0.08}
         - type: git
           name: github
           config: {provider: github, repositories: [mrjithendar/moks, mrjithendar/roboshop-ai, mrjithendar/tools, mrjithendar/jithendar.com]}
@@ -87,8 +97,30 @@ diagnostics:
   namespace: moks-diagnostics
 
 # Off: session isolation depends on NetworkPolicy, which this cluster does not enforce (below).
+# Read-only shells. A push changes nothing here: the gateway exists after roboshop-demo-moks-terminal is
+# synced by hand, and docs/TERMINAL.md lists what must pass before anyone else is granted the role.
 terminal:
-  enabled: false
+  enabled: true
+  image:
+    digest: sha256:a2a113027fe12b847b6f7edc3754a7cacd0a70d0b7204946aa95eb188a9fb917   # multi-arch index, built from ab99cf7
+  imagePullSecrets: []           # nodes pull from ECR with their node role
+  profiles:
+    - name: roboshop-demo-readonly
+      label: roboshop-demo, read-only
+      environment: roboshop-demo
+      account: "881026659929"
+      roleArn: arn:aws:iam::881026659929:role/moks/moks-terminal-readonly
+      regions: [us-east-1]
+      eksClusters: []
+      inCluster: true
+  kubernetes:
+    namespaces: [roboshop-ai]    # add namespaces only when a shell should read them
+  network:
+    apiServer: true
+    egress:                      # AWS needs HTTPS, so sessions reach any public HTTPS host
+      - cidr: 0.0.0.0/0
+        except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+        ports: [443]
 
 # Written for when enforcement is turned on: the VPC CNI runs with --enable-network-policy=false,
 # so today these are not applied.

@@ -8,7 +8,7 @@ from moks.db import session_scope
 from moks.models import Environment, Investigation
 from moks.orchestrator.engine import Investigator
 from tests.conftest import login, make_env, make_user
-from tests.fakes import FakeKubernetes
+from tests.fakes import SCENARIOS, FakeKubernetes
 
 
 @pytest.fixture(autouse=True)
@@ -146,11 +146,14 @@ async def test_finops_overview_skips_a_failing_namespace(client, monkeypatch):
             pass
 
         async def instant(self, q, at):
-            return {"resultType": "vector", "series": []}
+            pods = [(ns, p["metadata"]["name"], c["name"]) for ns in ("shop", "secure") for p in SCENARIOS[ns]["pods"] for c in p["spec"]["containers"]]
+            return {"resultType": "vector", "series": [{"metric": {"namespace": n, "pod": p, "container": c}, "value": [0, 0.1]} for n, p, c in pods]}
 
     monkeypatch.setitem(registry.CONNECTOR_TYPES, "prometheus", Prom)
     r = (await client.get("/moks/api/finops/overview", params={"environment": name})).json()
     env = r["environments"][0]
     assert env["errors"]["skipped namespaces"] == "kube-system"  # the fake lists it but cannot read it
     assert {w["namespace"] for w in env["workloads"]} == {"shop", "secure"} and "rightsizing" in env
+    assert sum(env["kubernetes"]["by_team"].values()) == pytest.approx(r["totals"]["kubernetes"], abs=0.01)
+    assert env["kubernetes"]["cluster_cost"] is not None and env["kubernetes"]["unallocated"] >= 0
     assert r["totals"]["kubernetes"] >= 0

@@ -72,6 +72,8 @@ def limits() -> tuple[int, int]:
 
 def kind_of(path: str) -> str:
     p = path.lower()
+    if p.startswith(("http://", "https://")):  # web pages are stored as Markdown-like text, whatever the URL ends in
+        return "markdown"
     name = p.rsplit("/", 1)[-1]
     if name in ("dockerfile", "makefile", "jenkinsfile") or name.startswith("dockerfile."):
         return "code"

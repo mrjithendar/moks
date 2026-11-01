@@ -1,4 +1,4 @@
-import { Fragment, useState, type FormEvent } from "react";
+import { Fragment, useState, type FormEvent, type ReactNode } from "react";
 import { api, qs } from "../api";
 import { useAuth } from "../auth";
 import { Badge, DataTable, ErrorBox, Loading, PageHead, Time, useLoad } from "../components";
@@ -19,21 +19,40 @@ function useAction() {
       setBusy(false);
     }
   }
-  return { error, busy, run };
+  return { error, busy, run, clear: () => setError(null) };
 }
 
 const lines = (s: string) => s.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+
+/** Add and edit forms open beside the table, so Edit never fills in a form scrolled out of view. */
+function FormDrawer({ title, submit, busy, blocked, error, onSubmit, onClose, children }: { title: string; submit: string; busy: boolean; blocked?: boolean; error: unknown; onSubmit: (e: FormEvent) => void; onClose: () => void; children: ReactNode }) {
+  return (
+    <Drawer title={title} onClose={onClose} footer={<><ErrorBox error={error} /><div className="row"><button form="admin-form" disabled={busy || blocked}>{busy ? "Saving…" : submit}</button><button type="button" className="ghost" onClick={onClose}>Cancel</button></div></>}>
+      <form id="admin-form" className="stack" onSubmit={onSubmit}>{children}</form>
+    </Drawer>
+  );
+}
+
+function FormSection({ title, help, children }: { title: string; help?: string; children: ReactNode }) {
+  return (
+    <section className="form-section">
+      <h3>{title}</h3>
+      {help && <div className="small muted">{help}</div>}
+      {children}
+    </section>
+  );
+}
 
 // ---- Data sources -------------------------------------------------------------------------------
 
 const REGIONS = ["us-east-1", "us-east-2", "us-west-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-south-1", "ap-southeast-1", "ap-northeast-1"];
 
 interface Field { key: string; label: string; kind?: "number" | "list" | "bool" | "region"; placeholder?: string; required?: boolean }
-interface Source { label: string; type: string; hint: string; defaults: any; fields: Field[] }
+interface Source { label: string; type: string; hint: string; defaults: any; fields: Field[]; auth?: boolean; cred?: string }
 
 const REGION: Field = { key: "region", label: "Region", kind: "region", required: true };
 const ROLE: Field = { key: "role_arn", label: "Role ARN to assume (optional)", placeholder: "arn:aws:iam::123456789012:role/moks-read" };
-const URLS: Field[] = [{ key: "base_url", label: "URL", required: true }, { key: "public_url", label: "Browser link URL (optional)" }];
+const URLS: Field[] = [{ key: "base_url", label: "URL MOKS connects to", required: true }, { key: "public_url", label: "Browser link URL (optional)" }];
 
 const SOURCES: Record<string, Source> = {
   eks: { label: "Amazon EKS", type: "kubernetes", hint: "Reads the cluster with a short-lived token from the pod's AWS identity. That identity needs an EKS access entry. Read-only until you add config.executor (edit as JSON).",
@@ -42,11 +61,11 @@ const SOURCES: Record<string, Source> = {
   kubeconfig: { label: "Kubernetes (kubeconfig)", type: "kubernetes", hint: "Needs a mounted kubeconfig file as the credential.", defaults: { mode: "kubeconfig", timeout_seconds: 15 }, fields: [{ key: "context", label: "Context (optional)" }] },
   cloudwatch: { label: "CloudWatch Logs", type: "cloudwatch", hint: "Logs Insights over the listed log groups only.", defaults: { region: "us-east-1", allowed_log_groups: [], max_window_minutes: 360, max_concurrent_queries: 2, poll_timeout_seconds: 60 },
     fields: [REGION, { key: "allowed_log_groups", label: "Allowed log groups", kind: "list", required: true, placeholder: "/aws/eks/prod/*" }, ROLE, { key: "max_window_minutes", label: "Max window (min)", kind: "number" }] },
-  prometheus: { label: "Prometheus", type: "prometheus", hint: "PromQL over HTTP.", defaults: { base_url: "http://prometheus.monitoring.svc:9090/prometheus", public_url: "https://jithendar.com/prometheus", timeout_seconds: 15, auth: "none" }, fields: URLS },
-  loki: { label: "Loki", type: "loki", hint: "LogQL over HTTP.", defaults: { base_url: "http://loki.monitoring.svc:3100", timeout_seconds: 20, namespace_label: "namespace", auth: "none" },
+  prometheus: { label: "Prometheus", type: "prometheus", hint: "PromQL over HTTP, from a server the MOKS pods can reach; usually its in-cluster service URL, with any path prefix. FinOps and rightsizing need this server to scrape cAdvisor.", auth: true, cred: "MOKS_CRED_PROMETHEUS_PASSWORD", defaults: { base_url: "http://prometheus.monitoring.svc:9090/prometheus", public_url: "https://jithendar.com/prometheus", timeout_seconds: 15, auth: "none" }, fields: URLS },
+  loki: { label: "Loki", type: "loki", hint: "LogQL over HTTP.", auth: true, cred: "MOKS_CRED_LOKI_PASSWORD", defaults: { base_url: "http://loki.monitoring.svc:3100", timeout_seconds: 20, namespace_label: "namespace", auth: "none" },
     fields: [URLS[0], { key: "namespace_label", label: "Namespace label" }, { key: "tenant_id", label: "Tenant ID (optional)" }] },
-  grafana: { label: "Grafana", type: "grafana", hint: "Dashboards and annotations. Use a service account token as the credential.", defaults: { base_url: "http://grafana.monitoring.svc.cluster.local/grafana", public_url: "https://jithendar.com/grafana", timeout_seconds: 15 }, fields: URLS },
-  git: { label: "GitHub", type: "git", hint: "Compares deployed revisions and syncs runbooks. Use a read-only token as the credential.", defaults: { provider: "github", repositories: [] },
+  grafana: { label: "Grafana", type: "grafana", hint: "Dashboards and annotations. Use a service account token as the credential.", cred: "MOKS_CRED_GRAFANA_TOKEN", defaults: { base_url: "http://grafana.monitoring.svc.cluster.local/grafana", public_url: "https://jithendar.com/grafana", timeout_seconds: 15 }, fields: URLS },
+  git: { label: "GitHub", type: "git", hint: "Compares deployed revisions and syncs runbooks. Use a read-only token as the credential.", cred: "MOKS_CRED_GITHUB_TOKEN", defaults: { provider: "github", repositories: [] },
     fields: [{ key: "repositories", label: "Repositories", kind: "list", required: true, placeholder: "owner/repo" }] },
   aws_cost: { label: "AWS Cost Explorer", type: "aws_cost", hint: "Each uncached request costs $0.01, so results are cached and capped.", defaults: { metric: "UnblendedCost", cache_minutes: 60, max_requests_per_hour: 60, allocation_tag_keys: [] },
     fields: [{ key: "cache_minutes", label: "Cache (min)", kind: "number" }, { key: "max_requests_per_hour", label: "Max requests / hour", kind: "number" }, ROLE] },
@@ -54,6 +73,20 @@ const SOURCES: Record<string, Source> = {
     fields: [{ key: "monthly_cost_usd", label: "Monthly cluster cost (USD)", kind: "number" }, { key: "cpu_hour_usd", label: "or CPU core-hour (USD)", kind: "number" }, { key: "gib_hour_usd", label: "and GiB-hour (USD)", kind: "number" },
       { key: "storage_gib_month_usd", label: "Storage GiB-month (USD)", kind: "number" }] },
 };
+
+/** What each environment needs for the portal to work; checked by type, because logs can come from either source. */
+const RECOMMENDED = [
+  { source: "in_cluster", types: ["kubernetes"], label: "Kubernetes", unlocks: "pods, events and changes" },
+  { source: "prometheus", types: ["prometheus"], label: "Prometheus", unlocks: "metrics" },
+  { source: "cost_model", types: ["cost_model"], label: "Cluster cost model", unlocks: "Kubernetes costs and rightsizing" },
+  { source: "loki", types: ["loki", "cloudwatch"], label: "Logs (Loki or CloudWatch)", unlocks: "log search" },
+];
+
+export const missingSources = (connectors: any[], environment: string) =>
+  RECOMMENDED.filter((r) => !connectors.some((c) => c.environment === environment && c.enabled && r.types.includes(c.type)));
+
+export const duplicateConnector = (connectors: any[], environment: string, name: string, editing: string | null) =>
+  connectors.find((c) => c.environment === environment && c.name === name && c.id !== editing);
 
 const PRESETS: Record<string, string[]> = { minikube: ["in_cluster", "prometheus", "loki", "cost_model"], eks: ["eks", "cloudwatch", "aws_cost"], kubernetes: ["kubeconfig"] };
 
@@ -66,9 +99,11 @@ function sourceOf(c: any): string {
   return c.config.mode === "eks" ? "eks" : c.config.mode === "kubeconfig" ? "kubeconfig" : "in_cluster";
 }
 
-function connectorBody(v: SourceValue, environment: string) {
+export function connectorBody(v: SourceValue, environment: string) {
   const config = v.advanced ? JSON.parse(v.json) : v.config;
-  const credential_ref = v.credType === "env" ? { type: "env", name: v.credName } : v.credType === "file" ? { type: "file", path: v.credPath } : { type: "none" };
+  // With no authentication the connector ignores any credential, so do not store one that looks in use.
+  const anonymous = SOURCES[v.source].auth && (config.auth ?? "none") === "none";
+  const credential_ref = anonymous ? { type: "none" } : v.credType === "env" ? { type: "env", name: v.credName } : v.credType === "file" ? { type: "file", path: v.credPath } : { type: "none" };
   return { environment, type: SOURCES[v.source].type, name: v.name, enabled: v.enabled, config, credential_ref };
 }
 
@@ -76,27 +111,36 @@ function connectorBody(v: SourceValue, environment: string) {
 function SourceFields({ value, onChange }: { value: SourceValue; onChange: (v: SourceValue) => void }) {
   const src = SOURCES[value.source];
   const setCfg = (k: string, v: unknown) => onChange({ ...value, config: { ...value.config, [k]: v } });
+  const auth = value.config.auth ?? "none";
+  const setAuth = (next: string) => onChange({ ...value, credType: next === "none" ? "none" : value.credType === "none" ? "env" : value.credType,
+    config: { ...value.config, auth: next, username: next === "basic" ? value.config.username : undefined } });
   return (
     <div className="stack">
       <div className="small muted">{src.hint}</div>
-      <div className="row">
-        <label>Name<input required pattern="[a-z0-9][a-z0-9\-]*" value={value.name} onChange={(e) => onChange({ ...value, name: e.target.value })} /></label>
+      <div className="form-grid">
+        <label>Name<input required pattern="[a-z0-9][a-z0-9\-]*" title="Lowercase letters, digits and hyphens" value={value.name} onChange={(e) => onChange({ ...value, name: e.target.value })} /></label>
         {!value.advanced && src.fields.map((f) => {
           const cur = value.config[f.key];
           if (f.kind === "list") return <label key={f.key}>{f.label}<input required={f.required} placeholder={f.placeholder} value={(cur ?? []).join(", ")} onChange={(e) => setCfg(f.key, e.target.value.split(/[\s,]+/).filter(Boolean))} /></label>;
           if (f.kind === "number") return <label key={f.key}>{f.label}<input type="number" step="any" min={0} value={cur ?? ""} onChange={(e) => setCfg(f.key, e.target.value === "" ? undefined : Number(e.target.value))} /></label>;
           return <label key={f.key}>{f.label}<input required={f.required} list={f.kind === "region" ? "aws-regions" : undefined} placeholder={f.placeholder} value={cur ?? ""} onChange={(e) => setCfg(f.key, e.target.value || undefined)} /></label>;
         })}
-        <label>Credential
+        {src.auth && !value.advanced && <label>Authentication
+          <select value={auth} onChange={(e) => setAuth(e.target.value)}><option value="none">None</option><option value="basic">Username and password</option><option value="bearer">Bearer token</option></select>
+        </label>}
+        {auth === "basic" && !value.advanced && <label>Username<input required value={value.config.username ?? ""} onChange={(e) => setCfg("username", e.target.value)} /></label>}
+        {(!src.auth || auth !== "none" || value.advanced) && <label>{auth === "basic" ? "Password from" : "Credential"}
           <select value={value.credType} onChange={(e) => onChange({ ...value, credType: e.target.value })}>
-            <option value="none">{src.type === "kubernetes" || src.type === "cloudwatch" || src.type === "aws_cost" ? "Pod identity" : "None"}</option>
+            {!src.auth && <option value="none">{src.type === "kubernetes" || src.type === "cloudwatch" || src.type === "aws_cost" ? "Pod identity" : "None"}</option>}
             <option value="env">Environment variable</option><option value="file">Mounted file</option>
           </select>
-        </label>
-        {value.credType === "env" && <label>Variable (MOKS_CRED_*)<input required value={value.credName} onChange={(e) => onChange({ ...value, credName: e.target.value })} placeholder="MOKS_CRED_GRAFANA_TOKEN" /></label>}
+        </label>}
+        {value.credType === "env" && <label>Variable in moks-secrets<input required pattern="MOKS_CRED_[A-Z0-9_]+" title="MOKS_CRED_ followed by capitals, digits and underscores" value={value.credName} onChange={(e) => onChange({ ...value, credName: e.target.value })} placeholder={src.cred ?? "MOKS_CRED_…"} /></label>}
         {value.credType === "file" && <label>Path under credentials dir<input required value={value.credPath} onChange={(e) => onChange({ ...value, credPath: e.target.value })} placeholder="eks/kubeconfig" /></label>}
-        <label className="inline"><input type="checkbox" checked={value.enabled} onChange={(e) => onChange({ ...value, enabled: e.target.checked })} /> enabled</label>
-        <label className="inline"><input type="checkbox" checked={value.advanced} onChange={(e) => onChange({ ...value, advanced: e.target.checked, json: JSON.stringify(value.config, null, 2) })} /> edit as JSON</label>
+      </div>
+      <div className="row">
+        <label className="inline"><input type="checkbox" checked={value.enabled} onChange={(e) => onChange({ ...value, enabled: e.target.checked })} /> Enabled</label>
+        <label className="inline"><input type="checkbox" checked={value.advanced} onChange={(e) => onChange({ ...value, advanced: e.target.checked, json: JSON.stringify(value.config, null, 2) })} /> Edit as JSON</label>
       </div>
       {value.advanced && <label>Configuration (JSON; no secrets)<textarea rows={6} className="mono" value={value.json} onChange={(e) => onChange({ ...value, json: e.target.value })} /></label>}
       <datalist id="aws-regions">{REGIONS.map((r) => <option key={r} value={r} />)}</datalist>
@@ -107,10 +151,12 @@ function SourceFields({ value, onChange }: { value: SourceValue; onChange: (v: S
 // ---- Environments -----------------------------------------------------------------------------
 
 export function Environments() {
+  const { toast } = useFeedback();
   const list = useLoad(() => api<any[]>("/environments"), []);
   const blank = { name: "", display_name: "", kind: "minikube", is_production: false, allowed_namespaces: "*", denied_namespaces: "kube-system", max_query_window_minutes: 360, grafana_url: "",
     is_default: false, detection_enabled: false, auto_investigate: false, alert_cooldown_minutes: 30, max_replicas: 10, allow_scale_to_zero: false, plan_ttl_minutes: 60 };
   const [form, setForm] = useState<any>(blank);
+  const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [sources, setSources] = useState<SourceValue[]>(PRESETS.minikube.map(blankSource));
   const [adding, setAdding] = useState("");
@@ -118,6 +164,17 @@ export function Environments() {
   const setKind = (kind: string) => {
     setForm({ ...form, kind });
     if (!editing) setSources(PRESETS[kind].map(blankSource));
+  };
+  const close = () => {
+    setOpen(false);
+    setEditing(null);
+    setForm(blank);
+    setSources(PRESETS.minikube.map(blankSource));
+  };
+  const edit = (e: any) => {
+    setEditing(e.name);
+    setForm({ ...e, allowed_namespaces: e.allowed_namespaces.join(", "), denied_namespaces: e.denied_namespaces.join(", "), grafana_url: e.grafana_url ?? "" });
+    setOpen(true);
   };
   async function save(e: FormEvent) {
     e.preventDefault();
@@ -134,18 +191,19 @@ export function Environments() {
     });
     list.reload();
     if (done) {
-      setForm(blank);
-      setEditing(null);
-      setSources(PRESETS.minikube.map(blankSource));
+      toast(`${editing ? "Saved" : "Created"} ${form.name}`);
+      close();
     }
   }
   return (
     <>
-      <PageHead title="Environments" sub="Clusters MOKS can read, and the infrastructure scope it may touch in each (independent of user roles)" />
+      <PageHead title="Environments" sub="Clusters MOKS can read, and the infrastructure scope it may touch in each (independent of user roles)">
+        <button onClick={() => { a.clear(); setOpen(true); }}>Add environment</button>
+      </PageHead>
       <div className="card">
         <Loading load={list} rows={3} />
-        {list.data && <DataTable label="Environments" rows={list.data as any[]} rowKey={(e) => e.name} empty={<Empty title="No environments yet.">Add the first one below.</Empty>}
-          menu={(e) => ({ label: `Actions for ${e.name}`, items: [{ label: "Edit", run: () => { setEditing(e.name); setForm({ ...e, allowed_namespaces: e.allowed_namespaces.join(", "), denied_namespaces: e.denied_namespaces.join(", "), grafana_url: e.grafana_url ?? "" }); } }] })}
+        {list.data && <DataTable label="Environments" rows={list.data as any[]} rowKey={(e) => e.name} onRow={edit} empty={<Empty title="No environments yet.">Use Add environment to connect the first cluster.</Empty>}
+          menu={(e) => ({ label: `Actions for ${e.name}`, items: [{ label: "Edit", run: () => edit(e) }] })}
           cols={[
             { key: "n", head: "Name", primary: true, cell: (e) => <><span className="row tight"><Truncate text={e.display_name} />{e.is_production && <Badge kind="warn">production</Badge>}</span><Truncate text={e.name} mono /></> },
             { key: "k", head: "Kind", cell: (e) => e.kind },
@@ -154,31 +212,43 @@ export function Environments() {
             { key: "w", head: "Max window", cell: (e) => `${e.max_query_window_minutes} min` },
           ]} />}
       </div>
-      <form className="card stack" style={{ marginTop: 14 }} onSubmit={save}>
-        <h2>{editing ? `Edit ${editing}` : "Add environment"}</h2>
-        <div className="row">
-          <label>Name<input required disabled={!!editing} pattern="[a-z0-9][a-z0-9\-]*" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
-          <label>Display name<input value={form.display_name} onChange={(e) => setForm({ ...form, display_name: e.target.value })} /></label>
-          <label>Cluster type<select value={form.kind} onChange={(e) => setKind(e.target.value)}><option value="minikube">Minikube</option><option value="eks">Amazon EKS</option><option value="kubernetes">Kubernetes (other)</option></select></label>
-          <label className="inline"><input type="checkbox" checked={form.is_production} onChange={(e) => setForm({ ...form, is_production: e.target.checked })} /> production</label>
-          <label className="inline"><input type="checkbox" checked={form.is_default} onChange={(e) => setForm({ ...form, is_default: e.target.checked })} /> default for investigations</label>
-        </div>
-        <div className="row">
-          <label>Allowed namespaces (patterns)<input value={form.allowed_namespaces} onChange={(e) => setForm({ ...form, allowed_namespaces: e.target.value })} /></label>
-          <label>Denied namespaces<input value={form.denied_namespaces} onChange={(e) => setForm({ ...form, denied_namespaces: e.target.value })} /></label>
-          <label>Max query window (min)<input type="number" min={5} max={10080} value={form.max_query_window_minutes} onChange={(e) => setForm({ ...form, max_query_window_minutes: Number(e.target.value) })} /></label>
-          <label>Grafana URL<input value={form.grafana_url} onChange={(e) => setForm({ ...form, grafana_url: e.target.value })} placeholder="https://…/grafana" /></label>
-        </div>
-        <div className="row">
-          <label className="inline"><input type="checkbox" checked={form.detection_enabled} onChange={(e) => setForm({ ...form, detection_enabled: e.target.checked })} /> run detection rules</label>
-          <label className="inline"><input type="checkbox" checked={form.auto_investigate} onChange={(e) => setForm({ ...form, auto_investigate: e.target.checked })} /> investigate firing alerts automatically</label>
-          <label>Alert cooldown (min)<input type="number" min={1} max={1440} value={form.alert_cooldown_minutes} onChange={(e) => setForm({ ...form, alert_cooldown_minutes: Number(e.target.value) })} /></label>
-          <label>Max replicas (scale policy)<input type="number" min={1} max={1000} value={form.max_replicas} onChange={(e) => setForm({ ...form, max_replicas: Number(e.target.value) })} /></label>
-          <label className="inline"><input type="checkbox" checked={form.allow_scale_to_zero} onChange={(e) => setForm({ ...form, allow_scale_to_zero: e.target.checked })} /> allow scale to zero</label>
-          <label>Plan TTL (min)<input type="number" min={5} max={1440} value={form.plan_ttl_minutes} onChange={(e) => setForm({ ...form, plan_ttl_minutes: Number(e.target.value) })} /></label>
-        </div>
-        {!editing && <div className="stack">
-          <h3>Data sources</h3>
+      {open && <FormDrawer title={editing ? `Edit ${editing}` : "Add environment"} submit={editing ? "Save" : "Create environment"} busy={a.busy} error={a.error} onSubmit={save} onClose={close}>
+        <FormSection title="Cluster">
+          <div className="form-grid">
+            <label>Name<input required disabled={!!editing} pattern="[a-z0-9][a-z0-9\-]*" title="Lowercase letters, digits and hyphens" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
+            <label>Display name<input value={form.display_name} onChange={(e) => setForm({ ...form, display_name: e.target.value })} /></label>
+            <label>Cluster type<select value={form.kind} onChange={(e) => setKind(e.target.value)}><option value="minikube">Minikube</option><option value="eks">Amazon EKS</option><option value="kubernetes">Kubernetes (other)</option></select></label>
+            <label>Grafana URL<input value={form.grafana_url} onChange={(e) => setForm({ ...form, grafana_url: e.target.value })} placeholder="https://…/grafana" /></label>
+          </div>
+          <div className="row">
+            <label className="inline"><input type="checkbox" checked={form.is_production} onChange={(e) => setForm({ ...form, is_production: e.target.checked })} /> Production</label>
+            <label className="inline"><input type="checkbox" checked={form.is_default} onChange={(e) => setForm({ ...form, is_default: e.target.checked })} /> Default for investigations</label>
+          </div>
+        </FormSection>
+        <FormSection title="Scope" help="What MOKS may read here. Separate patterns with commas; * means all.">
+          <div className="form-grid">
+            <label>Allowed namespaces<input value={form.allowed_namespaces} onChange={(e) => setForm({ ...form, allowed_namespaces: e.target.value })} /></label>
+            <label>Denied namespaces<input value={form.denied_namespaces} onChange={(e) => setForm({ ...form, denied_namespaces: e.target.value })} /></label>
+            <label>Max query window (min)<input type="number" min={5} max={10080} value={form.max_query_window_minutes} onChange={(e) => setForm({ ...form, max_query_window_minutes: Number(e.target.value) })} /></label>
+          </div>
+        </FormSection>
+        <FormSection title="Detection" help="Rules that raise alerts, and whether MOKS investigates them without being asked.">
+          <div className="row">
+            <label className="inline"><input type="checkbox" checked={form.detection_enabled} onChange={(e) => setForm({ ...form, detection_enabled: e.target.checked })} /> Run detection rules</label>
+            <label className="inline"><input type="checkbox" checked={form.auto_investigate} onChange={(e) => setForm({ ...form, auto_investigate: e.target.checked })} /> Investigate firing alerts automatically</label>
+          </div>
+          <div className="form-grid">
+            <label>Alert cooldown (min)<input type="number" min={1} max={1440} value={form.alert_cooldown_minutes} onChange={(e) => setForm({ ...form, alert_cooldown_minutes: Number(e.target.value) })} /></label>
+          </div>
+        </FormSection>
+        <FormSection title="Change safety" help="Limits on the action plans MOKS can run here.">
+          <div className="form-grid">
+            <label>Max replicas<input type="number" min={1} max={1000} value={form.max_replicas} onChange={(e) => setForm({ ...form, max_replicas: Number(e.target.value) })} /></label>
+            <label>Plan expires after (min)<input type="number" min={5} max={1440} value={form.plan_ttl_minutes} onChange={(e) => setForm({ ...form, plan_ttl_minutes: Number(e.target.value) })} /></label>
+          </div>
+          <label className="inline"><input type="checkbox" checked={form.allow_scale_to_zero} onChange={(e) => setForm({ ...form, allow_scale_to_zero: e.target.checked })} /> Allow scale to zero</label>
+        </FormSection>
+        {!editing && <FormSection title="Data sources" help="Created with the environment. You can add more under Connectors.">
           {sources.map((v, i) => (
             <div key={i} className="card stack">
               <div className="row between"><strong>{SOURCES[v.source].label}</strong><button type="button" className="ghost small" onClick={() => setSources(sources.filter((_, n) => n !== i))}>Remove</button></div>
@@ -191,10 +261,8 @@ export function Environments() {
               {Object.entries(SOURCES).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
             </select>
           </label>
-        </div>}
-        <ErrorBox error={a.error} />
-        <div className="row"><button disabled={a.busy}>{editing ? "Save" : "Create"}</button>{editing && <button type="button" className="ghost" onClick={() => { setEditing(null); setForm(blank); }}>Cancel</button>}</div>
-      </form>
+        </FormSection>}
+      </FormDrawer>}
     </>
   );
 }
@@ -202,45 +270,74 @@ export function Environments() {
 // ---- Connectors -------------------------------------------------------------------------------
 
 export function Connectors() {
-  const { confirm: ask } = useFeedback();
+  const { confirm: ask, toast } = useFeedback();
   const list = useLoad(() => api<any[]>("/admin/connectors"), []);
   const envs = useLoad(() => api<any[]>("/environments"), []);
   const [environment, setEnvironment] = useState("");
-  const [form, setForm] = useState<SourceValue>(blankSource("eks"));
+  const [form, setForm] = useState<SourceValue>(blankSource("prometheus"));
+  const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [tests, setTests] = useState<Record<string, any>>({});
   const a = useAction();
+  const connectors: any[] = list.data ?? [];
+  const activeEnv = environment || envs.data?.[0]?.name;
+  const clash = duplicateConnector(connectors, activeEnv, form.name, editing);
+  const gaps = (envs.data ?? []).flatMap((e) => missingSources(connectors, e.name).map((r) => ({ environment: e.name, ...r })));
 
-  async function save(e: FormEvent) {
-    e.preventDefault();
-    const body = () => connectorBody(form, environment || envs.data?.[0]?.name);
-    if (await a.run(() => api(editing ? `/admin/connectors/${editing}` : "/admin/connectors", { method: editing ? "PUT" : "POST", body: body() }))) {
-      setEditing(null);
-      list.reload();
-    }
-  }
-  async function test(id: string) {
+  async function test(id: string, name: string) {
     setTests((t) => ({ ...t, [id]: { busy: true } }));
-    const r = await api(`/admin/connectors/${id}/test`, { method: "POST" }).catch((e) => ({ ok: false, message: e.message }));
+    const r = await api<any>(`/admin/connectors/${id}/test`, { method: "POST" }).catch((e) => ({ ok: false, message: e.message }));
     setTests((t) => ({ ...t, [id]: r }));
+    toast(`${name}: ${r.message}`, r.ok ? "ok" : "bad");
     list.reload();
   }
-  async function remove(id: string) {
-    if (await ask({ title: "Delete this connector?", body: "MOKS stops reading from this data source.", action: "Delete connector", danger: true })) { await a.run(() => api(`/admin/connectors/${id}`, { method: "DELETE" })); list.reload(); }
+  function add(source: string, env?: string) {
+    a.clear();
+    setEditing(null);
+    if (env) setEnvironment(env);
+    setForm(blankSource(source));
+    setOpen(true);
   }
   function edit(c: any) {
+    a.clear();
     setEditing(c.id);
     setEnvironment(c.environment);
     setForm({ ...blankSource(sourceOf(c)), name: c.name, enabled: c.enabled, config: c.config,
       credType: c.credential_ref?.type ?? "none", credName: c.credential_ref?.name ?? "", credPath: c.credential_ref?.path ?? "" });
+    setOpen(true);
+  }
+  async function save(e: FormEvent) {
+    e.preventDefault();
+    const saved = await a.run(() => api<any>(editing ? `/admin/connectors/${editing}` : "/admin/connectors", { method: editing ? "PUT" : "POST", body: connectorBody(form, activeEnv) }));
+    if (saved) {
+      setOpen(false);
+      setEditing(null);
+      list.reload();
+      await test(saved.id, saved.name);
+    }
+  }
+  async function remove(c: any) {
+    if (await ask({ title: `Delete ${c.name}?`, body: `MOKS stops reading from this data source in ${c.environment}.`, action: "Delete connector", danger: true })) { await a.run(() => api(`/admin/connectors/${c.id}`, { method: "DELETE" })); list.reload(); }
   }
   return (
     <>
-      <PageHead title="Connectors" sub="Live data sources per environment. Credentials are references to mounted Secrets, never stored here." />
+      <PageHead title="Connectors" sub="Live data sources per environment. Credentials are references to mounted Secrets, never stored here.">
+        <button onClick={() => add("prometheus")}>Add connector</button>
+      </PageHead>
+      {!open && <ErrorBox error={a.error} />}
+      {list.data && gaps.length > 0 && <div className="card stack" style={{ marginBottom: 14 }}>
+        <h2>Finish setup</h2>
+        {gaps.map((g) => (
+          <div key={g.environment + g.source} className="row between">
+            <span className="small"><strong>{g.label}</strong> is not connected in <span className="mono">{g.environment}</span>. Needed for {g.unlocks}.</span>
+            <button className="ghost small" aria-label={`Add ${g.label} to ${g.environment}`} onClick={() => add(g.source, g.environment)}>Add</button>
+          </div>
+        ))}
+      </div>}
       <div className="card">
         <Loading load={list} rows={4} />
-        {list.data && <DataTable label="Connectors" rows={list.data as any[]} rowKey={(c) => c.id} empty={<Empty title="No connectors yet.">Add one below, then test it.</Empty>}
-          menu={(c) => ({ label: `Actions for ${c.name}`, items: [{ label: "Test", run: () => test(c.id) }, { label: "Edit", run: () => edit(c) }, { label: "Delete", danger: true, run: () => remove(c.id) }] })}
+        {list.data && <DataTable label="Connectors" rows={connectors} rowKey={(c) => c.id} onRow={edit} empty={<Empty title="No connectors yet.">Use Add connector, and MOKS tests it when you save.</Empty>}
+          menu={(c) => ({ label: `Actions for ${c.name}`, items: [{ label: "Test", run: () => test(c.id, c.name) }, { label: "Edit", run: () => edit(c) }, { label: "Delete", danger: true, run: () => remove(c) }] })}
           cols={[
             { key: "n", head: "Name", primary: true, cell: (c) => <Truncate text={c.name} /> },
             { key: "t", head: "Last test", status: true, cell: (c) => <>{tests[c.id]?.busy ? "testing…" : c.last_test_ok == null ? <span className="muted small">never</span> : <Badge kind={c.last_test_ok ? "ok" : "bad"}>{c.last_test_ok ? "ok" : "failed"}</Badge>}</> },
@@ -251,10 +348,9 @@ export function Connectors() {
             { key: "m", head: "Test result", cell: (c) => <span className="small">{c.last_test_at && <Time iso={c.last_test_at} />}{c.last_test_message && <span className="muted clamp-2">{c.last_test_message}</span>}</span> },
           ]} />}
       </div>
-      <form className="card stack" style={{ marginTop: 14 }} onSubmit={save}>
-        <h2>{editing ? "Edit connector" : "Add connector"}</h2>
-        <div className="row">
-          <label>Environment<select value={environment} onChange={(e) => setEnvironment(e.target.value)}>{envs.data?.map((e) => <option key={e.name}>{e.name}</option>)}</select></label>
+      {open && <FormDrawer title={editing ? `Edit ${form.name}` : "Add connector"} submit={editing ? "Save and test" : "Add and test"} busy={a.busy} blocked={!!clash} error={a.error} onSubmit={save} onClose={() => { setOpen(false); setEditing(null); }}>
+        <div className="form-grid">
+          <label>Environment<select value={activeEnv} onChange={(e) => setEnvironment(e.target.value)}>{envs.data?.map((e) => <option key={e.name}>{e.name}</option>)}</select></label>
           <label>Data source
             <select value={form.source} disabled={!!editing} onChange={(e) => setForm(blankSource(e.target.value))}>
               {Object.entries(SOURCES).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
@@ -262,9 +358,11 @@ export function Connectors() {
           </label>
         </div>
         <SourceFields value={form} onChange={setForm} />
-        <ErrorBox error={a.error} />
-        <div className="row"><button disabled={a.busy}>{editing ? "Save" : "Add"}</button>{editing && <button type="button" className="ghost" onClick={() => setEditing(null)}>Cancel</button>}</div>
-      </form>
+        {clash && <div className="alert warn small row between" role="alert">
+          <span>{activeEnv} already has a connector named {clash.name}. Edit it, or choose another name.</span>
+          <button type="button" className="ghost small" onClick={() => edit(clash)}>Edit {clash.name}</button>
+        </div>}
+      </FormDrawer>}
     </>
   );
 }
@@ -297,39 +395,52 @@ const presetOf = (form: any) => Object.keys(LLM_PRESETS).find((k) => LLM_PRESETS
 export { LLM_PRESETS, presetOf };
 
 export function LLMProviders() {
-  const { confirm: ask } = useFeedback();
+  const { confirm: ask, toast } = useFeedback();
   const list = useLoad(() => api<any[]>("/admin/llm"), []);
   const blank = { name: "", purpose: "chat", provider: "bedrock", model: "", endpoint: "", region: "us-east-1", credType: "none", credName: "",
     timeout_seconds: 60, max_output_tokens: 2000, daily_budget_usd: "5", input_price_per_mtok: "0", output_price_per_mtok: "0" };
   const [form, setForm] = useState<any>(blank);
+  const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [tests, setTests] = useState<Record<string, any>>({});
   const a = useAction();
+  const close = () => { setOpen(false); setEditing(null); setForm(blank); };
+  const edit = (c: any) => {
+    a.clear();
+    setEditing(c.id);
+    setForm({ ...c, endpoint: c.endpoint ?? "", region: c.region ?? "us-east-1", credType: c.credential_ref?.type ?? "none", credName: c.credential_ref?.name ?? "" });
+    setOpen(true);
+  };
   async function save(e: FormEvent) {
     e.preventDefault();
     const body = { ...form, endpoint: form.endpoint || null, region: form.provider === "bedrock" ? form.region : null,
       credential_ref: form.credType === "env" ? { type: "env", name: form.credName } : { type: "none" } };
     delete body.credType; delete body.credName;
     if (await a.run(() => api(editing ? `/admin/llm/${editing}` : "/admin/llm", { method: editing ? "PUT" : "POST", body }))) {
-      setForm(blank); setEditing(null); list.reload();
+      toast(`Saved ${form.name}`);
+      close();
+      list.reload();
     }
   }
-  async function test(id: string) {
+  async function test(id: string, name: string) {
     setTests((t) => ({ ...t, [id]: { message: "testing…" } }));
-    setTests((t) => ({ ...t }));
-    const r = await api(`/admin/llm/${id}/test`, { method: "POST" }).catch((e) => ({ ok: false, message: e.message }));
+    const r = await api<any>(`/admin/llm/${id}/test`, { method: "POST" }).catch((e) => ({ ok: false, message: e.message }));
     setTests((t) => ({ ...t, [id]: r }));
+    toast(`${name}: ${r.message}`, r.ok ? "ok" : "bad");
   }
   return (
     <>
-      <PageHead title="LLM providers" sub="Provider-neutral chat model used for planning and reports. Without an active chat model, investigations are rule-based." />
+      <PageHead title="LLM providers" sub="Provider-neutral chat model used for planning and reports. Without an active chat model, investigations are rule-based.">
+        <button onClick={() => { a.clear(); setOpen(true); }}>Add provider</button>
+      </PageHead>
+      {!open && <ErrorBox error={a.error} />}
       <div className="card">
         <Loading load={list} rows={3} />
-        {list.data && <DataTable label="LLM providers" rows={list.data as any[]} rowKey={(c) => c.id} empty={<Empty title="No LLM configured.">Investigations use rule-based diagnosis only.</Empty>}
+        {list.data && <DataTable label="LLM providers" rows={list.data as any[]} rowKey={(c) => c.id} onRow={edit} empty={<Empty title="No LLM configured.">Investigations use rule-based diagnosis only.</Empty>}
           menu={(c) => ({ label: `Actions for ${c.name}`, items: [
-            { label: "Test", run: () => test(c.id) },
+            { label: "Test", run: () => test(c.id, c.name) },
             { label: c.is_active ? "Deactivate" : "Activate", run: async () => { await a.run(() => api(`/admin/llm/${c.id}/activate${qs({ active: !c.is_active })}`, { method: "POST" })); list.reload(); } },
-            { label: "Edit", run: () => { setEditing(c.id); setForm({ ...c, endpoint: c.endpoint ?? "", region: c.region ?? "us-east-1", credType: c.credential_ref?.type ?? "none", credName: c.credential_ref?.name ?? "" }); } },
+            { label: "Edit", run: () => edit(c) },
             ...(!c.is_active ? [{ label: "Delete", danger: true, run: async () => { if (await ask({ title: `Delete ${c.name}?`, body: "Its usage history is kept.", action: "Delete provider", danger: true })) { await a.run(() => api(`/admin/llm/${c.id}`, { method: "DELETE" })); list.reload(); } } }] : []),
           ] })}
           cols={[
@@ -343,97 +454,149 @@ export function LLMProviders() {
             { key: "t", head: "Test", cell: (c) => (tests[c.id] ? <span className={`small ${tests[c.id].ok ? "" : "muted"}`}>{tests[c.id].message}</span> : "") },
           ]} />}
       </div>
-      <form className="card stack" style={{ marginTop: 14 }} onSubmit={save}>
-        <h2>{editing ? "Edit provider" : "Add provider"}</h2>
-        <div className="row">
-          <label>Name<input required pattern="[a-z0-9][a-z0-9\-]*" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
-          <label>Purpose<select value={form.purpose} onChange={(e) => setForm({ ...form, purpose: e.target.value })}><option>chat</option><option>embedding</option></select></label>
-          <label>Provider<select value={presetOf(form)} onChange={(e) => { const p = LLM_PRESETS[e.target.value]; setForm({ ...form, provider: p.provider, endpoint: p.endpoint ?? "", model: "", credType: p.key ? "env" : "none", credName: p.key ?? "" }); }}>{Object.entries(LLM_PRESETS).map(([k, p]) => <option key={k} value={k}>{p.label}</option>)}</select></label>
-          <label>Model<input required list="llm-models" value={form.model} onChange={(e) => { const price = LLM_PRESETS[presetOf(form)].prices?.[e.target.value]; setForm({ ...form, model: e.target.value, ...(price ? { input_price_per_mtok: price[0], output_price_per_mtok: price[1] } : {}) }); }} placeholder={form.provider === "bedrock" ? "inference profile or model ID" : "model name"} /></label>
+      {open && <FormDrawer title={editing ? `Edit ${form.name}` : "Add provider"} submit={editing ? "Save" : "Add provider"} busy={a.busy} error={a.error} onSubmit={save} onClose={close}>
+        <FormSection title="Model" help={LLM_PRESETS[presetOf(form)].hint}>
+          <div className="form-grid">
+            <label>Provider<select value={presetOf(form)} onChange={(e) => { const p = LLM_PRESETS[e.target.value]; setForm({ ...form, provider: p.provider, endpoint: p.endpoint ?? "", model: "", credType: p.key ? "env" : "none", credName: p.key ?? "" }); }}>{Object.entries(LLM_PRESETS).map(([k, p]) => <option key={k} value={k}>{p.label}</option>)}</select></label>
+            <label>Model<input required list="llm-models" value={form.model} onChange={(e) => { const price = LLM_PRESETS[presetOf(form)].prices?.[e.target.value]; setForm({ ...form, model: e.target.value, ...(price ? { input_price_per_mtok: price[0], output_price_per_mtok: price[1] } : {}) }); }} placeholder={form.provider === "bedrock" ? "inference profile or model ID" : "model name"} /></label>
+            <label>Name<input required pattern="[a-z0-9][a-z0-9\-]*" title="Lowercase letters, digits and hyphens" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
+            <label>Purpose<select value={form.purpose} onChange={(e) => setForm({ ...form, purpose: e.target.value })}><option>chat</option><option>embedding</option></select></label>
+          </div>
           <datalist id="llm-models">{LLM_PRESETS[presetOf(form)].models?.map((m) => <option key={m} value={m} />)}</datalist>
           <datalist id="aws-regions">{REGIONS.map((r) => <option key={r} value={r} />)}</datalist>
-        </div>
-        <div className="row">
-          {form.provider === "bedrock" ? <label>Region<input list="aws-regions" value={form.region} onChange={(e) => setForm({ ...form, region: e.target.value })} /></label> :
-            <label>Endpoint{form.provider === "ollama" ? " (required)" : " (optional)"}<input value={form.endpoint} onChange={(e) => setForm({ ...form, endpoint: e.target.value })} placeholder={form.provider === "ollama" ? "http://ollama.ollama:11434" : "default"} /></label>}
-          {form.provider !== "bedrock" && (
-            <label>API key reference<select value={form.credType} onChange={(e) => setForm({ ...form, credType: e.target.value })}><option value="none">none</option><option value="env">environment variable</option></select></label>
-          )}
-          {form.credType === "env" && form.provider !== "bedrock" && <label>Variable<input value={form.credName} onChange={(e) => setForm({ ...form, credName: e.target.value })} placeholder="MOKS_CRED_OPENAI_API_KEY" /></label>}
-          <span className="small muted">{LLM_PRESETS[presetOf(form)].hint}</span>
-        </div>
-        <div className="row">
-          <label>Timeout (s)<input type="number" value={form.timeout_seconds} onChange={(e) => setForm({ ...form, timeout_seconds: Number(e.target.value) })} /></label>
-          <label>Max output tokens<input type="number" value={form.max_output_tokens} onChange={(e) => setForm({ ...form, max_output_tokens: Number(e.target.value) })} /></label>
-          <label>Daily budget (USD)<input value={form.daily_budget_usd} onChange={(e) => setForm({ ...form, daily_budget_usd: e.target.value })} /></label>
-          <label>Input $ / 1M tokens<input value={form.input_price_per_mtok} onChange={(e) => setForm({ ...form, input_price_per_mtok: e.target.value })} /></label>
-          <label>Output $ / 1M tokens<input value={form.output_price_per_mtok} onChange={(e) => setForm({ ...form, output_price_per_mtok: e.target.value })} /></label>
-          {Number(form.input_price_per_mtok) === 0 && Number(form.output_price_per_mtok) === 0 && form.provider !== "ollama" && <span className="small muted">With no prices set, spend counts as $0 and the daily budget cannot limit this model.</span>}
-        </div>
-        <ErrorBox error={a.error} />
-        <div className="row"><button disabled={a.busy}>{editing ? "Save" : "Add"}</button>{editing && <button type="button" className="ghost" onClick={() => { setEditing(null); setForm(blank); }}>Cancel</button>}</div>
-      </form>
+        </FormSection>
+        <FormSection title="Connection">
+          <div className="form-grid">
+            {form.provider === "bedrock" ? <label>Region<input list="aws-regions" value={form.region} onChange={(e) => setForm({ ...form, region: e.target.value })} /></label> :
+              <label>Endpoint{form.provider === "ollama" ? " (required)" : " (optional)"}<input value={form.endpoint} onChange={(e) => setForm({ ...form, endpoint: e.target.value })} placeholder={form.provider === "ollama" ? "http://ollama.ollama:11434" : "default"} /></label>}
+            {form.provider !== "bedrock" && (
+              <label>API key reference<select value={form.credType} onChange={(e) => setForm({ ...form, credType: e.target.value })}><option value="none">None</option><option value="env">Environment variable</option></select></label>
+            )}
+            {form.credType === "env" && form.provider !== "bedrock" && <label>Variable in moks-secrets<input value={form.credName} onChange={(e) => setForm({ ...form, credName: e.target.value })} placeholder="MOKS_CRED_OPENAI_API_KEY" /></label>}
+            <label>Timeout (s)<input type="number" value={form.timeout_seconds} onChange={(e) => setForm({ ...form, timeout_seconds: Number(e.target.value) })} /></label>
+            <label>Max output tokens<input type="number" value={form.max_output_tokens} onChange={(e) => setForm({ ...form, max_output_tokens: Number(e.target.value) })} /></label>
+          </div>
+        </FormSection>
+        <FormSection title="Budget">
+          <div className="form-grid">
+            <label>Daily budget (USD)<input value={form.daily_budget_usd} onChange={(e) => setForm({ ...form, daily_budget_usd: e.target.value })} /></label>
+            <label>Input $ / 1M tokens<input value={form.input_price_per_mtok} onChange={(e) => setForm({ ...form, input_price_per_mtok: e.target.value })} /></label>
+            <label>Output $ / 1M tokens<input value={form.output_price_per_mtok} onChange={(e) => setForm({ ...form, output_price_per_mtok: e.target.value })} /></label>
+          </div>
+          {Number(form.input_price_per_mtok) === 0 && Number(form.output_price_per_mtok) === 0 && form.provider !== "ollama" && <div className="small muted">With no prices set, spend counts as $0 and the daily budget cannot limit this model.</div>}
+        </FormSection>
+      </FormDrawer>}
     </>
   );
 }
 
 // ---- Users and roles --------------------------------------------------------------------------
 
+const NO_GRANT = { role: "viewer", environment: "*", namespace: "*" };
+
+export const matchesUser = (u: any, text: string) => !text || `${u.email} ${u.display_name ?? ""}`.toLowerCase().includes(text.toLowerCase());
+
 export function Users() {
   const { me } = useAuth();
+  const { confirm: ask, toast } = useFeedback();
   const list = useLoad(() => api<any[]>("/admin/users"), []);
   const roles = useLoad(() => api<any[]>("/auth/roles"), []);
+  const envs = useLoad(() => api<any[]>("/environments"), []);
   const [nu, setNu] = useState({ email: "", display_name: "", password: "" });
-  const [grant, setGrant] = useState<Record<string, { role: string; environment: string; namespace: string }>>({});
+  const [adding, setAdding] = useState(false);
+  const [text, setText] = useState("");
+  const [managing, setManaging] = useState<string | null>(null);
+  const [grant, setGrant] = useState(NO_GRANT);
   const a = useAction();
+  const user = list.data?.find((u) => u.id === managing);
+  const manage = (u: any) => { a.clear(); setGrant(NO_GRANT); setManaging(u.id); };
+
+  async function addUser(e: FormEvent) {
+    e.preventDefault();
+    if (await a.run(() => api("/admin/users", { method: "POST", body: { ...nu, password: nu.password || null } }))) {
+      toast(`Added ${nu.email}. Grant a role so they can see anything.`);
+      setNu({ email: "", display_name: "", password: "" });
+      setAdding(false);
+      list.reload();
+    }
+  }
+  async function addBinding(e: FormEvent) {
+    e.preventDefault();
+    if (await a.run(() => api(`/admin/users/${managing}/bindings`, { method: "POST", body: grant }).then(() => true))) {
+      setGrant(NO_GRANT);
+      list.reload();
+    }
+  }
+  async function removeBinding(b: any) {
+    if (await ask({ title: `Remove ${b.role}?`, body: `${user.email} loses ${b.role} on ${b.environment}/${b.namespace}.`, action: "Remove access", danger: true })) {
+      await a.run(() => api(`/admin/users/${user.id}/bindings/${b.id}`, { method: "DELETE" }));
+      list.reload();
+    }
+  }
+  async function setActive() {
+    if (!user.is_active || await ask({ title: `Disable ${user.email}?`, body: "They can no longer sign in. Their history and role bindings are kept.", action: "Disable user", danger: true })) {
+      await a.run(() => api(`/admin/users/${user.id}/active${qs({ active: !user.is_active })}`, { method: "POST" }));
+      list.reload();
+    }
+  }
   return (
     <>
-      <PageHead title="Users & roles" sub="Application RBAC. Bindings scope a role to an environment and namespace pattern." />
-      <div className="card" style={{ marginBottom: 14 }}>
-        <h2>Roles</h2>
+      <PageHead title="Users & roles" sub="Application RBAC. Bindings scope a role to an environment and namespace pattern.">
+        {me?.auth_mode !== "oidc" && <button onClick={() => { a.clear(); setAdding(true); }}>Add user</button>}
+      </PageHead>
+      <details className="card" style={{ marginBottom: 14 }}>
+        <summary>What each role can do</summary>
         <dl className="kv">{roles.data?.map((r) => <Fragment key={r.role}><dt><Badge kind="info">{r.role}</Badge></dt><dd>{r.description}</dd></Fragment>)}</dl>
+      </details>
+      {!managing && !adding && <ErrorBox error={a.error} />}
+      <div className="card stack">
+        <label>Find a user<input type="search" value={text} onChange={(e) => setText(e.target.value)} placeholder="name or email" /></label>
+        <Loading load={list} rows={4} />
+        {list.data && <DataTable label="Users" rows={list.data.filter((u) => matchesUser(u, text))} rowKey={(u) => u.id} onRow={manage} empty={<Empty title={text ? "No users match." : "No users yet."} />}
+          menu={(u) => ({ label: `Actions for ${u.email}`, items: [{ label: "Manage access", run: () => manage(u) }] })}
+          cols={[
+            { key: "u", head: "User", primary: true, cell: (u) => <><Truncate text={u.display_name || u.email} /><Truncate text={u.email} /></> },
+            { key: "s", head: "Status", status: true, cell: (u) => (u.is_active ? <Badge kind="ok">active</Badge> : <Badge kind="bad">disabled</Badge>) },
+            { key: "a", head: "Access", cell: (u) => (u.bindings.length ? <span className="row tight">{u.bindings.slice(0, 3).map((b: any) => <Badge key={b.id} kind="info">{b.role}</Badge>)}{u.bindings.length > 3 && <span className="small muted">+{u.bindings.length - 3}</span>}</span> : <span className="muted small">no access</span>) },
+            { key: "l", head: "Sign-in", cell: (u) => <span className="small">{u.auth_provider}<div className="muted">last <Time iso={u.last_login_at} /></div></span> },
+          ]} />}
       </div>
-      <ErrorBox error={a.error} />
-      <div className="card">
-        <div className="table-wrap wide-form" role="region" aria-label="Users and role bindings" tabIndex={0}>
-        <table>
-          <thead><tr><th>User</th><th>Sign-in</th><th>Bindings</th><th>Grant</th><th /></tr></thead>
-          <tbody>{list.data?.map((u) => {
-            const g = grant[u.id] ?? { role: "viewer", environment: "*", namespace: "*" };
-            return (
-              <tr key={u.id}>
-                <td>{u.display_name || u.email}<div className="small muted">{u.email}</div>{!u.is_active && <Badge kind="bad">disabled</Badge>}</td>
-                <td className="small">{u.auth_provider}<div className="muted">last <Time iso={u.last_login_at} /></div></td>
-                <td className="small">{u.bindings.map((b: any) => (
-                  <div key={b.id}><Badge kind="info">{b.role}</Badge> <span className="mono">{b.environment}/{b.namespace}</span> <span className="muted">({b.source})</span>
-                    <button className="ghost small" aria-label={`Remove ${b.role} on ${b.environment}/${b.namespace} from ${u.email}`} style={{ marginLeft: 4 }} onClick={async () => { await a.run(() => api(`/admin/users/${u.id}/bindings/${b.id}`, { method: "DELETE" })); list.reload(); }}>×</button></div>
-                ))}{!u.bindings.length && <span className="muted">no access</span>}</td>
-                <td>
-                  <div className="row">
-                    <select aria-label="Role" value={g.role} onChange={(e) => setGrant({ ...grant, [u.id]: { ...g, role: e.target.value } })}>{roles.data?.map((r) => <option key={r.role}>{r.role}</option>)}</select>
-                    <input aria-label="Environment" style={{ width: 90 }} value={g.environment} onChange={(e) => setGrant({ ...grant, [u.id]: { ...g, environment: e.target.value } })} title="environment pattern" />
-                    <input aria-label="Namespace" style={{ width: 110 }} value={g.namespace} onChange={(e) => setGrant({ ...grant, [u.id]: { ...g, namespace: e.target.value } })} title="namespace pattern" />
-                    <button className="small" onClick={async () => { await a.run(() => api(`/admin/users/${u.id}/bindings`, { method: "POST", body: g })); list.reload(); }}>Grant</button>
-                  </div>
-                </td>
-                <td>{u.id !== me?.id && <button className="ghost small" onClick={async () => { await a.run(() => api(`/admin/users/${u.id}/active${qs({ active: !u.is_active })}`, { method: "POST" })); list.reload(); }}>{u.is_active ? "Disable" : "Enable"}</button>}</td>
-              </tr>
-            );
-          })}</tbody>
-        </table>
+      {me?.auth_mode === "oidc" && <div className="small muted" style={{ marginTop: 10 }}>With single sign-on, users appear after their first sign-in; grant roles here or map IdP groups (MOKS_OIDC_GROUP_ROLES).</div>}
+      {adding && <FormDrawer title="Add user" submit="Add user" busy={a.busy} error={a.error} onSubmit={addUser} onClose={() => setAdding(false)}>
+        <div className="form-grid">
+          <label>Email<input required type="email" value={nu.email} onChange={(e) => setNu({ ...nu, email: e.target.value })} /></label>
+          <label>Display name<input value={nu.display_name} onChange={(e) => setNu({ ...nu, display_name: e.target.value })} /></label>
+          {me?.auth_mode === "local" && <label>Initial password (at least 12 characters)<input type="password" minLength={12} required value={nu.password} onChange={(e) => setNu({ ...nu, password: e.target.value })} /></label>}
         </div>
-      </div>
-      {me?.auth_mode !== "oidc" ? (
-        <form className="card stack" style={{ marginTop: 14 }} onSubmit={async (e) => { e.preventDefault(); if (await a.run(() => api("/admin/users", { method: "POST", body: { ...nu, password: nu.password || null } }))) { setNu({ email: "", display_name: "", password: "" }); list.reload(); } }}>
-          <h2>Add user</h2>
-          <div className="row">
-            <label>Email<input required type="email" value={nu.email} onChange={(e) => setNu({ ...nu, email: e.target.value })} /></label>
-            <label>Display name<input value={nu.display_name} onChange={(e) => setNu({ ...nu, display_name: e.target.value })} /></label>
-            {me?.auth_mode === "local" && <label>Initial password (≥ 12)<input type="password" minLength={12} required value={nu.password} onChange={(e) => setNu({ ...nu, password: e.target.value })} /></label>}
-            <button disabled={a.busy}>Add</button>
-          </div>
-        </form>
-      ) : <div className="small muted" style={{ marginTop: 10 }}>With single sign-on, users appear after their first sign-in; grant roles here or map IdP groups (MOKS_OIDC_GROUP_ROLES).</div>}
+      </FormDrawer>}
+      {user && <Drawer title={`Access for ${user.email}`} onClose={() => setManaging(null)} footer={a.error ? <ErrorBox error={a.error} /> : undefined}>
+        <div className="stack">
+          <FormSection title="Current access">
+            {user.bindings.map((b: any) => (
+              <div key={b.id} className="row between">
+                <span className="small"><Badge kind="info">{b.role}</Badge> <span className="mono">{b.environment}/{b.namespace}</span> <span className="muted">({b.source})</span></span>
+                <button type="button" className="ghost small" aria-label={`Remove ${b.role} on ${b.environment}/${b.namespace}`} onClick={() => removeBinding(b)}>Remove</button>
+              </div>
+            ))}
+            {!user.bindings.length && <div className="small muted">No access yet. Grant a role below.</div>}
+          </FormSection>
+          <form onSubmit={addBinding}>
+            <FormSection title="Grant a role" help="* means every environment or namespace; patterns such as shop-* also work.">
+              <div className="form-grid">
+                <label>Role<select value={grant.role} onChange={(e) => setGrant({ ...grant, role: e.target.value })}>{roles.data?.map((r) => <option key={r.role}>{r.role}</option>)}</select></label>
+                <label>Environment<input required list="binding-envs" value={grant.environment} onChange={(e) => setGrant({ ...grant, environment: e.target.value })} /></label>
+                <label>Namespace<input required value={grant.namespace} onChange={(e) => setGrant({ ...grant, namespace: e.target.value })} /></label>
+              </div>
+              <datalist id="binding-envs">{envs.data?.map((e) => <option key={e.name} value={e.name} />)}</datalist>
+              <div className="small muted">{roles.data?.find((r) => r.role === grant.role)?.description}</div>
+              <div className="row"><button disabled={a.busy}>Grant role</button></div>
+            </FormSection>
+          </form>
+          {user.id !== me?.id && <FormSection title="Account">
+            <div className="row"><button type="button" className="ghost" onClick={setActive}>{user.is_active ? "Disable user" : "Enable user"}</button></div>
+          </FormSection>}
+        </div>
+      </Drawer>}
     </>
   );
 }

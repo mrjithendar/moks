@@ -1,5 +1,20 @@
-import { describe, expect, it } from "vitest";
-import { LLM_PRESETS, presetOf } from "./Admin";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const state = vi.hoisted(() => ({ calls: [] as { path: string; method?: string; body: any }[] }));
+vi.mock("../api", async (orig) => ({ ...(await orig<any>()), api: vi.fn(async (path: string, opts?: any) => {
+  state.calls.push({ path, method: opts?.method, body: opts?.body });
+  if (path === "/environments") return [{ name: "demo" }];
+  if (path === "/admin/connectors" && !opts?.method) return [{ id: "c1", environment: "demo", type: "prometheus", name: "prometheus", enabled: true, implemented: true, config: { base_url: "http://p" }, credential_ref: { type: "none" } }];
+  if (path === "/admin/connectors") return { id: "c2", name: opts.body.name };
+  if (path.endsWith("/test")) return { ok: true, message: "reachable" };
+  return {};
+}) }));
+
+import { FeedbackProvider } from "../ui";
+import { connectorBody, Connectors, duplicateConnector, LLM_PRESETS, matchesUser, missingSources, presetOf } from "./Admin";
+
+afterEach(() => { cleanup(); state.calls.length = 0; });
 
 describe("LLM presets", () => {
   it("offers the major providers and points compatible servers at their endpoints", () => {
@@ -16,5 +31,54 @@ describe("LLM presets", () => {
   it("only prices models it lists, and never a key value", () => {
     expect(LLM_PRESETS.anthropic.prices?.["claude-opus-5-5"]).toEqual(["4", "20"]);
     for (const p of Object.values(LLM_PRESETS)) if (p.key) expect(p.key).toMatch(/^MOKS_CRED_[A-Z0-9_]+$/);
+  });
+});
+
+const source = (extra: any = {}) => ({ source: "prometheus", name: "prom", enabled: true, config: { base_url: "http://p", auth: "none" }, advanced: false, json: "", credType: "env", credName: "MOKS_CRED_X", credPath: "", ...extra });
+
+describe("connector form rules", () => {
+  it("does not store a credential the connector would ignore", () => {
+    expect(connectorBody(source(), "demo").credential_ref).toEqual({ type: "none" });
+    expect(connectorBody(source({ config: { base_url: "http://p", auth: "basic", username: "eks" } }), "demo").credential_ref).toEqual({ type: "env", name: "MOKS_CRED_X" });
+  });
+  it("finds a name already used in that environment, but not the connector being edited", () => {
+    const rows = [{ id: "c1", environment: "demo", name: "prometheus" }];
+    expect(duplicateConnector(rows, "demo", "prometheus", null)?.id).toBe("c1");
+    expect(duplicateConnector(rows, "demo", "prometheus", "c1")).toBeUndefined();
+    expect(duplicateConnector(rows, "other", "prometheus", null)).toBeUndefined();
+  });
+  it("lists what an environment lacks, counting CloudWatch as logs and ignoring disabled connectors", () => {
+    const rows = [{ environment: "demo", type: "kubernetes", enabled: true }, { environment: "demo", type: "cloudwatch", enabled: true }, { environment: "demo", type: "prometheus", enabled: false }];
+    expect(missingSources(rows, "demo").map((m) => m.source)).toEqual(["prometheus", "cost_model"]);
+  });
+  it("finds users by name or email", () => {
+    expect(matchesUser({ email: "a@x.io", display_name: "Sam Lee" }, "lee")).toBe(true);
+    expect(matchesUser({ email: "a@x.io" }, "b@")).toBe(false);
+  });
+});
+
+describe("Connectors page", () => {
+  const open = async () => {
+    render(<FeedbackProvider><Connectors /></FeedbackProvider>);
+    fireEvent.click(await screen.findByRole("button", { name: "Add connector" }));
+  };
+  it("blocks a duplicate name and offers the existing connector", async () => {
+    await open();
+    await screen.findByRole("alert");
+    expect(screen.getByRole("alert").textContent).toContain("already has a connector named prometheus");
+    expect((screen.getByRole("button", { name: "Add and test" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Edit prometheus" }));
+    expect(await screen.findByRole("button", { name: "Save and test" })).toBeTruthy();
+  });
+  it("tests a new connector as soon as it is saved", async () => {
+    await open();
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "prom-2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add and test" }));
+    await waitFor(() => expect(state.calls.some((c) => c.path === "/admin/connectors/c2/test" && c.method === "POST")).toBe(true));
+    expect(await screen.findByText("prom-2: reachable")).toBeTruthy();
+  });
+  it("asks for the missing data sources", async () => {
+    render(<FeedbackProvider><Connectors /></FeedbackProvider>);
+    expect(await screen.findByRole("button", { name: "Add Cluster cost model to demo" })).toBeTruthy();
   });
 });

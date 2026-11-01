@@ -235,6 +235,11 @@ async def finops_budgets(ctx: ToolContext, a: NoArgs) -> ToolResult:
     return ToolResult(f"{len(rows)} budgets; at or over 100%: {', '.join(over) or 'none'}", rows, {"api": "budgets:DescribeBudgets"})
 
 
+def _team_of(pod: dict, labels: list[str]) -> str:
+    found = pod["metadata"].get("labels") or {}
+    return next((found[k] for k in labels if found.get(k)), "unassigned")
+
+
 def _workload_of(pod: dict) -> str:
     meta = pod["metadata"]
     owner = (meta.get("ownerReferences") or [{}])[0]
@@ -256,6 +261,7 @@ async def _usage(ctx: ToolContext, namespaces: list[str], days: int) -> tuple[di
         "cpu_p95": f"quantile_over_time(0.95, sum by (namespace, pod, container) (rate(container_cpu_usage_seconds_total{{{sel}}}[5m]))[{rng}:{step}])",
         "mem_avg": f"avg_over_time(sum by (namespace, pod, container) (container_memory_working_set_bytes{{{sel}}})[{rng}:{step}])",
         "mem_max": f"max_over_time(sum by (namespace, pod, container) (container_memory_working_set_bytes{{{sel}}})[{rng}:{step}])",
+        "samples": f"count_over_time(sum by (namespace, pod, container) (container_memory_working_set_bytes{{{sel}}})[{rng}:{step}])",
     }
     now = datetime.now(timezone.utc)
     values: dict[str, dict[tuple[str, str, str], float]] = {}
@@ -273,7 +279,7 @@ async def _prices(ctx: ToolContext) -> tuple[float, float, str]:
     total_cpu = sum(parse_cpu(n["allocatable"].get("cpu")) for n in nodes)
     total_gib = sum(parse_mem(n["allocatable"].get("memory")) for n in nodes) / 1024**3
     cpu_p, gib_p = model.unit_prices(total_cpu, total_gib)
-    return cpu_p, gib_p, model.describe()
+    return cpu_p, gib_p, model.describe(), total_cpu * cpu_p + total_gib * gib_p
 
 
 async def _pods_by_namespace(ctx: ToolContext, namespaces: list[str], named: str | None) -> tuple[dict[str, list[dict]], dict[str, str]]:
@@ -296,8 +302,8 @@ async def finops_k8s_allocation(ctx: ToolContext, a: AllocArgs) -> ToolResult:
     namespaces = await _namespaces(ctx, a.namespace)
     pods_by_ns, skipped = await _pods_by_namespace(ctx, namespaces, a.namespace)
     usage, queries, _ = await _usage(ctx, namespaces, a.days)
-    cpu_p, gib_p, model = await _prices(ctx)
-    storage_price = ctx.connector("cost_model").storage_gib_month
+    cpu_p, gib_p, model, capacity_hour = await _prices(ctx)
+    storage_price, team_labels = ctx.connector("cost_model").storage_gib_month, ctx.connector("cost_model").team_labels
     agg: dict[tuple[str, str], dict] = {}
     for ns, pods in pods_by_ns.items():
         pvc_size = {}
@@ -308,7 +314,7 @@ async def finops_k8s_allocation(ctx: ToolContext, a: AllocArgs) -> ToolResult:
             if p.get("status", {}).get("phase") not in ("Running", "Pending"):
                 continue
             wl = _workload_of(p)
-            w = agg.setdefault((ns, wl), {"namespace": ns, "workload": wl, "kind": wl.split("/")[0], "pods": 0, "cpu_request": 0.0, "mem_request": 0.0,
+            w = agg.setdefault((ns, wl), {"namespace": ns, "workload": wl, "kind": wl.split("/")[0], "team": _team_of(p, team_labels), "pods": 0, "cpu_request": 0.0, "mem_request": 0.0,
                                           "cpu_avg": 0.0, "mem_avg": 0.0, "storage_bytes": 0.0})
             w["pods"] += 1
             for v in p["spec"].get("volumes") or []:
@@ -326,19 +332,26 @@ async def finops_k8s_allocation(ctx: ToolContext, a: AllocArgs) -> ToolResult:
     by_resource = {r: round(sum(x["cost_by_resource"][r] for x in rows), 4) for r in ("cpu", "memory", "storage")}
     by_ns: dict[str, float] = {}
     by_kind: dict[str, float] = {}
+    by_team: dict[str, float] = {}
     for r in rows:
         r["cpu_request"], r["cpu_avg"] = round(r["cpu_request"], 3), round(r["cpu_avg"], 3)
         r["mem_request_mib"], r["mem_avg_mib"] = round(r.pop("mem_request") / 1024**2), round(r.pop("mem_avg") / 1024**2)
         r["storage_gib"] = round(r.pop("storage_bytes") / 1024**3, 2)
         by_ns[r["namespace"]] = by_ns.get(r["namespace"], 0) + r["cost"]
         by_kind[r["kind"]] = by_kind.get(r["kind"], 0) + r["cost"]
+        by_team[r["team"]] = by_team.get(r["team"], 0) + r["cost"]
     total, idle = round(sum(r["cost"] for r in rows), 2), round(sum(r["idle_cost"] for r in rows), 2)
+    # Only a whole-cluster report can say what no workload asked for.
+    cluster_cost = None if a.namespace else round(capacity_hour * a.days * 24, 2)
+    allocated = by_resource["cpu"] + by_resource["memory"]
+    unallocated = None if cluster_cost is None else round(max(cluster_cost - allocated, 0.0), 2)
     scope_txt = a.namespace or f"{len(namespaces)} namespaces"
     return ToolResult(f"{scope_txt}: est. cost {total} over {a.days} d ({len(rows)} workloads; cpu {by_resource['cpu']}, memory {by_resource['memory']}, "
                       f"storage {by_resource['storage']}), idle {idle}",
                       {"workloads": rows, "total": total, "idle": idle, "days": a.days, "namespaces": namespaces, "skipped_namespaces": skipped,
                        "by_resource": by_resource, "by_namespace": {k: round(v, 4) for k, v in sorted(by_ns.items(), key=lambda kv: -kv[1])},
                        "by_kind": {k: round(v, 4) for k, v in sorted(by_kind.items(), key=lambda kv: -kv[1])},
+                       "by_team": {k: round(v, 4) for k, v in sorted(by_team.items(), key=lambda kv: -kv[1])}, "cluster_cost": cluster_cost, "unallocated": unallocated,
                        "unit_prices": {"cpu_hour": round(cpu_p, 6), "gib_hour": round(gib_p, 6), "storage_gib_month": storage_price}, "cost_model": model,
                        "note": "Current pods only; usage from cAdvisor via Prometheus; cost charged on max(request, usage)."},
                       {"queries": list(queries.values())})
@@ -349,7 +362,8 @@ async def finops_rightsizing(ctx: ToolContext, a: AllocArgs) -> ToolResult:
     pods_by_ns, skipped = await _pods_by_namespace(ctx, namespaces, a.namespace)
     pods = [p for rows in pods_by_ns.values() for p in rows]
     usage, queries, _ = await _usage(ctx, namespaces, a.days)
-    cpu_p, gib_p, model = await _prices(ctx)
+    cpu_p, gib_p, model, _ = await _prices(ctx)
+    expected = a.days * 24 * 60 / (5 if a.days <= 2 else 15)  # samples in the window, at the step _usage queries with
     per: dict[tuple[str, str, str], dict] = {}
     for p in pods:
         if p.get("status", {}).get("phase") != "Running":
@@ -363,16 +377,24 @@ async def finops_rightsizing(ctx: ToolContext, a: AllocArgs) -> ToolResult:
                                      "cpu_request": parse_cpu((res.get("requests") or {}).get("cpu")),
                                      "cpu_limit": parse_cpu((res.get("limits") or {}).get("cpu")),
                                      "mem_request": parse_mem((res.get("requests") or {}).get("memory")),
-                                     "mem_limit": parse_mem((res.get("limits") or {}).get("memory")), "cpu_p95": 0.0, "mem_max": 0.0})
+                                     "mem_limit": parse_mem((res.get("limits") or {}).get("memory")), "cpu_p95": 0.0, "mem_max": 0.0, "measured": False, "coverage": 0.0})
             e["replicas"] += 1
             k = (pns, p["metadata"]["name"], c["name"])
             e["cpu_p95"] = max(e["cpu_p95"], float(usage["cpu_p95"].get(k, 0.0)))
             e["mem_max"] = max(e["mem_max"], float(usage["mem_max"].get(k, 0.0)))
-    recs = rightsize(list(per.values()), cpu_p, gib_p)
+            e["measured"] = e["measured"] or (k in usage["cpu_p95"] and k in usage["mem_max"])
+            e["coverage"] = max(e["coverage"], min(float(usage["samples"].get(k, 0.0)) / expected, 1.0))
+    # A missing series is unknown usage, not zero: treating it as zero would recommend the 10m/32Mi floor.
+    measured = [c for c in per.values() if c["measured"]]
+    unmeasured = sorted(f"{c['namespace']}/{c['workload']}/{c['container']}" for c in per.values() if not c["measured"])
+    if per and not measured:
+        raise ConnectorError("not_found", "Prometheus has no container usage (container_cpu_usage_seconds_total, container_memory_working_set_bytes): "
+                                          "scrape the kubelet's /metrics/cadvisor endpoint")
+    recs = rightsize(measured, cpu_p, gib_p)
     saving = round(sum(r["monthly_saving"] for r in recs if r["action"] == "reduce"), 2)
     risks = sum(1 for r in recs if r["action"] == "increase")
     return ToolResult(f"{a.namespace or f'{len(namespaces)} namespaces'}: {len(recs)} rightsizing recommendations; potential saving {saving}/month; {risks} under-provisioned",
-                      {"recommendations": recs, "monthly_saving": saving, "days": a.days, "cost_model": model, "skipped_namespaces": skipped,
+                      {"recommendations": recs, "monthly_saving": saving, "days": a.days, "cost_model": model, "skipped_namespaces": skipped, "unmeasured": unmeasured,
                        "note": "Recommendations need a reviewed config patch (action plan) to apply."},
                       {"queries": list(queries.values())})
 

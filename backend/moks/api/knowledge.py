@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,16 +17,28 @@ from ..config import get_settings
 from ..connectors.base import ConnectorError, describe_credential_ref
 from ..db import get_db
 from ..models import Chunk, Document, IndexOutbox, Job, KnowledgeSource, KnowledgeSyncItem, User
-from ..rag import ingest, service
+from ..rag import ingest, service, web
 from ..rbac import P
 from .admin import CredentialRef
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 
+SYNCED = ("github", "web")
+
+
+def clean_urls(urls: list[str]) -> list[str]:
+    try:
+        return list(dict.fromkeys(web.check_url(u) for u in urls))
+    except ConnectorError as exc:
+        raise ValueError(exc.message) from None
+
 
 class SourceIn(BaseModel):
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,99}$")
-    type: Literal["github", "upload"]
+    type: Literal["github", "upload", "web"]
+    urls: list[str] = Field(default_factory=list, max_length=100)
+    crawl: bool = False  # also read pages linked from these URLs, on the same host and under the same path
+    max_pages: int = Field(default=50, ge=1, le=ingest.MAX_PAGES)
     repository: str | None = Field(default=None, pattern=r"^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$")
     ref: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_./-]{1,100}$")
     include: list[str] = Field(default_factory=list, max_length=50)
@@ -48,6 +60,11 @@ class SourceIn(BaseModel):
     stale_policy: Literal["flag", "exclude"] = "flag"
     stale_after_days: int | None = Field(default=None, ge=1, le=3650)
 
+    @field_validator("urls")
+    @classmethod
+    def _urls(cls, v: list[str]) -> list[str]:
+        return clean_urls(v)
+
     @model_validator(mode="after")
     def _explicit_sharing(self) -> "SourceIn":
         check_sharing(self.scope_environment, self.scope_namespace, self.shared_globally, self.classification)
@@ -65,6 +82,9 @@ class SourceUpdate(BaseModel):
     """Name, type and repository cannot change: a different repository is a different source, and
     its documents would all look deleted upstream."""
     model_config = ConfigDict(extra="forbid")
+    urls: list[str] | None = Field(default=None, min_length=1, max_length=100)
+    crawl: bool | None = None
+    max_pages: int | None = Field(default=None, ge=1, le=ingest.MAX_PAGES)
     ref: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_./-]{1,100}$")
     include: list[str] | None = Field(default=None, max_length=50)
     exclude: list[str] | None = Field(default=None, max_length=50)
@@ -85,9 +105,16 @@ class SourceUpdate(BaseModel):
     stale_policy: Literal["flag", "exclude"] | None = None
     stale_after_days: int | None = Field(default=None, ge=1, le=3650)
 
+    @field_validator("urls")
+    @classmethod
+    def _urls(cls, v: list[str] | None) -> list[str] | None:
+        return clean_urls(v) if v is not None else v
+
 
 SYNC_FIELDS = ("revision", "listing", "content", "state", "started_at", "discovered", "processed", "excluded", "failed", "remaining", "deletions_applied")
-GITHUB_ONLY = {"ref", "include", "exclude", "services", "sync_interval_minutes", "credential_ref"}
+GITHUB_ONLY = {"ref", "include", "exclude", "services", "credential_ref"}
+WEB_ONLY = {"urls", "crawl", "max_pages"}
+ONLY_FOR = {"github": WEB_ONLY, "web": GITHUB_ONLY}
 
 
 def source_out(s: KnowledgeSource, counts: dict | None = None, job: str | None = None) -> dict[str, Any]:
@@ -95,8 +122,8 @@ def source_out(s: KnowledgeSource, counts: dict | None = None, job: str | None =
     return {"sync_interval_minutes": s.sync_interval_minutes, "next_sync_at": s.next_sync_at.isoformat() if s.next_sync_at else None,
             "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None, "last_attempt_at": s.last_attempt_at.isoformat() if s.last_attempt_at else None,
             "last_counts": s.last_counts, "sync_state": job or "idle", "timezone": get_settings().sync_timezone,
-            "stale": bool(s.type == "github" and stale_after and (not s.last_success_at or datetime.now(timezone.utc) - s.last_success_at > stale_after)),
-            "syncable": s.type == "github", "id": str(s.id), "name": s.name, "type": s.type, "config": s.config, "scope_environment": s.scope_environment,
+            "stale": bool(s.type in SYNCED and stale_after and (not s.last_success_at or datetime.now(timezone.utc) - s.last_success_at > stale_after)),
+            "syncable": s.type in SYNCED, "id": str(s.id), "name": s.name, "type": s.type, "config": s.config, "scope_environment": s.scope_environment,
             "scope_namespace": s.scope_namespace, "service": s.service, "owner": s.owner, "enabled": s.enabled, "revision": s.revision,
             "last_sync_at": s.last_sync_at.isoformat() if s.last_sync_at else None, "last_sync_status": s.last_sync_status,
             "last_error": s.last_error, "documents": counts or {}, "credential": describe_credential_ref(s.credential_ref),
@@ -138,17 +165,20 @@ async def list_sources(ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db
 async def create_source(body: SourceIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     if body.type == "github" and not body.repository:
         raise HTTPException(422, "github sources need a repository")
-    cfg = {"repository": body.repository, "ref": body.ref, "include": body.include, "exclude": body.exclude, "services": body.services} if body.type == "github" else {}
+    if body.type == "web" and not body.urls:
+        raise HTTPException(422, "web sources need at least one URL")
+    cfg = ({"repository": body.repository, "ref": body.ref, "include": body.include, "exclude": body.exclude, "services": body.services} if body.type == "github"
+           else {"urls": body.urls, "crawl": body.crawl, "max_pages": body.max_pages} if body.type == "web" else {})
     src = KnowledgeSource(name=body.name, type=body.type, config=cfg, credential_ref=body.credential_ref.model_dump(exclude_none=True),
                           scope_environment=body.scope_environment, scope_namespace=body.scope_namespace, service=body.service,
-                          owner=body.owner, enabled=body.enabled, sync_interval_minutes=body.sync_interval_minutes if body.type == "github" else 0,
+                          owner=body.owner, enabled=body.enabled, sync_interval_minutes=body.sync_interval_minutes if body.type in SYNCED else 0,
                           shared_globally=body.shared_globally, team=body.team, classification=body.classification, applies_to=body.applies_to, authority=body.authority,
                           review_interval_days=body.review_interval_days, stale_policy=body.stale_policy, stale_after_days=body.stale_after_days)
     db.add(src)
     await db.flush()
     await audit.record(db, action="knowledge.source_create", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="knowledge_source",
                        resource_id=str(src.id), details=body.model_dump(mode="json"))
-    if body.type == "github":
+    if body.type in SYNCED:
         await db.commit()
         await jobs.enqueue("knowledge_sync", {"source_id": str(src.id)}, dedupe_key=f"knowledge_sync:{src.id}", created_by=ctx.user.id)
     return source_out(src)
@@ -162,11 +192,12 @@ async def update_source(sid: uuid.UUID, body: SourceUpdate, ctx: AuthContext = D
     if src is None:
         raise HTTPException(404, "Source not found")
     changes = body.model_dump(exclude_unset=True)
-    if src.type != "github" and GITHUB_ONLY & set(changes):
-        raise HTTPException(422, f"{src.type} sources have no {', '.join(sorted(GITHUB_ONLY & set(changes)))}")
+    invalid = ONLY_FOR.get(src.type, GITHUB_ONLY | WEB_ONLY | {"sync_interval_minutes"}) & set(changes)
+    if invalid:
+        raise HTTPException(422, f"{src.type} sources have no {', '.join(sorted(invalid))}")
     old_scope = (src.scope_environment, src.scope_namespace)
     cfg = dict(src.config or {})
-    for key in ("ref", "include", "exclude", "services"):
+    for key in ("ref", "include", "exclude", "services", "urls", "crawl", "max_pages"):
         if key in changes:
             cfg[key] = changes[key]
     src.config = cfg
@@ -201,8 +232,8 @@ async def update_source(sid: uuid.UUID, body: SourceUpdate, ctx: AuthContext = D
 @router.post("/sources/{sid}/sync")
 async def sync(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     src = await db.get(KnowledgeSource, sid)
-    if src is None or src.type != "github":
-        raise HTTPException(404, "GitHub source not found")
+    if src is None or src.type not in SYNCED:
+        raise HTTPException(404, "Syncable source not found")
     jid = await jobs.enqueue("knowledge_sync", {"source_id": str(sid)}, dedupe_key=f"knowledge_sync:{sid}", created_by=ctx.user.id)
     await audit.record(db, action="knowledge.sync_request", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="knowledge_source", resource_id=str(sid),
                        decision="allow", outcome="queued" if jid else "already_running")
@@ -216,8 +247,8 @@ class ScheduleIn(BaseModel):
 @router.put("/sources/{sid}/schedule")
 async def schedule(sid: uuid.UUID, body: ScheduleIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     src = await db.get(KnowledgeSource, sid)
-    if src is None or src.type != "github":
-        raise HTTPException(404, "GitHub source not found")
+    if src is None or src.type not in SYNCED:
+        raise HTTPException(404, "Syncable source not found")
     src.sync_interval_minutes = body.sync_interval_minutes
     src.next_sync_at = datetime.now(timezone.utc) + timedelta(minutes=body.sync_interval_minutes) if body.sync_interval_minutes else None
     await audit.record(db, action="knowledge.schedule", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="knowledge_source", resource_id=str(sid),

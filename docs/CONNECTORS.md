@@ -89,6 +89,10 @@ On mk4, Alloy collects only the namespaces listed in the tools repository's `con
 forwards only allowlisted JSON fields. Logs from other namespaces (for example `moks-lab`) are not
 in Loki until they are added there. Pod logs through the Kubernetes API still work.
 
+EKS has no Loki, so `roboshop-demo` reads mk4's through `https://jithendar.com` with `auth: basic`.
+Set `base_url` without `/loki`, because the connector adds that path. Those logs are mk4's, not
+EKS's, and carry no `cluster` label, so a match in a namespace that exists on both is mk4's.
+
 ## LLM providers
 
 | Provider | Endpoint | Credential |

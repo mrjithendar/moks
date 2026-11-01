@@ -161,6 +161,10 @@ class AwsCostConnector:
         return out
 
 
+TEAM_LABELS = ["team", "owner", "cost-center", "app.kubernetes.io/part-of"]  # first one a pod carries names who pays for it
+LOW_COVERAGE = 0.5  # under half the window measured: a short-lived pod or a new metric, not a week of behaviour
+
+
 class CostModelConnector:
     """Unit prices for Kubernetes capacity (no external calls)."""
 
@@ -169,6 +173,7 @@ class CostModelConnector:
     def __init__(self, config: dict[str, Any], credential_ref: dict[str, Any] | None = None):
         self.currency = config.get("currency", "USD")
         self.monthly_cost = config.get("monthly_cost_usd")
+        self.team_labels = config.get("team_labels") or TEAM_LABELS
         self.cpu_hour = config.get("cpu_hour_usd")
         self.gib_hour = config.get("gib_hour_usd")
         self.cpu_share = float(config.get("cpu_share", 0.5))
@@ -294,6 +299,7 @@ def rightsize(containers: list[dict], cpu_price: float, gib_price: float, headro
             "recommended": {"cpu_request": fmt_cpu(rec_cpu), "mem_request": fmt_mem(rec_mem),
                             "mem_limit": fmt_mem(max(rec_mem * 1.5, c["mem_limit"] or 0)) if action != "reduce" else (fmt_mem(c["mem_limit"]) if c["mem_limit"] else None)},
             "action": action, "monthly_saving": round(monthly, 2), "findings": findings,
+            "coverage": round(c.get("coverage", 1.0), 2), "confidence": "low" if c.get("coverage", 1.0) < LOW_COVERAGE else "high",
         })
     recs.sort(key=lambda r: (r["action"] != "increase", -r["monthly_saving"]))
     return recs

@@ -1,4 +1,4 @@
-"""Ingestion pipeline: GitHub repositories, uploaded documents and approved postmortems.
+"""Ingestion pipeline: GitHub repositories, web pages, uploaded documents and approved postmortems.
 
 GitHub sync is incremental (git blob SHA per path plus the pipeline version), works through a
 persistent inventory in bounded batches, propagates deletions only from a complete listing, records
@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatchcase
 from typing import Any
@@ -23,7 +25,7 @@ from ..connectors.git import GitConnector
 from ..models import Document, Incident, KnowledgeSource, KnowledgeSyncItem
 from ..observability import INDEXING_DOCUMENTS
 from ..redaction import redact
-from . import service
+from . import service, web
 from .chunking import PIPELINE_VERSION
 
 log = logging.getLogger("moks.rag.ingest")
@@ -37,6 +39,9 @@ PIN_HOURS = 24  # a pinned revision older than this is listed afresh, keeping pr
 MAX_FILE_BYTES = 300_000
 BLOB_DELAY_SECONDS = 0.1  # GitHub asks for serial, spaced requests
 DEFAULT_TOKEN = "MOKS_CRED_GITHUB_TOKEN"
+MAX_PAGES = 200
+PAGE_DELAY_SECONDS = 0.5  # someone else's server
+WEB_PASS_SECONDS = 300
 
 
 def _match(path: str, patterns: list[str]) -> bool:
@@ -185,6 +190,76 @@ async def sync_github(db: AsyncSession, src: KnowledgeSource, transport=None) ->
                 "deleted": cursor.get("deleted", 0), "excluded": excluded, "failed": failed, "deletions_skipped": not trusted, "skipped_too_large": cursor.get("too_large", [])}
     finally:
         await git.aclose()
+
+
+async def sync_web(db: AsyncSession, src: KnowledgeSource, transport=None, resolver=None) -> dict[str, Any]:
+    """Reads the listed URLs and, with config.crawl, the pages they link to. As with GitHub, only a
+    pass that visited everything without a failure can show that a page has left the source."""
+    cfg = src.config or {}
+    seeds = [web.check_url(u) for u in cfg.get("urls") or []]
+    if not seeds:
+        raise ConnectorError("config", "web source needs at least one URL")
+    limit = min(int(cfg.get("max_pages") or 50), MAX_PAGES)
+    existing = {d.path: d for d in (await db.execute(select(Document).where(Document.source_id == src.id))).scalars()}
+    hashes = {path: d.content_hash for path, d in existing.items()}
+    queue, seen, read = deque(seeds), set(seeds), set()
+    robots: dict[str, Any] = {}
+    failed: dict[str, str] = {}
+    counts = dict.fromkeys(("added", "updated", "unchanged", "excluded", "deleted"), 0)
+    deadline = time.monotonic() + WEB_PASS_SECONDS
+    await db.execute(sa_delete(KnowledgeSyncItem).where(KnowledgeSyncItem.source_id == src.id))
+    while queue and len(read) + len(failed) < limit and time.monotonic() < deadline:
+        url = queue.popleft()
+        await asyncio.sleep(PAGE_DELAY_SECONDS)
+        try:
+            if cfg.get("crawl") and url not in seeds:
+                host = url.split("/")[2]
+                if host not in robots:
+                    robots[host] = await web.robots_for(url, transport=transport, resolver=resolver)
+                if not robots[host].can_fetch(web.USER_AGENT, url):
+                    continue
+            final, kind, body = await web.fetch(url, transport=transport, resolver=resolver)
+        except web.PageGone:
+            if url in existing and existing[url].status != "deleted":
+                await service.remove_document(db, existing[url])
+                counts["deleted"] += 1
+            await db.commit()
+            continue
+        except ConnectorError as exc:
+            failed[url] = _safe_error(exc)
+            continue
+        title, text, links = web.read_html(body) if kind in ("text/html", "application/xhtml+xml") else ("", body, [])
+        if not text.strip():
+            failed[url] = "no readable text; the page may need JavaScript to show its content"
+            continue
+        if cfg.get("crawl"):
+            for link in links:
+                target = web.in_crawl(link, final, seeds)
+                if target and target not in seen:
+                    seen.add(target)
+                    queue.append(target)
+        read.add(url)
+        doc = await service.index_document(db, src, url, text[:MAX_FILE_BYTES], revision=None, url=final, extra={"title": title or url[:500]})
+        counts["excluded" if doc.status == "excluded" else "unchanged" if hashes.get(url) == doc.content_hash else "updated" if url in hashes else "added"] += 1
+        await db.commit()
+    finished = not queue
+    trusted = finished and not failed and bool(read)
+    if trusted:
+        for path, doc in existing.items():
+            if path not in read and doc.status != "deleted":
+                await service.remove_document(db, doc)
+                counts["deleted"] += 1
+    for url, reason in failed.items():
+        db.add(KnowledgeSyncItem(source_id=src.id, path=url, blob_sha="", revision="", state="failed", attempts=1, last_error=reason, last_tried_at=datetime.now(timezone.utc)))
+    timed_out = bool(queue) and time.monotonic() >= deadline
+    problem = (f"{len(failed)} pages could not be read" if failed else f"stopped after {WEB_PASS_SECONDS // 60} minutes; {len(queue)} pages not read" if timed_out
+               else f"stopped at the limit of {limit} pages; {len(queue)} more were found" if queue else None)
+    src.sync_cursor = {"listing": "complete" if finished else "partial", "state": "done", "content": "partial" if problem else "complete", "discovered": len(read) + len(failed),
+                       "processed": len(read), "excluded": counts["excluded"], "failed": len(failed), "remaining": 0, "deletions_applied": trusted}
+    await service.mark_indexed_now(db, src, "partial" if problem else "ok", problem)
+    await db.commit()
+    return {**counts, "listing": src.sync_cursor["listing"], "content": src.sync_cursor["content"], "complete": not failed and not timed_out, "discovered": len(read) + len(failed),
+            "processed": len(read), "remaining": 0, "failed": len(failed)}
 
 
 async def add_upload(db: AsyncSession, src: KnowledgeSource, filename: str, content: bytes, scope: dict | None = None) -> Document:

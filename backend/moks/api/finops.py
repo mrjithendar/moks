@@ -137,7 +137,7 @@ async def overview(request: Request, environment: str = "all", namespace: str | 
             args = {"days": days, **({"namespace": namespace} if namespace else {})}
             alloc, rs = await asyncio.gather(ex.run("finops_k8s_allocation", args), ex.run("finops_rightsizing", args))
             if alloc.ok:
-                row["kubernetes"] = {k: alloc.data[k] for k in ("total", "idle", "by_resource", "by_namespace", "by_kind", "unit_prices", "cost_model", "namespaces")}
+                row["kubernetes"] = {k: alloc.data[k] for k in ("total", "idle", "by_resource", "by_namespace", "by_kind", "by_team", "cluster_cost", "unallocated", "unit_prices", "cost_model", "namespaces")}
                 row["workloads"] = alloc.data["workloads"]
                 for r in ("cpu", "memory", "storage"):
                     totals[r] += alloc.data["by_resource"][r]
@@ -150,6 +150,7 @@ async def overview(request: Request, environment: str = "all", namespace: str | 
             if rs.ok:
                 row["rightsizing"] = rs.data["recommendations"]
                 row["monthly_saving"] = rs.data["monthly_saving"]
+                row["unmeasured"] = rs.data["unmeasured"]
             else:
                 row["errors"]["rightsizing"] = rs.summary
         else:

@@ -115,7 +115,8 @@ Then create the first administrator as in section 6, with `--context roboshop-de
 through the Istio Gateway `istio-ingress/public` by a VirtualService, not an Ingress, and only reaches
 the addresses the NLB allows (`tools/eks-argocd/platform/istio-ingressgateway.yaml`).
 
-Differences from mk4: no Loki, Grafana, Argo CD connector or Velero, Prometheus has mesh metrics only,
+Differences from mk4: no Grafana, Argo CD connector or Velero, Loki is mk4's and holds no EKS logs,
+Prometheus has mesh metrics only,
 RAG is keyword-only, and the terminal is off because this cluster does not enforce NetworkPolicy.
 Releases work as in [RELEASES.md](RELEASES.md), with `--context roboshop-demo`.
 

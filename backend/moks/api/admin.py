@@ -14,6 +14,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import audit
@@ -84,13 +85,21 @@ async def _env_id(db: AsyncSession, name: str) -> uuid.UUID:
     return env.id
 
 
+async def _flush_unique(db: AsyncSession, conflict: str) -> None:
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(409, conflict) from None
+
+
 @router.post("/connectors", status_code=201)
 async def create_connector(body: ConnectorIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     _check_no_secrets(body.config)
     c = Connector(environment_id=await _env_id(db, body.environment), type=body.type, name=body.name, enabled=body.enabled,
                   config=body.config, credential_ref=body.credential_ref.model_dump(exclude_none=True))
     db.add(c)
-    await db.flush()
+    await _flush_unique(db, f"A connector named {body.name!r} already exists in {body.environment}; edit it or choose another name")
     await audit.record(db, action="connector.create", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="connector",
                        resource_id=str(c.id), environment=body.environment, details=body.model_dump())
     return connector_out(c, body.environment)
@@ -108,6 +117,7 @@ async def update_connector(cid: uuid.UUID, body: ConnectorIn, ctx: AuthContext =
     c.type, c.name, c.enabled, c.config = body.type, body.name, body.enabled, body.config
     c.credential_ref = body.credential_ref.model_dump(exclude_none=True)
     c.last_test_ok = None
+    await _flush_unique(db, f"A connector named {body.name!r} already exists in {body.environment}; edit it or choose another name")
     await audit.record(db, action="connector.update", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="connector",
                        resource_id=str(c.id), environment=body.environment, details={"before": before, "after": body.model_dump()})
     return connector_out(c, body.environment)
@@ -180,7 +190,7 @@ async def list_llm(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSess
 async def create_llm(body: LLMIn, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     c = LLMConfig(**{**body.model_dump(exclude={"credential_ref"}), "credential_ref": body.credential_ref.model_dump(exclude_none=True)})
     db.add(c)
-    await db.flush()
+    await _flush_unique(db, f"An LLM provider named {body.name!r} already exists; edit it or choose another name")
     await audit.record(db, action="llm.create", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="llm_config",
                        resource_id=str(c.id), details=body.model_dump(mode="json"))
     return llm_out(c)
@@ -196,6 +206,7 @@ async def update_llm(lid: uuid.UUID, body: LLMIn, ctx: AuthContext = Depends(nee
     for k, v in body.model_dump(exclude={"credential_ref"}).items():
         setattr(c, k, v)
     c.credential_ref = body.credential_ref.model_dump(exclude_none=True)
+    await _flush_unique(db, f"An LLM provider named {body.name!r} already exists; edit it or choose another name")
     await audit.record(db, action="llm.update", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="llm_config",
                        resource_id=str(c.id), details=body.model_dump(mode="json"))
     return llm_out(c)

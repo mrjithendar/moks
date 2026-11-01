@@ -82,13 +82,30 @@ function SyncState({ s }: { s: any }) {
     <>
       {s.last_sync_status ? <Badge kind={kind}>{s.last_sync_status}</Badge> : <Badge>not synced yet</Badge>} {s.stale && <Badge kind="warn">stale</Badge>}
       {s.sync?.listing && s.sync.listing !== "complete" && <Badge kind="warn">listing {s.sync.listing}</Badge>}
-      {s.sync?.discovered > 0 && <div className="muted">{s.sync.processed} of {s.sync.discovered} files · {s.sync.excluded} excluded · {s.sync.failed} failed · {s.sync.remaining} remaining</div>}
+      {s.sync?.discovered > 0 && <div className="muted">{s.sync.processed} of {s.sync.discovered} {s.type === "web" ? "pages" : "files"} · {s.sync.excluded} excluded · {s.sync.failed} failed · {s.sync.remaining} remaining</div>}
       {s.sync_state !== "idle" && <Badge kind="info">{s.sync_state}</Badge>}
       <div className="muted">last success <Time iso={s.last_success_at} /> · last attempt <Time iso={s.last_attempt_at} /></div>
       {c && <div className="muted">+{c.added} added, {c.updated} updated, {c.deleted} deleted, {c.excluded} excluded</div>}
-      {c?.failed > 0 && <div><Badge kind="warn">{c.failed} files failed</Badge></div>}
+      {c?.failed > 0 && <div><Badge kind="warn">{c.failed} {s.type === "web" ? "pages" : "files"} failed</Badge></div>}
       {s.last_error && <div className="muted">{s.last_error}</div>}
     </>
+  );
+}
+
+/** One URL per line; commas and spaces also work, because lists get pasted from anywhere. */
+export const parseUrls = (text: string) => [...new Set(text.split(/[\s,]+/).filter(Boolean))];
+
+function WebFields({ urls, crawl, maxPages, onChange }: { urls: string; crawl: boolean; maxPages: string; onChange: (c: { urls?: string; crawl?: boolean; maxPages?: string }) => void }) {
+  const count = parseUrls(urls).length;
+  return (
+    <div className="stack">
+      <label>URLs, one per line ({count} of 100)<textarea required rows={5} className="mono" value={urls} onChange={(e) => onChange({ urls: e.target.value })} placeholder={"https://docs.example.com/runbooks/\nhttps://example.com/status-page-guide"} /></label>
+      <div className="row">
+        <label className="inline"><input type="checkbox" checked={crawl} onChange={(e) => onChange({ crawl: e.target.checked })} /> Whole site: also read pages they link to</label>
+        {crawl && <label>Page limit<input type="number" min={1} max={200} required value={maxPages} onChange={(e) => onChange({ maxPages: e.target.value })} /></label>}
+      </div>
+      <div className="small muted">Public pages only: MOKS will not fetch private addresses, sign-in pages or content that needs JavaScript. With Whole site it stays on the same host and under the same path, and follows robots.txt. Pages are re-read on the schedule, and search results link back to them.</div>
+    </div>
   );
 }
 
@@ -97,7 +114,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
   const { can } = useAuth();
   const list = useLoad(() => api<any[]>("/knowledge/sources"), []);
   useInterval(() => { if (!list.loading && list.data?.some((s) => s.sync_state !== "idle")) list.reload(); }, 3000);
-  const [f, setF] = useState({ name: "", type: "github", repository: "", include: "", scope_environment: "", scope_namespace: "*", credType: "none", credName: "", shared: false, team: "", classification: "internal", review: "" });
+  const [f, setF] = useState({ name: "", type: "github", repository: "", urls: "", crawl: false, maxPages: "50", include: "", scope_environment: "", scope_namespace: "*", credType: "none", credName: "", shared: false, team: "", classification: "internal", review: "" });
   const [detail, setDetail] = useState<any>(null);
   const [error, setError] = useState<unknown>();
   const [editing, setEditing] = useState<any>(null);
@@ -106,6 +123,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
     setError(null);
     try {
       await api("/knowledge/sources", { method: "POST", body: { name: f.name, type: f.type, repository: f.type === "github" ? f.repository : null,
+        ...(f.type === "web" ? { urls: parseUrls(f.urls), crawl: f.crawl, max_pages: Number(f.maxPages) } : {}),
         include: f.include ? f.include.split(/[\s,]+/).filter(Boolean) : [], scope_environment: f.shared ? "*" : f.scope_environment || "*", scope_namespace: f.shared ? "*" : f.scope_namespace,
         shared_globally: f.shared, team: f.team || null, classification: f.classification, review_interval_days: f.review ? Number(f.review) : null,
         credential_ref: f.credType === "env" ? { type: "env", name: f.credName } : { type: "none" } } });
@@ -113,7 +131,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
     } catch (err) { setError(err); }
   }
   function startEdit(s: any) {
-    setEditing({ id: s.id, name: s.name, github: s.type === "github", repository: s.config?.repository, include: (s.config?.include ?? []).join(", "), exclude: (s.config?.exclude ?? []).join(", "),
+    setEditing({ id: s.id, name: s.name, github: s.type === "github", web: s.type === "web", urls: (s.config?.urls ?? []).join("\n"), crawl: !!s.config?.crawl, maxPages: String(s.config?.max_pages ?? 50), repository: s.config?.repository, include: (s.config?.include ?? []).join(", "), exclude: (s.config?.exclude ?? []).join(", "),
       scope_environment: s.scope_environment, scope_namespace: s.scope_namespace, owner: s.owner ?? "", service: s.service ?? "", enabled: s.enabled,
       credType: s.credential_ref?.type === "env" ? "env" : "none", credName: s.credential_ref?.name ?? "" });
   }
@@ -124,6 +142,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
     try {
       await api(`/knowledge/sources/${editing.id}`, { method: "PUT", body: { scope_environment: editing.scope_environment, scope_namespace: editing.scope_namespace,
         owner: editing.owner || null, service: editing.service || null, enabled: editing.enabled,
+        ...(editing.web ? { urls: parseUrls(editing.urls), crawl: editing.crawl, max_pages: Number(editing.maxPages) } : {}),
         ...(editing.github ? { include: globs(editing.include), exclude: globs(editing.exclude), credential_ref: editing.credType === "env" ? { type: "env", name: editing.credName } : { type: "none" } } : {}) } });
       setEditing(null); list.reload(); onChange();
     } catch (err) { setError(err); }
@@ -176,6 +195,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
           <label>Service<input value={editing.service} onChange={(e) => ed("service", e.target.value)} /></label>
           <label className="inline"><input type="checkbox" checked={editing.enabled} onChange={(e) => ed("enabled", e.target.checked)} /> enabled</label>
         </div>
+        {editing.web && <WebFields urls={editing.urls} crawl={editing.crawl} maxPages={editing.maxPages} onChange={(c) => setEditing({ ...editing, ...c })} />}
         {editing.github && <div className="row">
           <label style={{ flex: 1 }}>Include globs<input value={editing.include} onChange={(e) => ed("include", e.target.value)} placeholder="default set" /></label>
           <label style={{ flex: 1 }}>Exclude globs<input value={editing.exclude} onChange={(e) => ed("exclude", e.target.value)} /></label>
@@ -189,7 +209,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
       <form className="stack" onSubmit={add}>
         <div className="row">
           <label>Name<input required pattern="[a-z0-9][a-z0-9\-]*" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></label>
-          <label>Type<select value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })}><option value="github">GitHub repository</option><option value="upload">Uploads</option></select></label>
+          <label>Type<select value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })}><option value="github">GitHub repository</option><option value="web">Web pages</option><option value="upload">Uploads</option></select></label>
           {f.type === "github" && <label>Repository<input required placeholder="owner/name" value={f.repository} onChange={(e) => setF({ ...f, repository: e.target.value })} /></label>}
           <label>Scope env<input disabled={f.shared} required={!f.shared} value={f.scope_environment} onChange={(e) => setF({ ...f, scope_environment: e.target.value })} placeholder="prod" /></label>
           <label>Scope namespace<input disabled={f.shared} value={f.scope_namespace} onChange={(e) => setF({ ...f, scope_namespace: e.target.value })} /></label>
@@ -199,6 +219,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
         </div>
         <label className="inline"><input type="checkbox" checked={f.shared} disabled={["confidential", "restricted"].includes(f.classification)} onChange={(e) => setF({ ...f, shared: e.target.checked })} /> Share with everyone who can read knowledge, in every environment</label>
         {f.shared && <div className="alert warn small">Anyone with any read access will be able to retrieve this source. Use it only for content that is safe everywhere.</div>}
+        {f.type === "web" && <WebFields urls={f.urls} crawl={f.crawl} maxPages={f.maxPages} onChange={(c) => setF({ ...f, ...c })} />}
         {f.type === "github" && <div className="row">
           <label style={{ flex: 1 }}>Include globs (default: docs, runbooks, Markdown, YAML, Helm, Terraform, workflows)<input value={f.include} onChange={(e) => setF({ ...f, include: e.target.value })} placeholder="docs/** **/*.md k8s/**" /></label>
           <label>Token<select value={f.credType} onChange={(e) => setF({ ...f, credType: e.target.value })}><option value="none">public repo</option><option value="env">env variable</option></select></label>
@@ -271,6 +292,23 @@ function SourceDetail({ s, onClose }: { s: any; onClose: () => void }) {
 
 const money = (v: number | null | undefined) => (v == null ? "—" : v >= 100 ? v.toFixed(0) : v >= 1 || v === 0 ? v.toFixed(2) : v.toFixed(4));
 
+/** A leading = + - @ would run as a formula in a spreadsheet, and these names come from the cluster. */
+export function toCsv(rows: any[], cols: [string, (r: any) => unknown][]) {
+  const cell = (v: unknown) => {
+    const t = String(v ?? "");
+    return `"${(/^[=+\-@\t\r]/.test(t) ? `'${t}` : t).replace(/"/g, '""')}"`;
+  };
+  return [cols.map(([h]) => cell(h)), ...rows.map((r) => cols.map(([, get]) => cell(get(r))))].map((l) => l.join(",")).join("\r\n") + "\r\n";
+}
+
+function download(name: string, csv: string) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 function Share({ value, total }: { value: number; total: number }) {
   const pct = total > 0 ? Math.round((value / total) * 100) : 0;
   return <div className="row"><div className="bar" style={{ flex: 1 }}><span style={{ width: `${pct}%` }} /></div><span className="small muted">{pct}%</span></div>;
@@ -302,6 +340,16 @@ export function FinOps() {
   const tag = (r: any) => (x: any) => ({ ...x, environment: r.environment });
   const workloads = rows.flatMap((r) => (r.workloads ?? []).map(tag(r))).sort((a, b) => b.cost - a.cost);
   const recs = rows.flatMap((r) => (r.rightsizing ?? []).map(tag(r)));
+  const recBlockers = rows.flatMap((r) => [r.errors?.rightsizing, !r.rightsizing && r.errors?.kubernetes].filter(Boolean).map((m) => `${r.environment}: ${m}`));
+  const unmeasured = rows.reduce((n, r) => n + (r.unmeasured?.length ?? 0), 0);
+  const teams = rows.reduce((all: Record<string, number>, r) => { for (const [k, v] of Object.entries(r.kubernetes?.by_team ?? {})) all[k] = (all[k] ?? 0) + Number(v); return all; }, {});
+  const teamRows = Object.entries(teams).sort((a, b) => b[1] - a[1]);
+  const clusterCost = rows.reduce((n, r) => n + (r.kubernetes?.cluster_cost ?? 0), 0);
+  const unallocated = rows.reduce((n, r) => n + (r.kubernetes?.unallocated ?? 0), 0);
+  const exportWorkloads = () => download(`moks-workload-costs-${days}d.csv`, toCsv(shownWorkloads, [["Environment", (w) => w.environment], ["Namespace", (w) => w.namespace], ["Team", (w) => w.team], ["Workload", (w) => w.workload], ["Kind", (w) => w.kind], ["Pods", (w) => w.pods],
+    ["CPU request", (w) => w.cpu_request], ["CPU used", (w) => w.cpu_avg], ["Memory request MiB", (w) => w.mem_request_mib], ["Memory used MiB", (w) => w.mem_avg_mib], ["CPU cost", (w) => w.cost_by_resource.cpu], ["Memory cost", (w) => w.cost_by_resource.memory], ["Storage cost", (w) => w.cost_by_resource.storage], ["Total cost", (w) => w.cost], ["Idle cost", (w) => w.idle_cost]]));
+  const exportRecs = () => download(`moks-rightsizing-${days}d.csv`, toCsv(recs.filter(match), [["Environment", (r) => r.environment], ["Namespace", (r) => r.namespace], ["Workload", (r) => r.workload], ["Container", (r) => r.container], ["Action", (r) => r.action], ["Confidence", (r) => r.confidence],
+    ["Data coverage", (r) => r.coverage], ["CPU now", (r) => r.current.cpu_request], ["CPU recommended", (r) => r.recommended.cpu_request], ["Memory now", (r) => r.current.mem_request], ["Memory recommended", (r) => r.recommended.mem_request], ["Saving per month", (r) => r.monthly_saving], ["Findings", (r) => r.findings.join("; ")]]));
   const aws = rows.flatMap((r) => (r.aws?.groups ?? []).map(tag(r))).sort((a, b) => b.amount - a.amount);
   const kinds = [...new Set(workloads.map((w) => w.kind))];
   const match = (w: any) => (!kind || w.kind === kind) && (!text || JSON.stringify([w.workload, w.namespace, w.environment]).toLowerCase().includes(text.toLowerCase()));
@@ -357,6 +405,7 @@ export function FinOps() {
           <Stat value={`$${money(t.llm)}`} label={`LLM (${d.llm.calls} calls)`} />
           <Stat value={`$${money(t.idle)}`} label="idle (requested, unused)" />
           <Stat value={`$${money(saving)}`} label="possible saving / month" />
+          {clusterCost > 0 && <Stat value={`$${money(unallocated)}`} label={`unallocated of $${money(clusterCost)} cluster`} />}
         </div>
         {unpriced && <div className="alert warn small" style={{ marginBottom: 14 }}>Kubernetes costs are $0 until a cost_model connector has a price: set monthly_cost_usd, or cpu_hour_usd and gib_hour_usd, under Connectors.</div>}
         <div className="grid cols-2">
@@ -367,6 +416,14 @@ export function FinOps() {
               <tbody>{typeRows.map(([k, v]) => <tr key={k}><td>{k}</td><td>${money(v)}</td><td><Share value={v} total={t.all} /></td></tr>)}</tbody>
             </table>
           </div>
+          {teamRows.length > 0 && <div className="card">
+            <h2>Cost by team</h2>
+            <div className="small muted">From the team, owner, cost-center or part-of label on each pod. Set team_labels on the cost model to use others.</div>
+            <table>
+              <thead><tr><th>Team</th><th>Cost</th><th>Share</th></tr></thead>
+              <tbody>{teamRows.map(([k, v]) => <tr key={k}><td className={k === "unassigned" ? "muted" : "mono small"}>{k}</td><td>${money(v)}</td><td><Share value={v} total={t.kubernetes} /></td></tr>)}</tbody>
+            </table>
+          </div>}
           <div className="card">
             <h2>Cost by environment</h2>
             <div className="table-wrap" role="region" aria-label="Cost by environment" tabIndex={0}><table>
@@ -395,7 +452,7 @@ export function FinOps() {
           {d.llm.series.length > 0 && <LineChart series={d.llm.series} />}
         </div>
         <div className="card" style={{ marginTop: 14 }}>
-          <h2>Workloads ({shownWorkloads.length})</h2>
+          <div className="row between"><h2>Workloads ({shownWorkloads.length})</h2>{shownWorkloads.length > 0 && <button className="ghost small" onClick={exportWorkloads}>Export CSV</button>}</div>
           <div className="table-wrap" role="region" aria-label="Workload costs" tabIndex={0}>
             <table>
               <thead><tr><th>Environment</th><th>Namespace</th><th>Workload</th><th>Pods</th><th>CPU req / used</th><th>Mem req / used</th><th>CPU $</th><th>Mem $</th><th>Storage $</th><th>Total</th><th>Idle</th></tr></thead>
@@ -412,7 +469,7 @@ export function FinOps() {
           {!shownWorkloads.length && <div className="empty">No workloads match.</div>}
         </div>
         <div className="card" style={{ marginTop: 14 }}>
-          <h2>Rightsizing</h2>
+          <div className="row between"><h2>Rightsizing</h2>{recs.length > 0 && <button className="ghost small" onClick={exportRecs}>Export CSV</button>}</div>
           <div className="small muted">From p95 CPU and max memory over {days} days (+25% headroom).</div>
           <div className="table-wrap" role="region" aria-label="Rightsizing recommendations" tabIndex={0}>
             <table>
@@ -421,7 +478,7 @@ export function FinOps() {
                 <tr key={i}>
                   <td className="mono small">{r.environment}/{r.namespace}</td>
                   <td className="mono small">{r.workload}/{r.container}<div className="muted">{r.findings.join("; ")}</div></td>
-                  <td><Badge kind={r.action === "increase" ? "bad" : r.action === "reduce" ? "ok" : "warn"}>{r.action}</Badge></td>
+                  <td><Badge kind={r.action === "increase" ? "bad" : r.action === "reduce" ? "ok" : "warn"}>{r.action}</Badge>{r.confidence === "low" && <div><Badge kind="warn">low confidence</Badge><div className="small muted">{Math.round(r.coverage * 100)}% of the window measured</div></div>}</td>
                   <td className="small mono">cpu {r.current.cpu_request ?? "—"}→{r.recommended.cpu_request}<br />mem {r.current.mem_request ?? "—"}→{r.recommended.mem_request}</td>
                   <td>{r.monthly_saving < 0 ? <span className="small">+{money(-r.monthly_saving)} cost</span> : money(r.monthly_saving)}</td>
                   <td>{can("action.request") && r.workload.startsWith("Deployment/") && <button className="small ghost" onClick={() => setPropose(r)}>Propose</button>}</td>
@@ -429,7 +486,9 @@ export function FinOps() {
               ))}</tbody>
             </table>
           </div>
-          {!recs.length && <div className="empty">Requests match usage.</div>}
+          {recBlockers.map((m) => <div key={m} className="alert warn small">{m}</div>)}
+          {unmeasured > 0 && <div className="small muted">{unmeasured} container{unmeasured > 1 ? "s" : ""} skipped: no usage data yet.</div>}
+          {!recs.length && !recBlockers.length && <div className="empty">Requests match usage.</div>}
         </div>
         {aws.length > 0 && <div className="card" style={{ marginTop: 14 }}>
           <h2>Cloud services</h2>
