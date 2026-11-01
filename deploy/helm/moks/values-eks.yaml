@@ -1,66 +1,100 @@
-# Optional: MOKS running inside Amazon EKS. Review every value; nothing here has been applied.
+# roboshop-demo (EKS, 2 t4g.large arm64 nodes) behind Istio at https://eks.jithendar.com/moks
 image:
-  repository: <account>.dkr.ecr.<region>.amazonaws.com/moks
-  digest: ""            # pin sha256:...
-imagePullSecrets: []    # EKS nodes pull from ECR with their instance role
+  repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
+  # Same release flow as mk4: CI moves latest, and pods get it when they restart (docs/RELEASES.md).
+  tag: latest
+  pullPolicy: Always
+imagePullSecrets: []    # nodes pull from ECR with their node role
 
-publicUrl: https://ops.example.com/moks
+publicUrl: https://eks.jithendar.com/moks
 basePath: /moks
 
 config:
   env: production
-  authMode: oidc
-  oidcIssuer: https://login.example.com/          # Okta / Entra ID / Keycloak issuer URL
-  oidcClientId: moks
-  oidcAllowedDomains: example.com
-  oidcGroupRoles: '{"sre-admins": ["admin"], "sre-oncall": ["investigator:prod-eks:*"], "sre-viewers": ["viewer"]}'
-
-serviceAccount:
-  annotations:
-    # IRSA role from deploy/iam/moks-role-policy.json (Bedrock, CloudWatch read). Or use EKS Pod Identity.
-    eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/moks
-
-worker:
-  pools:
-    - {name: detection, classes: detection, capacity: "detection=4", replicas: 2}
-    - {name: interactive, classes: interactive, capacity: "", replicas: 2}
-    - {name: knowledge, classes: knowledge, capacity: "knowledge=2", replicas: 1}
-    - {name: maintenance, classes: maintenance, capacity: "maintenance=2", replicas: 1}
-
-rbac:
-  clusterWide: false
-  namespaces: [shop, payments, checkout]   # read access only where MOKS is meant to look
+  # local: email + password; closed until you run `moks create-user` (docs/OPERATOR_GUIDE.md).
+  authMode: local
+  bootstrapAdmins: ""
 
 seed:
   environments:
-    - name: prod-eks
-      display_name: Production (EKS)
+    - name: roboshop-demo
+      display_name: RoboShop EKS (roboshop-demo)
       kind: eks
+      is_default: true
       is_production: true
-      allowed_namespaces: [shop, payments, checkout]
-      denied_namespaces: [kube-system]
+      allowed_namespaces: ["*"]
+      denied_namespaces: []
       max_query_window_minutes: 360
       connectors:
         - type: kubernetes
           name: in-cluster
-          config: {mode: in_cluster, executor: {mode: in_cluster}}
+          config: {mode: in_cluster, timeout_seconds: 15, executor: {mode: in_cluster}}
+        # Mesh metrics only, 6 h retention, from tools/eks/platform/kiali-prometheus.yaml. The
+        # prometheus-agent in monitoring cannot be queried, and this cluster has no Loki.
+        - type: prometheus
+          name: prometheus
+          config: {base_url: "http://kiali-prometheus-server.istio-system.svc.cluster.local", timeout_seconds: 15}
+        - type: git
+          name: github
+          config: {provider: github, repositories: [mrjithendar/moks, mrjithendar/roboshop-ai, mrjithendar/tools, mrjithendar/jithendar.com]}
+  knowledge_sources:
+    - name: moks-docs
+      type: github
+      config: {repository: mrjithendar/moks, include: ["docs/**", "lab/**", "backend/moks/skills/**"], sync_interval_minutes: 360}
+
+# Half the chart's CPU requests: the nodes have about 440m unrequested between them, and the
+# defaults would leave a pod Pending. Limits stay, so idle headroom is still used.
+api:
+  replicas: 2
+  resources:
+    requests: {cpu: 50m}
+worker:
+  replicas: 1
+  resources:
+    requests: {cpu: 50m}
 
 ingress:
-  className: alb
-  host: ops.example.com
-  httpRedirect: false
-  annotations:
-    alb.ingress.kubernetes.io/scheme: internal
-    alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
-    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:<region>:<account>:certificate/<id>
-    # SSE: keep idle timeout above the 15 s keep-alive interval (default 60 s is fine).
+  enabled: false
+
+istio:
+  enabled: true
+  gateway: istio-ingress/public   # tools/eks/roboshop-demo/ingress
+  host: eks.jithendar.com
 
 postgres:
-  bundled: false        # use RDS PostgreSQL 16+; put its URL in MOKS_DATABASE_URL (moks-secrets)
+  bundled: true         # on the default gp3-encrypted StorageClass, which retains the volume
+  storage: 10Gi
+  resources:
+    requests: {cpu: 50m}
 
+# A shared Pinecone index would mix these vectors with mk4's. Keyword-only until an index is chosen.
+rag:
+  backend: postgres
+
+executor:
+  enabled: true
+  namespaces: []        # add namespaces only when you want MOKS to act there; also add them to project-eks.yaml
+
+databaseBackups:
+  enabled: true
+  namespaces: [moks, roboshop-ai]
+
+diagnostics:
+  enabled: true
+  namespace: moks-diagnostics
+
+# Off: session isolation depends on NetworkPolicy, which this cluster does not enforce (below).
+terminal:
+  enabled: false
+
+# Written for when enforcement is turned on: the VPC CNI runs with --enable-network-policy=false,
+# so today these are not applied.
 networkPolicy:
-  ingressNamespaces: []   # ALB target-type ip reaches pods from VPC addresses; restrict with security groups for pods
+  ingressNamespaces: [istio-ingress]
+  metricsNamespaces: [monitoring]
   apiServer:
-    cidrs: [10.0.0.0/8]   # EKS control-plane ENIs live in your VPC; narrow to your VPC CIDR
+    cidrs: [172.20.0.1/32, 10.0.0.0/16]   # kubernetes Service VIP and the VPC, where the control-plane ENIs rotate
     ports: [443]
+  inCluster:
+    - namespace: istio-system
+      ports: [80]

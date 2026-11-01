@@ -1,0 +1,35 @@
+# MOKS on the roboshop-demo EKS cluster, a remote cluster of Argo CD on mk4. The roboshop-demo-
+# prefix matches that cluster's other Applications, which share mk4's argocd namespace, and
+# roboshop-demo-moks is already the RoboShop shopping widget, which is unrelated.
+# Manual sync, never with prune enabled from the UI (see docs/OPERATOR_GUIDE.md).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: roboshop-demo-moks-portal
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: roboshop-gitops
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  project: moks-eks
+  source:
+    repoURL: https://github.com/mrjithendar/moks.git
+    targetRevision: master
+    path: deploy/helm/moks
+    helm:
+      releaseName: moks
+      valueFiles: [values-eks.yaml]
+  destination:
+    name: roboshop-demo
+    namespace: moks
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+      - FailOnSharedResource=true
+    managedNamespaceMetadata:
+      labels:
+        app.kubernetes.io/part-of: moks
+        pod-security.kubernetes.io/enforce: baseline
+        pod-security.kubernetes.io/warn: restricted

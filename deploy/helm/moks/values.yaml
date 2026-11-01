@@ -87,6 +87,12 @@ ingress:
   httpRedirect: true       # HTTP -> HTTPS via a Traefik middleware in this namespace
   annotations: {}
 
+# Route through an existing Istio Gateway instead of an Ingress. Set ingress.enabled false with it.
+istio:
+  enabled: false
+  gateway: ""              # <namespace>/<name>
+  host: ""
+
 postgres:
   bundled: true            # false: point MOKS_DATABASE_URL at an external database (e.g. RDS)
   image: postgres:17.11-alpine

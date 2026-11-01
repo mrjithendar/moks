@@ -1,0 +1,42 @@
+# AppProject for MOKS on the roboshop-demo EKS cluster. Separate from project moks, so mk4's
+# destinations and this cluster's can be retired independently.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: moks-eks
+  namespace: argocd
+spec:
+  description: MOKS SRE portal on the roboshop-demo EKS cluster, managed from Argo CD on mk4
+  sourceRepos:
+    - https://github.com/mrjithendar/moks.git
+  destinations:
+    - name: roboshop-demo
+      namespace: moks
+    - name: roboshop-demo
+      namespace: moks-diagnostics      # diagnostic session namespace (chart-managed)
+    - name: roboshop-demo
+      namespace: roboshop-ai           # Role for database backups (databaseBackups.namespaces)
+  clusterResourceWhitelist:
+    - {group: "", kind: Namespace}
+    - {group: rbac.authorization.k8s.io, kind: ClusterRole}
+    - {group: rbac.authorization.k8s.io, kind: ClusterRoleBinding}
+  namespaceResourceWhitelist:
+    - {group: "", kind: ConfigMap}
+    - {group: "", kind: Service}
+    - {group: "", kind: ServiceAccount}
+    - {group: "", kind: PersistentVolumeClaim}
+    - {group: apps, kind: Deployment}
+    - {group: apps, kind: ReplicaSet}  # Argo CD leaves unlisted kinds out of the app tree, so these
+    - {group: "", kind: Pod}           # two are what show the portal's pods, logs and events
+    - {group: apps, kind: StatefulSet}
+    - {group: networking.istio.io, kind: VirtualService}
+    - {group: networking.k8s.io, kind: NetworkPolicy}
+    - {group: policy, kind: PodDisruptionBudget}
+    - {group: rbac.authorization.k8s.io, kind: Role}
+    - {group: rbac.authorization.k8s.io, kind: RoleBinding}
+    - {group: "", kind: ResourceQuota}
+    - {group: "", kind: LimitRange}
+    - {group: batch, kind: CronJob}
+    - {group: batch, kind: Job}        # moks-migrate, when secrets.split is true
+  # Secrets are deliberately absent: they are created out of band (scripts/create-secrets.sh) and
+  # Argo CD can neither create nor prune them.

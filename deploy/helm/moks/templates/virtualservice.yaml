@@ -1,0 +1,25 @@
+{{- if .Values.istio.enabled }}
+# The Istio counterpart of ingress.yaml: a prefix match on the base path with no rewrite, because
+# MOKS serves everything under {{ .Values.basePath }} itself. No timeout field, which is Istio's "no
+# overall deadline": a route timeout would cut off SSE streams and terminal WebSockets.
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: moks
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  hosts: [{{ required "istio.host is required" .Values.istio.host }}]
+  gateways: [{{ required "istio.gateway is required: <namespace>/<name>" .Values.istio.gateway }}]
+  http:
+    {{- if .Values.terminal.enabled }}
+    # First, so it wins over the rule below. Istio carries the WebSocket upgrade as is.
+    - name: terminal
+      match: [{uri: {prefix: {{ .Values.basePath }}/api/terminal}}]
+      route:
+        - destination: {host: moks-terminal.{{ .Release.Namespace }}.svc.cluster.local, port: {number: 8080}}
+    {{- end }}
+    - name: portal
+      match: [{uri: {prefix: {{ .Values.basePath }}}}]
+      route:
+        - destination: {host: moks-api.{{ .Release.Namespace }}.svc.cluster.local, port: {number: 8080}}
+{{- end }}

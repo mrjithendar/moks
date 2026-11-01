@@ -76,6 +76,30 @@ chart's ClusterRole/ClusterRoleBinding, and it cannot touch Secrets. The Postgre
 sync. As with roboshop-ai, `kubectl apply` of a changed Application file is what updates its live
 spec.
 
+### roboshop-demo (EKS)
+
+Argo CD on mk4 deploys MOKS to the EKS cluster as `roboshop-demo-moks-portal`, in project `moks-eks`,
+with `values-eks.yaml`. It reads `master`, so push the chart first. This is a new, empty install at
+`https://eks.jithendar.com/moks`; nothing moves from mk4.
+
+```sh
+scripts/create-secrets.sh roboshop-demo
+kubectl --context mk4 apply -f deploy/argocd/project-eks.yaml -f deploy/argocd/application-eks.yaml
+argocd app diff roboshop-demo-moks-portal
+argocd app sync roboshop-demo-moks-portal   # never tick "Prune" for this app
+kubectl --context roboshop-demo -n moks rollout status deploy/moks-api
+```
+
+Then create the first administrator as in section 6, with `--context roboshop-demo`. Traffic goes
+through the Istio Gateway `istio-ingress/public` by a VirtualService, not an Ingress, and only reaches
+the addresses the NLB allows (`tools/eks/platform/istio-ingressgateway.yaml`).
+
+Differences from mk4: no Loki, Grafana, Argo CD connector or Velero, Prometheus has mesh metrics only,
+RAG is keyword-only, and the terminal is off because this cluster does not enforce NetworkPolicy.
+Enforcement is also what keeps other pods from reaching the API port, so until it is on, any pod in
+the cluster can reach MOKS directly and set `X-Forwarded-*` headers. Releases work as in
+[RELEASES.md](RELEASES.md), with `--context roboshop-demo`.
+
 ## 6. First administrator
 
 The site admits nobody until a user exists (local mode has no setup page):

@@ -33,7 +33,7 @@ real API server.
 ```text
 backend/          FastAPI app, worker, connectors, tools, orchestrator, migrations, tests
 frontend/         React portal
-deploy/helm/moks  Helm chart (values-minikube.yaml for mk4, values-eks.yaml optional)
+deploy/helm/moks  Helm chart (values-minikube.yaml for mk4, values-eks.yaml for roboshop-demo)
 deploy/argocd     AppProject + Application
 deploy/secrets    Secret templates (no real values)
 deploy/terraform  AWS: ECR repo, GitHub OIDC CI role, MOKS runtime IAM user (Bedrock)

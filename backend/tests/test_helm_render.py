@@ -34,6 +34,12 @@ def secrets(pod) -> set[str]:
 
 
 SPLIT = ("secrets.split=true", "backup.enabled=true", "backup.bucket=b", "velero.enabled=true")
+TERMINAL = (
+    "terminal.enabled=true",
+    "terminal.image.digest=sha256:" + "0" * 64,
+    "terminal.profiles[0].name=eks,terminal.profiles[0].label=eks,terminal.profiles[0].environment=roboshop-demo",
+    "terminal.profiles[0].account=1,terminal.profiles[0].roleArn=arn,terminal.profiles[0].regions[0]=us-east-1",
+)
 
 
 @pytest.mark.parametrize("values", ["values-minikube.yaml", "values-eks.yaml"])
@@ -79,9 +85,29 @@ def test_chart_renders_for_eks_split():
     assert any(d["kind"] == "Job" for d in render("values-eks.yaml", "secrets.split=true"))
 
 
-def test_eks_scales_each_class_separately():
-    names = {n for n, _ in pods(render("values-eks.yaml"))}
-    assert {"moks-worker-detection", "moks-worker-knowledge", "moks-worker-interactive", "moks-worker-maintenance"} <= names
+def test_worker_pools_scale_each_class_separately():
+    pools = [f"worker.pools[{i}].name={n},worker.pools[{i}].classes={n},worker.pools[{i}].replicas=1" for i, n in enumerate(["detection", "knowledge"])]
+    names = {n for n, _ in pods(render("values-eks.yaml", *pools))}
+    assert {"moks-worker-detection", "moks-worker-knowledge"} <= names and "moks-worker" not in names
+
+
+def test_eks_routes_through_istio_without_traefik():
+    docs = render("values-eks.yaml")
+    route = next(d for d in docs if d["kind"] == "VirtualService")
+    assert route["spec"]["gateways"] == ["istio-ingress/public"] and route["spec"]["hosts"] == ["eks.jithendar.com"]
+    assert [r["name"] for r in route["spec"]["http"]] == ["portal"]
+    assert not any(d["kind"] in ("Ingress", "Middleware") for d in docs)
+
+
+def test_istio_sends_terminal_traffic_to_the_gateway_first():
+    route = next(d for d in render("values-eks.yaml", *TERMINAL) if d["kind"] == "VirtualService")
+    first, second = route["spec"]["http"]
+    assert first["match"] == [{"uri": {"prefix": "/moks/api/terminal"}}] and second["match"] == [{"uri": {"prefix": "/moks"}}]
+    assert first["route"][0]["destination"]["host"] == "moks-terminal.moks.svc.cluster.local"
+
+
+def test_minikube_renders_no_virtualservice():
+    assert not any(d["kind"] == "VirtualService" for d in render("values-minikube.yaml"))
 
 
 def test_minikube_keeps_one_worker_with_reserved_capacity():
