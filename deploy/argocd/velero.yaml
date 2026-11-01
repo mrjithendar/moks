@@ -1,4 +1,4 @@
-# Velero on mk4, deployed by Argo CD. Apply once, then sync by hand like moks-portal, never with
+# Velero on mk4, deployed by Argo CD. Apply once, then sync by hand like the MOKS apps, never with
 # prune. The storage location, Secrets, schedules and backups are created by MOKS through reviewed
 # plans, so Argo does not track them. Its own project keeps cluster-wide CRDs out of project moks.
 apiVersion: argoproj.io/v1alpha1

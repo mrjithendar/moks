@@ -3,6 +3,7 @@
 {{- fail "rag.opensearch.url needs networkPolicy.internetEgress: true (HTTPS to the managed domain)" }}
 {{- end }}
 {{- else if eq .Values.rag.backend "opensearch" }}
+{{- if include "moks.inGroup" (dict "root" . "group" "opensearch") }}
 # Phase 2 RAG store. Single node, security plugin on, persistent volume. Memory: JVM heap
 # (rag.opensearch.heapSize) plus the same again for Lucene file cache; 1g heap -> 2Gi limit.
 {{- $heap := .Values.rag.opensearch.heapSize }}
@@ -83,6 +84,7 @@ spec:
     - from: [{podSelector: {matchLabels: {app: moks}}}]
       ports: [{port: 9200, protocol: TCP}]
   egress: []
+{{- end }}
 {{- else if not (has .Values.rag.backend (list "postgres" "pgvector" "pinecone")) }}
 {{- fail "rag.backend must be postgres, pgvector, opensearch or pinecone (only one backend at a time)" }}
 {{- end }}

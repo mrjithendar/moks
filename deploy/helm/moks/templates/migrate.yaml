@@ -1,3 +1,4 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "migrate") }}
 {{- if .Values.secrets.split }}
 # The only workload holding the schema owner. The name follows the image, so a new release runs a
 # new Job and runtime pods (wait-schema) start once it has finished.
@@ -33,4 +34,5 @@ spec:
           {{- include "moks.volumeMounts" (dict "root" . "component" "migrate") | nindent 10 }}
           resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
       {{- include "moks.volumes" (dict "root" . "component" "migrate") | nindent 6 }}
+{{- end }}
 {{- end }}

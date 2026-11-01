@@ -1,5 +1,16 @@
 {{- define "moks.name" -}}moks{{- end -}}
 
+{{/* resourceGroup picks what this render contains: "all" for the whole chart, or one group for one
+     child Argo CD Application (docs/ARGOCD_APP_SPLIT.md). Every resource belongs to exactly one group.
+     Returns "true" or nothing, and refuses a typo rather than rendering an empty Application. */}}
+{{- define "moks.inGroup" -}}
+{{- $selected := toString .root.Values.resourceGroup -}}
+{{- if not (has $selected (list "all" "foundation" "database" "migrate" "opensearch" "api" "worker" "executor" "terminal" "routing" "backup")) -}}
+{{- fail (printf "resourceGroup %q is not a resource group; see docs/ARGOCD_APP_SPLIT.md" $selected) -}}
+{{- end -}}
+{{- if or (eq $selected "all") (eq $selected .group) -}}true{{- end -}}
+{{- end -}}
+
 {{- define "moks.labels" -}}
 app.kubernetes.io/name: moks
 app.kubernetes.io/instance: {{ .Release.Name }}

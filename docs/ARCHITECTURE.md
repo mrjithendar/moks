@@ -72,7 +72,7 @@ sub-path, while RoboShop uses a `stripPrefix` middleware. MOKS follows the Grafa
   `end_session_endpoint` with `post_logout_redirect_uri=https://jithendar.com/moks/login`).
 
 `jithendar.com/roboshop/moks/*` is the unrelated RoboShop shopping widget (also called "Moks").
-It is untouched. The new Argo CD Application is `moks-portal` because `moks` is taken.
+It is untouched. The portal's Argo CD Applications are `moks-root` and `moks-<component>`, because `moks` is taken.
 
 ## Investigation loop
 

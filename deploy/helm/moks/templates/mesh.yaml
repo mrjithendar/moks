@@ -1,7 +1,8 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "routing") }}
 {{- if .Values.istio.mtls }}
 # STRICT: every pod in the namespace has a sidecar, and nothing outside the mesh can connect. No
 # DestinationRule is needed: auto mTLS is the default. Sidecars come from the namespace label
-# istio-injection (deploy/argocd/application-eks.yaml), which diagnostic sessions do not have.
+# istio-injection (deploy/argocd/eks/apps/roboshop-demo-moks-foundation.yaml), which diagnostic sessions do not have.
 apiVersion: security.istio.io/v1
 kind: PeerAuthentication
 metadata:
@@ -56,5 +57,6 @@ spec:
       to:
         - operation:
             ports: ["5432"]
+{{- end }}
 {{- end }}
 {{- end }}

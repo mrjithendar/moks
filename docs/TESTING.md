@@ -183,7 +183,10 @@ python -m pytest -q -s tests/live
 
 cd ../frontend && npm test && npm run build
 helm lint deploy/helm/moks -f deploy/helm/moks/values-minikube.yaml
+scripts/validate-argocd-split.py
 ```
+
+`scripts/validate-argocd-split.py` proves by rendering that the child Argo CD Applications add up to exactly the chart. It is static, so [ARGOCD_APP_SPLIT.md](ARGOCD_APP_SPLIT.md#validation) lists what only a live run can prove.
 
 ## Not yet verified (Phases 2–4)
 
@@ -215,7 +218,7 @@ helm lint deploy/helm/moks -f deploy/helm/moks/values-minikube.yaml
 |---|---|
 | `test_execution_fencing.py` | Lease expiry, worker pauses, database loss, stale checkpoints, late results, lease loss before recovery |
 | `test_db_grants.py` | Real plan and investigation flows under each database role, and refusals for everything else |
-| `test_helm_render.py` | What each component receives, for Minikube and EKS |
+| `test_helm_render.py` | What each component receives, for Minikube and EKS, and the `resourceGroup` selector |
 | `test_job_classes.py` | A blocked reindex leaves detection on target; overload, fairness, shutdown |
 | `test_index_outbox.py` | Rollback after failure, duplicates, out-of-order events, changes during reindex, crashes |
 | `test_revocation.py` | Revocation during an investigation and an open stream |

@@ -1,3 +1,4 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "database") }}
 {{- if .Values.postgres.bundled }}
 # Bundled PostgreSQL for single-cluster installs. For EKS prefer RDS (postgres.bundled=false).
 # The PVC carries resource-level Prune=false,Delete=false so an Argo CD prune can never delete it.
@@ -109,5 +110,6 @@ spec:
   {{- else }}
   egress: []
   {{- end }}
+{{- end }}
 {{- end }}
 {{- end }}

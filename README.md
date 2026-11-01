@@ -25,7 +25,7 @@ real API server.
 | Frontend | React 19 · TypeScript · Vite · React Router (basename `/moks`) |
 | Data | PostgreSQL (users, RBAC, sessions, environments, connectors, LLM configs, investigations, evidence, hash-chained audit) |
 | LLM | Provider-neutral: OpenAI(-compatible), Gemini, Amazon Bedrock, Ollama; rule-based fallback |
-| Deploy | One image, Helm chart, Argo CD (`moks-portal`, project `moks`), Traefik Prefix `/moks` without stripping |
+| Deploy | One image, Helm chart, Argo CD (a root and one Application per component, [docs/ARGOCD_APP_SPLIT.md](docs/ARGOCD_APP_SPLIT.md)), Traefik Prefix `/moks` without stripping |
 | Observability | Prometheus metrics on `:9464`, JSON logs for Alloy/Loki, OTel traces, Grafana dashboard |
 
 ## Layout
@@ -34,7 +34,7 @@ real API server.
 backend/          FastAPI app, worker, connectors, tools, orchestrator, migrations, tests
 frontend/         React portal
 deploy/helm/moks  Helm chart (values-minikube.yaml for mk4, values-eks.yaml for roboshop-demo)
-deploy/argocd     AppProject + Application
+deploy/argocd     AppProjects, root and child Applications per environment
 deploy/secrets    Secret templates (no real values)
 deploy/terraform  AWS: ECR repo, GitHub OIDC CI role, MOKS runtime IAM user (Bedrock)
 deploy/rbac, iam  Kubernetes RBAC and AWS IAM examples

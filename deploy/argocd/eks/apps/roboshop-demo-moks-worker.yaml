@@ -1,0 +1,29 @@
+# The worker Deployment, or one Deployment per worker.pools entry.
+# Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: roboshop-demo-moks-worker
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: roboshop-gitops
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  project: moks-eks
+  source:
+    repoURL: https://github.com/mrjithendar/moks.git
+    targetRevision: master
+    path: deploy/helm/moks
+    helm:
+      releaseName: moks
+      valueFiles: [values-eks.yaml]
+      parameters:
+        - {name: resourceGroup, value: worker}
+  destination:
+    name: roboshop-demo
+    namespace: moks
+  syncPolicy:
+    syncOptions:
+      - PruneLast=true
+      - FailOnSharedResource=true

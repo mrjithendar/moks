@@ -1,0 +1,35 @@
+# Owns moks-config, moks-seed and moks-skills; shared ServiceAccounts, RBAC, moks-metrics and the
+# moks NetworkPolicy. The only Application that sets namespace metadata, and the only one with
+# CreateNamespace.
+# Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: moks-foundation
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  project: moks
+  source:
+    repoURL: https://github.com/mrjithendar/moks.git
+    targetRevision: master
+    path: deploy/helm/moks
+    helm:
+      releaseName: moks
+      valueFiles: [values-minikube.yaml]
+      parameters:
+        - {name: resourceGroup, value: foundation}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: moks
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+      - FailOnSharedResource=true
+    managedNamespaceMetadata:
+      labels:
+        app.kubernetes.io/part-of: moks
+        pod-security.kubernetes.io/enforce: baseline
+        pod-security.kubernetes.io/warn: restricted

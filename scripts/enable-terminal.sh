@@ -14,7 +14,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 kc() { kubectl --context "$CONTEXT" "$@"; }
 k() { kc -n moks "$@"; }
 
-k get deploy moks-terminal >/dev/null || { echo "Deployment moks-terminal missing: set terminal.enabled and terminal.image.digest, then sync moks-portal." >&2; exit 1; }
+k get deploy moks-terminal >/dev/null || { echo "Deployment moks-terminal missing: set terminal.enabled and terminal.image.digest, then sync moks-terminal." >&2; exit 1; }
 kc get namespace "$TERMINALS" >/dev/null
 
 if [[ -z "$(k get secret moks-terminal-secrets --ignore-not-found -o name)" ]]; then

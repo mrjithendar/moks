@@ -1,0 +1,28 @@
+# The executor and its identity, action RBAC, database-backup Roles, Velero write Role and
+# the diagnostic namespace with its quota and NetworkPolicy.
+# Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: moks-executor
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  project: moks
+  source:
+    repoURL: https://github.com/mrjithendar/moks.git
+    targetRevision: master
+    path: deploy/helm/moks
+    helm:
+      releaseName: moks
+      valueFiles: [values-minikube.yaml]
+      parameters:
+        - {name: resourceGroup, value: executor}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: moks
+  syncPolicy:
+    syncOptions:
+      - PruneLast=true
+      - FailOnSharedResource=true

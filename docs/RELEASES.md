@@ -7,7 +7,7 @@ Git does not record which build is running. Check it with `/api/health`.
 ## Release
 
 1. A pull request passes the `check` job, which runs on pull requests only. Merging it to `master` builds one image, tags it with the commit SHA and moves `latest` to it. A failed image build or smoke test leaves `latest` where it was. A direct push to `master` is released without `check`, so require `check` in branch protection.
-2. Check any migration the release brings. Migrations run when the new API pods start.
+2. Check any migration the release brings. Migrations run when the new API pods start, or in the `moks-migrate` Job once `secrets.split` is true. A mutable tag never changes that Job's name, so it needs the steps in [ARGOCD_APP_SPLIT.md](ARGOCD_APP_SPLIT.md#upgrades-and-migrations) before this restart.
 3. Restart the pods, which pull `latest`:
 
    ```bash
@@ -16,7 +16,7 @@ Git does not record which build is running. Check it with `/api/health`.
 
 4. Check the running build: `curl https://jithendar.com/moks/api/health` shows the commit, and the profile menu warns if components differ.
 
-An Argo CD sync does not start a release. The manifests do not change between builds, so `moks-portal` stays Synced and no pod restarts. Sync it only when the chart changes, by hand and without prune.
+An Argo CD sync does not start a release. The manifests do not change between builds, so the MOKS Applications stay Synced and no pod restarts. Sync one only when the chart or its values change, by hand and without prune. Each component is its own Application, and a shared setting changes several: see [ARGOCD_APP_SPLIT.md](ARGOCD_APP_SPLIT.md#changing-shared-configuration).
 
 A pod that restarts for any other reason, such as a node restart, also pulls `latest`. It can run a newer build than the others until the rest are restarted, and a sync that changes a pod template rolls that component onto the newest build too.
 

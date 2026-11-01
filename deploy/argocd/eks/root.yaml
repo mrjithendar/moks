@@ -1,0 +1,26 @@
+# App of apps for MOKS. Syncing it writes the Application objects in apps/ and nothing else: it starts no
+# child sync and waits for no child, so a Synced root says nothing about the workloads. Sync the
+# children by hand, in the order in docs/ARGOCD_APP_SPLIT.md. Only apps/ is read, not optional/, and
+# there is no finalizer here or on a child, so deleting an Application never deletes what it manages.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: roboshop-demo-moks-root
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: roboshop-gitops
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  project: moks-root
+  source:
+    repoURL: https://github.com/mrjithendar/moks.git
+    targetRevision: master
+    path: deploy/argocd/eks/apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    syncOptions:
+      - PruneLast=true
+      - FailOnSharedResource=true

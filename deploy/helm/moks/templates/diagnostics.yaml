@@ -1,3 +1,4 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "executor") }}
 {{- if and .Values.diagnostics.enabled .Values.executor.enabled }}
 {{- $ns := .Values.diagnostics.namespace }}
 # Diagnostic sessions: disposable pods with no service-account token, CPU/memory quota, and
@@ -66,4 +67,5 @@ metadata: {name: moks-diagnostics, namespace: {{ $ns }}}
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: moks-diagnostics}
 subjects:
   - {kind: ServiceAccount, name: moks-executor, namespace: {{ .Release.Namespace }}}
+{{- end }}
 {{- end }}

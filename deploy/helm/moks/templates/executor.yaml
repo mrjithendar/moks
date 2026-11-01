@@ -1,3 +1,4 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "executor") }}
 {{- if .Values.executor.enabled }}
 # The executor is the only MOKS component with write credentials: its own ServiceAccount, bound
 # per namespace (executor.namespaces) to exactly what the allowlisted actions need. The API and
@@ -148,7 +149,7 @@ spec:
     metadata:
       labels: {app: moks, component: executor}
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/config: {{ include (print $.Template.BasePath "/_configmap.yaml") . | sha256sum }}
     spec:
       serviceAccountName: moks-executor
       enableServiceLinks: false
@@ -172,4 +173,5 @@ spec:
           livenessProbe: {tcpSocket: {port: metrics}, periodSeconds: 20, failureThreshold: 3}
           resources: {{- toYaml .Values.executor.resources | nindent 12 }}
       {{- include "moks.volumes" (dict "root" . "component" "executor") | nindent 6 }}
+{{- end }}
 {{- end }}

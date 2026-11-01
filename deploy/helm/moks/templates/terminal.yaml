@@ -3,6 +3,7 @@
 {{- $t := .Values.terminal }}
 {{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (toString $t.image.digest)) }}{{- fail "terminal.image.digest must be sha256:<64 hex characters>: terminals run a pinned, scanned image, never a tag" }}{{- end }}
 {{- if not $t.profiles }}{{- fail "terminal.profiles is empty: a terminal needs an explicit account, role and region" }}{{- end }}
+{{- if include "moks.inGroup" (dict "root" . "group" "terminal") }}
 # One disposable pod per session, reached only through the moks-terminal gateway. A shell is arbitrary
 # code in here: these limits, the session's IAM role and its RBAC are the controls. See docs/TERMINAL.md.
 apiVersion: v1
@@ -172,7 +173,7 @@ spec:
     metadata:
       labels: {app: moks, component: terminal}
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/config: {{ include (print $.Template.BasePath "/_configmap.yaml") . | sha256sum }}
     spec:
       serviceAccountName: moks-terminal
       enableServiceLinks: false
@@ -235,4 +236,5 @@ spec:
   selector: {app: moks, component: terminal}
   ports:
     - {name: http, port: 8080, targetPort: http}
+{{- end }}
 {{- end }}

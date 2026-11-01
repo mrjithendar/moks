@@ -1,7 +1,7 @@
 name: moks
 
 # check   -> pull requests only: backend tests against PostgreSQL, frontend typecheck/build,
-#            Helm lint/render
+#            Helm lint/render, Argo CD child Applications against the chart
 # terminal -> pull requests and pushes: diagnostic image build, scan and isolation test on kind
 # release -> default branch: build the arm64 image once, tag it with the commit and move latest to it.
 #            mk4 runs latest, and new pods pull it when restarted. CI never touches the cluster.
@@ -59,6 +59,10 @@ jobs:
           helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-minikube.yaml > /dev/null
           helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-minikube.yaml --set secrets.split=true,backup.enabled=true,backup.bucket=ci,velero.enabled=true > /dev/null
           helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-eks.yaml --set image.tag=ci,secrets.split=true > /dev/null
+      - name: Argo CD Applications add up to the chart
+        run: |
+          pip install pyyaml
+          python scripts/validate-argocd-split.py
       - uses: hashicorp/setup-terraform@v4
       - name: Terraform
         working-directory: deploy/terraform

@@ -61,38 +61,59 @@ It refuses to overwrite existing Secrets. Add provider credentials later as `MOK
 
 CI tags each image with its commit and moves `latest` to it. mk4 runs `latest`, so restarting the MOKS pods is the rollout, and pointing `latest` back at an earlier commit is the rollback. See [RELEASES.md](RELEASES.md).
 
-## 5. Argo CD project and application
+## 5. Argo CD projects and applications
+
+MOKS is a root Application and one child per component (`moks-foundation`, `moks-database`,
+`moks-api`, `moks-worker`, `moks-executor`, `moks-terminal`, `moks-routing`). The root only writes
+those Application objects. It syncs none of them, so sync each child by hand, in order, and check it
+before the next. [ARGOCD_APP_SPLIT.md](ARGOCD_APP_SPLIT.md) has what each one owns, how to change
+shared configuration, and how to migrate an install that still runs `moks-portal`.
 
 ```sh
-kubectl --context mk4 apply -f deploy/argocd/project.yaml -f deploy/argocd/application.yaml
-argocd app diff moks-portal          # or the Argo CD UI at https://jithendar.com/argocd
-argocd app sync moks-portal          # never tick "Prune" for this app
-kubectl --context mk4 -n moks rollout status deploy/moks-api deploy/moks-worker
+kubectl --context mk4 apply -f deploy/argocd/project-root.yaml -f deploy/argocd/minikube/project.yaml \
+  -f deploy/argocd/minikube/root.yaml
+argocd app sync moks-root            # or the Argo CD UI at https://jithendar.com/argocd
+argocd app sync moks-foundation      # never tick "Prune" for any of these
+argocd app sync moks-database
+kubectl --context mk4 -n moks rollout status statefulset/moks-postgres
+argocd app sync moks-api
+kubectl --context mk4 -n moks rollout status deploy/moks-api
+argocd app sync moks-worker moks-executor
+kubectl --context mk4 -n moks rollout status deploy/moks-worker
+kubectl --context mk4 -n moks rollout status deploy/moks-executor
+argocd app sync moks-terminal moks-routing
 ```
 
-The `moks` AppProject only admits this repository, namespace `moks`, the listed kinds and the
-chart's ClusterRole/ClusterRoleBinding, and it cannot touch Secrets. The PostgreSQL PVC carries
-`Prune=false,Delete=false`. Like the other Applications on mk4, `moks-portal` has no automated
-sync. As with roboshop-ai, `kubectl apply` of a changed Application file is what updates its live
-spec.
+The `moks` AppProject only admits this repository, the listed namespaces and kinds and the chart's
+ClusterRole/ClusterRoleBinding, and it cannot touch Secrets. The root runs in its own project,
+`moks-root`, which can write only Applications in `argocd`. The PostgreSQL PVC carries
+`Prune=false,Delete=false`. Like the other Applications on mk4, these have no automated sync. As with
+roboshop-ai, `kubectl apply` of a changed project or root is what updates its live spec, and syncing
+the root is what updates a child's.
 
 ### roboshop-demo (EKS)
 
-Argo CD on mk4 deploys MOKS to the EKS cluster as `roboshop-demo-moks-portal`, in project `moks-eks`,
-with `values-eks.yaml`. It reads `master`, so push the chart first. This is a new, empty install at
-`https://eks.jithendar.com/moks`; nothing moves from mk4.
+Argo CD on mk4 deploys MOKS to the EKS cluster as `roboshop-demo-moks-root` and its children, in
+project `moks-eks`, with `values-eks.yaml`. They read `master`, so push the chart first. This is a
+separate install at `https://eks.jithendar.com/moks`; nothing moves from mk4.
 
 ```sh
 scripts/create-secrets.sh roboshop-demo
-kubectl --context mk4 apply -f deploy/argocd/project-eks.yaml -f deploy/argocd/application-eks.yaml
-argocd app diff roboshop-demo-moks-portal
-argocd app sync roboshop-demo-moks-portal   # never tick "Prune" for this app
+kubectl --context mk4 apply -f deploy/argocd/project-root.yaml -f deploy/argocd/eks/project.yaml \
+  -f deploy/argocd/eks/root.yaml
+argocd app sync roboshop-demo-moks-root
+argocd app sync roboshop-demo-moks-foundation     # never tick "Prune" for any of these
+argocd app sync roboshop-demo-moks-routing        # STRICT mTLS and deny-by-default before any pod
+argocd app sync roboshop-demo-moks-database
+kubectl --context roboshop-demo -n moks rollout status statefulset/moks-postgres
+argocd app sync roboshop-demo-moks-api
 kubectl --context roboshop-demo -n moks rollout status deploy/moks-api
+argocd app sync roboshop-demo-moks-worker roboshop-demo-moks-executor
 ```
 
 Then create the first administrator as in section 6, with `--context roboshop-demo`. Traffic goes
 through the Istio Gateway `istio-ingress/public` by a VirtualService, not an Ingress, and only reaches
-the addresses the NLB allows (`tools/eks/platform/istio-ingressgateway.yaml`).
+the addresses the NLB allows (`tools/eks-argocd/platform/istio-ingressgateway.yaml`).
 
 Differences from mk4: no Loki, Grafana, Argo CD connector or Velero, Prometheus has mesh metrics only,
 RAG is keyword-only, and the terminal is off because this cluster does not enforce NetworkPolicy.
@@ -101,8 +122,8 @@ Releases work as in [RELEASES.md](RELEASES.md), with `--context roboshop-demo`.
 Every pod in `moks` has a sidecar and PeerAuthentication is STRICT. Port 8080 accepts only the ingress
 gateway and PostgreSQL only the `moks` namespace, so these rules are what protect both ports while
 NetworkPolicy is off. The sidecar needs `NET_ADMIN`, so the namespace's enforced pod security level is
-`privileged`. Changing the labels means applying `application-eks.yaml` again before the sync, and pods
-get sidecars only when they restart. Nothing scrapes port 9464 here; a scraper would need an ALLOW rule.
+`privileged`. `roboshop-demo-moks-foundation` is the only Application that sets those labels. Changing
+them means syncing `roboshop-demo-moks-root`, then foundation, and pods get sidecars only when they restart. Nothing scrapes port 9464 here; a scraper would need an ALLOW rule.
 
 ## 6. First administrator
 
@@ -180,13 +201,14 @@ See [../lab/README.md](../lab/README.md). It applies to namespace `moks-lab`, an
 
 ## 11. Phases 2–4: what changes on mk4 and in what order
 
-The chart changes in this release add pods and RBAC. Review `argocd app diff moks-portal`, then sync
-**without prune**. Apply the AppProject first (it now allows `moks-diagnostics`, `moks-lab`,
+The chart changes in this release add pods and RBAC. Review `argocd app diff` for each child, then
+sync **without prune**. Apply the AppProject first (it now allows `moks-diagnostics`, `moks-lab`,
 `ResourceQuota`, `LimitRange` and `Role`):
 
 ```sh
-kubectl --context mk4 apply -f deploy/argocd/project.yaml
-argocd app diff moks-portal && argocd app sync moks-portal
+kubectl --context mk4 apply -f deploy/argocd/minikube/project.yaml
+argocd app diff moks-foundation && argocd app sync moks-foundation
+argocd app diff moks-executor && argocd app sync moks-executor
 kubectl --context mk4 -n moks rollout status deploy/moks-api deploy/moks-worker deploy/moks-executor
 kubectl --context mk4 -n moks rollout status statefulset/moks-opensearch     # rag.backend: opensearch
 ```
@@ -395,7 +417,7 @@ can lose is about an hour.
 3. Create the Secret, using `--from-env-file` or similar so values stay out of your shell history. Its keys
    are `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `MOKS_BACKUP_ENCRYPTION_KEY`. Name it `moks-backup`.
 4. Set `backup.enabled`, `backup.bucket`, and for R2 `backup.endpoint` and `backup.region: auto`.
-5. Apply `deploy/argocd/project.yaml`, which now allows CronJobs, then sync.
+5. Apply `deploy/argocd/minikube/project.yaml`, which now allows CronJobs, move `deploy/argocd/minikube/optional/moks-backup.yaml` into `apps/`, push, sync `moks-root`, then sync `moks-backup`.
 6. Run one by hand and check the stored copy:
    `kubectl --context mk4 -n moks create job --from=cronjob/moks-backup first-backup`
 

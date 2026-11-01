@@ -1,0 +1,18 @@
+# AppProject for the two MOKS roots. It may only write Applications into argocd. Those Applications can
+# name any project, so a separate project keeps that power off moks and moks-eks, where the chart runs.
+# AppProjects stay out of it, so a root cannot widen a project; apply them by hand.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: moks-root
+  namespace: argocd
+spec:
+  description: Roots of the MOKS Applications on mk4 and roboshop-demo
+  sourceRepos:
+    - https://github.com/mrjithendar/moks.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - {group: argoproj.io, kind: Application}

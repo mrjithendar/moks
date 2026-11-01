@@ -140,7 +140,7 @@ Each step here is a change to AWS or to mk4, and is yours to run.
 4. **Key, database role and Secret:** run `scripts/create-terminal-secrets.sh`. It creates a key for `moks-terminal-gateway`, sets the `moks_terminal` password and grants through `moks db-grants`, and writes `moks-terminal-secrets`. Add `ROTATE=1` to replace them. Do not reuse `moks-mk4-runtime`.
 5. **Pull secret:** the ecr-refresh CronJob (tools repo) creates `ecr-pull` in every namespace, but only every 6 hours. Once `moks-terminals` exists, run it once: `kubectl -n roboshop-ai create job ecr-refresh-now --from=cronjob/ecr-refresh`.
 6. **Values:** set `terminal.enabled`, `terminal.image.digest`, `terminal.imagePullSecrets: [ecr-pull]`, `terminal.profiles`, `terminal.kubernetes.namespaces` and `terminal.network`.
-7. **Argo:** apply `deploy/argocd/project.yaml`, then sync without prune.
+7. **Argo:** apply `deploy/argocd/minikube/project.yaml`, then sync `moks-root`, `moks-terminal` and `moks-routing` without prune. `deploy/argocd/minikube/apps/moks-terminal.yaml` is the only terminal Application. EKS has none, because the terminal stays off there.
 8. **Grant** the `terminal` role to one person, and open a session in `moks-lab`.
 9. **Verify on that cluster,** from inside the session:
 

@@ -1,3 +1,4 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "routing") }}
 {{- if .Values.ingress.enabled }}
 # Prefix match on the base path WITHOUT prefix stripping: MOKS serves the SPA, API, SSE and
 # auth callbacks under {{ .Values.basePath }} itself. A Prefix rule on /moks also matches /moks/...,
@@ -59,5 +60,6 @@ spec:
           - path: {{ .Values.basePath }}
             pathType: Prefix
             backend: {service: {name: moks-api, port: {name: http}}}
+{{- end }}
 {{- end }}
 {{- end }}

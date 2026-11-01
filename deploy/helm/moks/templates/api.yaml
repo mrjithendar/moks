@@ -1,3 +1,4 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "api") }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,7 +15,7 @@ spec:
     metadata:
       labels: {app: moks, component: api}
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/config: {{ include (print $.Template.BasePath "/_configmap.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "moks.serviceAccount" (dict "root" . "component" "api") }}
       enableServiceLinks: false
@@ -52,18 +53,6 @@ spec:
   selector: {app: moks, component: api}
   ports:
     - {name: http, port: 8080, targetPort: http}
----
-# Headless service for Prometheus DNS discovery (dns_sd_configs), like jithendar-com-metrics.
-apiVersion: v1
-kind: Service
-metadata:
-  name: moks-metrics
-  labels: {{- include "moks.labels" . | nindent 4 }}
-spec:
-  clusterIP: None
-  selector: {app: moks}
-  ports:
-    - {name: metrics, port: 9464, targetPort: 9464}
 {{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.api.replicas) 1) }}
 ---
 apiVersion: policy/v1
@@ -74,4 +63,5 @@ spec:
   minAvailable: 1
   selector:
     matchLabels: {app: moks, component: api}
+{{- end }}
 {{- end }}

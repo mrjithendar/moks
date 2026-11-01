@@ -1,5 +1,7 @@
 # AppProject for MOKS on the roboshop-demo EKS cluster. Separate from project moks, so mk4's
 # destinations and this cluster's can be retired independently.
+# The child Applications in eks/apps run here. The root does not: it writes Applications, so it has its
+# own project (project-root.yaml) and this one never gains a destination on mk4.
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:

@@ -51,6 +51,27 @@ def test_default_render_changes_nothing_for_existing_installs(values):
     assert not any(d["kind"] == "Job" for d in docs)
 
 
+def test_the_default_group_is_the_whole_chart():
+    assert {(d["kind"], d["metadata"]["name"]) for d in render("values-minikube.yaml")} == {
+        (d["kind"], d["metadata"]["name"]) for d in render("values-minikube.yaml", "resourceGroup=all")}
+
+
+def test_a_mistyped_group_is_refused_rather_than_rendering_nothing():
+    with pytest.raises(subprocess.CalledProcessError) as refused:
+        render("values-minikube.yaml", "resourceGroup=frontend")
+    assert "is not a resource group" in refused.value.stderr
+
+
+def test_config_changes_still_roll_consumers_though_only_foundation_renders_the_configmaps():
+    assert [d["metadata"]["name"] for d in render("values-minikube.yaml", "resourceGroup=api") if d["kind"] == "ConfigMap"] == []
+    assert {"moks-config", "moks-seed"} <= {d["metadata"]["name"] for d in render("values-minikube.yaml", "resourceGroup=foundation") if d["kind"] == "ConfigMap"}
+
+    def checksum(*sets):
+        return of(render("values-minikube.yaml", "resourceGroup=api", *sets), "Deployment", "moks-api")["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
+    whole = of(render("values-minikube.yaml"), "Deployment", "moks-api")["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
+    assert checksum() == whole and checksum("config.logLevel=DEBUG") != whole
+
+
 def test_each_component_gets_only_its_secret():
     by = dict(pods(render("values-minikube.yaml", *SPLIT)))
     assert secrets(by["moks-api"]) == {"moks-api-secrets"}

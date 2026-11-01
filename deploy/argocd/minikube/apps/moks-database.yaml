@@ -1,0 +1,28 @@
+# Bundled PostgreSQL: StatefulSet, Service and NetworkPolicy. Its volumeClaimTemplates and
+# selector are immutable, so never change them here.
+# Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: moks-database
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  project: moks
+  source:
+    repoURL: https://github.com/mrjithendar/moks.git
+    targetRevision: master
+    path: deploy/helm/moks
+    helm:
+      releaseName: moks
+      valueFiles: [values-minikube.yaml]
+      parameters:
+        - {name: resourceGroup, value: database}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: moks
+  syncPolicy:
+    syncOptions:
+      - PruneLast=true
+      - FailOnSharedResource=true

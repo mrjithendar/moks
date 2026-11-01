@@ -29,7 +29,7 @@ seed:
         - type: kubernetes
           name: in-cluster
           config: {mode: in_cluster, timeout_seconds: 15, executor: {mode: in_cluster}}
-        # Mesh metrics only, 6 h retention, from tools/eks/platform/kiali-prometheus.yaml. The
+        # Mesh metrics only, 6 h retention, from tools/eks-argocd/platform/kiali-prometheus.yaml. The
         # prometheus-agent in monitoring cannot be queried, and this cluster has no Loki.
         - type: prometheus
           name: prometheus
@@ -59,7 +59,7 @@ ingress:
 
 istio:
   enabled: true
-  gateway: istio-ingress/public   # tools/eks/roboshop-demo/ingress
+  gateway: istio-ingress/public   # tools/eks-argocd/roboshop-demo/ingress
   host: eks.jithendar.com
   mtls: true
   gatewayPrincipal: cluster.local/ns/istio-ingress/sa/istio-ingressgateway
@@ -76,7 +76,7 @@ rag:
 
 executor:
   enabled: true
-  namespaces: []        # add namespaces only when you want MOKS to act there; also add them to project-eks.yaml
+  namespaces: []        # add namespaces only when you want MOKS to act there; also add them to deploy/argocd/eks/project.yaml
 
 databaseBackups:
   enabled: true

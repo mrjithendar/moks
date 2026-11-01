@@ -1,11 +1,11 @@
-# MOKS on the roboshop-demo EKS cluster, a remote cluster of Argo CD on mk4. The roboshop-demo-
-# prefix matches that cluster's other Applications, which share mk4's argocd namespace, and
-# roboshop-demo-moks is already the RoboShop shopping widget, which is unrelated.
-# Manual sync, never with prune enabled from the UI (see docs/OPERATOR_GUIDE.md).
+# Owns moks-config, moks-seed and moks-skills; shared ServiceAccounts, RBAC, moks-metrics and the
+# moks NetworkPolicy. The only Application that sets namespace metadata, and the only one with
+# CreateNamespace.
+# Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: roboshop-demo-moks-portal
+  name: roboshop-demo-moks-foundation
   namespace: argocd
   labels:
     app.kubernetes.io/part-of: roboshop-gitops
@@ -20,6 +20,8 @@ spec:
     helm:
       releaseName: moks
       valueFiles: [values-eks.yaml]
+      parameters:
+        - {name: resourceGroup, value: foundation}
   destination:
     name: roboshop-demo
     namespace: moks

@@ -1,0 +1,14 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "foundation") }}
+# Headless service for Prometheus DNS discovery (dns_sd_configs), like jithendar-com-metrics.
+# Selects every MOKS component, so it belongs to foundation rather than the API.
+apiVersion: v1
+kind: Service
+metadata:
+  name: moks-metrics
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector: {app: moks}
+  ports:
+    - {name: metrics, port: 9464, targetPort: 9464}
+{{- end }}

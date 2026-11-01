@@ -1,5 +1,7 @@
 # AppProject for MOKS: only this repository, only namespace moks, and only the cluster-scoped
 # kinds the chart needs (its read-only ClusterRole/Binding and the namespace).
+# The child Applications in minikube/apps run here. The root does not: it writes Applications, so it has
+# its own project (project-root.yaml) and this one never gains the argocd namespace.
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:

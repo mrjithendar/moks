@@ -64,13 +64,13 @@ kubectl -n moks exec deploy/moks-api -c api -- env MOKS_DB_PASSWORD_API='<new>' 
 
 ## Stage 3: switch
 
-Set `secrets.split: true` (and `velero.enabled` if used) through a reviewed Git change, and sync. The `moks-migrate-<hash>` Job runs, runtime pods wait for it in `wait-schema`, and Deployments roll.
+Set `secrets.split: true` (and `velero.enabled` if used) through a reviewed Git change, and move `deploy/argocd/<environment>/optional/<prefix>-migrate.yaml` into `apps/` in the same change. Sync the root, then these children, in this order and each without prune: foundation, for the new ServiceAccounts; migrate, then wait for its `moks-migrate-<hash>` Job to complete; then api, worker, executor, and terminal where it runs. Runtime pods wait for the Job in `wait-schema`, and Deployments roll. See [ARGOCD_APP_SPLIT.md](ARGOCD_APP_SPLIT.md#upgrades-and-migrations), including its warning about sidecars on EKS and about a Job whose name does not change under `latest`.
 
 Check that sign-in works, that an investigation completes, and that a test plan in a non-production namespace executes. Then watch for `permission denied` in the logs.
 
 ## Roll back
 
-Set `secrets.split: false` and sync. Components return to `moks-secrets`, which was never changed. Roles and grants stay in place and do no harm.
+Set `secrets.split: false`, move the migrate Application back to `optional/`, and sync the root and then foundation, api, worker and executor. Components return to `moks-secrets`, which was never changed. Roles and grants stay in place and do no harm. Delete the `moks-migrate` Application and Job by hand, never by prune.
 
 ## Stage 4: remove what is no longer needed
 

@@ -1,3 +1,4 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "foundation") }}
 {{- with .Values.ecrRefresh }}
 {{- if .enabled }}
 # Lets the cluster's ecr-refresh CronJob (mk4: roboshop-ai/ecr-refresh, tools repo) keep the
@@ -16,5 +17,6 @@ metadata:
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: ecr-refresh}
 subjects:
   - {kind: ServiceAccount, name: {{ .serviceAccount }}, namespace: {{ .namespace }}}
+{{- end }}
 {{- end }}
 {{- end }}

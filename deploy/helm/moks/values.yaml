@@ -1,5 +1,10 @@
 # Defaults. Environment-specific files (values-minikube.yaml, values-eks.yaml) override these.
 
+# What to render: all, or one of foundation, database, migrate, opensearch, api, worker, executor,
+# terminal, routing, backup. Each child Argo CD Application sets its own group as a parameter and
+# shares the environment's values file, so shared checksums match. See docs/ARGOCD_APP_SPLIT.md.
+resourceGroup: all
+
 image:
   repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
   # mk4 runs tag latest. A digest (sha256:...), if set, replaces the tag.
