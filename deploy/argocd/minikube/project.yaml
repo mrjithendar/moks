@@ -43,6 +43,7 @@ spec:
     - {group: networking.k8s.io, kind: NetworkPolicy}
     - {group: policy, kind: PodDisruptionBudget}
     - {group: traefik.io, kind: Middleware}
+    - {group: traefik.io, kind: IngressRoute}
     - {group: rbac.authorization.k8s.io, kind: Role}
     - {group: "", kind: ResourceQuota}
     - {group: "", kind: LimitRange}

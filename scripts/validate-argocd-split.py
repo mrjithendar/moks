@@ -148,7 +148,7 @@ def facts(docs: dict) -> dict[str, dict]:
             found["selectors"][name] = spec.get("selector")
         if k[1] == "NetworkPolicy":
             found["networkPolicies"][name] = spec
-        if k[1] in ("PeerAuthentication", "AuthorizationPolicy", "VirtualService", "Ingress", "Middleware"):
+        if k[1] in ("PeerAuthentication", "AuthorizationPolicy", "VirtualService", "Ingress", "IngressRoute", "Middleware"):
             found["meshAndRouting"][name] = spec
         if k[1] in ("Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding"):
             found["rbac"][name] = {f: d.get(f) for f in ("rules", "roleRef", "subjects")}

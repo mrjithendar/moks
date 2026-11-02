@@ -5,7 +5,7 @@ postgres   - full-text (websearch_to_tsquery, ts_rank_cd) and, when the pgvector
              installed and an embedding index is active, cosine k-NN; fused with RRF.
 opensearch - one index per embedding version (moks-chunks-<version>), BM25 multi_match plus
              knn_vector; fused client-side with RRF so no search pipeline plugin is required.
-             Self-hosted (basic auth) or an Amazon OpenSearch Service domain (SigV4).
+             Self-hosted (basic auth, one identity per job) or an Amazon OpenSearch Service domain (SigV4).
 pinecone   - vectors only, one index per embedding version. Keyword search stays in PostgreSQL, which
              holds the text. Pinecone receives vectors, document ids and scope names, never chunk text.
 """
@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,9 +24,55 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..connectors.base import ConnectorError
+from ..observability import OPENSEARCH_BULK_ITEMS, OPENSEARCH_SEARCH_FAILURES, OPENSEARCH_SEARCH_SECONDS
 from . import access
 
 RRF_K = 60
+MAPPING_VERSION = 2
+INDEX_PREFIX = "moks-chunks-"
+SEARCH_COOLDOWN_SECONDS = 30.0
+# Everything a chunk is filtered, cited or explained by. Strict, so a typo or an unplanned field is
+# refused at write time instead of quietly creating a mapping nobody chose.
+_KEYWORDS = ("chunk_id", "document_id", "source_id", "realm", "environment", "namespace", "repository", "service", "applies_to", "owner", "team",
+             "lifecycle", "classification", "trust", "kind", "git_revision", "content_hash", "text_hash", "embedding_model")
+_DATES = ("document_updated_at", "checked_at", "indexed_at")
+_INTEGERS = ("ord", "start_line", "end_line", "start_offset", "end_offset", "embedding_dimensions")
+SEARCH_FIELDS = ["heading^2", "text", "path^1.5", "heading.exact^3", "text.exact^3", "path.exact^3"]
+# Splits on spaces and punctuation that surrounds a name, never inside one: moks-api, MOKS_RAG_BACKEND,
+# deploy/helm/values.yaml and CrashLoopBackOff stay whole, and match in any case.
+_ANALYSIS = {
+    "tokenizer": {"moks_identifier": {"type": "pattern", "pattern": "[\\s,;()\\[\\]{}\"'`<>=|]+"}},
+    "normalizer": {"moks_lowercase": {"type": "custom", "filter": ["lowercase"]}},
+    "analyzer": {"moks_identifier": {"type": "custom", "tokenizer": "moks_identifier", "filter": ["lowercase"]}},
+}
+_EXACT = {"exact": {"type": "text", "analyzer": "moks_identifier", "norms": False}}
+
+
+def index_body(dims: int | None, model_key: str = "") -> dict:
+    """The index definition for one generation. One shard and no replica: a single node cannot place a
+    replica, so one would only hold the cluster yellow. It is redundancy this deployment does not have."""
+    props: dict[str, Any] = {name: {"type": "keyword"} for name in _KEYWORDS}
+    props |= {name: {"type": "date"} for name in _DATES} | {name: {"type": "integer"} for name in _INTEGERS}
+    props |= {"content_revision": {"type": "long"}, "has_vector": {"type": "boolean"},
+              "identifiers": {"type": "keyword", "normalizer": "moks_lowercase", "ignore_above": 200},
+              "path": {"type": "text", "analyzer": "english", "fields": {"raw": {"type": "keyword"}, **_EXACT}},
+              "heading": {"type": "text", "analyzer": "english", "fields": _EXACT},
+              "text": {"type": "text", "analyzer": "english", "fields": _EXACT}}
+    settings: dict[str, Any] = {"index": {"number_of_shards": 1, "number_of_replicas": 0, "refresh_interval": "1s"}, "analysis": _ANALYSIS}
+    if dims:
+        props["embedding"] = {"type": "knn_vector", "dimension": dims, "method": {"name": "hnsw", "engine": "lucene", "space_type": "cosinesimil"}}
+        settings["index"]["knn"] = True
+    return {"settings": settings, "mappings": {"dynamic": "strict", "_meta": {"mapping_version": MAPPING_VERSION, "model_key": model_key, "dimensions": dims}, "properties": props}}
+
+
+@dataclass
+class BulkResult:
+    """What the server said about each item. HTTP 200 only means the request was read."""
+    written: int = 0
+    vectors: int = 0
+    superseded: int = 0  # a newer revision was already there: correct, not a failure
+    failed: list[str] = field(default_factory=list)
+    first_error: str | None = None
 
 
 @dataclass
@@ -158,107 +206,259 @@ class SigV4(httpx.Auth):
 
 class OpenSearchBackend:
     name = "opensearch"
+    keeps_old_chunks = True  # a rewrite replaces chunks without a moment where the document has none
 
     def __init__(self, url: str, username: str = "", password: str = "", verify: bool = True,
-                 transport: httpx.AsyncBaseTransport | None = None, aws_region: str = ""):
+                 transport: httpx.AsyncBaseTransport | None = None, aws_region: str = "", ca_file: str = "",
+                 index_auth: tuple[str, str] | None = None, lifecycle_auth: tuple[str, str] | None = None, search_timeout: float = 3.0):
         if not url:
             raise ConnectorError("config", "MOKS_OPENSEARCH_URL is required for the opensearch backend")
         if aws_region and username:
             raise ConnectorError("config", "set MOKS_OPENSEARCH_AWS_REGION or MOKS_OPENSEARCH_USERNAME, not both")
         if aws_region and not url.startswith("https://"):
             raise ConnectorError("config", "an Amazon OpenSearch Service endpoint must use https")
+        if username and url.startswith("http://") and not url.startswith("http://localhost"):
+            raise ConnectorError("config", "OpenSearch credentials must not travel over plain http; use an https URL")
+        if ca_file and not verify:
+            raise ConnectorError("config", "MOKS_OPENSEARCH_CA_FILE is set but certificate verification is off")
+        tls: Any = verify
+        if ca_file:
+            try:
+                tls = ssl.create_default_context(cafile=ca_file)
+            except (OSError, ssl.SSLError) as exc:
+                raise ConnectorError("config", f"cannot read the OpenSearch CA file ({type(exc).__name__})") from None
+        base = url.rstrip("/")
         auth: Any = SigV4(aws_region) if aws_region else (username, password) if username else None
-        self.client = httpx.AsyncClient(base_url=url.rstrip("/"), auth=auth, verify=verify, timeout=20, transport=transport)
+
+        def client(who: Any, timeout: float) -> httpx.AsyncClient:
+            return httpx.AsyncClient(base_url=base, auth=who, verify=tls, timeout=timeout, transport=transport)
+
+        self.client = client(auth, 20)
+        self.search_client = client(auth, search_timeout)
+        self.index_client = client(index_auth, 60) if index_auth else self.client
+        self.lifecycle_client = client(lifecycle_auth, 60) if lifecycle_auth else self.client
+        self._quiet_until = 0.0
 
     async def aclose(self) -> None:
-        await self.client.aclose()
+        for c in {self.client, self.search_client, self.index_client, self.lifecycle_client}:
+            await c.aclose()
 
-    async def _req(self, method: str, path: str, body: Any = None, ok404: bool = False, ndjson: str | None = None) -> dict:
+    async def _req(self, method: str, path: str, body: Any = None, ok404: bool = False, ndjson: str | None = None, via: httpx.AsyncClient | None = None) -> dict:
+        client = via or self.client
         try:
             if ndjson is not None:
-                r = await self.client.request(method, path, content=ndjson, headers={"Content-Type": "application/x-ndjson"})
+                r = await client.request(method, path, content=ndjson, headers={"Content-Type": "application/x-ndjson"})
             else:
-                r = await self.client.request(method, path, json=body)
+                r = await client.request(method, path, json=body)
         except httpx.HTTPError as exc:
             raise ConnectorError("unavailable", f"cannot reach OpenSearch ({type(exc).__name__})", retryable=True) from None
         if r.status_code == 404 and ok404:
             return {}
+        if r.status_code in (401, 403):
+            raise ConnectorError("auth", f"OpenSearch refused {method} {path}: {r.status_code}")
+        if r.status_code == 429:
+            raise ConnectorError("unavailable", f"OpenSearch is rejecting requests: {method} {path}", retryable=True)
         if r.status_code >= 400:
-            raise ConnectorError("unavailable" if r.status_code >= 500 else "bad_request", f"OpenSearch {method} {path}: {r.status_code} {r.text[:300]}")
+            raise ConnectorError("unavailable" if r.status_code >= 500 else "bad_request", f"OpenSearch {method} {path}: {r.status_code} {r.text[:300]}", retryable=r.status_code >= 500)
         return r.json() if r.content else {}
 
+    async def _search(self, kind: str, index_name: str, body: dict) -> list[str]:
+        """A search that cannot wait: a user is behind it, and PostgreSQL can answer in its place. A missing
+        index is a fault here, never an empty result. After a failure, this process stops asking for a moment."""
+        if time.monotonic() < self._quiet_until:
+            OPENSEARCH_SEARCH_FAILURES.labels(kind, "cooldown").inc()
+            raise ConnectorError("unavailable", "OpenSearch failed moments ago", retryable=True)
+        start = time.monotonic()
+        try:
+            resp = await self._req("POST", f"/{index_name}/_search", body, via=self.search_client)
+        except ConnectorError as exc:
+            OPENSEARCH_SEARCH_FAILURES.labels(kind, exc.kind).inc()
+            self._quiet_until = time.monotonic() + SEARCH_COOLDOWN_SECONDS
+            raise
+        OPENSEARCH_SEARCH_SECONDS.labels(kind).observe(time.monotonic() - start)
+        if (resp.get("_shards") or {}).get("failed"):
+            OPENSEARCH_SEARCH_FAILURES.labels(kind, "shard").inc()
+            raise ConnectorError("unavailable", "OpenSearch answered from only part of the index", retryable=True)
+        return [h["_source"]["chunk_id"] for h in (resp.get("hits") or {}).get("hits", [])]
+
     async def health(self) -> dict:
-        return await self._req("GET", "/_cluster/health")
+        return await self._req("GET", "/_cluster/health", via=self.lifecycle_client)
+
+    async def mapping(self, name: str) -> dict | None:
+        resp = await self._req("GET", f"/{name}/_mapping", ok404=True, via=self.lifecycle_client)
+        return (resp.get(name) or {}).get("mappings") if resp else None
 
     async def vector_dimensions(self, name: str) -> int | None:
         """Dimension of an existing index's vector field; None when it is keyword-only or absent."""
-        resp = await self._req("GET", f"/{name}/_mapping", ok404=True)
-        props = ((resp.get(name) or {}).get("mappings") or {}).get("properties") or {}
+        props = ((await self.mapping(name)) or {}).get("properties") or {}
         return (props.get("embedding") or {}).get("dimension")
 
-    async def ensure_index(self, name: str, dims: int | None) -> None:
-        if (await self.client.head(f"/{name}")).status_code == 200:
-            found = await self.vector_dimensions(name)
-            if found != dims:
-                raise ConnectorError("config", f"OpenSearch index {name} has vector dimension {found}, expected {dims}; run a reindex")
+    async def ensure_index(self, name: str, dims: int | None, model_key: str = "") -> None:
+        found = await self.mapping(name)
+        if found is not None:
+            have = ((found.get("properties") or {}).get("embedding") or {}).get("dimension")
+            if have != dims:
+                raise ConnectorError("config", f"OpenSearch index {name} has vector dimension {have}, expected {dims}; run a reindex")
             return
-        props: dict[str, Any] = {
-            "chunk_id": {"type": "keyword"}, "document_id": {"type": "keyword"}, "environment": {"type": "keyword"},
-            "namespace": {"type": "keyword"}, "repository": {"type": "keyword"}, "service": {"type": "keyword"},
-            "path": {"type": "text", "fields": {"raw": {"type": "keyword"}}}, "heading": {"type": "text"}, "text": {"type": "text"},
-        }
-        settings: dict[str, Any] = {"index": {"number_of_shards": 1, "number_of_replicas": 0}}
-        if dims:
-            props["embedding"] = {"type": "knn_vector", "dimension": dims,
-                                  "method": {"name": "hnsw", "engine": "lucene", "space_type": "cosinesimil"}}
-            settings["index"]["knn"] = True
-        await self._req("PUT", f"/{name}", {"settings": settings, "mappings": {"properties": props}})
+        await self._req("PUT", f"/{name}", index_body(dims, model_key), via=self.lifecycle_client)
 
-    async def index_chunks(self, index_name: str, rows: list[dict], embeddings: list[list[float]] | None) -> None:
-        lines = []
+    async def preflight(self, needed_bytes: int) -> dict:
+        """Before a build starts rather than halfway through it. Reads what the node says; hostPath volumes
+        have no quota, so free space here is the disk every workload shares."""
+        state = await self.status()
+        if not state["reachable"]:
+            raise ConnectorError("unavailable", f"OpenSearch is not answering: {state.get('error')}", retryable=True)
+        if state["health"] == "red":
+            raise ConnectorError("config", "OpenSearch cluster health is red; fix it before building an index")
+        if state["read_only"]:
+            raise ConnectorError("config", "OpenSearch has a write block, usually the flood-stage disk watermark; free disk first")
+        if state["disk_free_bytes"] is not None and state["disk_free_bytes"] - state.get("flood_stage_bytes", 0) < needed_bytes:
+            raise ConnectorError("config", f"a new index needs about {needed_bytes} bytes and only {state['disk_free_bytes']} are free on the disk OpenSearch shares")
+        return state
+
+    async def status(self) -> dict:
+        """Cluster state for the admin page and metrics, in one shape whatever fails."""
+        out: dict[str, Any] = {"reachable": False, "health": None, "read_only": False, "unassigned_shards": None, "heap_used_percent": None, "disk_free_bytes": None,
+                               "disk_total_bytes": None, "search_rejected": None, "write_rejected": None, "gc_seconds": None, "version": None, "error": None}
+        try:
+            health = await self.health()
+            out |= {"reachable": True, "health": health.get("status"), "unassigned_shards": health.get("unassigned_shards")}
+            out["version"] = ((await self._req("GET", "/", via=self.lifecycle_client)).get("version") or {}).get("number")
+            stats = await self._req("GET", "/_nodes/stats/jvm,fs,thread_pool", via=self.lifecycle_client)
+            node = next(iter((stats.get("nodes") or {}).values()), {})
+            mem, disk, pools = (node.get("jvm") or {}).get("mem") or {}, (node.get("fs") or {}).get("total") or {}, node.get("thread_pool") or {}
+            collectors = ((node.get("jvm") or {}).get("gc") or {}).get("collectors") or {}
+            out |= {"heap_used_percent": mem.get("heap_used_percent"), "disk_free_bytes": disk.get("available_in_bytes"), "disk_total_bytes": disk.get("total_in_bytes"),
+                    "search_rejected": (pools.get("search") or {}).get("rejected"), "write_rejected": (pools.get("write") or {}).get("rejected"),
+                    "gc_seconds": sum(c.get("collection_time_in_millis", 0) for c in collectors.values()) / 1000}
+            blocks = await self._req("GET", "/_cluster/state/blocks", via=self.lifecycle_client)
+            out["read_only"] = bool((blocks.get("blocks") or {}).get("indices") or (blocks.get("blocks") or {}).get("global"))
+        except ConnectorError as exc:
+            out["error"] = exc.message[:300]
+        return out
+
+    async def index_chunks(self, index_name: str, rows: list[dict], embeddings: list[list[float]] | None) -> BulkResult:
+        """A row carrying content_revision is fenced by it: an older write can never replace a newer one,
+        and replaying the same one is harmless. Every item is read back, because a bulk request that
+        answers 200 can still have refused any of its items."""
+        lines, result = [], BulkResult()
         for i, r in enumerate(rows):
-            doc = {k: r[k] for k in ("chunk_id", "document_id", "environment", "namespace", "repository", "service", "path", "heading", "text")}
+            doc = dict(r)
+            action: dict[str, Any] = {"_index": index_name, "_id": r["chunk_id"]}
+            if "content_revision" in r:
+                action |= {"version": r["content_revision"], "version_type": "external_gte"}
             if embeddings:
                 doc["embedding"] = embeddings[i]
-            lines.append(json.dumps({"index": {"_index": index_name, "_id": r["chunk_id"]}}))
+            lines.append(json.dumps({"index": action}))
             lines.append(json.dumps(doc))
-        if lines:
-            resp = await self._req("POST", "/_bulk?refresh=wait_for", ndjson="\n".join(lines) + "\n")
-            if resp.get("errors"):
-                first = next((it for it in resp.get("items", []) if (it.get("index") or {}).get("error")), {})
-                raise ConnectorError("bad_request", f"OpenSearch bulk indexing failed: {json.dumps(first)[:300]}")
+        if not lines:
+            return result
+        resp = await self._req("POST", "/_bulk?refresh=wait_for", ndjson="\n".join(lines) + "\n", via=self.index_client)
+        items = [next(iter(it.values())) for it in resp.get("items") or []]
+        if len(items) != len(rows) and (resp.get("errors") or items):
+            raise ConnectorError("bad_request", f"OpenSearch answered {len(items)} items for a bulk of {len(rows)}")
+        for row, item in zip(rows, items):
+            error = item.get("error")
+            if error and item.get("status") == 409:
+                result.superseded += 1
+            elif error:
+                result.failed.append(row["chunk_id"])
+                result.first_error = result.first_error or json.dumps(error)[:300]
+            else:
+                result.written += 1
+        if resp.get("errors") and not items:
+            raise ConnectorError("bad_request", "OpenSearch reported bulk errors without saying which items failed")
+        if not items:
+            result.written = len(rows)
+        result.vectors = result.written if embeddings else 0
+        OPENSEARCH_BULK_ITEMS.labels("written").inc(result.written)
+        OPENSEARCH_BULK_ITEMS.labels("superseded").inc(result.superseded)
+        OPENSEARCH_BULK_ITEMS.labels("failed").inc(len(result.failed))
+        if result.failed:
+            raise ConnectorError("partial", f"OpenSearch refused {len(result.failed)} of {len(rows)} bulk items: {result.first_error}", retryable=True)
+        return result
 
-    async def delete_document(self, index_name: str, document_id: uuid.UUID) -> None:
-        await self._req("POST", f"/{index_name}/_delete_by_query?refresh=true",
-                        {"query": {"term": {"document_id": str(document_id)}}}, ok404=True)
+    async def delete_document(self, index_name: str, document_id: uuid.UUID, keep: list[str] | None = None) -> None:
+        """Removes the document's chunks, or with `keep`, every chunk except those. Rewriting a document
+        writes first and prunes after, so a failure in between leaves old text, never no text."""
+        query: dict[str, Any] = {"bool": {"filter": [{"term": {"document_id": str(document_id)}}]}}
+        if keep:
+            query["bool"]["must_not"] = [{"terms": {"chunk_id": keep}}]
+        resp = await self._req("POST", f"/{index_name}/_delete_by_query?refresh=true&conflicts=proceed", {"query": query}, ok404=True, via=self.index_client)
+        if resp.get("failures") or resp.get("version_conflicts"):
+            raise ConnectorError("partial", f"OpenSearch left chunks of {document_id} undeleted ({resp.get('version_conflicts', 0)} conflicts)", retryable=True)
 
     async def update_scope(self, index_name: str, document_id: uuid.UUID, environment: str, namespace: str) -> None:
         await self._req("POST", f"/{index_name}/_update_by_query?refresh=true&conflicts=proceed", {
             "query": {"term": {"document_id": str(document_id)}},
             "script": {"lang": "painless", "source": "ctx._source.environment = params.e; ctx._source.namespace = params.n",
-                       "params": {"e": environment, "n": namespace}}}, ok404=True)
+                       "params": {"e": environment, "n": namespace}}}, ok404=True, via=self.index_client)
 
     async def count_document(self, index_name: str, document_id: uuid.UUID) -> int | None:
-        resp = await self._req("POST", f"/{index_name}/_count", {"query": {"term": {"document_id": str(document_id)}}}, ok404=True)
+        resp = await self._req("POST", f"/{index_name}/_count", {"query": {"term": {"document_id": str(document_id)}}}, ok404=True, via=self.index_client)
         return resp.get("count") if resp else 0
 
-    async def keyword(self, index_name: str, query: str, found: list[access.Grant], k: int) -> tuple[list[str], bool]:
-        flt, exact = access.opensearch(found)
-        body = {"size": k, "_source": ["chunk_id"], "query": {"bool": {
-            "must": [{"multi_match": {"query": query, "fields": ["heading^2", "text", "path^1.5"]}}], "filter": [flt] if flt else []}}}
-        resp = await self._req("POST", f"/{index_name}/_search", body, ok404=True)
-        return [h["_source"]["chunk_id"] for h in (resp.get("hits") or {}).get("hits", [])], exact
+    async def count(self, index_name: str, query: dict | None = None) -> int | None:
+        """Chunks in an index, None when it does not exist."""
+        resp = await self._req("POST", f"/{index_name}/_count", {"query": query} if query else None, ok404=True, via=self.lifecycle_client)
+        return resp.get("count") if resp else None
 
-    async def vector(self, index_name: str, embedding: list[float], found: list[access.Grant], k: int) -> tuple[list[str], bool]:
+    @staticmethod
+    def _filter(found: list[access.Grant], exclude: dict | None) -> tuple[dict | None, bool]:
+        """Grants, plus what PostgreSQL says is not searchable right now. Those ids are read per search,
+        so a quarantine takes effect at commit, whatever the index last recorded for the document."""
         flt, exact = access.opensearch(found)
+        terms = [{"terms": {field: ids}} for field, ids in (("source_id", (exclude or {}).get("sources")), ("document_id", (exclude or {}).get("documents"))) if ids]
+        if not terms:
+            return flt, exact
+        return {"bool": {"filter": [flt] if flt else [], "must_not": terms}}, exact
+
+    async def keyword(self, index_name: str, query: str, found: list[access.Grant], k: int, exclude: dict | None = None, tokens: list[str] | None = None) -> tuple[list[str], bool]:
+        flt, exact = self._filter(found, exclude)
+        should: list[dict] = [{"multi_match": {"query": query, "fields": SEARCH_FIELDS}}]
+        if tokens:
+            should.append({"terms": {"identifiers": [t.lower() for t in tokens], "boost": 4.0}})  # lower() matches the normalizer: terms skips it on some versions
+        body = {"size": k, "_source": ["chunk_id"], "track_total_hits": False, "timeout": "2500ms",
+                "query": {"bool": {"should": should, "minimum_should_match": 1, "filter": [flt] if flt else []}}}
+        return await self._search("keyword", index_name, body), exact
+
+    async def vector(self, index_name: str, embedding: list[float], found: list[access.Grant], k: int, exclude: dict | None = None) -> tuple[list[str], bool]:
+        flt, exact = self._filter(found, exclude)
         knn: dict[str, Any] = {"vector": embedding, "k": k}
         if flt:
             knn["filter"] = flt  # applied during the search, so unreadable neighbours do not use up k
-        resp = await self._req("POST", f"/{index_name}/_search", {"size": k, "_source": ["chunk_id"], "query": {"knn": {"embedding": knn}}}, ok404=True)
-        return [h["_source"]["chunk_id"] for h in (resp.get("hits") or {}).get("hits", [])], exact
+        return await self._search("vector", index_name, {"size": k, "_source": ["chunk_id"], "track_total_hits": False, "query": {"knn": {"embedding": knn}}}), exact
 
     async def drop_index(self, index_name: str) -> None:
-        await self._req("DELETE", f"/{index_name}", ok404=True)
+        if not index_name.startswith(INDEX_PREFIX):  # the lifecycle identity cannot either; this says why
+            raise ConnectorError("config", f"refusing to delete {index_name}: not a MOKS knowledge index")
+        await self._req("DELETE", f"/{index_name}", ok404=True, via=self.lifecycle_client)
+
+    async def configure_snapshots(self, repository: str, policy: str, bucket: str, base_path: str, schedule: str, keep: int, retain: str) -> dict:
+        """Registers the repository, which makes the node prove it can write there, and the schedule."""
+        await self._req("PUT", f"/_snapshot/{repository}", {"type": "s3", "settings": {"bucket": bucket, "base_path": base_path}}, via=self.lifecycle_client)
+        return await self.put_snapshot_policy(repository, policy, schedule, keep, retain)
+
+    async def put_snapshot_policy(self, repository: str, policy: str, schedule: str, keep: int, retain: str) -> dict:
+        body = {"description": "MOKS knowledge indexes", "enabled": True,
+                "snapshot_config": {"repository": repository, "indices": f"{INDEX_PREFIX}*", "include_global_state": False, "ignore_unavailable": True, "partial": False},
+                "creation": {"schedule": {"cron": {"expression": schedule, "timezone": "UTC"}}, "time_limit": "1h"},
+                "deletion": {"schedule": {"cron": {"expression": schedule, "timezone": "UTC"}}, "condition": {"max_age": retain, "max_count": keep, "min_count": 1}, "time_limit": "1h"}}
+        path = f"/_plugins/_sm/policies/{policy}"
+        current = await self._req("GET", path, ok404=True, via=self.lifecycle_client)
+        if current.get("_seq_no") is not None:
+            path += f"?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}"
+            return await self._req("PUT", path, body, via=self.lifecycle_client)
+        return await self._req("POST", path, body, via=self.lifecycle_client)
+
+    async def snapshots(self, repository: str) -> dict:
+        """Newest snapshot and newest good one. A repository nobody can read is a fact to show, not to hide."""
+        resp = await self._req("GET", f"/_snapshot/{repository}/_all", ok404=True, via=self.lifecycle_client)
+        rows = sorted(resp.get("snapshots") or [], key=lambda s: s.get("start_time_in_millis") or 0)
+        good = [s for s in rows if s.get("state") == "SUCCESS"]
+        return {"repository": repository, "count": len(rows), "registered": bool(resp), "latest_state": rows[-1].get("state") if rows else None,
+                "latest_at": rows[-1].get("end_time") if rows else None, "last_success_at": good[-1].get("end_time") if good else None,
+                "last_success_ms": good[-1].get("end_time_in_millis") if good else None}
 
 
 class PineconeBackend:

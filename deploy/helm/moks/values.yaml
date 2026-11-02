@@ -148,6 +148,12 @@ rag:
     nodeName: ""
     fixVolumePermissions: false   # true for storage that ignores fsGroup (minikube hostPath)
     diskWatermarks: {}     # {low: 3gb, high: 2gb, floodStage: 1gb} replaces the percentages. All three or none.
+    # Publish the bundled pod's read endpoints on ingress.host behind a basic-auth login. The pod has no
+    # security of its own, and this bypasses MOKS document access: the login reads every indexed chunk.
+    publicRoute:
+      enabled: false
+      path: /opensearch
+      authSecret: moks-opensearch-auth   # created out of band, see docs/OPERATOR_GUIDE.md
 
 # Phase 3 executor: the only component with write access. It acts only in these namespaces
 # (one RoleBinding each, verbs limited to the allowlisted actions), plus diagnostics.namespace.

@@ -91,6 +91,7 @@ rag:
     # All mk4 nodes share one disk, already past the default 90% limit on a 150 GiB volume. Bytes free
     # say what is really left. Below 1gb OpenSearch stops writes, which protects the other databases.
     diskWatermarks: {low: 3gb, high: 2gb, floodStage: 1gb}
+    publicRoute: {enabled: true}   # https://jithendar.com/opensearch, needs Secret moks-opensearch-auth
 
 executor:
   enabled: true

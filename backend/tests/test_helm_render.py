@@ -329,6 +329,24 @@ def test_the_mesh_allows_only_the_callers():
     assert rule["to"][0]["operation"]["ports"] == ["8090"] and all(p.startswith("cluster.local/ns/moks/sa/") for p in rule["from"][0]["source"]["principals"])
 
 
+def test_opensearch_public_route_is_read_only_behind_a_login():
+    docs = render("values-minikube.yaml")
+    route = of(docs, "IngressRoute", "opensearch")["spec"]
+    match = route["routes"][0]["match"]
+    assert route["entryPoints"] == ["websecure"] and "tls" in route
+    assert [m["name"] for m in route["routes"][0]["middlewares"]] == ["opensearch-auth", "opensearch-strip-prefix"]
+    assert "PUT" not in match and "DELETE" not in match and "(search|msearch|count)$" in match
+    assert of(docs, "Middleware", "opensearch-auth")["spec"]["basicAuth"] == {"secret": "moks-opensearch-auth", "removeHeader": True}
+    rules = of(docs, "NetworkPolicy", "moks-opensearch")["spec"]["ingress"]
+    assert {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "traefik"}}} in rules[1]["from"]
+
+
+@pytest.mark.parametrize("sets", [("rag.opensearch.publicRoute.enabled=false",), ("rag.opensearch.url=https://d.example", "rag.opensearch.awsRegion=us-east-1")])
+def test_opensearch_stays_private_unless_the_bundled_pod_is_published(sets):
+    docs = render("values-minikube.yaml", *sets)
+    assert not any(d["kind"] == "IngressRoute" or d["metadata"]["name"].startswith("opensearch-") for d in docs)
+
+
 def test_mk4_runs_opensearch_on_the_node_with_its_data():
     docs = render("values-minikube.yaml")
     spec = of(docs, "StatefulSet", "moks-opensearch")["spec"]["template"]["spec"]

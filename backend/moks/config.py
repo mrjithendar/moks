@@ -93,6 +93,23 @@ class Settings(BaseSettings):
     opensearch_username: str = ""
     opensearch_password: str = Field(default="", repr=False)
     opensearch_verify_tls: bool = True
+    opensearch_ca_file: str = ""       # PEM bundle for a private CA (the bundled moks-search cluster)
+    # Separate identities, least privilege first. opensearch_username searches; these two exist only in
+    # the worker and the migration Job, so an API pod holds nothing that can write. Unset: the search one.
+    opensearch_index_username: str = ""
+    opensearch_index_password: str = Field(default="", repr=False)
+    opensearch_lifecycle_username: str = ""
+    opensearch_lifecycle_password: str = Field(default="", repr=False)
+    # Names the cluster an index generation lives in. Empty is the original cluster. Generations are kept per
+    # cluster, so a second cluster can be filled, checked and reverted to without touching the first.
+    opensearch_cluster: str = ""
+    # true in the migration Job: this process fills a cluster that search does not use yet.
+    opensearch_standby: bool = False
+    opensearch_compare_url: str = ""   # the cluster `moks opensearch compare` reads as the old side
+    opensearch_search_timeout_seconds: float = 3.0
+    opensearch_snapshot_repository: str = ""
+    opensearch_snapshot_policy: str = "moks-knowledge"
+    rag_retired_retention_hours: int = 168  # a replaced generation stays this long, so it can be activated again
     # Amazon OpenSearch Service: sign requests with the AWS identity (SigV4) instead of a password.
     opensearch_aws_region: str = ""
     # Database backups: namespaces the executor may dump from (it needs pods/exec there).

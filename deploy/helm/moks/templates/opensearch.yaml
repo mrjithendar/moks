@@ -88,6 +88,13 @@ spec:
   ingress:
     - from: [{podSelector: {matchLabels: {app: moks}}}]
       ports: [{port: 9200, protocol: TCP}]
+    {{- if .Values.rag.opensearch.publicRoute.enabled }}
+    - from:
+        {{- range .Values.networkPolicy.ingressNamespaces }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ . }}}}
+        {{- end }}
+      ports: [{port: 9200, protocol: TCP}]
+    {{- end }}
   egress: []
 {{- end }}
 {{- else if not (has .Values.rag.backend (list "postgres" "pgvector" "pinecone")) }}

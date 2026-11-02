@@ -120,7 +120,7 @@ def opensearch(found: list[Grant]) -> tuple[dict | None, bool]:
         nonlocal exact
         if value == "*":
             return None
-        if "[" in value:
+        if "[" in value or "\\" in value:  # a wildcard query reads a backslash as an escape; fnmatch does not
             exact = False
             return None
         if any(c in value for c in GLOB):

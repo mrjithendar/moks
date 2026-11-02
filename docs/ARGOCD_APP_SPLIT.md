@@ -17,7 +17,7 @@ The roots run in `argocd` on mk4 and only write Application objects. Sync everyt
 | worker | `moks-worker` | `roboshop-demo-moks-worker` | Worker Deployments, including `worker.pools` |
 | executor | `moks-executor` | `roboshop-demo-moks-executor` | Executor, its identity and action RBAC, database-backup Roles, Velero write Role, diagnostics namespace and controls |
 | terminal | `moks-terminal` | none, the terminal stays off on EKS | Gateway, session identities, terminal namespace, quota and NetworkPolicy |
-| routing | `moks-routing` | `roboshop-demo-moks-routing` | mk4: Traefik Ingresses and Middleware. EKS: VirtualService, PeerAuthentication, AuthorizationPolicies |
+| routing | `moks-routing` | `roboshop-demo-moks-routing` | mk4: Traefik Ingresses, IngressRoute and Middleware. EKS: VirtualService, PeerAuthentication, AuthorizationPolicies |
 
 Three more wait in `deploy/argocd/<environment>/optional/`, because each would be empty today. The root reads `apps/` only.
 

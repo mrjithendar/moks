@@ -61,5 +61,51 @@ spec:
             pathType: Prefix
             backend: {service: {name: moks-api, port: {name: http}}}
 {{- end }}
+{{- with .Values.rag.opensearch.publicRoute }}
+{{- if and .enabled (eq $.Values.rag.backend "opensearch") (not $.Values.rag.opensearch.url) }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: opensearch-auth
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  basicAuth:
+    secret: {{ .authSecret }}
+    removeHeader: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: opensearch-strip-prefix
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  stripPrefix: {prefixes: [{{ .path }}]}
+---
+# OpenSearch has no authentication here and POST and PUT also change data, so only reads are routed:
+# GET and HEAD, plus POST to the search endpoints, which take their query in the body. Anything else
+# under this path falls through to the site's "/" rule. A missing Secret leaves this router out too.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: opensearch
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  entryPoints: [websecure]
+  routes:
+    - kind: Rule
+      match: >-
+        Host(`{{ $.Values.ingress.host }}`) && (Path(`{{ .path }}`) || PathPrefix(`{{ .path }}/`))
+        && (Method(`GET`) || Method(`HEAD`)
+        || (Method(`POST`) && PathRegexp(`^{{ .path }}(/[^/]+)?/_(search|msearch|count)$`)))
+      middlewares:
+        - name: opensearch-auth
+        - name: opensearch-strip-prefix
+      services:
+        - name: moks-opensearch
+          port: http
+  tls: {}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}

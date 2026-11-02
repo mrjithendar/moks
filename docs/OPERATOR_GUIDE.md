@@ -255,6 +255,28 @@ The API's init container runs migration `0002` automatically. Take a backup firs
 
 See [TERMINAL.md](TERMINAL.md). It is off until `terminal.enabled` is set, and needs a Terraform apply, a Secret, a database role and an image digest first.
 
+## OpenSearch at /opensearch
+
+On mk4 Traefik publishes the bundled pod at `https://jithendar.com/opensearch` for reads only: GET and HEAD,
+plus POST to `_search`, `_msearch` and `_count`. The pod has no security of its own, so everything rests on the
+login in `moks-opensearch-auth`. That login skips MOKS document access and reads every indexed chunk.
+
+Create the Secret, apply the AppProject, then sync. Until the Secret exists Traefik drops the route, so the
+path shows the site's 404.
+
+```sh
+PASS=$(openssl rand -hex 32)
+kubectl --context mk4 -n moks create secret generic moks-opensearch-auth \
+  --type=kubernetes.io/basic-auth --from-literal=username=moks --from-literal=password="$PASS"
+echo "$PASS"   # kept nowhere else
+kubectl --context mk4 apply -f deploy/argocd/minikube/project.yaml
+argocd app sync moks-opensearch && argocd app sync moks-routing   # never --prune
+curl -u "moks:$PASS" 'https://jithendar.com/opensearch/_cat/indices?v'
+```
+
+To rotate the password, delete and recreate the Secret. To remove the route, set
+`rag.opensearch.publicRoute.enabled: false` and delete the Middlewares and IngressRoute by hand, because syncs here never prune.
+
 ## Using Amazon OpenSearch Service
 
 This keeps BM25 and k-NN search in a managed domain instead of a pod. Requests are signed with the AWS
