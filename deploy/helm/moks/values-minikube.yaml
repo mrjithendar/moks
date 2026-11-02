@@ -138,4 +138,8 @@ ecrRefresh:
 
 # Off until docs/RERANKING.md's gates pass on real questions. Set reranker.enabled and image.digest to run it.
 reranker:
-  enabled: false
+  enabled: true
+  image:
+    digest: latest
+  client:
+    enabled: true
