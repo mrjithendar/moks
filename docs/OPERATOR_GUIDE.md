@@ -277,6 +277,26 @@ curl -u "moks:$PASS" 'https://jithendar.com/opensearch/_cat/indices?v'
 To rotate the password, delete and recreate the Secret. To remove the route, set
 `rag.opensearch.publicRoute.enabled: false` and delete the Middlewares and IngressRoute by hand, because syncs here never prune.
 
+## OpenSearch Dashboards at /opensearch-dashboards
+
+The web UI for the bundled pod, at `https://jithendar.com/opensearch-dashboards`. It runs as the Deployment
+`moks-opensearch-dashboards` (about 1 GiB, in the `opensearch` group), with its route in `routing`. The login
+has its own Secret because it is more powerful than the API's: Dashboards reaches OpenSearch directly, so Dev Tools
+and index management can write and delete anything, and MOKS document access does not apply. PostgreSQL stays the
+source of truth, so `moks reindex` rebuilds the knowledge index. Saved dashboards live only in OpenSearch.
+
+```sh
+PASS=$(openssl rand -hex 32)
+kubectl --context mk4 -n moks create secret generic moks-opensearch-dashboards-auth \
+  --type=kubernetes.io/basic-auth --from-literal=username=moks --from-literal=password="$PASS"
+echo "$PASS"   # kept nowhere else
+argocd app sync moks-opensearch && argocd app sync moks-routing   # never --prune
+kubectl --context mk4 -n moks rollout status deploy/moks-opensearch-dashboards --timeout=300s
+```
+
+Sign in, open **Dashboards Management > Index patterns**, create `moks-chunks-*`, then use **Discover**. To remove
+it, set `rag.opensearch.dashboards.enabled: false` and delete the objects by hand, because syncs here never prune.
+
 ## Using Amazon OpenSearch Service
 
 This keeps BM25 and k-NN search in a managed domain instead of a pod. Requests are signed with the AWS

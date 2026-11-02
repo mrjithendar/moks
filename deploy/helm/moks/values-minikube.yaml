@@ -92,6 +92,15 @@ rag:
     # say what is really left. Below 1gb OpenSearch stops writes, which protects the other databases.
     diskWatermarks: {low: 3gb, high: 2gb, floodStage: 1gb}
     publicRoute: {enabled: true}   # https://jithendar.com/opensearch, needs Secret moks-opensearch-auth
+    dashboards: {enabled: true}    # https://jithendar.com/opensearch-dashboards, needs Secret moks-opensearch-dashboards-auth
+    # The secured cluster beside this one (docs/OPENSEARCH.md). Off until you run that document's steps.
+    secure:
+      enabled: false
+      active: false
+      nodeName: mk4-m02
+      fixVolumePermissions: true
+      allowMmap: true      # mk4 nodes report vm.max_map_count 1048576
+      diskWatermarks: {low: 3gb, high: 2gb, floodStage: 1gb}
 
 executor:
   enabled: true

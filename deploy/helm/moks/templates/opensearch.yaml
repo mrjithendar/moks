@@ -95,6 +95,10 @@ spec:
         {{- end }}
       ports: [{port: 9200, protocol: TCP}]
     {{- end }}
+    {{- if .Values.rag.opensearch.dashboards.enabled }}
+    - from: [{podSelector: {matchLabels: {app: moks-opensearch-dashboards}}}]
+      ports: [{port: 9200, protocol: TCP}]
+    {{- end }}
   egress: []
 {{- end }}
 {{- else if not (has .Values.rag.backend (list "postgres" "pgvector" "pinecone")) }}
