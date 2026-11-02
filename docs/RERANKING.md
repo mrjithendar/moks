@@ -35,11 +35,15 @@ Published figures are NDCG@10 74.30 on TREC DL 2019 and MRR@10 39.01 on MS MARCO
 
 ## Delivery
 
-`reranker/Dockerfile` installs pinned dependencies with CPU-only torch, downloads the model at the pinned revision, and verifies every file against `reranker/model.lock.json`, which holds SHA-256 for each. The service loads from local files with Hugging Face offline mode on, so a running pod needs no network, and its NetworkPolicy allows none. The chart requires an image digest.
+`reranker/Dockerfile` installs pinned dependencies with CPU-only torch, downloads the model at the pinned revision, and verifies every file against `reranker/model.lock.json`, which holds SHA-256 for each. The service loads from local files with Hugging Face offline mode on, so a running pod needs no network, and its NetworkPolicy allows none.
 
-**To change the model:** update `model.lock.json` with the new revision and hashes, rerun the evaluation, build, then set `reranker.image.digest` and `reranker.model.revision` together. If they differ, MOKS refuses the service's answers and keeps its existing order. That is also the rollback: put back the previous digest and revision.
+CI builds on every push to `master` and pushes the commit tag and `latest`. The chart runs `reranker.image.tag` (`latest`) with `imagePullPolicy: Always`, so a pod gets the newest build when it restarts. `reranker.image.digest` replaces the tag if set. As with the main image, `latest` means two pods can run different builds until both restart.
 
-The pinned requirements resolve for Python 3.12 on `linux/amd64` (298 MB of wheels) and `linux/arm64` (257 MB). **The image has never been built**, because this development machine has no container runtime, so its size and container startup are unmeasured. The CI job `reranker-image` builds it, and starts it with `--network none`, `--read-only` and a non-root user.
+**To change the model:** update `model.lock.json` with the new revision and hashes, rerun the evaluation, push, then set `reranker.model.revision` and restart the reranker, API and worker. Until the revisions agree, MOKS refuses the service's answers and keeps its existing order.
+
+**Rollback:** point `latest` at an earlier commit tag and restart, or set `reranker.image.digest`.
+
+The pinned requirements resolve for Python 3.12 on `linux/amd64` (298 MB of wheels) and `linux/arm64` (257 MB). The CI job `reranker-image` builds it and passed its smoke test, which starts it with `--network none`, `--read-only` and a non-root user.
 
 ## Measurements
 
@@ -116,9 +120,9 @@ A slot belongs to the computation. It is released when the work really ends, so 
 
 ## Enabling
 
-1. Apply Terraform for the `moks-reranker` ECR repository, and let CI build. Read the digest from the job summary.
+1. Apply Terraform for the `moks-reranker` ECR repository, and let CI build.
 2. Create the Secret from `deploy/secrets/moks-reranker-secrets.example.yaml`, and put the same token in `moks-secrets`.
-3. Set `reranker.enabled: true` and `reranker.image.digest`. Move `deploy/argocd/minikube/optional/moks-reranker.yaml` to `apps/`, sync `moks-root`, `moks-foundation`, `moks-reranker`, and restart the API and worker for the new configuration.
+3. Set `reranker.enabled: true`. Move `deploy/argocd/minikube/optional/moks-reranker.yaml` to `apps/`, sync `moks-root`, `moks-foundation`, `moks-reranker`, and restart the API and worker for the new configuration.
 4. Check the service under **Knowledge > Index health > Reranking**, and measure real CPU and memory.
 5. Run `moks eval rerank` in a worker pod, and build a dataset from real questions before trusting the result.
 6. Set `reranker.client.enabled: true` only if the gates pass. Watch `moks_rerank_calls_total` by outcome.

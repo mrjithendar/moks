@@ -1,4 +1,4 @@
-# Internal reranking service. Move this file to ../apps/ only when reranker.enabled is true.
+# Internal reranking service, part of the mk4 deployment since reranker.enabled is true.
 # Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
 apiVersion: argoproj.io/v1alpha1
 kind: Application

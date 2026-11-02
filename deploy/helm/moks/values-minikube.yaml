@@ -136,10 +136,10 @@ logCollector:
 ecrRefresh:
   enabled: true         # also add "moks" to TARGET_NAMESPACES of the ecr-refresh CronJob (tools repo)
 
-# Off until docs/RERANKING.md's gates pass on real questions. Set reranker.enabled and image.digest to run it.
+# docs/RERANKING.md. CI moves latest on every master build, and a pod gets it when it restarts.
 reranker:
   enabled: true
   image:
-    digest: latest
+    tag: latest
   client:
     enabled: true

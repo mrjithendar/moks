@@ -1,7 +1,8 @@
 {{- if include "moks.inGroup" (dict "root" . "group" "reranker") }}
 {{- with .Values.reranker }}
 {{- if .enabled }}
-{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (toString .image.digest)) -}}{{- fail "reranker.image.digest must be sha256:<64 hex characters>: this service runs a pinned image" -}}{{- end }}
+{{- if and .image.digest (not (regexMatch "^sha256:[0-9a-f]{64}$" (toString .image.digest))) -}}{{- fail "reranker.image.digest must be sha256:<64 hex characters>; use reranker.image.tag for a tag" -}}{{- end }}
+{{- if not (or .image.digest .image.tag) -}}{{- fail "reranker.image.tag or reranker.image.digest is required" -}}{{- end }}
 # Internal text reranking (docs/RERANKING.md). No Ingress, no VirtualService, no Kubernetes API access
 # and no outbound network: the model is in the image, and this pod only ever answers the API and worker.
 apiVersion: v1
@@ -53,8 +54,8 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: reranker
-          image: {{ .image.repository }}@{{ .image.digest }}
-          imagePullPolicy: IfNotPresent
+          image: {{ .image.repository }}{{ if .image.digest }}@{{ .image.digest }}{{ else }}:{{ .image.tag }}{{ end }}
+          imagePullPolicy: {{ if .image.digest }}IfNotPresent{{ else }}Always{{ end }}
           {{- include "moks.containerSecurity" $ | nindent 10 }}
           env:
             - {name: RERANKER_THREADS, value: {{ .threads | quote }}}

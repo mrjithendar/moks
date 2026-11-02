@@ -32,7 +32,7 @@ resource "aws_ecr_repository" "terminal" {
 
 resource "aws_ecr_repository" "reranker" {
   name                 = "${var.repository_name}-reranker"
-  image_tag_mutability = "IMMUTABLE" # the chart runs a digest, and a model lives in the image
+  image_tag_mutability = "MUTABLE" # latest has to move, like the moks repository; a rollback points it back at a commit tag
   force_delete         = false
 
   encryption_configuration {

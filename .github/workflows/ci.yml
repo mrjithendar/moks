@@ -170,7 +170,7 @@ jobs:
           pip install -r requirements-test.txt
           python -m pytest tests -q
 
-  # Sets nothing live: the chart runs a digest, and reranker.image.digest stays empty until an operator sets it.
+  # Moves latest. Nothing changes live until the moks-reranker Deployment restarts.
   reranker-image:
     if: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     needs: [reranker]
@@ -211,8 +211,9 @@ jobs:
           "
           docker rm -f smoke
           docker images smoke --format 'image size {{ .Size }}' >> "$GITHUB_STEP_SUMMARY"
-          docker buildx build --platform linux/arm64,linux/amd64 --provenance=false --build-arg GIT_COMMIT=${{ github.sha }} --metadata-file meta.json --push -t "$IMAGE" .
-          echo "pushed $IMAGE. Set reranker.image.digest to $(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")" >> "$GITHUB_STEP_SUMMARY"
+          LATEST="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
+          docker buildx build --platform linux/arm64,linux/amd64 --provenance=false --build-arg GIT_COMMIT=${{ github.sha }} --metadata-file meta.json --push -t "$IMAGE" -t "$LATEST" .
+          echo "pushed $IMAGE and $LATEST ($(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")). Restart moks-reranker to run it." >> "$GITHUB_STEP_SUMMARY"
 
   # Built and pushed on every push to the default branch. Sessions run a digest, so this changes nothing
   # until the chart's terminal.image.digest is moved to what this reports.

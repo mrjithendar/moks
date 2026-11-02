@@ -189,7 +189,8 @@ reranker:
   enabled: false
   image:
     repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-reranker
-    digest: ""              # required: this runs a pinned image, whose build pins the model
+    tag: latest             # CI moves it on every master build. Pods get it when they restart (docs/RELEASES.md).
+    digest: ""              # if set, replaces the tag
   model:                    # must equal what the service reports, or search keeps its existing order
     id: cross-encoder/ms-marco-MiniLM-L6-v2
     revision: 233902d25c440f23af6f7d6e94d2946bac0bee0a

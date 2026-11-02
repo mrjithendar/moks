@@ -165,7 +165,7 @@ def test_mk4_always_pulls_latest():
     for name, pod in pods(render("values-minikube.yaml")):
         for c in pod["containers"]:
             if c["image"].split("/")[-1].startswith("moks"):
-                assert c["image"].endswith("/moks:latest") and c["imagePullPolicy"] == "Always", name
+                assert c["image"].endswith(("/moks:latest", "/moks-reranker:latest")) and c["imagePullPolicy"] == "Always", name
 
 
 def test_the_chart_ships_the_consistent_dump():
@@ -280,15 +280,14 @@ def test_configured_egress_is_exactly_what_was_listed():
 RERANKER = ("reranker.enabled=true", "reranker.image.digest=sha256:" + "b" * 64)
 
 
-@pytest.mark.parametrize("values", ["values-minikube.yaml", "values-eks.yaml"])
-def test_reranking_is_absent_by_default(values):
-    docs = render(values, *([] if "minikube" in values else ["image.tag=ci"]))
+def test_reranking_is_absent_when_off():
+    docs = render("values-eks.yaml", "image.tag=ci")
     assert not [d for d in docs if "reranker" in d["metadata"]["name"]]
     assert not [k for d in docs if d["kind"] == "ConfigMap" for k in (d.get("data") or {}) if "RERANK" in k]
 
 
 def test_deploying_the_service_does_not_turn_it_on_for_search():
-    config = next(d for d in render("values-minikube.yaml", *RERANKER) if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "moks-config")["data"]
+    config = next(d for d in render("values-minikube.yaml", *RERANKER, "reranker.client.enabled=false") if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "moks-config")["data"]
     assert config["MOKS_RAG_RERANK_ENABLED"] == "false" and config["MOKS_RAG_RERANK_REVISION"] and config["MOKS_RAG_RERANK_URL"].startswith("http://moks-reranker.moks.svc")
 
 
@@ -300,7 +299,7 @@ def test_the_reranker_has_no_public_route_and_runs_restricted():
     c = pod["containers"][0]
     assert pod["automountServiceAccountToken"] is False and pod["securityContext"]["runAsNonRoot"] is True and pod["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
     assert c["securityContext"]["readOnlyRootFilesystem"] is True and c["securityContext"]["allowPrivilegeEscalation"] is False and c["securityContext"]["capabilities"]["drop"] == ["ALL"]
-    assert c["resources"]["limits"]["memory"] and "@sha256:" in c["image"]
+    assert c["resources"]["limits"]["memory"] and "@sha256:" in c["image"] and c["imagePullPolicy"] == "IfNotPresent"
     assert {e["name"] for e in c["env"]} >= {"RERANKER_TOKEN", "RERANKER_THREADS"} and "envFrom" not in c  # never the database credentials
 
 
@@ -313,9 +312,15 @@ def test_only_the_api_and_worker_reach_it_and_it_reaches_nothing():
     assert any(r.get("to") == [{"podSelector": {"matchLabels": {"app": "moks-reranker"}}}] for r in of(docs, "NetworkPolicy", "moks")["spec"]["egress"])
 
 
-def test_the_reranker_runs_a_pinned_image_or_not_at_all():
+def test_a_tag_is_pulled_on_every_start_so_a_restart_gets_it():
+    c = of(render("values-minikube.yaml", "reranker.enabled=true", "reranker.image.tag=latest"), "Deployment", "moks-reranker")["spec"]["template"]["spec"]["containers"][0]
+    assert c["image"].endswith("/moks-reranker:latest") and c["imagePullPolicy"] == "Always"
+
+
+@pytest.mark.parametrize("bad", [("reranker.image.digest=latest",), ("reranker.image.tag=",)])
+def test_an_unusable_image_reference_is_refused(bad):
     with pytest.raises(subprocess.CalledProcessError):
-        render("values-minikube.yaml", "reranker.enabled=true")
+        render("values-minikube.yaml", "reranker.enabled=true", *bad)
 
 
 def test_the_mesh_allows_only_the_callers():
