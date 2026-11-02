@@ -52,6 +52,11 @@ spec:
             # Reachable only from MOKS pods (NetworkPolicy below); plain HTTP inside the namespace.
             - {name: DISABLE_SECURITY_PLUGIN, value: "true"}
             - {name: DISABLE_INSTALL_DEMO_CONFIG, value: "true"}
+            {{- with .Values.rag.opensearch.diskWatermarks }}
+            - {name: cluster.routing.allocation.disk.watermark.low, value: {{ required "diskWatermarks.low" .low | quote }}}
+            - {name: cluster.routing.allocation.disk.watermark.high, value: {{ required "diskWatermarks.high" .high | quote }}}
+            - {name: cluster.routing.allocation.disk.watermark.flood_stage, value: {{ required "diskWatermarks.floodStage" .floodStage | quote }}}
+            {{- end }}
           ports: [{name: http, containerPort: 9200}]
           resources:
             requests: {cpu: 250m, memory: 2Gi}

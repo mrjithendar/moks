@@ -147,6 +147,7 @@ rag:
     storage: 20Gi
     nodeName: ""
     fixVolumePermissions: false   # true for storage that ignores fsGroup (minikube hostPath)
+    diskWatermarks: {}     # {low: 3gb, high: 2gb, floodStage: 1gb} replaces the percentages. All three or none.
 
 # Phase 3 executor: the only component with write access. It acts only in these namespaces
 # (one RoleBinding each, verbs limited to the allowlisted actions), plus diagnostics.namespace.

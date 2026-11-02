@@ -328,3 +328,18 @@ def test_the_mesh_allows_only_the_callers():
     rule = of(docs, "AuthorizationPolicy", "moks-reranker")["spec"]["rules"][0]
     assert rule["to"][0]["operation"]["ports"] == ["8090"] and all(p.startswith("cluster.local/ns/moks/sa/") for p in rule["from"][0]["source"]["principals"])
 
+
+def test_mk4_runs_opensearch_on_the_node_with_its_data():
+    docs = render("values-minikube.yaml")
+    spec = of(docs, "StatefulSet", "moks-opensearch")["spec"]["template"]["spec"]
+    assert spec["nodeSelector"] == {"kubernetes.io/hostname": "mk4-m02"} and spec["initContainers"][0]["name"] == "volume-permissions"
+    env = {e["name"]: e["value"] for e in spec["containers"][0]["env"]}
+    assert env["cluster.routing.allocation.disk.watermark.flood_stage"] == "1gb"
+    config = next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "moks-config")["data"]
+    assert config["MOKS_RAG_BACKEND"] == "opensearch" and config["MOKS_OPENSEARCH_URL"] == "http://moks-opensearch:9200"
+
+
+def test_watermarks_stay_out_of_the_chart_unless_asked_for():
+    env = of(render("values-minikube.yaml", "rag.opensearch.diskWatermarks=null"), "StatefulSet", "moks-opensearch")["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert not [e for e in env if "watermark" in e["name"]]
+
