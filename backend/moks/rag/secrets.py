@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 
 from ..connectors.git import SECRET_PATHS
-from ..redaction import redact
+from ..redaction import redact, redact_lines
 
 PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 K8S_SECRET = re.compile(r"(?m)^kind:\s*Secret\s*$")
@@ -16,7 +16,7 @@ BINARY = re.compile(r"[\x00-\x08\x0e-\x1f]")
 def exclusion_reason(path: str, text: str) -> str | None:
     if SECRET_PATHS.search(path):
         return "path matches secret-file patterns"
-    if BINARY.search(text[:4000]):
+    if BINARY.search(text[:4000]) or "\x00" in text:  # PostgreSQL cannot store a NUL, wherever it falls
         return "binary content"
     if PRIVATE_KEY.search(text):
         return "contains a private key"
@@ -29,4 +29,4 @@ def exclusion_reason(path: str, text: str) -> str | None:
 
 
 def clean(text: str) -> str:
-    return redact(text)
+    return redact_lines(text)

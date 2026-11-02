@@ -20,7 +20,10 @@ const Terminals = page(terminal, "Terminals"), TerminalView = page(terminal, "Te
 const Backups = page(backups, "Backups"), BackupStorage = page(backups, "BackupStorage");
 const Workspace = lazy(() => import("./pages/Conversations").then((m) => ({ default: m.Workspace })));
 const InvestigationView = page(investigate, "InvestigationView"), NewInvestigation = page(investigate, "NewInvestigation");
-const Evals = page(insights, "Evals"), FinOps = page(insights, "FinOps"), Knowledge = page(insights, "Knowledge"), Skills = page(insights, "Skills");
+const Evals = page(insights, "Evals"), FinOps = page(insights, "FinOps"), Knowledge = page(insights, "Knowledge");
+const knowledge = () => import("./pages/Knowledge");
+const KnowledgeExplorer = page(knowledge, "KnowledgeExplorer"), RetrievalWorkspace = page(knowledge, "RetrievalWorkspace"), KnowledgeReview = page(knowledge, "KnowledgeReview");
+const Skills = lazy(() => import("./pages/Skills").then((m) => ({ default: m.Skills })));
 const Explorer = page(live, "Explorer");
 const Logs = lazy(() => import("./pages/Logs").then((m) => ({ default: m.Logs })));
 const Detections = lazy(() => import("./pages/Detections").then((m) => ({ default: m.Detections })));
@@ -65,6 +68,9 @@ export default function App() {
         <Route path="/terminal" element={<Need any={["terminal.use", "terminal.revoke"]}><Terminals /></Need>} />
         <Route path="/terminal/:id" element={<Need any={["terminal.use", "terminal.revoke"]}><TerminalView /></Need>} />
         <Route path="/knowledge" element={<Knowledge />} />
+        <Route path="/knowledge/explorer" element={<Need any={["knowledge.read"]}><KnowledgeExplorer /></Need>} />
+        <Route path="/knowledge/retrieval" element={<Need any={["knowledge.test"]}><RetrievalWorkspace /></Need>} />
+        <Route path="/knowledge/review" element={<Need any={["knowledge.review", "skills.review", "investigation.read"]}><KnowledgeReview /></Need>} />
         <Route path="/finops" element={<Need any={["finops.read"]}><FinOps /></Need>} />
         <Route path="/evals" element={<Need any={["admin.policies"]}><Evals /></Need>} />
         <Route path="/skills" element={<Skills />} />

@@ -143,8 +143,22 @@ Not verified:
 - The evaluation boundary is application-enforced, inside one database and role.
 - The `rag` and `skills` datasets are small and synthetic, and the evaluation realm has keyword ranking only, so vector retrieval is not evaluated.
 - Injection evaluation checks data framing, skill integrity and tool policy with no live model, so model behavior under injection is not measured.
-- Improvement proposals stop at review: approval does not create the runbook or skill version. An approved one is applied through the normal Git and publication path by hand.
-- Skills have no diff view or per-environment readiness history in the UI, and AI drafting of skill changes was not built.
+- Skills have no per-environment readiness history in the UI, and AI drafting of skill changes was not built.
+
+## Knowledge Explorer, retrieval test and skill governance (2026-11-02)
+
+Verified with a real PostgreSQL, fake connectors and no model, and in headless Chrome at 1440 and 390 pixels against a local server with seeded documents. An admin and a scoped viewer were both checked over HTTP. Not verified: anything on mk4, vector retrieval, a real reranker comparison, a real embedding provider, or a real LLM reading injected text.
+
+- **Evaluation numbers come from small synthetic datasets written with the code.** A perfect score there shows the wiring works, not that retrieval is relevant on real questions. Vector retrieval and injection against a real model report `not_applicable` with the reason.
+- **The injection gate checks wiring:** retrieved text stays framed, never reaches the trusted instructions, and no tool it asks for exists. It does not measure how a model behaves on reading it.
+- **Claim support is literal overlap,** not entailment.
+- **Conflicts** are same title or same service and heading in one scope. Two documents that disagree under different titles are not noticed.
+- **Index membership is per document.** PostgreSQL does not record which chunks a generation holds on OpenSearch, and the Explorer does not ask the cluster. `verify_index` samples counts.
+- **The Explorer loads up to 20,000 readable documents per request,** then says its counts are partial. That suits this corpus and would not suit a far larger one.
+- **Classification is metadata and a sharing limit.** It does not restrict reading further within a binding.
+- **An embedding outage during a scope change** rewrites that document without vectors. The state says so, and backfill restores them.
+- **Skill budgets** are checked between steps, so one slow tool can overrun, and tokens are estimated.
+- **Rollback of an old image:** see [KNOWLEDGE_ROLLOUT.md](KNOWLEDGE_ROLLOUT.md).
 
 ## Reranking
 
@@ -159,4 +173,5 @@ Off by default. See [RERANKING.md](RERANKING.md) for what was measured. The cont
 - **The custom image is built but has never started a cluster.** CI builds it and confirms both plugins are listed; separately, the same plugins ran in the 3.9.0 tarball.
 - **Rankings differ from the original cluster,** because prose is stemmed and identifiers have their own field. No evaluation on real questions has been run, so no relevance gain is claimed.
 - **Lifecycle, classification and trust in the index** are as of the last write. PostgreSQL decides. Stale-content exclusion runs only in the final check, so it can cost candidates, within the bounded expansion.
-- **Not built:** OpenSearch Dashboards for `moks-search`, and an automatic scheduled restore drill.
+- **Not built:** an automatic scheduled restore drill.
+- **Dashboards for `moks-search`** is rendered and tested as Helm output only. It has never started, so its login, TLS against the private CA, `${VAR}` references and base path are unverified. It does not follow MOKS RBAC.

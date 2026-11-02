@@ -444,6 +444,9 @@ class Document(Base):
     review_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     vector_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    vector_attempts: Mapped[int] = mapped_column(Integer, default=0)  # failed tries since vectors last succeeded
+    vector_tried_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # backfill takes the least recently tried first
+    ingest_note: Mapped[str | None] = mapped_column(Text, nullable=True)  # what ingestion could not keep, shown wherever the document is
 
 
 class ImprovementProposal(Base):
@@ -460,10 +463,30 @@ class ImprovementProposal(Base):
     owner: Mapped[str] = mapped_column(String(200))
     version: Mapped[int] = mapped_column(Integer, default=1)
     state: Mapped[str] = mapped_column(String(20), default="draft")  # draft | approved | rejected
+    draft_ref: Mapped[dict] = mapped_column(JSONB, default=dict)  # what approval made: a draft document, or an unpublished skill version
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     reviewed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RetrievalFeedback(Base):
+    """What someone said about a search result. Review input only: nothing reads this to train, rerank or publish."""
+    __tablename__ = "retrieval_feedback"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    query: Mapped[str] = mapped_column(Text)  # redacted before it is stored
+    environment: Mapped[str | None] = mapped_column(String(100), nullable=True)  # the scope asked about, which decides who may read this
+    namespace: Mapped[str | None] = mapped_column(String(253), nullable=True)
+    document_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # none: something was missing
+    chunk_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    verdict: Mapped[str] = mapped_column(String(20))  # relevant | irrelevant | outdated | missing
+    note: Mapped[str] = mapped_column(Text, default="")
+    context: Mapped[dict] = mapped_column(JSONB, default=dict)  # mode, index, pipeline, reranking state at the time
+    state: Mapped[str] = mapped_column(String(20), default="open")  # open | reviewed | dismissed
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -664,6 +687,7 @@ class SkillVersion(Base):
     validation: Mapped[list] = mapped_column(JSONB, default=list)
     reviewed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     published_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -679,6 +703,7 @@ class SkillGeneration(Base):
     reason: Mapped[str] = mapped_column(Text, default="")
     release_revision: Mapped[str | None] = mapped_column(String(100), nullable=True)
     evaluation: Mapped[dict] = mapped_column(JSONB, default=dict)  # the run that backed this publication, if any
+    previous: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # the generation this one replaced, for diffs and rollback
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

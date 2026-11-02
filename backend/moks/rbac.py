@@ -34,17 +34,28 @@ class P(StrEnum):
     INCIDENT_WRITE = "incident.write"        # create/update incidents and timelines
     TERMINAL_USE = "terminal.use"            # open a shell; granted only by the terminal role, never by admin
     TERMINAL_REVOKE = "terminal.revoke"      # end someone else's terminal session; never attach to it
+    KNOWLEDGE_READ = "knowledge.read"        # read documents one binding covers on both axes (rag/access.py)
+    KNOWLEDGE_TEST = "knowledge.test"        # compare retrieval modes in the test workspace
+    KNOWLEDGE_REVIEW = "knowledge.review"    # review documents, change their lifecycle, read feedback; scoped by binding
+    KNOWLEDGE_SOURCE_ADMIN = "knowledge.source_admin"  # create, change, sync and retire sources
+    KNOWLEDGE_INDEX = "knowledge.index"      # index generations, outbox, backfill and retrieval diagnostics
+    SKILL_REVIEW = "skills.review"           # record that a skill version was read and is fit to publish
+    SKILL_PUBLISH = "skills.publish"         # publish and roll back generations; set skill policy
     ADMIN_USERS = "admin.users"
     ADMIN_CONNECTORS = "admin.connectors"
     ADMIN_LLM = "admin.llm"
     ADMIN_POLICIES = "admin.policies"
 
 
-_VIEWER = {P.OVERVIEW_READ, P.INVESTIGATION_READ}
-_INVESTIGATOR = _VIEWER | {P.INVESTIGATION_RUN, P.EXPLORER_READ, P.METRICS_RAW_QUERY, P.FINOPS_READ, P.INCIDENT_WRITE, P.BACKUP_READ}
+_VIEWER = {P.OVERVIEW_READ, P.INVESTIGATION_READ, P.KNOWLEDGE_READ}
+_INVESTIGATOR = _VIEWER | {P.INVESTIGATION_RUN, P.EXPLORER_READ, P.METRICS_RAW_QUERY, P.FINOPS_READ, P.INCIDENT_WRITE, P.BACKUP_READ, P.KNOWLEDGE_TEST}
 _OPERATOR = _INVESTIGATOR | {P.ACTION_REQUEST, P.ACTION_EXECUTE}
 _APPROVER = _VIEWER | {P.ACTION_APPROVE, P.FINOPS_READ, P.BACKUP_READ}
 _TERMINAL = _VIEWER | {P.TERMINAL_USE}
+_KNOWLEDGE_REVIEWER = _VIEWER | {P.KNOWLEDGE_TEST, P.KNOWLEDGE_REVIEW}
+_KNOWLEDGE_ADMIN = _KNOWLEDGE_REVIEWER | {P.KNOWLEDGE_SOURCE_ADMIN}
+_INDEX_OPERATOR = _VIEWER | {P.KNOWLEDGE_TEST, P.KNOWLEDGE_INDEX}
+_SKILL_PUBLISHER = _VIEWER | {P.SKILL_REVIEW, P.SKILL_PUBLISH}
 _ADMIN = set(P) - {P.TERMINAL_USE}  # a shell is arbitrary code: it is granted to a person on purpose, not bundled
 
 ROLES: dict[str, frozenset[P]] = {
@@ -53,6 +64,10 @@ ROLES: dict[str, frozenset[P]] = {
     "operator": frozenset(_OPERATOR),
     "approver": frozenset(_APPROVER),
     "terminal": frozenset(_TERMINAL),
+    "knowledge_reviewer": frozenset(_KNOWLEDGE_REVIEWER),
+    "knowledge_admin": frozenset(_KNOWLEDGE_ADMIN),
+    "index_operator": frozenset(_INDEX_OPERATOR),
+    "skill_publisher": frozenset(_SKILL_PUBLISHER),
     "admin": frozenset(_ADMIN),
 }
 
@@ -62,12 +77,17 @@ ROLE_DESCRIPTIONS = {
     "operator": "Request and execute permitted operational actions and diagnostic sessions.",
     "approver": "Approve or reject action plans within the assigned scope (never their own).",
     "terminal": "Open a disposable Bash terminal with short-lived, read-only credentials. Needs namespace '*'. Not part of any other role, including admin.",
+    "knowledge_reviewer": "Review documents in the bound scope, change their lifecycle, and read retrieval feedback.",
+    "knowledge_admin": "Administer knowledge sources and review their documents. Needs environment and namespace '*'.",
+    "index_operator": "Operate the search index: generations, outbox, backfill and retrieval diagnostics. Needs environment and namespace '*'.",
+    "skill_publisher": "Review and publish skill versions, roll back generations and set skill policy. Needs environment and namespace '*'.",
     "admin": "Manage users, connectors, LLM providers and policies, and end anyone's terminal session. Their own action plans need no second approval.",
 }
 
 # Permissions that only make sense globally: a binding grants them only when both its
 # environment and namespace are '*'.
-GLOBAL_PERMISSIONS = {P.ADMIN_USERS, P.ADMIN_CONNECTORS, P.ADMIN_LLM, P.ADMIN_POLICIES, P.AUDIT_READ, P.TERMINAL_REVOKE}
+GLOBAL_PERMISSIONS = {P.ADMIN_USERS, P.ADMIN_CONNECTORS, P.ADMIN_LLM, P.ADMIN_POLICIES, P.AUDIT_READ, P.TERMINAL_REVOKE,
+                      P.KNOWLEDGE_SOURCE_ADMIN, P.KNOWLEDGE_INDEX, P.SKILL_REVIEW, P.SKILL_PUBLISH}
 
 # Raw PromQL cannot be reliably restricted to a namespace, so it requires a binding whose
 # namespace is '*' for the environment. Namespace-scoped users get templated metric tools.

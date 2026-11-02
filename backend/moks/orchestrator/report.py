@@ -51,6 +51,7 @@ class Report(BaseModel):
     validation: dict[str, Any] = Field(default_factory=dict)
     verified_causes: list[dict[str, Any]] = Field(default_factory=list)  # verified configuration defects only
     verified_findings: list[dict[str, Any]] = Field(default_factory=list)  # every check that passed, by category
+    withheld_findings: list[dict[str, Any]] = Field(default_factory=list)  # observed, but a skill's required evidence is missing
     conflicts: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -182,14 +183,14 @@ def focus(question: str, findings: list[dict]) -> list[dict]:
     return sorted(findings, key=lambda f: not f["kind"].startswith("argocd_")) if ARGO_QUESTION.search(question) else findings
 
 
-def verify_causes(report: Report, findings: list[dict], ledger: ev.Ledger | None = None) -> None:
+def verify_causes(report: Report, findings: list[dict], ledger: ev.Ledger | None = None, withheld: dict[str, str] | None = None) -> None:
     """Verified means a named check read the condition from a successful, in-scope observation of a
     specific target. Model confidence never counts: however sure the LLM is, its causes stay suspected.
     Observing a failure does not establish why it happened, so only a configuration defect goes in
     verified_causes. Recovery is validated by action plans after a change, never by a report."""
     for c in report.suspected_causes:
         c.verified = False
-    verified = []
+    verified, held = [], []
     for f in findings:
         kind = f.get("kind")
         category = "configuration_defect" if kind in CONFIGURATION_DEFECTS else "observed_failure" if kind in OBSERVED_FAILURES else None
@@ -198,10 +199,13 @@ def verify_causes(report: Report, findings: list[dict], ledger: ev.Ledger | None
             refs = [r for r in refs if r in ledger.entries and ledger.entries[r].kind in ev.LIVE and ledger.in_scope(ledger.entries[r])]
         if not category or not refs:
             continue
+        if kind in (withheld or {}):
+            held.append({"kind": kind, "cause": f["title"], "reason": withheld[kind], "evidence": refs})
+            continue
         verified.append({"category": category, "check": f"deterministic detector: {kind}", "result": "condition present", "target": (f.get("resources") or [None])[0],
                          "resources": f.get("resources", []), "namespace": f.get("namespace"), "at": ledger.as_of(refs) if ledger else None, "evidence": refs,
                          "cause": f["title"], "detail": f.get("detail", "")})
-    report.verified_findings = verified
+    report.verified_findings, report.withheld_findings = verified, held
     report.verified_causes = [v for v in verified if v["category"] == "configuration_defect"]
 
 

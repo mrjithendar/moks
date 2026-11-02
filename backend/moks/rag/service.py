@@ -236,7 +236,7 @@ async def index_document(db: AsyncSession, src: KnowledgeSource, path: str, raw:
     now = datetime.now(timezone.utc)
     doc = (await db.execute(select(Document).where(Document.source_id == src.id, Document.path == path))).scalar_one_or_none()
     if doc and doc.content_hash == content_hash and doc.status == "active" and doc.pipeline_version == PIPELINE_VERSION:
-        doc.checked_at, doc.revision = now, revision or doc.revision
+        doc.checked_at, doc.revision, doc.url = now, revision or doc.revision, url or doc.url  # the link follows the revision it is cited at
         return doc  # unchanged: incremental sync skips it
     content_changed = doc is None or doc.content_hash != content_hash
     if doc is None:
@@ -284,10 +284,13 @@ async def index_document(db: AsyncSession, src: KnowledgeSource, path: str, raw:
     return doc
 
 
-def _note_vectors(doc: Document, idx: EmbeddingIndex, written: bool, error: str | None) -> None:
-    """A document indexed without its vectors is not fully indexed: it stays eligible for backfill."""
-    doc.vector_state = "not_applicable" if not idx.dimensions else "complete" if written else "missing"
+def _note_vectors(doc: Document, idx: EmbeddingIndex, chunks: int, written: bool, error: str | None) -> None:
+    """A document indexed without its vectors is not fully indexed: it stays eligible for backfill. One
+    with no chunks has nothing to embed, and left as missing it would hold the front of that queue for good."""
+    doc.vector_state = "not_applicable" if not idx.dimensions or not chunks else "complete" if written else "missing"
     doc.vector_error = error
+    if doc.vector_state != "missing":
+        doc.vector_attempts, doc.vector_tried_at = 0, None
 
 
 async def _note_index(db: AsyncSession, doc_id: uuid.UUID, idx: EmbeddingIndex, revision: int, chunks: int, vectors: int, expected: int | None = None, error: str | None = None) -> None:
@@ -311,7 +314,7 @@ async def _try_embed(db: AsyncSession, idx: EmbeddingIndex, chunks: list[Chunk])
 async def _write_postgres(db: AsyncSession, idx: EmbeddingIndex, doc: Document, src: KnowledgeSource, chunks: list[Chunk]) -> None:
     embeddings, error = await _try_embed(db, idx, chunks)
     await PostgresBackend(db).index_chunks(idx, [_row(c, doc, src) for c in chunks], embeddings)
-    _note_vectors(doc, idx, embeddings is not None, error)
+    _note_vectors(doc, idx, len(chunks), embeddings is not None, error)
     await _note_index(db, doc.id, idx, doc.content_revision, len(chunks), len(embeddings or []), error=error)
 
 
@@ -361,7 +364,7 @@ async def _write_document(db: AsyncSession, idx: EmbeddingIndex, document_id: uu
     if prune_after:
         await ext.delete_document(idx.index_name, document_id, keep=[str(c.id) for c in chunks])
     if idx.status == "active" and is_live():  # a build in progress says nothing about what search can use today
-        _note_vectors(doc, idx, embeddings is not None, error)
+        _note_vectors(doc, idx, len(chunks), embeddings is not None, error)
     await _note_index(db, doc.id, idx, revision or doc.content_revision, len(chunks), len(embeddings or []), error=error)
 
 
@@ -508,7 +511,13 @@ async def activate_generation(db: AsyncSession, index_name: str) -> dict:
         current.status, current.cleanup_pending, current.retired_at = "retired", True, now
         await db.flush()
     target.status, target.cleanup_pending, target.retired_at, target.activated_at = "active", False, None, now
-    return {"active": index_name, "replaced": current.index_name if current else None}
+    await db.flush()
+    gaps = await _coverage(db, target)  # what it was at retirement says nothing about what changed since
+    target.activation = "degraded" if gaps else "complete"
+    target.error = f"activated with {len(gaps)} incomplete documents" if gaps else None
+    if is_live():
+        await _adopt_states(db, target, gaps)
+    return {"active": index_name, "replaced": current.index_name if current else None, "activation": target.activation, "incomplete_documents": len(gaps)}
 
 
 async def verify_index(sample: int = 50) -> dict[str, int]:
@@ -551,7 +560,7 @@ async def backfill_vectors(limit: int = 20) -> dict[str, int]:
             if idx is None or not idx.dimensions:
                 return done
             doc = (await db.execute(select(Document).where(Document.realm == access.realm(), Document.status == "active", Document.vector_state.in_(("missing", "unknown")), Document.content_revision == Document.indexed_revision)
-                                    .order_by(Document.updated_at).limit(1).with_for_update(skip_locked=True))).scalars().first()
+                                    .order_by(Document.vector_tried_at.asc().nulls_first(), Document.updated_at).limit(1).with_for_update(skip_locked=True))).scalars().first()
             if doc is None or not await _lock_document(db, doc.id):
                 return done
             if external():
@@ -559,12 +568,23 @@ async def backfill_vectors(limit: int = 20) -> dict[str, int]:
             else:
                 src = await db.get(KnowledgeSource, doc.source_id)
                 await _write_postgres(db, idx, doc, src, (await db.execute(select(Chunk).where(Chunk.document_id == doc.id).order_by(Chunk.ord))).scalars().all())
-            if doc.vector_state != "complete":
+            if doc.vector_state not in ("complete", "not_applicable"):
+                doc.vector_attempts, doc.vector_tried_at = (doc.vector_attempts or 0) + 1, datetime.now(timezone.utc)  # to the back, so one that always fails cannot hold up the rest
                 done["failed"] += 1
                 return done
-            done["filled"] += 1
+            done["filled"] += doc.vector_state == "complete"
             await _settle_activation(db, idx)
     return done
+
+
+async def requeue(document_id: uuid.UUID) -> int:
+    """One more event for a document the index lacks, whatever became of the last one."""
+    async with session_scope() as db:
+        doc = await db.get(Document, document_id)
+        if doc is None or not external():
+            return 0
+        await _record_change(db, doc, "upsert" if doc.status == "active" else "delete")
+        return 1
 
 
 async def retry_dead(document_id: uuid.UUID | None = None, limit: int = 200) -> int:
@@ -577,13 +597,15 @@ async def retry_dead(document_id: uuid.UUID | None = None, limit: int = 200) -> 
         return len(rows)
 
 
-async def _index_batch(db: AsyncSession, new: EmbeddingIndex, batch: list) -> None:
+async def _index_batch(db: AsyncSession, new: EmbeddingIndex, batch: list) -> bool:
+    """Whether vectors went in. _embed answers None when a generation's model has gone."""
     rows = [_row(c, d, src, new) for c, d, src in batch]
     embs = await _embed(db, new, [f"{r['heading']}\n{r['text']}" for r in rows], tries=REINDEX_EMBED_TRIES)
     if external():
         await external().index_chunks(new.index_name, rows, embs)
     else:
         await PostgresBackend(db).index_chunks(new, rows, embs)
+    return embs is not None
 
 
 async def _pending_rows(db: AsyncSession, done: set) -> list:
@@ -593,26 +615,31 @@ async def _pending_rows(db: AsyncSession, done: set) -> list:
     return [r for r in rows if r[0].id not in done]
 
 
-async def _record_copy(db: AsyncSession, new: EmbeddingIndex, done: set) -> None:
-    """What the bulk copy wrote, per document, counted from chunks it actually finished. A document
-    the catch-up rewrote already has its own, more recent record."""
+async def _record_copy(db: AsyncSession, new: EmbeddingIndex, done: set, embedded: set) -> None:
+    """What the bulk copy wrote, per document, counted from chunks it actually finished, and vectors from
+    the chunks that really got one. A document the catch-up rewrote already has its own, more recent record."""
     rows = (await db.execute(select(Chunk.document_id, Chunk.id, Document.content_revision).join(Document, Document.id == Chunk.document_id)
                              .where(Document.status == "active", Document.realm == access.realm()))).all()
     expected: dict[uuid.UUID, int] = {}
     written: dict[uuid.UUID, int] = {}
+    vectors: dict[uuid.UUID, int] = {}
     revision: dict[uuid.UUID, int] = {}
     for document_id, cid, rev in rows:
         expected[document_id] = expected.get(document_id, 0) + 1
         written[document_id] = written.get(document_id, 0) + (cid in done)
+        vectors[document_id] = vectors.get(document_id, 0) + (cid in embedded)
         revision[document_id] = rev
     held = {r[0] for r in (await db.execute(select(DocumentIndexState.document_id).where(DocumentIndexState.index_id == new.id))).all()}
     for document_id, want in expected.items():
         if document_id not in held:
-            await _note_index(db, document_id, new, revision[document_id], written[document_id], written[document_id] if new.dimensions else 0, expected=want)
+            await _note_index(db, document_id, new, revision[document_id], written[document_id], vectors[document_id] if new.dimensions else 0, expected=want)
 
 
 def _gap(state: DocumentIndexState | None, revision: int, idx: EmbeddingIndex, chunks: int) -> str | None:
-    """Why this generation does not fully hold this document, if it does not."""
+    """Why this generation does not fully hold this document, if it does not. A document with no chunks has
+    nothing to hold, so an empty file in a repository cannot fail a strict reindex."""
+    if not chunks and (state is None or not state.chunks):
+        return None
     if state is None:
         return "not written to this index"
     if state.revision != revision:
@@ -658,7 +685,8 @@ async def _bytes_needed(db: AsyncSession, dims: int | None) -> int:
 
 async def _adopt_states(db: AsyncSession, idx: EmbeddingIndex, gaps: dict[uuid.UUID, str]) -> None:
     """Each document's state comes from what was recorded for this generation; none is assumed."""
-    await db.execute(update(Document).where(Document.status == "active", Document.realm == access.realm()).values(vector_state="complete" if idx.dimensions else "not_applicable", vector_error=None))
+    await db.execute(update(Document).where(Document.status == "active", Document.realm == access.realm()).values(vector_state="complete" if idx.dimensions else "not_applicable", vector_error=None, vector_attempts=0, vector_tried_at=None))
+    await db.execute(update(Document).where(Document.status == "active", Document.realm == access.realm(), ~select(Chunk.id).where(Chunk.document_id == Document.id).exists()).values(vector_state="not_applicable"))
     for document_id, why in gaps.items():
         await db.execute(update(Document).where(Document.id == document_id).values(vector_state="missing" if idx.dimensions else "not_applicable", vector_error=why[:300]))
 
@@ -692,6 +720,7 @@ async def reindex(db: AsyncSession, job_id: uuid.UUID | None = None) -> dict:
     await db.commit()  # visible and recoverable from here on
     new_id = new.id
     done: set = set()
+    embedded: set = set()
     try:
         if external():
             if hasattr(external(), "preflight"):
@@ -703,11 +732,12 @@ async def reindex(db: AsyncSession, job_id: uuid.UUID | None = None) -> dict:
                 break
             for i in range(0, len(rows), 200):
                 batch = rows[i:i + 200]
-                await _index_batch(db, new, batch)
+                if await _index_batch(db, new, batch):
+                    embedded.update(r[0].id for r in batch)
                 done.update(r[0].id for r in batch)
                 new.heartbeat_at, new.chunk_count = datetime.now(timezone.utc), len(done)  # also the progress an operator sees
                 await db.commit()
-        await _record_copy(db, new, done)
+        await _record_copy(db, new, done, embedded)
         await db.commit()
         if external():
             caught = new.build_watermark or 0
@@ -781,7 +811,7 @@ async def cleanup_retired() -> int:
         return done
 
 
-IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9]*(?:[-_.:/][A-Za-z0-9]+)+|[A-Za-z]+[0-9]+[A-Za-z0-9]*|[0-9]+[A-Za-z]+[A-Za-z0-9]*|[a-z]+[A-Z][A-Za-z0-9]*")
+IDENTIFIER = re.compile(r"\b(?:[A-Za-z0-9]+(?:[-_.:/][A-Za-z0-9]+)+|[A-Z]+[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,}[a-z]+[A-Za-z0-9]*|[A-Z][a-z]+(?:[A-Z][a-z0-9]*)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Za-z]+[0-9]+[A-Za-z0-9]*|[0-9]+[A-Za-z]+[A-Za-z0-9]*)")
 WORD = re.compile(r"[a-z0-9]{3,}")
 STOP = set("the and for are was why how what when with from that this does did has have not can you our into any all its show get".split())
 MAX_POOL = 400
@@ -827,15 +857,40 @@ def _judge(query: str, tokens: list[str], results: list[dict]) -> dict:
     """Whether the passages could answer this, from what they literally contain. Deterministic, and
     deliberately not derived from fused scores, which rank but do not measure."""
     if not results:
-        return {"state": "none", "reason": "No readable document matched. Nothing here says it is fine or broken."}
-    body = " ".join(f"{r['title']} {r['heading']} {r['text']} {r['citation']['path']}" for r in results[:3]).lower()
-    if tokens and not any(t.lower() in body for t in tokens):
-        return {"state": "weak", "reason": f"No passage contains {', '.join(tokens[:3])}, so these are only loosely related."}
+        return {"state": "none", "reason": "No readable document matched. Nothing here says it is fine or broken.", "missing_identifiers": tokens[:6], "quality": {"passages": 0, "current": 0, "reviewed": 0, "possible_conflicts": 0}}
+    top = results[:3]
+    body = " ".join(f"{r['title']} {r['heading']} {r['text']} {r['citation']['path']}" for r in top).lower()
+    missing = [t for t in tokens if t.lower() not in body]
+    quality = {"passages": len(results), "current": sum(r["freshness"]["state"] == "current" for r in results), "reviewed": sum(r["freshness"]["trust"] == "reviewed" for r in results),
+               "possible_conflicts": sum(bool(r["freshness"].get("possible_conflict")) for r in results)}
+    extra = {"missing_identifiers": missing[:6], "quality": quality}
+    if tokens and len(missing) == len(tokens):
+        return {"state": "weak", "reason": f"No passage contains {', '.join(tokens[:3])}, so these are only loosely related.", **extra}
     terms = _terms(query)
     covered = sum(t in body for t in terms)
     if terms and not tokens and covered / len(terms) < 0.4:
-        return {"state": "weak", "reason": "The passages share few of the question's terms."}
-    return {"state": "supported", "reason": "The passages contain the terms searched for. That is not proof they answer the question."}
+        return {"state": "weak", "reason": "The passages share few of the question's terms.", **extra}
+    if all(r["freshness"]["state"] != "current" for r in top):
+        return {"state": "weak", "reason": "The passages that match are all stale, superseded or deprecated. Check what replaced them before relying on them.", **extra}
+    if missing:
+        return {"state": "supported", "reason": f"The passages contain some of what was searched for, but not {', '.join(missing[:3])}. That is not proof they answer the question.", **extra}
+    return {"state": "supported", "reason": "The passages contain the terms searched for. That is not proof they answer the question.", **extra}
+
+
+def claim_support(claim: str, results: list[dict], least: float = 0.6) -> dict:
+    """Whether one passage holds the words of a claim: every identifier in it and most of its terms. Literal
+    overlap, so a well-formed false sentence about the right resource can pass. A citation existing proves less
+    than this, and this proves less than a person reading the passage."""
+    tokens, terms = identifiers(claim), _terms(claim)
+    best: dict = {"state": "unsupported", "overlap": 0.0, "chunk_id": None}
+    for r in results:
+        body = f"{r['title']} {r['heading']} {r['text']}".lower()
+        if any(t.lower() not in body for t in tokens):
+            continue
+        overlap = sum(t in body for t in terms) / len(terms) if terms else 0.0
+        if overlap > best["overlap"]:
+            best = {"state": "supported" if overlap >= least else "unsupported", "overlap": round(overlap, 3), "chunk_id": r["chunk_id"]}
+    return {**best, "basis": "literal overlap, not entailment"}
 
 
 EXCLUDE_LIMIT = 1000
@@ -850,28 +905,36 @@ async def _unsearchable(db: AsyncSession) -> tuple[dict, bool]:
     return {"sources": [str(i) for i in sources[:EXCLUDE_LIMIT]], "documents": [str(i) for i in documents[:EXCLUDE_LIMIT]]}, complete
 
 
-async def _rankings(db: AsyncSession, query: str, tokens: list[str], found: list, pool: int, idx: EmbeddingIndex | None, qv: list[float] | None) -> tuple[list[list[str]], bool, str | None]:
-    """Each ranker's candidates, whether every one of them came through a complete filter, and why any fell back."""
+async def _rankings(db: AsyncSession, query: str, tokens: list[str], found: list, pool: int, idx: EmbeddingIndex | None, qv: list[float] | None,
+                    retrieval: str = "hybrid", only: list[str] | None = None) -> tuple[list[list[str]], bool, str | None]:
+    """Each ranker's candidates, whether every one of them came through a complete filter, and why any fell back.
+    `only` narrows to named sources; it never adds anything the grants do not."""
     rankings, exact, reason = [], True, None
     pg = PostgresBackend(db)
     exclude: dict = {}
     if is_opensearch(backend_name()):
         exclude, exact = await _unsearchable(db)
-        try:
-            ranked, ok = await opensearch().keyword(idx.index_name, query, found, pool, exclude, tokens)
-            rankings.append(ranked)
-            exact = exact and ok
-        except ConnectorError as exc:
-            reason = f"OpenSearch unavailable, keyword search served by PostgreSQL ({exc.kind})"
-            rankings.append(await pg.keyword(query, found, pool))
-    else:
-        rankings.append(await pg.keyword(query, found, pool))
-    if tokens:
-        ranked = await pg.identifiers(tokens, found, pool)
-        rankings += [ranked, ranked]  # an exact identifier outweighs any other single signal
-    for part in parts(query) if get_settings().rag_decompose else ():
-        rankings.append(await pg.keyword(part, found, pool))  # bounded, and under the same grants as everything else
-    if qv is not None and idx is not None:
+        if only and idx is not None and (idx.mapping_version or 1) >= 2:
+            exclude["only_sources"] = only
+        elif only:
+            exact = False  # an older mapping has no source field, so the final check does this
+    if retrieval != "vector":
+        if is_opensearch(backend_name()):
+            try:
+                ranked, ok = await opensearch().keyword(idx.index_name, query, found, pool, exclude, tokens)
+                rankings.append(ranked)
+                exact = exact and ok
+            except ConnectorError as exc:
+                reason = f"OpenSearch unavailable, keyword search served by PostgreSQL ({exc.kind})"
+                rankings.append(await pg.keyword(query, found, pool, only))
+        else:
+            rankings.append(await pg.keyword(query, found, pool, only))
+        if tokens:
+            ranked = await pg.identifiers(tokens, found, pool, only)
+            rankings += [ranked, ranked]  # an exact identifier outweighs any other single signal
+        for part in parts(query) if get_settings().rag_decompose else ():
+            rankings.append(await pg.keyword(part, found, pool, only))  # bounded, and under the same grants as everything else
+    if qv is not None and idx is not None and retrieval != "keyword":
         if external():
             try:
                 ranked, ok = await external().vector(idx.index_name, qv, found, pool, exclude)
@@ -880,7 +943,7 @@ async def _rankings(db: AsyncSession, query: str, tokens: list[str], found: list
             except ConnectorError as exc:
                 reason = reason or f"vector search unavailable ({exc.kind}), so this is keyword only"
         else:
-            rankings.append(await pg.vector(qv, idx.id, found, pool))
+            rankings.append(await pg.vector(qv, idx.id, found, pool, only))
     return rankings, exact, reason
 
 
@@ -903,26 +966,53 @@ async def _query_vector(db: AsyncSession, principal: Principal, query: str, idx:
         return None, f"embedding failed ({getattr(exc, 'kind', 'error')}), so this is keyword only"
 
 
+async def prepare_query(db: AsyncSession, principal: Principal, query: str) -> tuple[list[float] | None, str | None]:
+    """One embedding, for a page that compares several ways of searching the same words."""
+    return await _query_vector(db, principal, query, await active_index(db))
+
+
+def _mode(retrieval: str, qv: list[float] | None, backend_reason: str | None) -> str:
+    """What actually ran, which may be less than what was asked for."""
+    if retrieval == "keyword":
+        return "keyword"
+    if retrieval == "vector":
+        return "vector" if qv is not None and not backend_reason else "none"
+    return "hybrid" if qv is not None and not backend_reason else "keyword"
+
+
 async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8, environment: str | None = None,
-                 namespace: str | None = None, service: str | None = None, neighbors: bool = False, reranker: reranking.Reranker | None = None) -> dict:
+                 namespace: str | None = None, service: str | None = None, neighbors: bool = False, reranker: reranking.Reranker | None = None,
+                 retrieval: str = "hybrid", rerank: bool | None = None, sources: list[str] | None = None, resource_type: str | None = None,
+                 prepared: tuple[list[float] | None, str | None] | None = None) -> dict:
+    """question and scope, then identifiers, then keyword and vector candidates under whole-binding filters, then
+    PostgreSQL's lifecycle and access check, then optional reranking, then diverse selection, citations and an
+    evidence report. `retrieval`, `rerank` and `sources` are what the test workspace varies: each can only narrow."""
     start = time.monotonic()
     environment, namespace = environment or None, None if namespace in (None, "*") else namespace
     found = access.grants(principal, environment, namespace)
-    empty = {"results": [], "evidence": _judge(query, [], []), "score_note": SCORE_NOTE}
+    empty = {"results": [], "evidence": _judge(query, [], []), "abstain": True, "score_note": SCORE_NOTE}
     if not found:
         return {**empty, "mode": "none", "note": "you have no knowledge access for this scope"}
     idx = await active_index(db)
     if is_opensearch(backend_name()) and idx is None:
         return {**empty, "mode": "empty", "note": "nothing has been indexed yet"}
     tokens = identifiers(query)
-    qv, reason = await _query_vector(db, principal, query, idx)
+    embedded = 0
+    if retrieval == "keyword":
+        qv, reason = None, None
+    elif prepared is not None:
+        qv, reason = prepared
+    else:
+        qv, reason = await _query_vector(db, principal, query, idx)
+        embedded = int(qv is not None)
     now = datetime.now(timezone.utc)
     pool = max(k * 4, 20)
     expanded = 0
+    wanted_sources = set(sources or ())
     while True:
-        rankings, exact, backend_reason = await _rankings(db, query, tokens, found, pool, idx, qv)
+        rankings, exact, backend_reason = await _rankings(db, query, tokens, found, pool, idx, qv, retrieval, sources)
         reason = backend_reason or reason
-        mode = "hybrid" if qv is not None and not backend_reason else "keyword"
+        mode = _mode(retrieval, qv, backend_reason)
         fused = rrf(*rankings)
         ids = [uuid.UUID(cid) for cid, _ in fused]
         rows = (await db.execute(select(Chunk, Document, KnowledgeSource).join(Document, Document.id == Chunk.document_id)
@@ -938,19 +1028,23 @@ async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8,
             # Authoritative: what the index said is only a suggestion.
             if not access.can_read(principal, d.environment, d.namespace) or not access.in_request(environment, namespace, d.environment, d.namespace):
                 continue
+            if wanted_sources and str(d.source_id) not in wanted_sources:
+                continue
             state, why = _freshness(s, d, now)
             if state == "stale" and s.stale_policy == "exclude":
                 continue
             allowed.append((cid, score, c, d, s, state, why))
-        full = max(len(r) for r in rankings) if rankings else 0
+        full = max((len(r) for r in rankings), default=0)
         if len(allowed) >= k * 2 or full < pool or pool >= MAX_POOL:
             break  # enough survived, or there is nothing further down
         pool = min(pool * 3, MAX_POOL)  # unreadable or retired documents crowded this page
         expanded += 1
-    scored = _score(allowed, query, tokens, service, now)
+    understanding = understand(query, tokens)
+    resources = set(understanding["resource_types"]) | ({resource_type.lower()} if resource_type else set())
+    scored = _score(allowed, query, tokens, service, now, resources, environment, namespace)
     client = reranker or reranking.active()
     applied: dict | None = None
-    if client is not None and scored:
+    if rerank is not False and client is not None and scored:
         scored, applied = await _apply_reranker(client, scored, query)
     results = _select(scored, min(k, get_settings().rag_rerank_results, reranking.MAX_RESULTS) if applied else k)
     if applied:
@@ -958,15 +1052,17 @@ async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8,
     if neighbors:
         await _attach_neighbors(db, results)
     _flag_conflicts(results)
-    RETRIEVAL_LATENCY.labels(backend_name()).observe(time.monotonic() - start)
+    elapsed = time.monotonic() - start
+    RETRIEVAL_LATENCY.labels(backend_name()).observe(elapsed)
     _note_retrieval(mode, reason)
     judged = _judge(query, tokens, results)
-    out = {"results": results, "mode": mode, "index": idx.index_name if idx else None, "evidence": judged, "abstain": judged["state"] != "supported", "score_note": SCORE_NOTE,
-           "understanding": understand(query, tokens),
+    out = {"results": results, "mode": mode, "requested_mode": retrieval, "index": idx.index_name if idx else None, "evidence": judged, "abstain": judged["state"] != "supported", "score_note": SCORE_NOTE,
+           "understanding": understanding, "latency_ms": round(elapsed * 1000, 1),
+           "usage": {"embedding_calls": embedded, "tokens": len(query) // 4 if embedded else 0, "tokens_basis": "estimated: embedding providers do not report usage"},
            "candidates": {"filtered_before_ranking": exact, "expanded": expanded, "considered": len(allowed)}}
     if applied:
         out["reranking"] = applied["public"]
-    if reason:
+    if reason and (retrieval != "keyword"):
         out["fallback_reason"] = reason
     return out
 
@@ -982,10 +1078,11 @@ def _note_retrieval(mode: str, reason: str | None) -> None:
         RETRIEVAL_SEEN["fallbacks"][reason] = RETRIEVAL_SEEN["fallbacks"].get(reason, 0) + 1
 
 
-def _score(allowed: list, query: str, tokens: list[str], service: str | None, now: datetime) -> list:
+def _score(allowed: list, query: str, tokens: list[str], service: str | None, now: datetime, resources: set[str] | None = None, environment: str | None = None, namespace: str | None = None) -> list:
     """After authorization, so nothing unreadable can influence it. Small, explainable adjustments
     on top of the fused rank: enough to break near ties, not enough to bury a clear match."""
     wanted = {service.lower()} if service else set()
+    resources = resources or set()
     terms = _terms(query)
     scored = []
     for cid, score, c, d, s, state, why in allowed:
@@ -997,6 +1094,10 @@ def _score(allowed: list, query: str, tokens: list[str], service: str | None, no
         names = {x.lower() for x in [d.service, *((s.applies_to or {}).get("services") or [])] if x}
         if names & (wanted | terms):
             signals["service"] = 0.015
+        if resources & {str(x).lower() for x in (s.applies_to or {}).get("resources") or []}:
+            signals["resource_type"] = 0.01
+        if (environment and d.environment == environment) or (namespace and d.namespace == namespace):
+            signals["scope"] = 0.005  # written for this place, ahead of something shared everywhere
         if s.authority and d.trust == "reviewed":  # a sync finding a file gives it no authority of its own
             signals["authority"] = 0.003 * s.authority
         if state == "stale":
@@ -1083,7 +1184,7 @@ def _select(scored: list, k: int) -> list[dict]:
         results.append({
             "chunk_id": cid, "document_id": str(d.id), "ord": c.ord, "score": round(rank, 5), "signals": signals, "title": d.title, "heading": c.heading, "text": c.text,
             "citation": {"source": s.name, "source_type": s.type, "repository": (s.config or {}).get("repository"), "path": d.path, "revision": d.revision,
-                         "lines": [c.start_line, c.end_line], "offsets": [c.start_offset, c.end_offset], "url": _line_url(d.url, c.start_line, c.end_line)},
+                         "lines": [c.start_line, c.end_line], "offsets": [c.start_offset, c.end_offset], "url": _line_url(d.url, c.start_line, c.end_line, s.type, d.kind)},
             "scope": {"environment": d.environment, "namespace": d.namespace, "service": d.service, "owner": d.owner, "team": s.team, "classification": s.classification},
             "freshness": {"state": state, "reason": why, "trust": d.trust, "reviewed_at": d.reviewed_at.isoformat() if d.reviewed_at else None, "last_checked": d.checked_at.isoformat() if d.checked_at else None, "content_changed_in": d.changed_revision,
                           "document_updated": d.updated_at.isoformat() if d.updated_at else None, "source_synced": s.last_sync_at.isoformat() if s.last_sync_at else None},
@@ -1116,12 +1217,21 @@ def _flag_conflicts(results: list[dict]) -> None:
         if len({r["document_id"] for r in rows}) > 1:
             for r in rows:
                 r["freshness"]["possible_conflict"] = True
+                others = {o["citation"]["path"] for o in rows if o["document_id"] != r["document_id"]}
+                r["freshness"]["conflict_with"] = sorted(set(r["freshness"].get("conflict_with", [])) | others)[:5]
 
 
-def _line_url(url: str | None, start: int | None, end: int | None) -> str | None:
-    if not url or "github" not in url or not start:
+def safe_url(url: str | None) -> str | None:
+    """Only web links leave MOKS: a stored value must never become a javascript: or data: link in someone's browser."""
+    return url if url and url.lower().startswith(("https://", "http://")) else None
+
+
+def _line_url(url: str | None, start: int | None, end: int | None, source_type: str = "github", kind: str = "") -> str | None:
+    """Line anchors exist on a Git host's file view, not on a web page, and only the plain view of Markdown has them."""
+    url = safe_url(url)
+    if not url or source_type != "github" or not start:
         return url
-    return f"{url}#L{start}" + (f"-L{end}" if end and end != start else "")
+    return f"{url}{'?plain=1' if kind == 'markdown' else ''}#L{start}" + (f"-L{end}" if end and end != start else "")
 
 
 LIFECYCLE_MOVES = {"draft": {"quarantined", "active", "deleted"}, "quarantined": {"active", "archived", "deleted"}, "active": {"quarantined", "archived", "deleted"}, "archived": {"active", "deleted"}}
@@ -1129,20 +1239,25 @@ LIFECYCLE_MOVES = {"draft": {"quarantined", "active", "deleted"}, "quarantined":
 
 async def set_document_lifecycle(db: AsyncSession, doc: Document, state: str, superseded_by: uuid.UUID | None = None) -> None:
     """Search reads the lifecycle from PostgreSQL, so a quarantine takes effect at commit, before any index catches up."""
-    if state not in LIFECYCLE_MOVES.get(doc.lifecycle, ()):
+    if state not in LIFECYCLE_MOVES.get(doc.lifecycle, ()) and not (superseded_by and state == doc.lifecycle):
         raise ValueError(f"a document cannot go from {doc.lifecycle} to {state}")
     if superseded_by:
         other = await db.get(Document, superseded_by)
         if other is None or other.id == doc.id or other.realm != doc.realm or other.lifecycle != "active":
             raise ValueError("the replacement must be another active document")
+        if other.environment not in ("*", doc.environment) or other.namespace not in ("*", doc.namespace):
+            raise ValueError("the replacement must be readable by everyone who can read this document")  # its path is shown to them
         doc.superseded_by_id, doc.superseded_by, doc.doc_state = other.id, other.path, "superseded"
     doc.lifecycle = state
     if state == "deleted":
         await remove_document(db, doc)
 
 
-def review_document(doc: Document, actor: uuid.UUID, due: datetime | None) -> None:
-    doc.trust, doc.reviewed_by, doc.reviewed_at, doc.review_due_at = "reviewed", actor, datetime.now(timezone.utc), due
+def review_document(doc: Document, actor: uuid.UUID, due: datetime | None, interval_days: int | None = None) -> None:
+    """Without a date, the next review is the source's interval from now."""
+    now = datetime.now(timezone.utc)
+    doc.trust, doc.reviewed_by, doc.reviewed_at = "reviewed", actor, now
+    doc.review_due_at = due or (now + timedelta(days=interval_days) if interval_days else None)
 
 
 async def rescope_source(db: AsyncSession, src: KnowledgeSource, old: tuple[str, str]) -> int:

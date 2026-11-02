@@ -18,7 +18,7 @@ if [[ "${1:-}" == --files ]]; then FILES="${2:?usage: $0 --files DIR}"; else CON
 k() { kubectl --context "$CONTEXT" -n "$NS" "$@"; }
 command -v openssl > /dev/null && command -v htpasswd > /dev/null || { echo "needs openssl and htpasswd" >&2; exit 1; }
 
-SECRETS=(moks-search-tls moks-search-admin-tls moks-search-users moks-search-clients moks-search-admin-login)
+SECRETS=(moks-search-tls moks-search-admin-tls moks-search-users moks-search-clients moks-search-admin-login moks-search-dashboards moks-search-viewer-login)
 if [[ -z "$FILES" ]]; then
   for s in "${SECRETS[@]}"; do
     if k get secret "$s" > /dev/null 2>&1; then echo "Secret $NS/$s exists; leaving everything unchanged." >&2; exit 1; fi
@@ -46,6 +46,7 @@ issue admin "/O=moks/CN=moks-search-admin" "extendedKeyUsage=clientAuth\n"
 password() { openssl rand -hex 32; }
 bcrypt() { htpasswd -nbBC 12 "" "$1" | tr -d ':\n'; }
 SEARCH="$(password)"; INDEX="$(password)"; LIFECYCLE="$(password)"; MONITOR="$(password)"; ADMIN="$(password)"
+DASHBOARDS="$(password)"; VIEWER="$(password)"; COOKIE="$(password)"
 cat > internal_users.yml <<YAML
 _meta: {type: internalusers, config_version: 2}
 moks_search: {hash: "$(bcrypt "$SEARCH")", description: API pods}
@@ -53,12 +54,14 @@ moks_indexer: {hash: "$(bcrypt "$INDEX")", description: Worker}
 moks_lifecycle: {hash: "$(bcrypt "$LIFECYCLE")", description: Index generations and snapshots}
 moks_monitor: {hash: "$(bcrypt "$MONITOR")", description: Prometheus}
 moks_admin: {hash: "$(bcrypt "$ADMIN")", description: People}
+moks_dashboards: {hash: "$(bcrypt "$DASHBOARDS")", description: The Dashboards server itself}
+moks_viewer: {hash: "$(bcrypt "$VIEWER")", description: People reading in Dashboards}
 YAML
 
 if [[ -n "$FILES" ]]; then
   mkdir -p "$FILES"
   cp ca.crt node.crt node.key admin.crt admin.key internal_users.yml "$FILES/"
-  printf '%s\n' "search=$SEARCH" "index=$INDEX" "lifecycle=$LIFECYCLE" "monitor=$MONITOR" "admin=$ADMIN" > "$FILES/passwords"
+  printf '%s\n' "search=$SEARCH" "index=$INDEX" "lifecycle=$LIFECYCLE" "monitor=$MONITOR" "admin=$ADMIN" "dashboards=$DASHBOARDS" "viewer=$VIEWER" > "$FILES/passwords"
   exit 0
 fi
 
@@ -70,4 +73,6 @@ k create secret generic moks-search-clients \
   --from-literal=search-password="$SEARCH" --from-literal=index-password="$INDEX" \
   --from-literal=lifecycle-password="$LIFECYCLE" --from-literal=monitor-password="$MONITOR"
 k create secret generic moks-search-admin-login --from-literal=username=moks_admin --from-literal=password="$ADMIN"
+k create secret generic moks-search-dashboards --from-literal=password="$DASHBOARDS" --from-literal=cookie-password="$COOKIE"
+k create secret generic moks-search-viewer-login --from-literal=username=moks_viewer --from-literal=password="$VIEWER"
 echo "Created ${SECRETS[*]} in $NS. Next: docs/OPENSEARCH.md, step 3."

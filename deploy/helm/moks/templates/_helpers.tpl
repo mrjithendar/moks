@@ -182,3 +182,23 @@ s3.client.default.path_style_access: {{ $secure.snapshots.pathStyle }}
 {{- define "moks.searchActive" -}}
 {{- if and (eq .Values.rag.backend "opensearch") .Values.rag.opensearch.secure.active -}}true{{- end -}}
 {{- end -}}
+
+{{/* Settings for moks-search-dashboards. A file rather than variables, so TLS verification cannot fall back to an image default. */}}
+{{- define "moks.searchDashboardsConfig" -}}
+server.host: "0.0.0.0"
+server.port: 5601
+server.name: moks-search-dashboards
+server.basePath: {{ .base | quote }}
+server.rewriteBasePath: {{ ne .base "" }}
+opensearch.hosts: ["https://moks-search:9200"]
+opensearch.ssl.verificationMode: full
+opensearch.ssl.certificateAuthorities: ["/etc/moks-dashboards/ca.crt"]
+opensearch.username: moks_dashboards
+opensearch.password: "${MOKS_DASHBOARDS_PASSWORD}"
+opensearch.requestHeadersAllowlist: ["Authorization", "security_tenant", "securitytenant"]
+opensearch_security.cookie.password: "${MOKS_DASHBOARDS_COOKIE}"
+opensearch_security.cookie.secure: {{ .secureCookie }}
+opensearch_security.multitenancy.enabled: false
+opensearch_security.readonly_mode.roles: ["moks_knowledge_viewer"]
+telemetry.enabled: false
+{{- end -}}

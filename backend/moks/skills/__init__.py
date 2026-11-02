@@ -47,6 +47,13 @@ VARS = {"namespace", "pod", "workload", "deployment", "service", "question", "re
 _VAR = re.compile(r"\{([a-z_]+)\}")
 
 
+class StepCondition(BaseModel):
+    """Run this step only if the named earlier step ended in one of these."""
+    model_config = ConfigDict(extra="forbid")
+    step: str = Field(pattern=r"^[a-z0-9-]{1,40}$")
+    status: list[Literal["executed", "failed", "skipped", "not_applicable"]] = Field(default_factory=lambda: ["executed"], min_length=1)
+
+
 class StepSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tool: str
@@ -58,13 +65,44 @@ class StepSpec(BaseModel):
     required: bool = False  # skipping it is reported as a gap in the skill's result
     id: str | None = Field(default=None, pattern=r"^[a-z0-9-]{1,40}$")
     requires_finding: str | None = Field(default=None, pattern=r"^[a-z_]+$")  # precondition: run only if this finding exists
+    unless_finding: str | None = Field(default=None, pattern=r"^[a-z_]+$")    # the other branch: run only if it does not
+    if_step: "StepCondition | None" = None                                    # branch on how an earlier step went
     stop_if_finding: str | None = Field(default=None, pattern=r"^[a-z_]+$")   # checked after this step
     escalate: str = Field(default="", max_length=200)  # what a person should do when stop_if_finding fires
 
 
 class SkillBudget(BaseModel):
+    """Limits on one run. Each is enforced between steps, and reaching one is recorded as a gap in the evidence."""
     model_config = ConfigDict(extra="forbid")
     max_tool_calls: int | None = Field(default=None, ge=1, le=30)
+    max_seconds: int | None = Field(default=None, ge=1, le=600)
+    max_tokens: int | None = Field(default=None, ge=100, le=200_000)  # estimated from what its tools returned
+
+
+class InputSpec(BaseModel):
+    """What a run needs from the question or the findings. A required input that is absent stops the skill."""
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    required: bool = True
+    description: str = Field(default="", max_length=200)
+
+
+class OutputSpec(BaseModel):
+    """What a reader should expect. Descriptive: MOKS does not check it."""
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(max_length=80)
+    description: str = Field(default="", max_length=200)
+
+
+class Precondition(BaseModel):
+    """Checked before the first step. Unmet, the skill runs nothing and says why."""
+    model_config = ConfigDict(extra="forbid")
+    finding: str = Field(pattern=r"^[a-z_]+$")
+    expect: Literal["present", "absent"] = "present"
+    label: str = Field(default="", max_length=200)
+
+
+StepSpec.model_rebuild()
 
 
 class RemediationSpec(BaseModel):
@@ -126,10 +164,14 @@ class QueryTemplate(BaseModel):
 
 
 class Hypothesis(BaseModel):
+    """`supports` and `refutes` are guidance for a reader. The finding lists are checked after a run, and the
+    result is reported as supported, contradicted or untested. It is never a conclusion."""
     model_config = ConfigDict(extra="forbid")
     statement: str = Field(max_length=300)
     supports: str = Field(default="", max_length=300)
     refutes: str = Field(default="", max_length=300)
+    supported_by: list[str] = Field(default_factory=list, max_length=6)
+    contradicted_by: list[str] = Field(default_factory=list, max_length=6)
 
 
 class EvidenceCheck(BaseModel):
@@ -139,6 +181,7 @@ class EvidenceCheck(BaseModel):
     min_ok: int = Field(default=1, ge=1, le=20)
     when_finding: str | None = Field(default=None, pattern=r"^[a-z_]+$")  # only applies when this finding exists
     label: str = Field(default="", max_length=200)
+    optional: bool = False  # reported, but its absence is not a gap
 
 
 class VerificationCheck(BaseModel):
@@ -183,7 +226,10 @@ class SkillMeta(BaseModel):
     hypotheses: list[Hypothesis] = Field(default_factory=list, max_length=8)
     evidence_required: list[EvidenceCheck | str] = Field(default_factory=list, max_length=10)  # a plain string is guidance only
     verification: list[VerificationCheck | str] = Field(default_factory=list, max_length=8)    # a plain string is guidance only
-    recovery_validation: list[str] = Field(default_factory=list, max_length=8)  # guidance only: the action plan's own validation is what runs
+    recovery_validation: list[VerificationCheck | str] = Field(default_factory=list, max_length=8)  # handed to a proposed action to check afterwards; never run by the skill
+    inputs: list[InputSpec] = Field(default_factory=list, max_length=8)
+    outputs: list[OutputSpec] = Field(default_factory=list, max_length=8)
+    preconditions: list[Precondition] = Field(default_factory=list, max_length=6)
     environments: list[str] = Field(default_factory=lambda: ["*"], max_length=20)
     permissions: list[str] = Field(default_factory=list, max_length=8)
     overrides_builtin: bool = False  # a custom skill must say so to replace a built-in of the same name
@@ -370,6 +416,11 @@ def select(question: str, finding_kinds: set[str], limit: int = SELECT_LIMIT, el
     if asked and asked not in top:
         top[-1] = asked
     return top
+
+
+def resources_of(findings: list[dict]) -> set[str]:
+    """Resource kinds the findings are about, spelled as skills declare them."""
+    return {str(r).split("/", 1)[0].capitalize() for f in findings for r in f.get("resources") or []}
 
 
 def template_vars(value: Any) -> set[str]:

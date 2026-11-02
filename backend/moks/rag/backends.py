@@ -90,9 +90,13 @@ def rrf(*rankings: list[str]) -> list[tuple[str, float]]:
     return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
 
 
-def _filters_sql(found: list[access.Grant], params: dict) -> str:
+def _filters_sql(found: list[access.Grant], params: dict, only: list[str] | None = None) -> str:
     params["realm"] = access.realm()
-    return f"d.status = 'active' AND d.lifecycle = 'active' AND s.lifecycle = 'active' AND d.realm = :realm AND s.realm = :realm AND {access.sql(found, params)}"
+    narrowed = ""
+    if only:
+        params["only"] = [uuid.UUID(i) for i in only]
+        narrowed = " AND s.id = ANY(CAST(:only AS uuid[]))"
+    return f"d.status = 'active' AND d.lifecycle = 'active' AND s.lifecycle = 'active' AND d.realm = :realm AND s.realm = :realm AND {access.sql(found, params)}{narrowed}"
 
 
 class PostgresBackend:
@@ -106,9 +110,9 @@ class PostgresBackend:
             "SELECT 1 FROM information_schema.columns WHERE table_name = 'chunk_embeddings' AND column_name = 'embedding'"))).first()
         return row is not None
 
-    async def keyword(self, query: str, found: list[access.Grant], k: int) -> list[str]:
+    async def keyword(self, query: str, found: list[access.Grant], k: int, only: list[str] | None = None) -> list[str]:
         params: dict[str, Any] = {"q": query, "k": k}
-        where = _filters_sql(found, params)
+        where = _filters_sql(found, params, only)
         rows = (await self.db.execute(text(f"""
             SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id JOIN knowledge_sources s ON s.id = d.source_id
             WHERE {where} AND c.tsv @@ websearch_to_tsquery('english', :q)
@@ -123,13 +127,13 @@ class PostgresBackend:
                     ORDER BY ts_rank_cd(c.tsv, to_tsquery('english', :q2)) DESC LIMIT :k"""), params)).all()
         return [str(r[0]) for r in rows]
 
-    async def identifiers(self, tokens: list[str], found: list[access.Grant], k: int) -> list[str]:
+    async def identifiers(self, tokens: list[str], found: list[access.Grant], k: int, only: list[str] | None = None) -> list[str]:
         """Exact matches for error codes, resource names, paths and configuration keys, which a text
         search stems and splits. PostgreSQL holds the text whichever backend ranks the rest."""
         if not tokens:
             return []
         params: dict[str, Any] = {"k": k}
-        where = _filters_sql(found, params)
+        where = _filters_sql(found, params, only)
         hits = []
         for i, t in enumerate(tokens[:6]):
             params[f"t{i}"] = "%" + t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
@@ -140,9 +144,9 @@ class PostgresBackend:
             WHERE {where} AND ({score}) > 0 ORDER BY ({score}) DESC, c.id LIMIT :k"""), params)).all()
         return [str(r[0]) for r in rows]
 
-    async def vector(self, embedding: list[float], index_id: uuid.UUID, found: list[access.Grant], k: int) -> list[str]:
+    async def vector(self, embedding: list[float], index_id: uuid.UUID, found: list[access.Grant], k: int, only: list[str] | None = None) -> list[str]:
         params: dict[str, Any] = {"v": json.dumps(embedding), "k": k, "idx": index_id}
-        where = _filters_sql(found, params)
+        where = _filters_sql(found, params, only)
         rows = (await self.db.execute(text(f"""
             SELECT c.id FROM chunk_embeddings e JOIN chunks c ON c.id = e.chunk_id JOIN documents d ON d.id = c.document_id JOIN knowledge_sources s ON s.id = d.source_id
             WHERE {where} AND e.index_id = :idx
@@ -406,9 +410,10 @@ class OpenSearchBackend:
         so a quarantine takes effect at commit, whatever the index last recorded for the document."""
         flt, exact = access.opensearch(found)
         terms = [{"terms": {field: ids}} for field, ids in (("source_id", (exclude or {}).get("sources")), ("document_id", (exclude or {}).get("documents"))) if ids]
-        if not terms:
+        only = (exclude or {}).get("only_sources")
+        if not terms and not only:
             return flt, exact
-        return {"bool": {"filter": [flt] if flt else [], "must_not": terms}}, exact
+        return {"bool": {"filter": ([flt] if flt else []) + ([{"terms": {"source_id": only}}] if only else []), "must_not": terms}}, exact
 
     async def keyword(self, index_name: str, query: str, found: list[access.Grant], k: int, exclude: dict | None = None, tokens: list[str] | None = None) -> tuple[list[str], bool]:
         flt, exact = self._filter(found, exclude)

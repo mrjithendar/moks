@@ -1,0 +1,126 @@
+{{- $secure := .Values.rag.opensearch.secure -}}
+{{- with $secure.dashboards }}
+{{- if .enabled }}
+{{- if not $secure.enabled }}{{ fail "rag.opensearch.secure.dashboards needs rag.opensearch.secure.enabled: it reads moks-search" }}{{ end -}}
+{{- if and .ingress.enabled (not $.Values.ingress.enabled) }}{{ fail "rag.opensearch.secure.dashboards.ingress needs ingress.enabled" }}{{ end -}}
+{{- if and .ingress.enabled $.Values.rag.opensearch.publicRoute.enabled (eq .ingress.path $.Values.rag.opensearch.publicRoute.path) }}{{ fail "rag.opensearch.secure.dashboards.ingress.path is taken by rag.opensearch.publicRoute: turn that route off, or use another path" }}{{ end -}}
+{{- if and .ingress.enabled (eq (trimSuffix "/" .ingress.path) "") }}{{ fail "rag.opensearch.secure.dashboards.ingress.path must not be the site root" }}{{ end -}}
+{{- $base := "" }}{{ if .ingress.enabled }}{{ $base = trimSuffix "/" .ingress.path }}{{ end }}
+{{- if include "moks.inGroup" (dict "root" $ "group" "opensearch") }}
+{{- $config := include "moks.searchDashboardsConfig" (dict "base" $base "secureCookie" .ingress.enabled) }}
+# OpenSearch Dashboards for administrators, on the secured cluster (docs/OPENSEARCH.md). Off by default and
+# reached by port-forward first. It has its own logins and does NOT follow MOKS RBAC: anyone who signs in sees
+# every chunk their OpenSearch role allows, whatever their MOKS bindings. Engineers browse knowledge in MOKS.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moks-search-dashboards
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+data:
+  opensearch_dashboards.yml: |
+    {{- $config | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moks-search-dashboards
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: moks-search-dashboards}}
+  template:
+    metadata:
+      labels: {app: moks-search-dashboards}
+      annotations:
+        checksum/config: {{ $config | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsUser: 1000, runAsGroup: 1000, runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: dashboards
+          image: {{ .image }}
+          env:
+            # Only the server's own identity. A person signs in with their own login, and the browser never holds either.
+            - name: MOKS_DASHBOARDS_PASSWORD
+              valueFrom: {secretKeyRef: {name: {{ .secret }}, key: password}}
+            - name: MOKS_DASHBOARDS_COOKIE
+              valueFrom: {secretKeyRef: {name: {{ .secret }}, key: cookie-password}}
+            - {name: NODE_OPTIONS, value: "--max-old-space-size=768"}
+          ports: [{name: http, containerPort: 5601}]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /usr/share/opensearch-dashboards/config/opensearch_dashboards.yml, subPath: opensearch_dashboards.yml, readOnly: true}
+            - {name: ca, mountPath: /etc/moks-dashboards, readOnly: true}
+          startupProbe:
+            httpGet: {path: {{ $base }}/app/login, port: http}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: {{ $base }}/app/login, port: http}
+            periodSeconds: 10
+          resources: {{- toYaml .resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap: {name: moks-search-dashboards}
+        - name: ca   # the CA only, never the node's key
+          secret: {secretName: {{ $secure.secrets.tls }}, items: [{key: ca.crt, path: ca.crt}]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moks-search-dashboards
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {app: moks-search-dashboards}
+  ports: [{name: http, port: 5601, targetPort: http}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: moks-search-dashboards
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app: moks-search-dashboards}}
+  policyTypes: [Ingress, Egress]
+  {{- if .ingress.enabled }}
+  ingress:
+    - from:
+        {{- range $.Values.networkPolicy.ingressNamespaces }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ . }}}}
+        {{- end }}
+      ports: [{port: 5601, protocol: TCP}]
+  {{- else }}
+  ingress: []   # kubectl port-forward arrives from the node, not through a Service
+  {{- end }}
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    - to: [{podSelector: {matchLabels: {app: moks-search}}}]
+      ports: [{port: 9200, protocol: TCP}]
+{{- end }}
+{{- if and .ingress.enabled (include "moks.inGroup" (dict "root" $ "group" "routing")) }}
+---
+# Optional. Everything behind this path needs an OpenSearch login: the security plugin refuses anonymous users,
+# and Dashboards serves its base path itself, so nothing strips the prefix.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: moks-search-dashboards
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  entryPoints: [websecure]
+  routes:
+    - kind: Rule
+      match: Host(`{{ $.Values.ingress.host }}`) && (Path(`{{ $base }}`) || PathPrefix(`{{ $base }}/`))
+      services:
+        - name: moks-search-dashboards
+          port: http
+  tls: {}
+{{- end }}
+{{- end }}
+{{- end }}

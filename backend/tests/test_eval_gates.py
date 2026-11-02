@@ -15,6 +15,7 @@ async def test_every_gate_passes_and_results_record_their_versions(dataset):
     await runner.execute(rid)
     async with session_scope() as db:
         run = await db.get(EvalRun, rid)
-    failed = [(g["name"], g["failures"]) for g in run.gates if not g["passed"]]
+    failed = [(g["name"], g["failures"]) for g in run.gates if g["state"] not in ("passed", "not_applicable")]
     assert not failed, failed
+    assert all(g.get("reason") for g in run.gates if g["state"] == "not_applicable")  # a gate that did not apply says why
     assert run.kind == dataset and {"dataset", "skills_generation", "pipeline", "prompt"} <= set(run.versions)

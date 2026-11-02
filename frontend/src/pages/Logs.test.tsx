@@ -42,6 +42,7 @@ describe("Generate LogQL with AI", () => {
     expect(screen.getByRole("status").textContent).toContain("Nothing has run");
     expect(screen.getByText("Timeouts in shop.")).toBeTruthy();
     expect(sent("/logs/generate")[0].body).toMatchObject({ environment: "mk4", connector: "c1", namespace: "shop", prompt: "find checkout timeouts" });
+    await waitFor(() => expect((screen.getByLabelText("Time") as HTMLSelectElement).value).toBe("30"));  // the suggested window reaches the URL a moment after the draft
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
     await screen.findByText("Log result");
     expect(sent("/logs/query")[0].body).toMatchObject({ logql: draft().query, minutes: 30, connector: "c1" });

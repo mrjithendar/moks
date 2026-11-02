@@ -4,6 +4,18 @@ Knowledge is untrusted reference material. A retrieved document can inform an in
 never become a skill, grant a permission, or stand in for live evidence. That holds even for a document
 that looks exactly like a `SKILL.md`.
 
+## Who can do what
+
+| Permission | Roles | Allows | Scope |
+| --- | --- | --- | --- |
+| `knowledge.read` | every role that can read investigations | search, the Explorer, feedback | per binding |
+| `knowledge.test` | investigator, operator, `knowledge_reviewer`, `knowledge_admin`, `index_operator` | the retrieval test page | per binding |
+| `knowledge.review` | `knowledge_reviewer`, `knowledge_admin`, admin | see drafts and quarantined documents, review, change a document's lifecycle, read feedback | per binding |
+| `knowledge.source_admin` | `knowledge_admin`, admin | create, change, sync and retire sources | global only |
+| `knowledge.index` | `index_operator`, admin | index generations, outbox, backfill, retries, diagnostics | global only |
+
+Administering a source and running the index are separate on purpose. A reviewer outside their binding gets 404, as for any document they cannot see.
+
 ## Who can read what
 
 A document has the environment and namespace of its source. `*` means that axis is unrestricted.
@@ -28,16 +40,21 @@ There is no retrieval result cache, so no cache key can outlive a revoked bindin
 
 | State | Syncs | Searchable | Notes |
 | --- | --- | --- | --- |
+| draft | yes | no | Fills up so a reviewer can read it first. |
 | active | yes | yes | |
 | quarantined | no | no | Stops at once. Documents are kept for review. |
 | archived | no | no | |
 | deleted | no | no | Tombstones stay until the index has dropped them. The name can be reused. |
+
+A document has its own `draft`, `quarantined`, `active`, `archived` or `deleted` state. `review_required` on a source holds new and changed documents in quarantine for a reviewer. Reviewing a document sets its next review date from the source's interval when no date is given.
 
 `review_interval_days` makes a source stale when its review is overdue, and `stale_after_days` when a
 document has not been confirmed against its source. `stale_policy: flag` marks results, and `exclude` drops them.
 Example: [examples/knowledge-source.json](examples/knowledge-source.json).
 
 ## Synchronization
+
+Sync is daily by default, with Sync Now on the Sources table. Both go through one job, deduplicated per source, and `next_sync_at` is in PostgreSQL, so a restart loses nothing.
 
 Each sync is one bounded pass of 500 files against a persistent inventory (`knowledge_sync_items`).
 
@@ -48,7 +65,9 @@ Each sync is one bounded pass of 500 files against a persistent inventory (`know
 
 The state is reported separately: listing `complete | partial | failed`, content `in_progress | partial | complete`,
 and counts of discovered, processed, excluded, failed and remaining files. **Deletions come only from a
-complete listing.** `last_success_at` moves only when both the listing and the content are complete.
+complete listing.** On a web source that means a pass that visited everything: a 404 during an interrupted crawl deletes nothing, because a failing site looks the same. `last_success_at` moves only when both the listing and the content are complete, so stopping at a page limit is not a success.
+
+A file PostgreSQL refuses is recorded as failed, and the pass goes on. A page over 300 KB keeps its first 300 KB and says so wherever the document is shown.
 
 `PIPELINE_VERSION` in `rag/chunking.py` is part of change detection. Raise it when chunking, redaction,
 extraction or stored metadata change, and GitHub documents are read again even though their content did not change.
@@ -62,7 +81,9 @@ and keeps fences together when they fit, YAML on documents and top-level keys, c
 line heuristics, not parsers. A line too long for one chunk is split across several, so nothing is dropped.
 
 Offsets refer to the stored, redacted text. A citation gives source, path, revision and line range.
-`revision` is the last commit it was confirmed at, `content_changed_in` the commit its content last changed in.
+`revision` is the last commit it was confirmed at, `content_changed_in` the commit its content last changed in. A link always names the same commit as `revision`, including when a file was confirmed unchanged.
+
+Only newlines count as lines, as on a Git host, and redaction keeps every line break, so a citation's lines are the source's. Links have line anchors on Git hosts only, using the plain view for Markdown. Only `http` and `https` links leave MOKS.
 
 ## Index consistency
 
@@ -72,7 +93,7 @@ PostgreSQL is the authority. Each change adds an outbox event in its own transac
 - If a newer revision committed during a write, the event is recorded as superseded and the newer event rewrites from PostgreSQL.
 - `document_index_state` records what each index generation holds.
 - A document written while embedding failed has `vector_state: missing`. It is searchable by keyword, shown in
-  status, and retried by `backfill_vectors` every minute, stopping at the first failure.
+  status, and retried by `backfill_vectors` every minute, stopping at the first failure. The document that failed goes to the back of the queue, so one that always fails cannot hold up the rest. A document with no chunks has nothing to embed, and counts as complete for a strict reindex.
 - `reconcile_index` requeues documents whose revisions disagree. `verify_index` compares chunk counts on a sample
   (OpenSearch only: Pinecone cannot count by metadata).
 - Dead events are retried one document at a time or in a bounded batch, and every retry is audited.
@@ -82,12 +103,14 @@ Deletion and replacement run write-first: new chunks go in, fenced by content re
 ## Retrieval
 
 Results are fused from keyword, vector and exact-identifier rankings with RRF, then adjusted after authorization by
-small, visible `signals`: exact identifier, service, source authority, stale, superseded. Duplicates collapse within
+small, visible `signals`: exact identifier, service, resource type, a document written for the scope asked about, source authority, stale, superseded. Duplicates collapse within
 a scope. An RRF score only orders one result list. It is not a probability, and MOKS never presents it as confidence.
 
 `mode` and `fallback_reason` say what actually ran. `evidence.state` is `supported`, `weak` or `none`, decided from what
-the passages literally contain. `supported` means the terms are present, not that the answer is right.
-Conflicts are flagged when two documents share a title and scope. MOKS does not decide which is right.
+the passages literally contain. `supported` means the terms are present, not that the answer is right. Search abstains when no identifier from the question appears, when the terms barely overlap, or when every passage that matches is stale or superseded, and it lists the identifiers it could not find.
+Conflicts are flagged when two documents share a title and scope, and each result names the other. MOKS does not decide which is right.
+
+Scores order one result list. They are not probabilities, and a citation existing does not show that it supports a claim. `claim_support` checks literal overlap in one passage, and says so. Documents are guidance: what is true of a cluster now needs live tool evidence.
 
 ## Index coverage
 
@@ -96,6 +119,22 @@ Conflicts are flagged when two documents share a title and scope. MOKS does not 
 ## Document lifecycle and trust
 
 A document is `draft`, `quarantined`, `active`, `archived` or `deleted`, and only `active` is searched. Search reads this from PostgreSQL, so a quarantine works at commit. `trust` is separate: a sync finding a file makes it `unreviewed`, and changed content loses a review. Only a reviewed document's source authority affects ranking.
+
+Activating a retained generation recomputes its coverage: it comes back `degraded` if it missed anything, and documents' vector state is taken from its own record. Nothing is marked complete because a generation became active. Vector counts come from chunks that really received a vector.
+
+## Knowledge Explorer
+
+**Knowledge > Knowledge Explorer** lists what you can read, with filters by source, scope, service, resource type, document type, owner, team, lifecycle, classification, freshness, indexing and embedding. Sync, indexing and embedding are shown as three states per source, because they finish at different times. A document opens to its sanitized preview, original link, version and citation details, chunks with line and offset ranges, and which index generations hold it.
+
+One predicate in `rag/explore.py` decides what a person sees. The list, each count, every filter option and each direct link use it, so an unreadable document does not appear in a total, does not offer a filter value, and answers exactly like one that does not exist. Excluded, draft and quarantined documents are for reviewers. Retries and errors are for `knowledge.index`.
+
+Everything comes from PostgreSQL. The Explorer never calls OpenSearch, and there is no proxy to it. Embeddings are never shown: only the model, dimensions and coverage. Per-chunk membership is not recorded, so membership is per document, and `verify_index` samples what the index really holds.
+
+## Retrieval test
+
+**Knowledge > Retrieval test**, with `knowledge.test`, compares keyword, vector and hybrid search for one question, and reranking on and off when a reranker is enabled. It runs at most four searches and one embedding, under your own grants. Each column shows what actually ran, which can be less than what was asked for, and why. `knowledge.index` adds candidates and the index name. Token counts are estimates, because embedding providers report none.
+
+Feedback (relevant, irrelevant, outdated, missing information) goes to **Knowledge review** for a person. Nothing reads it to train a model, change ranking or publish anything. It is redacted when stored, and a reviewer sees only what their binding covers.
 
 ## Evaluation isolation
 

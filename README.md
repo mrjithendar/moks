@@ -58,6 +58,7 @@ docs/             Architecture, security/RBAC, connectors, operator guide, testi
 - [FinOps](docs/FINOPS.md)
 - [Trustworthy reports and durable investigations](docs/INVESTIGATION_DURABILITY.md)
 - [Reranking](docs/RERANKING.md): optional internal PyTorch service, off by default
+- [Knowledge sources](docs/KNOWLEDGE.md) and [rolling out knowledge governance](docs/KNOWLEDGE_ROLLOUT.md)
 - [OpenSearch](docs/OPENSEARCH.md): the secured knowledge cluster, migration, rollback and recovery
 - [Testing and results](docs/TESTING.md)
 - [Status and limitations](docs/LIMITATIONS.md)

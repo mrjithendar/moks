@@ -28,7 +28,10 @@ export const NAV: NavGroup[] = [
     { to: "/backups", label: "Backups", icon: "archive", show: (can) => can("backup.read") },
   ] },
   { label: "Knowledge", items: [
-    { to: "/knowledge", label: "Runbooks & knowledge", icon: "book", show: read },
+    { to: "/knowledge/explorer", label: "Knowledge Explorer", icon: "layers", show: (can) => can("knowledge.read") },
+    { to: "/knowledge/retrieval", label: "Retrieval test", icon: "flask", show: (can) => can("knowledge.test") },
+    { to: "/knowledge/review", label: "Knowledge review", icon: "check", show: (can) => can("knowledge.review") || can("skills.review") },
+    { to: "/knowledge", label: "Runbooks & knowledge", icon: "book", end: true, show: read },
     { to: "/skills", label: "SRE skills", icon: "spark", show: read },
   ] },
   { label: "Cost", items: [{ to: "/finops", label: "FinOps", icon: "coin", show: (can) => can("finops.read") }] },
@@ -39,7 +42,7 @@ export const NAV: NavGroup[] = [
     { to: "/admin/backup-storage", label: "Backup storage", icon: "cloud", show: (can) => can("admin.connectors") },
     { to: "/admin/llm", label: "LLM providers", icon: "cpu", show: (can) => can("admin.llm") },
     { to: "/admin/users", label: "Users & roles", icon: "users", show: (can) => can("admin.users") },
-    { to: "/evals", label: "Evaluation", icon: "flask", show: (can) => can("admin.policies") },
+    { to: "/evals", label: "Evaluation", icon: "chart", show: (can) => can("admin.policies") },
   ] },
 ];
 

@@ -279,7 +279,7 @@ class UserIn(BaseModel):
 
 
 class BindingIn(BaseModel):
-    role: Literal["viewer", "investigator", "operator", "approver", "admin"]
+    role: Literal["viewer", "investigator", "operator", "approver", "knowledge_reviewer", "knowledge_admin", "index_operator", "skill_publisher", "admin"]
     environment: str = Field(default="*", pattern=r"^[a-z0-9*?\-]{1,100}$")
     namespace: str = Field(default="*", pattern=r"^[a-z0-9*?\-]{1,63}$")
 

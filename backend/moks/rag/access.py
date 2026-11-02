@@ -4,7 +4,7 @@ A document carries an environment and a namespace, from its source. "*" on the d
 axis is unrestricted, so (*, *) is shared with everyone who can read knowledge at all; a source only
 gets that scope by an explicit decision (KnowledgeSource.shared_globally).
 
-A person reads a document when one of their bindings grants investigation.read and that single
+A person reads a document when one of their bindings grants knowledge.read and that single
 binding matches the document on both axes. Environment and namespace must be judged together: someone
 with prod/team-a and dev/team-b may not read prod/team-b. So the filter is a list of whole grants, never
 one list of environments and another of namespaces.
@@ -21,7 +21,7 @@ from fnmatch import fnmatchcase
 
 from ..rbac import ROLES, P, Principal
 
-PERM = P.INVESTIGATION_READ
+PERM = P.KNOWLEDGE_READ
 GLOB = "*?["
 OPERATIONAL = "operational"
 EVALUATION = "evaluation"
@@ -56,13 +56,14 @@ def _covers(g: Grant, environment: str, namespace: str) -> bool:
     return (environment == "*" or fnmatchcase(environment, g.environment)) and (namespace == "*" or fnmatchcase(namespace, g.namespace))
 
 
-def grants(principal: Principal, environment: str | None = None, namespace: str | None = None) -> list[Grant]:
+def grants(principal: Principal, environment: str | None = None, namespace: str | None = None, perm: P = PERM) -> list[Grant]:
     """The bindings that give knowledge access, narrowed to a requested environment and namespace.
     Asking for an environment or namespace you hold no binding on gives no grants, and so no results,
-    even for shared documents: the request is about a scope you cannot see."""
+    even for shared documents: the request is about a scope you cannot see. `perm` is for reviewers,
+    whose scope is judged the same way."""
     out: dict[Grant, None] = {}
     for b in principal.bindings:
-        if PERM not in ROLES.get(b.role, ()):
+        if perm not in ROLES.get(b.role, ()):
             continue
         if (environment and not fnmatchcase(environment, b.environment)) or (namespace and not fnmatchcase(namespace, b.namespace)):
             continue
@@ -94,7 +95,7 @@ def _regex(pattern: str) -> str:
     return "".join(out) + "$"
 
 
-def sql(found: list[Grant], params: dict, column: str = "d") -> str:
+def sql(found: list[Grant], params: dict, column: str = "d", prefix: str = "g") -> str:
     """One predicate per grant, so a binding keeps its environment and namespace together."""
     def axis(col: str, value: str, name: str) -> str | None:
         if value == "*":
@@ -104,7 +105,7 @@ def sql(found: list[Grant], params: dict, column: str = "d") -> str:
 
     parts = []
     for i, g in enumerate(found):
-        terms = [x for x in (axis(f"{column}.environment", g.environment, f"ge{i}"), axis(f"{column}.namespace", g.namespace, f"gn{i}")) if x]
+        terms = [x for x in (axis(f"{column}.environment", g.environment, f"{prefix}e{i}"), axis(f"{column}.namespace", g.namespace, f"{prefix}n{i}")) if x]
         if not terms:
             return "TRUE"  # one unrestricted grant covers every other
         parts.append(" AND ".join(terms))

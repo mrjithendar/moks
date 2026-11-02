@@ -1,4 +1,5 @@
 """What each component actually receives once credentials are split."""
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -469,3 +470,89 @@ def test_no_chart_file_holds_a_credential():
     from pathlib import Path
     for f in (Path(__file__).parents[2] / "deploy/helm/moks/files/opensearch").iterdir():
         assert "$2" not in f.read_text() and "hash:" not in f.read_text() and "BEGIN" not in f.read_text()
+
+
+# ---- OpenSearch Dashboards on the secured cluster ------------------------------------------------
+
+
+DASH = (*SECURE, "rag.opensearch.secure.dashboards.enabled=true")
+ROUTED = (*DASH, "rag.opensearch.publicRoute.enabled=false", "rag.opensearch.secure.dashboards.ingress.enabled=true")
+
+
+def dashboards_config(docs) -> dict:
+    return yaml.safe_load(of(docs, "ConfigMap", "moks-search-dashboards")["data"]["opensearch_dashboards.yml"])
+
+
+def test_secured_dashboards_are_off_by_default():
+    for args in ((), SECURE):
+        assert not [d for d in render("values-minikube.yaml", *args) if d["metadata"]["name"].startswith("moks-search-dashboards")]
+
+
+def test_secured_dashboards_need_the_secured_cluster():
+    with pytest.raises(subprocess.CalledProcessError):
+        render("values-minikube.yaml", "rag.opensearch.secure.dashboards.enabled=true")
+
+
+def test_secured_dashboards_are_internal_and_verify_tls():
+    docs = render("values-minikube.yaml", *DASH)
+    assert of(docs, "Service", "moks-search-dashboards")["spec"]["type"] == "ClusterIP"
+    assert not [d for d in docs if d["kind"] in ("IngressRoute", "Ingress") and d["metadata"]["name"] == "moks-search-dashboards"]
+    assert of(docs, "NetworkPolicy", "moks-search-dashboards")["spec"]["ingress"] == []
+    cfg = dashboards_config(docs)
+    assert cfg["opensearch.ssl.verificationMode"] == "full" and cfg["opensearch.hosts"] == ["https://moks-search:9200"] and cfg["opensearch.ssl.certificateAuthorities"] == ["/etc/moks-dashboards/ca.crt"]
+    assert cfg["server.basePath"] == "" and cfg["server.rewriteBasePath"] is False
+
+
+def test_secured_dashboards_hold_their_own_identity_and_no_admin_credential():
+    docs = render("values-minikube.yaml", *DASH)
+    pod = of(docs, "Deployment", "moks-search-dashboards")["spec"]["template"]["spec"]
+    cfg = dashboards_config(docs)
+    assert cfg["opensearch.username"] == "moks_dashboards" and cfg["opensearch.password"] == "${MOKS_DASHBOARDS_PASSWORD}"  # a reference, not a value
+    env = {e["name"]: e for e in pod["containers"][0]["env"]}
+    assert env["MOKS_DASHBOARDS_PASSWORD"]["valueFrom"]["secretKeyRef"]["name"] == "moks-search-dashboards"
+    assert "moks-search-admin" not in json.dumps(pod) and "moks-search-clients" not in json.dumps(pod)
+    secret = next(v for v in pod["volumes"] if v["name"] == "ca")["secret"]
+    assert secret["items"] == [{"key": "ca.crt", "path": "ca.crt"}]  # the CA, never the node key
+    assert pod["automountServiceAccountToken"] is False and pod["containers"][0]["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+    assert "@sha256:" in pod["containers"][0]["image"]
+
+
+def test_secured_dashboards_may_reach_moks_search_and_nothing_else_may_through_them():
+    docs = render("values-minikube.yaml", *DASH)
+    allowed = of(docs, "NetworkPolicy", "moks-search")["spec"]["ingress"][0]["from"]
+    assert {"podSelector": {"matchLabels": {"app": "moks-search-dashboards"}}} in allowed
+    egress = of(docs, "NetworkPolicy", "moks-search-dashboards")["spec"]["egress"]
+    assert egress[-1]["to"] == [{"podSelector": {"matchLabels": {"app": "moks-search"}}}] and egress[-1]["ports"] == [{"port": 9200, "protocol": "TCP"}]
+
+
+def test_secured_dashboards_can_sit_behind_a_base_path():
+    docs = render("values-minikube.yaml", *ROUTED)
+    cfg = dashboards_config(docs)
+    assert cfg["server.basePath"] == "/opensearch" and cfg["server.rewriteBasePath"] is True and cfg["opensearch_security.cookie.secure"] is True
+    pod = of(docs, "Deployment", "moks-search-dashboards")["spec"]["template"]["spec"]["containers"][0]
+    assert pod["startupProbe"]["httpGet"]["path"] == "/opensearch/app/login"  # with rewriteBasePath the server answers under it
+    route = of(docs, "IngressRoute", "moks-search-dashboards")["spec"]
+    assert route["entryPoints"] == ["websecure"] and "tls" in route and "middlewares" not in route["routes"][0]  # nothing strips the prefix
+    assert "PathPrefix(`/opensearch/`)" in route["routes"][0]["match"]
+    assert of(docs, "NetworkPolicy", "moks-search-dashboards")["spec"]["ingress"]
+
+
+def test_secured_dashboards_cannot_take_a_path_already_in_use():
+    with pytest.raises(subprocess.CalledProcessError, match="") as e:
+        render("values-minikube.yaml", *DASH, "rag.opensearch.secure.dashboards.ingress.enabled=true")
+    assert "taken by rag.opensearch.publicRoute" in e.value.stderr
+
+
+def test_anonymous_access_stays_refused():
+    config = (CHART / "files/opensearch/config.yml").read_text()
+    assert "anonymous_auth_enabled: false" in config
+
+
+def test_the_dashboards_identities_have_least_privilege():
+    roles = yaml.safe_load((CHART / "files/opensearch/roles.yml").read_text())
+    viewer = roles["moks_knowledge_viewer"]
+    assert viewer["index_permissions"][0]["index_patterns"] == ["moks-chunks-*"] and viewer["index_permissions"][0]["fls"] == ["~embedding"]
+    assert not {"write", "indices_all", "crud", "manage"} & set(viewer["index_permissions"][0]["allowed_actions"])
+    mapping = yaml.safe_load((CHART / "files/opensearch/roles_mapping.yml").read_text())
+    assert "moks_dashboards" not in mapping["all_access"]["users"] and "moks_viewer" not in mapping["all_access"]["users"]
+    assert mapping["kibana_server"]["users"] == ["moks_dashboards"]

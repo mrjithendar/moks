@@ -220,7 +220,7 @@ async def test_abandoned_evaluation_content_is_collected():
 def test_a_gate_that_checked_nothing_has_not_passed():
     g = gates._gate("x", [], 0)
     assert g["state"] == "skipped" and g["passed"] is False and not gates.gates_ok([g])
-    assert gates._not_applicable([g], ["x"])[0]["state"] == "not_applicable" and gates.gates_ok([g])
+    assert gates.gates_ok([gates._gate("x", [], 0, applicable={"x": "no model in this mode"})])
     assert not gates.gates_ok([])
 
 

@@ -18,6 +18,7 @@ from typing import Any
 
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..connectors.base import ConnectorError
@@ -100,6 +101,8 @@ async def _take_inventory(db: AsyncSession, src: KnowledgeSource, git: GitConnec
         elif current:
             item.state, item.last_error = ("excluded" if doc.status == "excluded" else "done"), None
             doc.checked_at, doc.revision = now, sha
+            if doc.status == "active":  # a citation's revision and its link must name the same commit
+                doc.url = git.provider.blob_url(repo, path, sha)
         else:
             item.state = "pending"
             if not same_blob:
@@ -141,8 +144,16 @@ async def _read_batch(db: AsyncSession, src: KnowledgeSource, git: GitConnector,
             await db.commit()
             continue
         known = (await db.execute(select(Document.id).where(Document.source_id == src.id, Document.path == path))).first() is not None
-        doc = await service.index_document(db, src, path, text, revision=sha, content_hash=f"git:{blob_sha}", url=git.provider.blob_url(repo, path, sha),
-                                           extra={"service": service_for(path, cfg.get("services") or {}) or src.service})
+        try:
+            async with db.begin_nested():  # one file PostgreSQL refuses must not stop the pass, or be first again on every retry
+                doc = await service.index_document(db, src, path, text, revision=sha, content_hash=f"git:{blob_sha}", url=git.provider.blob_url(repo, path, sha),
+                                                   extra={"service": service_for(path, cfg.get("services") or {}) or src.service})
+        except DBAPIError as exc:
+            item.attempts += 1
+            item.last_error, item.state = f"could not store this file: {type(exc.orig).__name__}"[:300], "failed"
+            log.warning("skip file", extra={"event": "ingest_skip", "errorType": type(exc.orig).__name__})
+            await db.commit()
+            continue
         item.state, item.last_error = ("excluded" if doc.status == "excluded" else "done"), doc.excluded_reason if doc.status == "excluded" else None
         cursor["updated" if known else "added"] = cursor.get("updated" if known else "added", 0) + 1
         await db.commit()
@@ -206,6 +217,7 @@ async def sync_web(db: AsyncSession, src: KnowledgeSource, transport=None, resol
     robots: dict[str, Any] = {}
     failed: dict[str, str] = {}
     counts = dict.fromkeys(("added", "updated", "unchanged", "excluded", "deleted"), 0)
+    gone: set[str] = set()
     deadline = time.monotonic() + WEB_PASS_SECONDS
     await db.execute(sa_delete(KnowledgeSyncItem).where(KnowledgeSyncItem.source_id == src.id))
     while queue and len(read) + len(failed) < limit and time.monotonic() < deadline:
@@ -220,10 +232,7 @@ async def sync_web(db: AsyncSession, src: KnowledgeSource, transport=None, resol
                     continue
             final, kind, body = await web.fetch(url, transport=transport, resolver=resolver)
         except web.PageGone:
-            if url in existing and existing[url].status != "deleted":
-                await service.remove_document(db, existing[url])
-                counts["deleted"] += 1
-            await db.commit()
+            gone.add(url)  # one 404 proves little: a site failing or moving looks the same, so only a complete pass deletes
             continue
         except ConnectorError as exc:
             failed[url] = _safe_error(exc)
@@ -240,6 +249,7 @@ async def sync_web(db: AsyncSession, src: KnowledgeSource, transport=None, resol
                     queue.append(target)
         read.add(url)
         doc = await service.index_document(db, src, url, text[:MAX_FILE_BYTES], revision=None, url=final, extra={"title": title or url[:500]})
+        doc.ingest_note = f"only the first {MAX_FILE_BYTES // 1000} KB of this page was kept" if len(text) > MAX_FILE_BYTES else None
         counts["excluded" if doc.status == "excluded" else "unchanged" if hashes.get(url) == doc.content_hash else "updated" if url in hashes else "added"] += 1
         await db.commit()
     finished = not queue
@@ -258,7 +268,7 @@ async def sync_web(db: AsyncSession, src: KnowledgeSource, transport=None, resol
                        "processed": len(read), "excluded": counts["excluded"], "failed": len(failed), "remaining": 0, "deletions_applied": trusted}
     await service.mark_indexed_now(db, src, "partial" if problem else "ok", problem)
     await db.commit()
-    return {**counts, "listing": src.sync_cursor["listing"], "content": src.sync_cursor["content"], "complete": not failed and not timed_out, "discovered": len(read) + len(failed),
+    return {**counts, "listing": src.sync_cursor["listing"], "content": src.sync_cursor["content"], "complete": not problem, "discovered": len(read) + len(failed),
             "processed": len(read), "remaining": 0, "failed": len(failed)}
 
 

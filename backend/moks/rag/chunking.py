@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from ..config import get_settings
 
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3  # 3: line numbers count only newlines and skip leading blanks; redaction keeps line breaks
 CHARS_PER_TOKEN = 4  # an estimate: no tokenizer is shipped, and models differ
 MAX_CHUNKS = 3000
 
@@ -124,7 +124,8 @@ def _spans(text: str, kind: str, size: int) -> tuple[list[_Span], list[tuple[str
     sections: list[tuple[str, int, int]] = []
     stack: list[tuple[int, str]] = []
     heading, section_start, offset, fenced = "", 0, 0, False
-    lines = text.splitlines(keepends=True)
+    # Only newlines end a line. str.splitlines also breaks on form feeds and Unicode separators, which no editor or Git host counts.
+    lines = re.findall(r"[^\n]*\n|[^\n]+$", text)
     for number, raw in enumerate(lines, 1):
         bare = raw.rstrip("\r\n")
         opens = kind == "markdown" and FENCE.match(bare)
@@ -219,6 +220,8 @@ def _piece(text: str, spans: list[_Span], heading: str) -> ChunkPiece | None:
     body = raw.strip()
     if not body:
         return None
-    a += len(raw) - len(raw.lstrip())
+    skipped = raw[:len(raw) - len(raw.lstrip())]
+    a += len(skipped)
     b = a + len(body)
-    return ChunkPiece(heading, body, spans[0].line, spans[-1].line, a, b)
+    start = spans[0].line + skipped.count("\n")  # a citation points at the text, not at the blank lines before it
+    return ChunkPiece(heading, body, start, start + body.count("\n"), a, b)

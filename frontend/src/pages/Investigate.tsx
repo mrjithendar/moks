@@ -239,7 +239,7 @@ export function InvestigationView() {
             </div>
           </div>
           {opened && <EvidenceDrawer e={opened} grafana={inv.grafana_url} onClose={() => setOpen(null)} />}
-          {report && can("investigation.run") && <div className="mt"><ProposalForm investigation={inv.id} question={inv.question} evidence={evidence} /></div>}
+          {report && can("investigation.run") && <div className="mt"><ProposalForm investigation={inv.id} question={inv.question} evidence={evidence} findings={[...new Set<string>((report.findings ?? []).map((f: any) => f.kind))]} /></div>}
           {propose && <Dialog title="Propose an action plan" wide onClose={() => setPropose(null)}>
             <p className="small muted">Proposal from the report: {propose.action}</p>
             <PlanForm env={inv.environment} ns={inv.namespace} initial={proposalPlan(inv, propose)} onDone={(id) => nav(`/actions/${id}`)} /></Dialog>}
@@ -250,14 +250,14 @@ export function InvestigationView() {
 }
 
 /** A draft for someone else to review. Nothing here publishes a skill or a runbook. */
-function ProposalForm({ investigation, question, evidence }: { investigation: string; question: string; evidence: any[] }) {
+function ProposalForm({ investigation, question, evidence, findings }: { investigation: string; question: string; evidence: any[]; findings: string[] }) {
   const usable = evidence.filter((e) => e.kind === "observation" || e.kind === "incomplete");
   const [form, setForm] = useState({ kind: "runbook", title: "", body: "", owner: "", refs: [] as string[] });
   const [state, setState] = useState<{ saved?: string; error?: string }>({});
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     try {
-      const r = await api<any>("/proposals", { method: "POST", body: { investigation_id: investigation, kind: form.kind, title: form.title, body: form.body, owner: form.owner, evidence: form.refs, regression_fixture: { question } } });
+      const r = await api<any>("/proposals", { method: "POST", body: { investigation_id: investigation, kind: form.kind, title: form.title, body: form.body, owner: form.owner, evidence: form.refs, regression_fixture: { question, findings } } });
       setState({ saved: `Saved as draft v${r.version}. It needs a review by someone else.` });
     } catch (err: any) {
       setState({ error: err.message });
@@ -266,8 +266,8 @@ function ProposalForm({ investigation, question, evidence }: { investigation: st
   return (
     <details className="card"><summary>Propose a runbook or skill update</summary>
       <form className="stack" onSubmit={submit}>
-        <p className="small muted">Saved as a redacted draft with this question as its regression case. It changes nothing until it is reviewed and published.</p>
-        <label>Type<select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })}><option value="runbook">Runbook</option><option value="skill">Skill</option></select></label>
+        <p className="small muted">Saved as a redacted draft with this question as its regression case. Someone else reviews it, approval makes a draft, and it changes nothing until that draft is published.</p>
+        <label>Type<select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })}><option value="runbook">Runbook</option><option value="skill">Skill (a complete SKILL.md)</option></select></label>
         <label>Title<input required minLength={5} maxLength={200} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></label>
         <label>Owner<input required minLength={2} maxLength={200} value={form.owner} onChange={(e) => setForm({ ...form, owner: e.target.value })} placeholder="team-payments" /></label>
         <label>What should change<textarea required minLength={20} rows={5} value={form.body} onChange={(e) => setForm({ ...form, body: e.target.value })} /></label>
@@ -350,6 +350,7 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose }
         <ul>{report.skill_actions.map((a: any, i: number) => (
           <li key={i}><span className="mono">{a.action}</span>{a.target_name && <span className="mono small"> · {a.target_kind}/{a.target_name}</span>}
             <span className="small muted"> — {a.note} (finding: {a.finding}; skill {a.skill})</span>
+            {a.evidence_complete === false && <Badge kind="warn">skill evidence incomplete</Badge>}
             {onPropose && <button type="button" className="ghost small" style={{ marginLeft: 8 }} onClick={() => onPropose({ ...a, fromSkill: true })}>Propose as action plan</button>}</li>
         ))}</ul>
       </Section>}
@@ -362,14 +363,17 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose }
         ))}</ul>
         <div className="small muted proposal-note">Proposals only: nothing was changed. Turn one into a reviewed action plan to execute it (approval required in production).</div>
       </Section>}
+      {report.withheld_findings?.length > 0 && <div className="alert warn small">Not reported as verified, because required evidence is missing: {report.withheld_findings.map((w: any) => `${w.cause} (${w.reason})`).join("; ")}</div>}
       {report.skill_runs?.length > 0 && <Section title="What each skill did" count={report.skill_runs.length} open={false}>
         {report.skill_runs.map((r: any) => <div key={r.skill} className="stack tight skill-run">
           <div className="small"><strong>{r.skill}</strong> <span className="muted">v{r.version} · <span className="mono">{r.digest?.slice(0, 12)}</span> · {r.reasons.join("; ")}</span></div>
-          {r.outcome && <div><Badge kind={r.outcome === "complete" ? "ok" : "warn"}>{r.outcome}</Badge></div>}
+          {r.outcome && <div><Badge kind={r.outcome === "complete" ? "ok" : r.outcome === "not_applicable" ? "neutral" : "warn"}>{r.outcome.replace("_", " ")}</Badge></div>}
+          {r.not_run && <div className="small muted">Did not run: {r.not_run}</div>}
           {r.stopped && <div className="alert warn small">Stopped during this run: {r.stopped}{r.escalation ? `. ${r.escalation}` : ""}</div>}
           {r.gaps?.map((g: string) => <div key={g} className="alert warn small">{g}</div>)}
           <ul className="small">{r.steps.map((s: any, i: number) => <li key={i}><span className="mono">{s.tool}</span> <Badge kind={s.status === "executed" ? "ok" : s.status === "failed" ? "bad" : "neutral"}>{s.status}</Badge>{s.evidence.length > 0 && <Cites refs={[...new Set<string>(s.evidence)]} onCite={onCite} />} <span className="muted">{s.reason ?? s.errors[0] ?? ""}</span></li>)}</ul>
-          {r.checks?.filter((c: any) => c.status !== "guidance_only").map((c: any, i: number) => <div key={i} className="small"><Badge kind={c.status === "passed" ? "ok" : c.status === "failed" ? "bad" : "neutral"}>{c.status.replace("_", " ")}</Badge> {c.text}</div>)}
+          {r.checks?.filter((c: any) => c.status !== "guidance_only").map((c: any, i: number) => <div key={i} className="small"><Badge kind={c.status === "passed" ? "ok" : c.status === "failed" ? "bad" : "neutral"}>{c.status.replace(/_/g, " ")}</Badge> {c.text}</div>)}
+          {r.hypotheses?.map((h: any, i: number) => <div key={i} className="small"><Badge kind={h.status === "contradicted" ? "warn" : "neutral"}>{h.status}</Badge> {h.statement}</div>)}
         </div>)}
         {report.skill_rejected?.length > 0 && <div className="small muted">Not used: {report.skill_rejected.map((r: any) => `${r.skill} (${r.reason})`).join("; ")}</div>}
       </Section>}

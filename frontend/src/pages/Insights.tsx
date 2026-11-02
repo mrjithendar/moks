@@ -3,9 +3,8 @@ import { useNavigate } from "react-router-dom";
 import { api, apiForm, qs } from "../api";
 import { useAuth } from "../auth";
 import { Badge, DataTable, type Env, ErrorBox, LineChart, Loading, PageHead, Stat, Time, useInterval, useLoad } from "../components";
-import { type Chip, FilterPanel, useUrlFilters } from "../filters";
 import { PlanForm } from "./Ops";
-import { Drawer, Empty, Truncate, useFeedback, useIsMobile } from "../ui";
+import { Drawer, Empty, Truncate, useFeedback } from "../ui";
 
 // ---- Knowledge ----------------------------------------------------------------------------------
 
@@ -22,7 +21,7 @@ export function Knowledge() {
   }
   return (
     <>
-      <PageHead title="Runbooks & knowledge" sub={status.data ? `${status.data.backend} index ${status.data.index?.name ?? "(not built yet)"} · ${status.data.index?.model ?? ""} · ${status.data.chunks} passages` : ""} />
+      <PageHead title="Runbooks & knowledge" sub={status.data ? (status.data.scoped ? `${status.data.chunks} passages you can read` : `${status.data.backend} index ${status.data.index?.name ?? "(not built yet)"} · ${status.data.index?.model ?? ""} · ${status.data.chunks} passages`) : ""} />
       <form className="card row nowrap" onSubmit={search}>
         <input aria-label="Search knowledge" className="grow" value={q} onChange={(e) => setQ(e.target.value)} placeholder="e.g. checkout 502 runbook, redis failover, rollback procedure" />
         <button disabled={q.length < 2}>Search</button>
@@ -31,14 +30,14 @@ export function Knowledge() {
       {res && <div className="stack" style={{ marginTop: 14 }}>
         <div className="small muted">{res.results.length} results · {res.mode === "hybrid" ? "keyword and vector search" : res.mode === "keyword" ? "keyword search" : res.mode}. Only sources you are allowed to read are searched and returned.</div>
         {res.fallback_reason && <div className="alert warn small">Vector search was not used: {res.fallback_reason}.</div>}
-        {res.evidence && res.evidence.state !== "supported" && <div className="alert info small">{res.evidence.reason}</div>}
+        {res.evidence && (res.evidence.state !== "supported" || res.evidence.missing_identifiers?.length > 0) && <div className="alert info small">{res.evidence.reason}</div>}
         <div className="small muted">These passages are documented knowledge. Current production facts need live evidence.</div>
         {res.results.map((h: any) => (
           <div key={h.chunk_id} className="card">
             <div className="stack tight"><strong className="clamp-2" title={h.title}>{h.title}{h.heading && <span className="muted"> › {h.heading}</span>}</strong>
               <span className="small muted">{h.citation.source} · {h.scope.environment}/{h.scope.namespace}</span>
               {h.freshness.state !== "current" && <span><Badge kind="warn">{h.freshness.state}</Badge> <span className="small muted">{h.freshness.reason}</span></span>}
-              {h.freshness.possible_conflict && <span><Badge kind="warn">may conflict</Badge> <span className="small muted">Another document here has the same title. Check which applies.</span></span>}</div>
+              {h.freshness.possible_conflict && <span><Badge kind="warn">may conflict</Badge> <span className="small muted">Another document here covers the same thing{h.freshness.conflict_with?.length ? ` (${h.freshness.conflict_with.join(", ")})` : ""}. Check which applies.</span></span>}</div>
             <pre className="passage">{h.text.slice(0, 1200)}</pre>
             <div className="small" style={{ marginTop: 6 }}>
               {h.citation.url ? <a href={h.citation.url} target="_blank" rel="noreferrer noopener">{h.citation.path}{h.citation.lines?.[0] ? ` L${h.citation.lines[0]}-${h.citation.lines[1]}` : ""}</a> : h.citation.path}
@@ -49,8 +48,8 @@ export function Knowledge() {
           </div>
         ))}
       </div>}
-      {status.data && can("admin.connectors") && <IndexHealth s={status.data} />}
-      {can("admin.connectors") && <KnowledgeSources onChange={status.reload} />}
+      {status.data && !status.data.scoped && <IndexHealth s={status.data} />}
+      {can("knowledge.source_admin") && <KnowledgeSources onChange={status.reload} />}
     </>
   );
 }
@@ -78,7 +77,7 @@ function IndexHealth({ s }: { s: any }) {
 
 function SearchBackend() {
   const { can } = useAuth();
-  const r = useLoad(() => (can("admin.llm") ? api<any>("/knowledge/backend") : Promise.resolve(null)), []);
+  const r = useLoad(() => (can("knowledge.index") ? api<any>("/knowledge/backend") : Promise.resolve(null)), []);
   const d = r.data;
   if (!d) return null;
   const p = d.probe, active = d.generations.find((g: any) => g.serving), snap = p?.snapshots, c = d.coverage;
@@ -204,7 +203,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
   }
   return (
     <div className="card stack" style={{ marginTop: 14 }}>
-      <div className="row between"><h2>Sources</h2>{can("admin.llm") && <button className="ghost small" onClick={() => api("/knowledge/reindex", { method: "POST" }).then(() => toast("Reindex queued"), (e) => toast(e.message, "bad"))}>Rebuild index (embedding change)</button>}</div>
+      <div className="row between"><h2>Sources</h2>{can("knowledge.index") && <button className="ghost small" onClick={() => api("/knowledge/reindex", { method: "POST" }).then(() => toast("Reindex queued"), (e) => toast(e.message, "bad"))}>Rebuild index (embedding change)</button>}</div>
       <Loading load={list} rows={4} />
       {list.data && <DataTable label="Knowledge sources" rows={list.data} rowKey={(s) => s.id} empty={<Empty title="No sources yet.">Add a repository or an upload source below.</Empty>}
         menu={(s) => ({ label: `Actions for ${s.name}`, items: [
@@ -343,7 +342,7 @@ function SourceDetail({ s, onClose }: { s: any; onClose: () => void }) {
 /** Administrators only: the endpoint refuses others, and a refusal simply hides this. */
 function RerankingStatus() {
   const { can } = useAuth();
-  const r = useLoad(() => (can("admin.llm") ? api<any>("/knowledge/reranking") : Promise.resolve(null)), []);
+  const r = useLoad(() => (can("knowledge.index") ? api<any>("/knowledge/reranking") : Promise.resolve(null)), []);
   const d = r.data;
   if (!d) return null;
   const fallbacks = Object.entries(d.stats?.fallbacks ?? {}) as [string, number][];
@@ -612,106 +611,18 @@ export function Evals() {
           {r.gates?.length > 0 && <div className="stack">
             <div className="row small">{r.gates.map((g: any) => <Badge key={g.name} kind={GATE_TONE[g.state ?? (g.passed ? "passed" : "failed")]}>{g.name.replace(/_/g, " ")}: {(g.state ?? (g.passed ? "passed" : "failed")).replace("_", " ")} ({g.checked})</Badge>)}</div>
             {r.gates.filter((g: any) => g.state === "failed" || (!g.state && !g.passed)).flatMap((g: any) => g.failures.slice(0, 5).map((f: string) => <div key={g.name + f} className="alert error small">{g.name}: {f}</div>))}
-            {r.versions?.metrics && <div className="small muted mono">{Object.entries(r.versions.metrics).map(([k, v]) => `${k} ${v}`).join(" · ")}</div>}
-            <div className="small muted">Gates are deterministic checks. The score summarizes quality; a failed gate fails the run whatever the score says.</div>
+            {r.versions?.metrics && <div className="small muted mono">{Object.entries(r.versions.metrics).filter(([, v]) => typeof v !== "object").map(([k, v]) => `${k} ${v}`).join(" · ")}</div>}
+            {r.gates.filter((g: any) => g.state === "not_applicable" && g.reason).map((g: any) => <div key={g.name} className="small muted">{g.name.replace(/_/g, " ")}: not applicable. {g.reason}</div>)}
+            {r.gates.some((g: any) => g.evidence === "simulated") && <div className="small muted">Simulated, with fixtures and no live service: {r.gates.filter((g: any) => g.evidence === "simulated").map((g: any) => g.name.replace(/_/g, " ")).join(", ")}.</div>}
+            <div className="small muted">Gates are checks. The score summarizes quality; a failed or skipped gate fails the run whatever the score says.</div>
           </div>}
-          {r.versions?.dataset && <div className="small muted mono">dataset {r.versions.dataset} · skills generation {r.versions.skills_generation ?? "none"} · pipeline {r.versions.pipeline} · prompt {r.versions.prompt}</div>}
+          {r.versions?.dataset && <div className="small muted mono">dataset {r.versions.dataset} · skills generation {r.versions.skills_generation ?? "none"} · pipeline {r.versions.pipeline} · prompt {r.versions.prompt} · model {r.versions.model ?? "none"} · {r.versions.index}</div>}
           {r.kind === "investigation" && <div className="table-wrap" role="region" aria-label={`Results of ${r.dataset}`} tabIndex={0}><table><thead><tr><th>Case</th><th>Score</th><th>Failed checks</th><th>Findings</th><th>Tools</th></tr></thead>
             <tbody>{r.results.map((c: any) => <tr key={c.case}><td className="mono small">{c.case}</td><td>{c.score.toFixed(2)}</td>
               <td className="small">{Object.entries(c.checks).filter(([, v]) => !v).map(([k]) => k).join(", ") || "—"}</td>
               <td className="small">{c.findings.join(", ")}</td><td>{c.tool_calls}</td></tr>)}</tbody></table></div>}
         </div>
       ))}
-    </>
-  );
-}
-
-// ---- SRE skills -------------------------------------------------------------------------------
-
-const CATEGORIES = ["kubernetes", "application", "aws", "devops", "support", "finops"];
-
-export function Skills() {
-  const { can } = useAuth();
-  const list = useLoad(() => api<any>("/skills"), []);
-  const [open, setOpen] = useState<string | null>(null);
-  const [{ category, q: text }, setF, clearF] = useUrlFilters({ category: "", q: "" });
-  const phone = useIsMobile();
-  const chips: Chip[] = [...(category ? [{ key: "c", label: category, onRemove: () => setF({ category: "" }) }] : []), ...(text ? [{ key: "q", label: `matches ${text}`, onRemove: () => setF({ q: "" }) }] : [])];
-  const detail = useLoad(() => (open ? api<any>(`/skills/${open}`) : Promise.resolve(null)), [open]);
-  const generation = useLoad(() => api<any>("/skills/generation"), []);
-  const registry = useLoad(() => (can("admin.policies") ? api<any>("/skills/registry").catch(() => null) : Promise.resolve(null)), []);
-  const { toast } = useFeedback();
-  const waiting: any[] = (registry.data?.versions ?? []).filter((v: any) => v.state === "validated" || v.state === "draft");
-  async function publish(name: string, digest: string, path = "publish") {
-    try { await api(`/skills/${name}/${path}`, { method: "POST", body: { digest, note: "" } }); await api("/skills/reload", { method: "POST" }); list.reload(); detail.reload(); registry.reload(); generation.reload(); toast("Published. Every process moves to the new generation within a minute."); }
-    catch (e: any) { toast(e.message, "bad"); }
-  }
-  const rows = (list.data?.skills ?? []).filter((s: any) => (!category || s.category === category) && JSON.stringify([s.name, s.title, s.description]).toLowerCase().includes(text.toLowerCase()));
-  const d = detail.data;
-  const blocked = (s: any) => Object.entries(s.availability as Record<string, any>).filter(([, v]) => !v.available);
-  const guidance = (rows: any[]) => rows.filter((x) => typeof x === "string");
-  const checked = (rows: any[]) => rows.filter((x) => typeof x !== "string");
-  async function toggle(s: any) {
-    await api(`/skills/${s.name}/policy`, { method: "PUT", body: { enabled: !s.enabled } });
-    list.reload();
-    detail.reload();
-  }
-  const skillBody = d && <>
-            <div className="row between"><h2>{d.title} <span className="small muted">v{d.version} · {d.owner}</span></h2>
-              {can("admin.policies") && <button className="ghost small" onClick={() => toggle(d)}>{d.enabled ? "Turn off" : "Turn on"}</button>}</div>
-            <p className="muted" style={{ margin: 0 }}>{d.description}</p>
-            <div className="small">Needs: {d.needs.join(", ") || "nothing beyond MOKS"}{d.telemetry.length > 0 && <> · metrics {d.telemetry.join(", ")}</>}</div>
-            <div className="small muted">Version {d.version} · <span className="mono">{d.digest?.slice(0, 12)}</span></div>
-            <div className="row small">{Object.entries(d.availability as Record<string, any>).map(([e, v]) => <Badge key={e} kind={v.state === "ready" ? "ok" : v.state === "unavailable" ? "bad" : "warn"}>{e}: {v.state}{v.reasons[0] ? ` (${v.reasons[0]})` : ""}</Badge>)}</div>
-            {d.history?.length > 1 && <><h3>Versions</h3>{d.history.map((h: any) => <div key={h.digest} className="row between small"><span>v{h.version} <Badge kind={h.digest === d.digest ? "ok" : "neutral"}>{h.digest === d.digest ? "running" : h.state}</Badge> <span className="mono muted">{h.digest.slice(0, 12)}</span></span>
-              {can("admin.policies") && h.digest !== d.digest && ["published", "deprecated"].includes(h.state) && <button className="ghost small" onClick={() => publish(d.name, h.digest, "rollback")}>Roll back to this</button>}</div>)}</>}
-            <h3>Triggers</h3><div className="small">keywords: {d.triggers.keywords.join(", ") || "—"} · findings: {d.triggers.findings.join(", ") || "—"}</div>
-            {d.steps.length > 0 && <><h3>Steps (read-only, policy-checked)</h3>
-              <ol className="small">{d.steps.map((s: any, i: number) => <li key={i}><span className="mono">{s.tool}</span> {s.for_each && <Badge>{s.for_each}</Badge>} {s.purpose}</li>)}</ol></>}
-            {d.detection.length > 0 && <><h3>Detection rules</h3><ul className="small">{d.detection.map((r: any) => <li key={r.id}><span className="mono">{r.id}</span> {r.kind} · {r.severity} · every {r.interval_minutes} min, {r.sustained_checks} checks to open</li>)}</ul></>}
-            {d.hypotheses.length > 0 && <><h3>Hypotheses</h3><ul className="small">{d.hypotheses.map((h: any, i: number) => <li key={i}>{h.statement} <span className="muted">Supported by: {h.supports || "—"} Refuted by: {h.refutes || "—"}</span></li>)}</ul></>}
-            {(d.evidence_required.length > 0 || d.verification.length > 0) && <><h3>Checked in every run</h3>
-              {[...checked(d.evidence_required), ...checked(d.verification)].length === 0 && <div className="small muted">Nothing here is checked automatically yet.</div>}
-              <ul className="small">{[...checked(d.evidence_required), ...checked(d.verification)].map((x: any, i: number) => <li key={i}>{x.label || x.tool || x.finding}</li>)}</ul>
-              {[...guidance(d.evidence_required), ...guidance(d.verification)].length > 0 && <><h3>Guidance only, not checked</h3><ul className="small">{[...guidance(d.evidence_required), ...guidance(d.verification)].map((x: string, i: number) => <li key={i}>{x}</li>)}</ul></>}</>}
-            {d.recovery_validation.length > 0 && <><h3>Recovery validation (guidance only)</h3><ul className="small">{d.recovery_validation.map((x: string, i: number) => <li key={i}>{x}</li>)}</ul></>}
-            {d.remediation.length > 0 && <><h3>Remediation hints</h3><ul className="small">{d.remediation.map((r: any, i: number) => <li key={i}>when <Badge kind="warn">{r.when}</Badge> → <span className="mono">{r.action}</span> {r.target} <span className="muted">{r.note}</span></li>)}</ul></>}
-            <h3>Guidance</h3><pre className="logbox">{d.body}</pre>
-  </>;
-  return (
-    <>
-      <PageHead title="SRE skills" sub="Versioned playbooks from SKILL.md files. MOKS picks them from the question and findings, runs their read-only steps and follows their guidance.">
-        {can("admin.policies") && <button className="ghost" onClick={() => api("/skills/reload", { method: "POST" }).then(list.reload)}>Reload</button>}
-      </PageHead>
-      {list.data?.errors?.length > 0 && <div className="alert error" style={{ marginBottom: 12 }}>{list.data.errors.map((e: any) => <div key={e.path} className="small">{e.path}: {e.error}</div>)}</div>}
-      {generation.data?.active && <div className="card stack">
-        <div className="row between"><span className="small">Skill generation <strong>{generation.data.active.generation}</strong> · {generation.data.active.skills} skills · <span className="mono">{generation.data.active.digest.slice(0, 12)}</span></span>
-          <Badge kind={generation.data.consistent ? "ok" : "warn"}>{generation.data.consistent ? "every process current" : "processes differ"}</Badge></div>
-        <div className="row small">{generation.data.processes.map((p: any) => <span key={p.instance} title={p.error ?? p.instance}><Badge kind={p.error ? "bad" : p.current ? "ok" : "warn"}>{p.component} {p.generation ?? "none"}</Badge></span>)}</div>
-        {generation.data.processes.filter((p: any) => p.error).map((p: any) => <div key={p.instance} className="alert error small">{p.instance} kept its last valid generation: {p.error}</div>)}
-      </div>}
-      {waiting.length > 0 && <div className="card stack mt"><h2>Waiting for review ({waiting.length})</h2>
-        {waiting.map((v) => <div key={v.digest} className="row between small"><span><strong>{v.skill}</strong> v{v.version} · {v.owner} · <span className="mono">{v.digest.slice(0, 12)}</span> {v.validation.filter((i: any) => i.level === "error").map((i: any) => <div key={i.message} className="muted">{i.where}: {i.message}</div>)}</span>
-          {v.state === "validated" ? <button className="ghost small" onClick={() => publish(v.skill, v.digest)}>Publish</button> : <Badge kind="bad">failed validation</Badge>}</div>)}</div>}
-      <div className="mt" />
-      <FilterPanel chips={chips} onClear={clearF} search={<input type="search" className="grow" aria-label="Search skills" value={text} onChange={(e) => setF({ q: e.target.value })} placeholder="Search skills" />}>
-        <label>Category<select value={category} onChange={(e) => setF({ category: e.target.value })}><option value="">All</option>{CATEGORIES.map((c) => <option key={c}>{c}</option>)}</select></label>
-      </FilterPanel>
-      <Loading load={list} rows={8} />
-      <div className="small muted mt">{rows.length} skills</div>
-      <div className="grid split-2-3 mt">
-        <div className="card">
-          {!rows.length && list.data && <Empty title="No skills match." />}
-          <ul className="rl">{rows.map((s: any) => (
-            <li key={s.name} className={`rl-row${open === s.name ? " active" : ""}`}><button type="button" className="rl-main" onClick={() => setOpen(s.name)}>
-              <span className="rl-top"><span className="rl-name"><strong className="trunc" title={s.title}>{s.title}</strong></span><span className="rl-status"><Badge>{s.category}</Badge>{s.source === "custom" && <Badge kind="info">custom</Badge>}{!s.enabled && <Badge kind="warn">off</Badge>}{s.detection_rules.length > 0 && <Badge kind="info">{s.detection_rules.length} detection</Badge>}</span></span>
-              <span className="small muted clamp-2">{s.description}</span>
-              {blocked(s).length > 0 && <span className="small muted clamp-2">Unavailable in {blocked(s).map(([e]) => e).join(", ")}: {(blocked(s)[0][1] as any).reasons.join("; ")}</span>}
-            </button></li>
-          ))}</ul>
-        </div>
-        {phone ? (open && d && <Drawer title={d.title} onClose={() => setOpen(null)}><div className="stack">{skillBody}</div></Drawer>) : <div className="card stack">{d ? skillBody : <Empty title="Select a skill." />}</div>}
-      </div>
     </>
   );
 }

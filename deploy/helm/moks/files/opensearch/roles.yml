@@ -56,3 +56,13 @@ moks_monitor:
   index_permissions:
     - index_patterns: ["*"]
       allowed_actions: ["indices:monitor/*"]
+
+# People using Dashboards to look, on top of the built-in kibana_user. Reads knowledge chunks without their
+# vectors. It still reads every chunk: OpenSearch knows nothing of MOKS bindings, so give this login only to
+# people cleared for all knowledge.
+moks_knowledge_viewer:
+  cluster_permissions: ["cluster_composite_ops_ro"]
+  index_permissions:
+    - index_patterns: ["moks-chunks-*"]
+      fls: ["~embedding"]
+      allowed_actions: ["read", "indices:monitor/settings/get", "indices:admin/mappings/get", "indices:admin/resolve/index"]

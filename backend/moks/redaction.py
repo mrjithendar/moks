@@ -56,6 +56,16 @@ def redact(text: str) -> str:
     return text
 
 
+def redact_lines(text: str) -> str:
+    """redact, keeping every line break: a stored document's line numbers must stay those of its source,
+    and a value that spans lines would otherwise pull everything after it up."""
+    if not text:
+        return text
+    for pattern, repl in _PATTERNS:
+        text = pattern.sub(lambda m, r=repl: m.expand(r) + "\n" * m.group(0).count("\n"), text)
+    return text
+
+
 def redact_obj(value: Any, _depth: int = 0) -> Any:
     """Recursively redact strings and values under sensitive keys."""
     if _depth > 20:

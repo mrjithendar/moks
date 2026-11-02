@@ -210,7 +210,7 @@ async def events(action, sid=None):
 def test_terminal_access_is_separate_from_every_other_role():
     assert P.TERMINAL_USE in ROLES["terminal"]
     assert not [r for r, perms in ROLES.items() if P.TERMINAL_USE in perms and r != "terminal"]
-    assert ROLES["terminal"] == {P.TERMINAL_USE, P.OVERVIEW_READ, P.INVESTIGATION_READ}
+    assert ROLES["terminal"] == {P.TERMINAL_USE, P.OVERVIEW_READ, P.INVESTIGATION_READ, P.KNOWLEDGE_READ}
 
 
 def test_a_namespace_scoped_grant_does_not_open_a_terminal():

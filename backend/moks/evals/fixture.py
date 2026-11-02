@@ -43,6 +43,7 @@ class FixtureKubernetes:
         self.logs = f.get("logs", {})
         self.events_def = f.get("events", [])
         self.rollouts = f.get("rollouts", {})
+        self.failing = set(case.get("fail_tools") or [])  # what a required-evidence case takes away
 
     async def aclose(self):
         pass
@@ -70,6 +71,8 @@ class FixtureKubernetes:
         return {"summary": summarize_pod(p), "containers": describe_containers(p), "conditions": [], "node": "node-1", "events": []}
 
     async def pod_logs(self, namespace, pod, container, previous, tail_lines, since_seconds):
+        if "pod_logs" in self.failing:
+            raise ConnectorError("unavailable", "the API server did not answer")
         self._check(namespace)
         return self.logs.get(pod, self.logs.get("*", ""))
 

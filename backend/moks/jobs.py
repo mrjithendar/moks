@@ -180,6 +180,9 @@ async def _plan_next(db: AsyncSession, src: KnowledgeSource) -> None:
     await db.flush()
 
 
+SYNCING = ("active", "draft")  # a draft source fills up for review, and search reads only active ones
+
+
 def handlers() -> dict[str, Handler]:
     from . import alerts, detection
     from .evals import runner
@@ -187,7 +190,7 @@ def handlers() -> dict[str, Handler]:
 
     async def knowledge_sync(db: AsyncSession, p: dict) -> dict:
         src = await db.get(KnowledgeSource, uuid.UUID(p["source_id"]))
-        if src is None or not src.enabled or src.lifecycle != "active":
+        if src is None or not src.enabled or src.lifecycle not in SYNCING:
             return {"skipped": "source missing, disabled or not active"}
         if src.type not in ("github", "web"):
             return {"skipped": f"{src.type} sources are updated on upload/approval"}
@@ -345,7 +348,7 @@ async def schedule_periodic() -> None:
         envs = (await db.execute(select(Environment.id).where(Environment.auto_investigate.is_(True)))).scalars().all()
         watched = (await db.execute(select(Environment.id).where(Environment.detection_enabled.is_(True)))).scalars().all()
         now = datetime.now(timezone.utc)
-        sources = (await db.execute(select(KnowledgeSource).where(KnowledgeSource.enabled.is_(True), KnowledgeSource.type.in_(("github", "web")),
+        sources = (await db.execute(select(KnowledgeSource).where(KnowledgeSource.enabled.is_(True), KnowledgeSource.type.in_(("github", "web")), KnowledgeSource.lifecycle.in_(SYNCING),
                                                                   KnowledgeSource.sync_interval_minutes > 0,
                                                                   or_(KnowledgeSource.next_sync_at.is_(None), KnowledgeSource.next_sync_at <= now)))).scalars().all()
     try:

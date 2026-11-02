@@ -256,3 +256,9 @@ MOKS_TEST_OPENSEARCH_URL=https://localhost:9200 MOKS_TEST_OPENSEARCH_CREDS=/tmp/
 ```
 
 Never point it at a cluster that serves anyone. It does not replace a run on mk4.
+
+## Knowledge and skill governance
+
+`tests/test_knowledge_explorer.py` covers direct-object, count and filter isolation, the retrieval workspace, feedback, and the ingestion and index corrections. `tests/test_skill_governance.py` covers publication steps, contract enforcement, proposals and the evaluation gates. `tests/test_helm_render.py` covers Dashboards as rendered output, and `frontend/src/pages/Knowledge.test.tsx` and `Skills.test.tsx` the pages.
+
+Populated screens were checked by running the real API and built frontend against a local PostgreSQL and driving headless Chrome over CDP, as an admin and as a viewer bound to one namespace.

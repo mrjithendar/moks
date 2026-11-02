@@ -178,6 +178,9 @@ spec:
               - {key: app, operator: In, values: [moks]}
               - {key: component, operator: In, values: [api, worker, search-ops]}
         - podSelector: {matchLabels: {app: moks-search-admin}}
+        {{- if $secure.dashboards.enabled }}
+        - podSelector: {matchLabels: {app: moks-search-dashboards}}
+        {{- end }}
         {{- range .Values.networkPolicy.metricsNamespaces }}
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ . }}}}
         {{- end }}

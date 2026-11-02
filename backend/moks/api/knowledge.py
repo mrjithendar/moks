@@ -1,4 +1,6 @@
-"""Knowledge base: sources (admin), sync, upload, search (access-filtered), index status."""
+"""Knowledge base: sources, sync, upload, search (access-filtered), index status. Reading, source
+administration, review and index operations are separate permissions, and a reviewer's scope is checked on
+every document. api/knowledge_explorer.py has browsing, the retrieval workspace and feedback."""
 from __future__ import annotations
 
 import uuid
@@ -17,7 +19,7 @@ from ..config import get_settings
 from ..connectors.base import ConnectorError, describe_credential_ref
 from ..db import get_db
 from ..models import Chunk, Document, IndexOutbox, Job, KnowledgeSource, KnowledgeSyncItem, User
-from ..rag import ingest, service, web
+from ..rag import explore, ingest, service, web
 from ..rbac import P
 from .admin import CredentialRef
 
@@ -52,6 +54,8 @@ class SourceIn(BaseModel):
     credential_ref: CredentialRef = Field(default_factory=CredentialRef)
     enabled: bool = True
     shared_globally: bool = False  # readable by everyone who can read any knowledge: must be chosen, never a default
+    lifecycle: Literal["draft", "active"] = "active"  # a draft source fills up for review before anyone can retrieve it
+    review_required: bool = False  # new or changed documents wait in quarantine for a reviewer
     team: str | None = Field(default=None, max_length=120)
     classification: Literal["public", "internal", "confidential", "restricted"] = "internal"
     applies_to: dict[str, list[str]] = Field(default_factory=dict)
@@ -97,6 +101,7 @@ class SourceUpdate(BaseModel):
     credential_ref: CredentialRef | None = None
     enabled: bool | None = None
     shared_globally: bool | None = None
+    review_required: bool | None = None
     team: str | None = Field(default=None, max_length=120)
     classification: Literal["public", "internal", "confidential", "restricted"] | None = None
     applies_to: dict[str, list[str]] | None = None
@@ -136,7 +141,7 @@ def source_out(s: KnowledgeSource, counts: dict | None = None, job: str | None =
             "credential_ref": s.credential_ref, "lifecycle": s.lifecycle, "team": s.team, "classification": s.classification, "shared_globally": s.shared_globally,
             "applies_to": s.applies_to or {}, "authority": s.authority, "review_interval_days": s.review_interval_days, "last_reviewed_at": s.last_reviewed_at.isoformat() if s.last_reviewed_at else None,
             "review_overdue": bool(s.review_interval_days and (s.last_reviewed_at is None or datetime.now(timezone.utc) - s.last_reviewed_at > timedelta(days=s.review_interval_days))),
-            "stale_policy": s.stale_policy, "stale_after_days": s.stale_after_days, "sync": {k: v for k, v in (s.sync_cursor or {}).items() if k in SYNC_FIELDS}}
+            "stale_policy": s.stale_policy, "stale_after_days": s.stale_after_days, "review_required": s.review_required, "sync": {k: v for k, v in (s.sync_cursor or {}).items() if k in SYNC_FIELDS}}
 
 
 @router.get("/search")
@@ -149,22 +154,36 @@ async def search(q: str, k: int = 8, environment: str | None = None, namespace: 
     except ConnectorError as exc:
         raise HTTPException(502, exc.message) from None
     await audit.record(db, action="knowledge.search", actor_id=ctx.user.id, actor_email=ctx.user.email, details={"chars": len(q), "results": len(r["results"])})
-    return r
+    return for_reader(r, ctx.principal)
+
+
+def for_reader(result: dict, principal) -> dict:
+    """Index names, candidate counts and the reranking model are for those who run the index."""
+    if principal.can(P.KNOWLEDGE_INDEX):
+        return result
+    out = {k: v for k, v in result.items() if k not in ("index", "candidates")}
+    if "reranking" in out:
+        out["reranking"] = {k: out["reranking"].get(k) for k in ("state", "note")}
+    return out
 
 
 @router.get("/status")
 async def status(ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
-    return await service.stats(db)
+    """Whole-corpus figures would show what exists beyond a person's bindings, so others get their own."""
+    if ctx.principal.can(P.KNOWLEDGE_INDEX) or ctx.principal.can(P.KNOWLEDGE_SOURCE_ADMIN):
+        return await service.stats(db)
+    idx = await service.active_index(db)
+    return {**await explore.counts(db, ctx.principal), "scoped": True, "backend": None, "index": {"mode": "hybrid" if idx.dimensions else "keyword-only"} if idx else None}
 
 
 @router.get("/backend")
-async def backend_status(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def backend_status(ctx: AuthContext = Depends(needs(P.KNOWLEDGE_INDEX)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Index generations and cluster state. Only for those who may rebuild the index."""
     return await service.backend_report(db)
 
 
 @router.get("/reranking")
-async def reranking_status(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def reranking_status(ctx: AuthContext = Depends(needs(P.KNOWLEDGE_INDEX)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Configured state, the service's own answer, this process's counters, and the latest comparison."""
     from ..models import EvalRun
     from ..rag import rerank
@@ -179,7 +198,7 @@ async def reranking_status(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: A
 
 
 @router.get("/sources")
-async def list_sources(ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> list[dict]:
+async def list_sources(ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> list[dict]:
     rows = (await db.execute(select(KnowledgeSource).where(KnowledgeSource.lifecycle != "deleted", KnowledgeSource.realm == "operational").order_by(KnowledgeSource.name))).scalars().all()
     counts: dict[uuid.UUID, dict] = {}
     for sid, st, n in (await db.execute(select(Document.source_id, Document.status, func.count()).where(Document.realm == "operational").group_by(Document.source_id, Document.status))).all():
@@ -189,7 +208,7 @@ async def list_sources(ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db
 
 
 @router.post("/sources", status_code=201)
-async def create_source(body: SourceIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def create_source(body: SourceIn, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     if body.type == "github" and not body.repository:
         raise HTTPException(422, "github sources need a repository")
     if body.type == "web" and not body.urls:
@@ -200,7 +219,7 @@ async def create_source(body: SourceIn, ctx: AuthContext = Depends(needs(P.ADMIN
                           scope_environment=body.scope_environment, scope_namespace=body.scope_namespace, service=body.service,
                           owner=body.owner, enabled=body.enabled, sync_interval_minutes=body.sync_interval_minutes if body.type in SYNCED else 0,
                           shared_globally=body.shared_globally, team=body.team, classification=body.classification, applies_to=body.applies_to, authority=body.authority,
-                          review_interval_days=body.review_interval_days, stale_policy=body.stale_policy, stale_after_days=body.stale_after_days)
+                          lifecycle=body.lifecycle, review_required=body.review_required, review_interval_days=body.review_interval_days, stale_policy=body.stale_policy, stale_after_days=body.stale_after_days)
     db.add(src)
     await db.flush()
     await audit.record(db, action="knowledge.source_create", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="knowledge_source",
@@ -212,7 +231,7 @@ async def create_source(body: SourceIn, ctx: AuthContext = Depends(needs(P.ADMIN
 
 
 @router.put("/sources/{sid}")
-async def update_source(sid: uuid.UUID, body: SourceUpdate, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def update_source(sid: uuid.UUID, body: SourceUpdate, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Changes settings and keeps indexed documents. A sync then applies any new include or exclude
     rules; changing a credential alone re-reads nothing."""
     src = await _source(db, sid)
@@ -231,7 +250,7 @@ async def update_source(sid: uuid.UUID, body: SourceUpdate, ctx: AuthContext = D
     for key in ("service", "owner", "team", "review_interval_days", "stale_after_days"):  # null clears these
         if key in changes:
             setattr(src, key, changes[key])
-    for key in ("scope_environment", "scope_namespace", "enabled", "shared_globally", "classification", "applies_to", "authority", "stale_policy"):
+    for key in ("scope_environment", "scope_namespace", "enabled", "shared_globally", "review_required", "classification", "applies_to", "authority", "stale_policy"):
         if changes.get(key) is not None:
             setattr(src, key, changes[key])
     if {"scope_environment", "scope_namespace", "shared_globally", "classification"} & set(changes):  # other edits leave an older source's sharing as it was
@@ -257,7 +276,7 @@ async def update_source(sid: uuid.UUID, body: SourceUpdate, ctx: AuthContext = D
 
 
 @router.post("/sources/{sid}/sync")
-async def sync(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def sync(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     src = await _source(db, sid)
     if src is None or src.type not in SYNCED:
         raise HTTPException(404, "Syncable source not found")
@@ -272,7 +291,7 @@ class ScheduleIn(BaseModel):
 
 
 @router.put("/sources/{sid}/schedule")
-async def schedule(sid: uuid.UUID, body: ScheduleIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def schedule(sid: uuid.UUID, body: ScheduleIn, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     src = await _source(db, sid)
     if src is None or src.type not in SYNCED:
         raise HTTPException(404, "Syncable source not found")
@@ -284,12 +303,12 @@ async def schedule(sid: uuid.UUID, body: ScheduleIn, ctx: AuthContext = Depends(
 
 
 class LifecycleIn(BaseModel):
-    lifecycle: Literal["active", "quarantined", "archived"]
+    lifecycle: Literal["draft", "active", "quarantined", "archived"]
     reason: str = Field(min_length=3, max_length=500)
 
 
 @router.put("/sources/{sid}/lifecycle")
-async def set_lifecycle(sid: uuid.UUID, body: LifecycleIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def set_lifecycle(sid: uuid.UUID, body: LifecycleIn, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Quarantined and archived sources stop being retrieved at once, because every result is checked against PostgreSQL. Their documents are kept."""
     src = await _source(db, sid)
     if src is None or src.lifecycle == "deleted":
@@ -301,9 +320,9 @@ async def set_lifecycle(sid: uuid.UUID, body: LifecycleIn, ctx: AuthContext = De
 
 
 @router.post("/sources/{sid}/review")
-async def reviewed(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def reviewed(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_REVIEW)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     src = await _source(db, sid)
-    if src is None or src.lifecycle == "deleted":
+    if src is None or src.lifecycle == "deleted" or not ctx.principal.can(P.KNOWLEDGE_REVIEW, src.scope_environment, src.scope_namespace):
         raise HTTPException(404, "Source not found")
     src.last_reviewed_at = datetime.now(timezone.utc)
     await audit.record(db, action="knowledge.review", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="knowledge_source", resource_id=str(sid), decision="allow", details={"name": src.name})
@@ -311,7 +330,7 @@ async def reviewed(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONN
 
 
 @router.delete("/sources/{sid}")
-async def delete_source(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def delete_source(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Soft: the source and its document rows stay as tombstones until the index has dropped them, and for history."""
     src = await _source(db, sid)
     if src is None or src.lifecycle == "deleted":
@@ -328,7 +347,7 @@ async def delete_source(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN
 
 @router.post("/sources/{sid}/upload", status_code=201)
 async def upload(sid: uuid.UUID, file: UploadFile = File(...), namespace: str | None = Form(None), environment: str | None = Form(None),
-                 ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+                 ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     src = await _source(db, sid)
     if src is None or src.type != "upload":
         raise HTTPException(404, "Upload source not found")
@@ -350,7 +369,7 @@ async def upload(sid: uuid.UUID, file: UploadFile = File(...), namespace: str | 
 
 
 @router.get("/sources/{sid}/documents")
-async def documents(sid: uuid.UUID, status: str | None = None, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> list[dict]:
+async def documents(sid: uuid.UUID, status: str | None = None, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> list[dict]:
     q = select(Document).where(Document.source_id == sid, Document.realm == "operational").order_by(Document.path).limit(2000)
     if status:
         q = q.where(Document.status == status)
@@ -361,8 +380,10 @@ async def documents(sid: uuid.UUID, status: str | None = None, ctx: AuthContext 
 
 
 @router.get("/sources/{sid}/failures")
-async def failures(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def failures(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Files not read, and files excluded. Reasons only: rejected content is never stored, so it cannot be shown."""
+    if await _source(db, sid) is None:
+        raise HTTPException(404, "Source not found")
     items = (await db.execute(select(KnowledgeSyncItem).where(KnowledgeSyncItem.source_id == sid, KnowledgeSyncItem.state.in_(("failed", "excluded", "pending"))).order_by(KnowledgeSyncItem.state, KnowledgeSyncItem.path).limit(500))).scalars().all()
     ids = (await db.execute(select(Document.id).where(Document.source_id == sid))).scalars().all()
     events = (await db.execute(select(IndexOutbox).where(IndexOutbox.document_id.in_(ids), IndexOutbox.status != "done").order_by(IndexOutbox.id.desc()).limit(200))).scalars().all() if ids else []
@@ -371,12 +392,12 @@ async def failures(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONN
 
 
 @router.post("/sources/{sid}/retry")
-async def retry_source(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def retry_source(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Failed files go back in the queue for the current listing, and a pass is queued."""
-    n = (await db.execute(update(KnowledgeSyncItem).where(KnowledgeSyncItem.source_id == sid, KnowledgeSyncItem.state == "failed").values(state="pending", last_error=None).returning(KnowledgeSyncItem.path))).all()
     src = await _source(db, sid)
     if src is None:
         raise HTTPException(404, "Source not found")
+    n = (await db.execute(update(KnowledgeSyncItem).where(KnowledgeSyncItem.source_id == sid, KnowledgeSyncItem.state == "failed").values(state="pending", last_error=None).returning(KnowledgeSyncItem.path))).all()
     if n:
         src.sync_cursor = {**(src.sync_cursor or {}), "state": "ingesting", "started_at": datetime.now(timezone.utc).isoformat()}
     await db.commit()
@@ -387,16 +408,14 @@ async def retry_source(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_
 
 @router.get("/documents/{did}")
 async def document(did: uuid.UUID, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
-    """Preview with citations, under the same access rule as search. An excluded document has no text to show."""
-    from ..rag import access
-
-    d = await db.get(Document, did)
-    if d is None or d.status == "deleted" or d.realm != access.OPERATIONAL or not access.can_read(ctx.principal, d.environment, d.namespace):
+    """Preview with citations, under the rule every Explorer page uses. An excluded document has no text to show."""
+    pair = await explore.get(db, ctx.principal, did)
+    if pair is None:
         raise HTTPException(404, "Document not found")
-    s = await db.get(KnowledgeSource, d.source_id)
+    d, s = pair
     chunks = (await db.execute(select(Chunk).where(Chunk.document_id == did).order_by(Chunk.ord).limit(200))).scalars().all()
     return {"id": str(d.id), "title": d.title, "path": d.path, "status": d.status, "excluded_reason": d.excluded_reason, "source": s.name, "revision": d.revision, "changed_revision": d.changed_revision,
-            "url": d.url, "doc_state": d.doc_state, "superseded_by": d.superseded_by, "lifecycle": d.lifecycle, "trust": d.trust, "reviewed_at": d.reviewed_at.isoformat() if d.reviewed_at else None, "review_due_at": d.review_due_at.isoformat() if d.review_due_at else None, "checked_at": d.checked_at.isoformat() if d.checked_at else None, "vector_state": d.vector_state,
+            "url": service.safe_url(d.url), "doc_state": d.doc_state, "superseded_by": d.superseded_by, "lifecycle": d.lifecycle, "trust": d.trust, "reviewed_at": d.reviewed_at.isoformat() if d.reviewed_at else None, "review_due_at": d.review_due_at.isoformat() if d.review_due_at else None, "checked_at": d.checked_at.isoformat() if d.checked_at else None, "vector_state": d.vector_state,
             "chunks": [{"ord": c.ord, "heading": c.heading, "text": c.text, "lines": [c.start_line, c.end_line], "offsets": [c.start_offset, c.end_offset], "tokens": c.token_estimate} for c in chunks]}
 
 
@@ -410,11 +429,17 @@ class DocumentReviewIn(BaseModel):
     review_due_at: datetime | None = None
 
 
-@router.put("/documents/{did}/lifecycle")
-async def document_lifecycle(did: uuid.UUID, body: DocumentLifecycleIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
-    d = await db.get(Document, did)
-    if d is None or d.realm != "operational":
+async def _for_review(db: AsyncSession, ctx: AuthContext, did: uuid.UUID) -> Document:
+    """A reviewer's binding must cover this document. Outside it the document does not exist, as for anyone else."""
+    pair = await explore.get(db, ctx.principal, did)
+    if pair is None or not ctx.principal.can(P.KNOWLEDGE_REVIEW, pair[0].environment, pair[0].namespace):
         raise HTTPException(404, "Document not found")
+    return pair[0]
+
+
+@router.put("/documents/{did}/lifecycle")
+async def document_lifecycle(did: uuid.UUID, body: DocumentLifecycleIn, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_REVIEW)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    d = await _for_review(db, ctx, did)
     before = d.lifecycle
     try:
         await service.set_document_lifecycle(db, d, body.state, body.superseded_by)
@@ -425,13 +450,12 @@ async def document_lifecycle(did: uuid.UUID, body: DocumentLifecycleIn, ctx: Aut
 
 
 @router.post("/documents/{did}/review")
-async def document_review(did: uuid.UUID, body: DocumentReviewIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
-    d = await db.get(Document, did)
-    if d is None or d.realm != "operational":
-        raise HTTPException(404, "Document not found")
-    service.review_document(d, ctx.user.id, body.review_due_at)
+async def document_review(did: uuid.UUID, body: DocumentReviewIn, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_REVIEW)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    d = await _for_review(db, ctx, did)
+    src = await db.get(KnowledgeSource, d.source_id)
+    service.review_document(d, ctx.user.id, body.review_due_at, src.review_interval_days)
     await audit.record(db, action="knowledge.document_review", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="document", resource_id=str(did), details={"revision": d.revision, "content_hash": d.content_hash})
-    return {"id": str(d.id), "trust": d.trust, "reviewed_at": d.reviewed_at.isoformat()}
+    return {"id": str(d.id), "trust": d.trust, "reviewed_at": d.reviewed_at.isoformat(), "review_due_at": d.review_due_at.isoformat() if d.review_due_at else None}
 
 
 @router.get("/sources/{sid}/access")
@@ -459,7 +483,7 @@ class RetryIn(BaseModel):
 
 
 @router.post("/outbox/retry")
-async def retry_outbox(body: RetryIn | None = None, ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def retry_outbox(body: RetryIn | None = None, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_INDEX)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Index changes that ran out of attempts go back in the queue once the index is healthy."""
     body = body or RetryIn()
     n = await service.retry_dead(body.document_id, body.limit)
@@ -468,6 +492,6 @@ async def retry_outbox(body: RetryIn | None = None, ctx: AuthContext = Depends(n
 
 
 @router.post("/reindex")
-async def reindex(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+async def reindex(ctx: AuthContext = Depends(needs(P.KNOWLEDGE_INDEX)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     jid = await jobs.enqueue("knowledge_reindex", {}, dedupe_key="knowledge_reindex", created_by=ctx.user.id)
     return {"queued": bool(jid)}

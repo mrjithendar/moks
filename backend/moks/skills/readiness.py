@@ -40,8 +40,10 @@ async def metric_names(key: str, prom: Any) -> tuple[set[str] | None, bool]:
     return names, names is not None and len(names) < METRIC_LIMIT
 
 
-def readiness(sk: "Skill", connectors: set[str], metrics: set[str] | None = None, metrics_complete: bool = True, can=None) -> dict:
-    """`can(permission)` answers for the person or automation that would run it. None: not checked."""
+def readiness(sk: "Skill", connectors: set[str], metrics: set[str] | None = None, metrics_complete: bool = True, can=None, resources: set[str] | None = None) -> dict:
+    """`can(permission)` answers for the person or automation that would run it. None: not checked.
+    `resources` are the kinds this run is about: a skill for something else can still run, but only in part.
+    A metric counts as present only if it reported in the last hour, so stale telemetry reads as missing."""
     from ..tools.builtin import REGISTRY
     from ..tools.contracts import PSEUDO_CONNECTORS
 
@@ -68,6 +70,9 @@ def readiness(sk: "Skill", connectors: set[str], metrics: set[str] | None = None
             add("telemetry", m, "missing" if metrics_complete else "unknown", True)
     for p in sk.meta.permissions:
         add("permission", p, "unknown" if can is None else "ok" if can(p) else "missing", True)
+    if resources and sk.meta.resource_types:
+        for kind in sorted(set(sk.meta.resource_types) & resources) or sorted(resources)[:1]:
+            add("resource", kind, "ok" if kind in sk.meta.resource_types else "missing", False)
     blocking = [c for c in checks if c["status"] == "missing" and c["required"]]
     missing = [c for c in checks if c["status"] == "missing"]
     if blocking or (sk.meta.steps and not runnable):
@@ -78,6 +83,9 @@ def readiness(sk: "Skill", connectors: set[str], metrics: set[str] | None = None
         state = "unknown"
     else:
         state = "ready"
-    word = {"connector": "needs the {} connector", "step": "needs the {} connector", "telemetry": "needs metric {}", "permission": "needs permission {}"}
+    word = {"connector": "needs the {} connector", "step": "needs the {} connector", "telemetry": "needs metric {} reported in the last hour", "permission": "needs permission {}", "resource": "is not written for {}"}
+    fix = {"connector": "Add a {} connector to this environment under Connectors.", "step": "Add a {} connector to this environment under Connectors.", "telemetry": "Check that {} is being scraped here; it has not reported in the last hour.",
+           "permission": "Ask an administrator for a role that includes {}.", "resource": "Expect partial results for {}: this skill does not list it."}
     reasons = [word[c["kind"]].format(c["name"]) for c in missing] + [f"could not check {c['name']}" for c in checks if c["status"] == "unknown"]
-    return {"state": state, "available": state != "unavailable", "reasons": list(dict.fromkeys(reasons)), "checks": checks}
+    actions = list(dict.fromkeys(fix[c["kind"]].format(c["name"]) for c in missing))
+    return {"state": state, "available": state != "unavailable", "reasons": list(dict.fromkeys(reasons)), "actions": actions, "checks": checks}

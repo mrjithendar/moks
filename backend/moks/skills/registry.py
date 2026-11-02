@@ -40,7 +40,7 @@ from .. import audit
 from ..db import session_scope
 from ..models import SkillGeneration, SkillPolicy, SkillVersion
 from . import Skill, SkillLibrary, load, parse, replace_library
-from .validate import errors, validate
+from .validate import errors, validate, validate_set
 
 log = logging.getLogger("moks.skills")
 LOCK = 7_203_115
@@ -86,29 +86,94 @@ async def _active(db: AsyncSession) -> SkillGeneration | None:
     return (await db.execute(select(SkillGeneration).where(SkillGeneration.status == "active").order_by(SkillGeneration.generation.desc()).limit(1))).scalars().first()
 
 
-async def _activate(db: AsyncSession, manifest: dict[str, str], reason: str, actor: uuid.UUID | None, evaluation: dict | None = None) -> SkillGeneration:
-    """Refuses a set that could not run together. The current generation stays active if this raises."""
+async def _proposed(db: AsyncSession, manifest: dict[str, str]) -> tuple[dict[str, Skill], list[dict]]:
+    """Every skill of a proposed generation, and what the whole set says about itself."""
     rows = (await db.execute(select(SkillVersion).where(SkillVersion.digest.in_(list(manifest.values()))))).scalars().all()
     if len(rows) != len(set(manifest.values())):
         raise PublishError("a version in this set is not registered")
     parsed = {r.skill_id: parse(r.content, f"registry:{r.skill_id}@{r.version}", r.source) for r in rows}
+    return parsed, validate_set(parsed)
+
+
+async def _activate(db: AsyncSession, manifest: dict[str, str], reason: str, actor: uuid.UUID | None, evaluation: dict | None = None) -> SkillGeneration:
+    """Refuses a set that could not run together. The current generation stays active if this raises."""
+    parsed, issues = await _proposed(db, manifest)
     rule_owner: dict[str, str] = {}
     for sk in parsed.values():
         for rule in sk.meta.detection:
             if rule_owner.setdefault(rule.id, sk.name) != sk.name:
                 raise PublishError(f"detection rule {rule.id} is declared by both {rule_owner[rule.id]} and {sk.name}")
-    for sk in parsed.values():
-        bad = errors(validate(sk, parsed))
-        if bad:
-            raise PublishError(f"{sk.name} {sk.meta.version} cannot run in this set: {bad[0]}")
+    bad = [i for i in issues if i["level"] == "error"]
+    if bad:
+        raise PublishError(f"{bad[0]['skill']} {bad[0]['version']} cannot run in this set: {bad[0]['message']}")
+    current = await _active(db)
     await db.execute(update(SkillGeneration).where(SkillGeneration.status == "active").values(status="retired"))
-    gen = SkillGeneration(digest=manifest_digest(manifest), manifest=manifest, status="active", reason=reason[:500], created_by=actor,
+    gen = SkillGeneration(digest=manifest_digest(manifest), manifest=manifest, status="active", reason=reason[:500], created_by=actor, previous=current.generation if current else None,
                           release_revision=os.environ.get("MOKS_RELEASE_REVISION") or None, evaluation=evaluation or {})
     db.add(gen)
     await db.flush()
     await audit.record(db, action="skills.generation", actor_id=actor, resource_type="skill_generation", resource_id=str(gen.generation), decision="allow",
                        details={"digest": gen.digest, "skills": len(manifest), "reason": reason[:300], "release": gen.release_revision, "evaluated": bool(evaluation)})
     return gen
+
+
+async def _check_override(db: AsyncSession, name: str, replaces: str | None, source: str, meta_says: bool) -> None:
+    """Replacing a built-in is a decision with two halves: the file says it means to, and policy allows it."""
+    if source == "builtin" or replaces is None:
+        return
+    current = await db.get(SkillVersion, replaces)
+    if current is None or current.source != "builtin":
+        return
+    pol = await db.get(SkillPolicy, name)
+    if not (meta_says and pol and pol.allow_override):
+        raise PublishError(f"{name} is a built-in; allow overriding it first, and set overrides_builtin in the file")
+
+
+async def preview(db: AsyncSession, digest: str) -> dict:
+    """What publishing this version would do, with nothing changed: the whole proposed generation is checked,
+    the same way publication will check it."""
+    row = await db.get(SkillVersion, digest)
+    if row is None:
+        raise PublishError("unknown skill version")
+    active = await _active(db)
+    manifest = dict(active.manifest) if active else {}
+    previous = manifest.get(row.skill_id)
+    manifest[row.skill_id] = digest
+    parsed, issues = await _proposed(db, manifest)
+    errs = [i for i in issues if i["level"] == "error"]
+    try:
+        await _check_override(db, row.skill_id, previous, row.source, parsed[row.skill_id].meta.overrides_builtin)
+    except PublishError as exc:
+        errs.append({"level": "error", "where": "policy", "message": str(exc), "skill": row.skill_id, "version": row.version})
+    return {"ok": not errs and row.state != "draft", "skill": row.skill_id, "version": row.version, "state": row.state, "reviewed": row.reviewed_at is not None, "replaces": previous, "generation": active.generation if active else None, "skills": len(manifest),
+            "errors": errs, "warnings": [i for i in issues if i["level"] == "warning" and i.get("skill") == row.skill_id]}
+
+
+async def review(db: AsyncSession, digest: str, actor: uuid.UUID, note: str) -> SkillVersion:
+    """Someone read this exact text and says it is fit to publish. A new version has to be read again."""
+    row = await db.get(SkillVersion, digest, with_for_update=True)
+    if row is None:
+        raise PublishError("unknown skill version")
+    if row.state == "draft":
+        raise PublishError("this version failed validation and cannot be reviewed")
+    row.reviewed_by, row.reviewed_at, row.review_note = actor, datetime.now(timezone.utc), note[:500]
+    await audit.record(db, action="skills.review", actor_id=actor, resource_type="skill", resource_id=row.skill_id, decision="allow", details={"version": row.version, "digest": digest, "note": note[:300]})
+    return row
+
+
+async def register_proposal(db: AsyncSession, content: str, proposal_id: str) -> SkillVersion:
+    """A skill text from an approved incident proposal becomes a registered version. It runs nowhere until someone
+    reviews and publishes it, like anything else in the registry."""
+    await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": LOCK})
+    try:
+        sk = parse(content, f"proposal:{proposal_id}", "proposal")
+    except ValueError as exc:
+        raise PublishError(f"this is not a valid SKILL.md: {exc}") from None
+    from . import library
+
+    row = await register(db, sk, content, library().skills)
+    row.meta = {**row.meta, "proposal": proposal_id}
+    return row
 
 
 async def register(db: AsyncSession, sk: Skill, content: str, others: dict[str, Skill]) -> SkillVersion:
@@ -194,6 +259,7 @@ async def release(actor: uuid.UUID | None, reason: str, *, names: list[str] | No
             if row is None or row.state == "draft":
                 raise PublishError(f"{sk.name} {sk.meta.version} failed validation")
             previous = manifest.get(sk.name)
+            await _check_override(db, sk.name, previous, sk.source, sk.meta.overrides_builtin)
             manifest[sk.name] = sk.digest
             changed.append((row, previous))
         for name in remove or []:
@@ -220,20 +286,18 @@ async def publish(db: AsyncSession, digest: str, actor: uuid.UUID, note: str = "
         raise PublishError("unknown skill version")
     if row.state == "draft":
         raise PublishError("this version failed validation and cannot be published")
+    if row.source != "builtin" and row.reviewed_at is None:
+        raise PublishError("this version has not been reviewed")  # built-ins were reviewed in Git, and their release names a reason
     active = await _active(db)
     manifest = dict(active.manifest) if active else {}
-    if row.source == "custom" and row.skill_id in manifest:
-        current = await db.get(SkillVersion, manifest[row.skill_id])
-        pol = await db.get(SkillPolicy, row.skill_id)
-        if current.source == "builtin" and not (pol and pol.allow_override):
-            raise PublishError(f"{row.skill_id} is a built-in; allow overriding it first")
+    await _check_override(db, row.skill_id, manifest.get(row.skill_id), row.source, parse(row.content, "registry", row.source).meta.overrides_builtin)
     now = datetime.now(timezone.utc)
     previous = manifest.get(row.skill_id)
     manifest[row.skill_id] = digest
     gen = await _activate(db, manifest, f"publish {row.skill_id} {row.version}: {note}", actor)
     if previous and previous != digest:
         await db.execute(update(SkillVersion).where(SkillVersion.digest == previous).values(state="deprecated"))
-    row.state, row.published_by, row.published_at, row.reviewed_by, row.reviewed_at = "published", actor, now, actor, now
+    row.state, row.published_by, row.published_at = "published", actor, now
     await audit.record(db, action="skills.publish", actor_id=actor, resource_type="skill", resource_id=row.skill_id, decision="allow",
                        details={"version": row.version, "digest": digest, "generation": gen.generation, "replaced": previous, "note": note[:300]})
     return gen
@@ -285,7 +349,11 @@ async def refresh(force: bool = False) -> SkillLibrary:
         replace_library(SkillLibrary(skills, [], number, digest))
     except Exception as exc:  # a generation this build cannot run: keep working on the last good one
         log.error("skill generation not applied", extra={"event": "skill_generation_failed", "errorType": type(exc).__name__})
-        lib.error = f"{type(exc).__name__}: {exc}"[:300]
+        reason = f"{type(exc).__name__}: {exc}"[:300]
+        if lib.generation is None:  # nothing valid to keep: this process has only its image, which nobody published
+            replace_library(SkillLibrary({}, [], None, None, reason))
+        else:
+            lib.error = reason
     return current()
 
 

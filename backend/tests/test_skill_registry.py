@@ -48,6 +48,11 @@ async def active():
         return await registry._active(db)
 
 
+async def reviewed_publish(db, digest, uid, note=""):
+    await registry.review(db, digest, uid, "read it")
+    return await registry.publish(db, digest, uid, note)
+
+
 async def test_builtins_publish_as_one_generation_and_every_version_is_pinned_by_digest():
     gen = await active()
     assert gen.status == "active" and len(gen.manifest) == 51
@@ -70,7 +75,7 @@ async def test_a_custom_skill_waits_until_it_is_published(tmp_path):
     sk = skills.load(str(tmp_path)).skills["demo-skill"]
     uid = await make_user(f"p-{uuid.uuid4().hex[:6]}@example.com", ["admin"])
     async with session_scope() as db:
-        await registry.publish(db, sk.digest, uid, "reviewed in PR 12")
+        await reviewed_publish(db, sk.digest, uid, "reviewed in PR 12")
     await registry.refresh(force=True)
     assert "demo-skill" in skills.library().skills
     async with session_scope() as db:
@@ -93,12 +98,12 @@ async def test_rollback_restores_a_published_version_in_a_new_generation(tmp_pat
     await registry.register_all(extra_dir=str(tmp_path))
     one = skills.load(str(tmp_path)).skills["demo-skill"].digest
     async with session_scope() as db:
-        await registry.publish(db, one, uid)
+        await reviewed_publish(db, one, uid)
     write(tmp_path, "demo-skill", text_of(version="2"))
     await registry.register_all(extra_dir=str(tmp_path))
     two = skills.load(str(tmp_path)).skills["demo-skill"].digest
     async with session_scope() as db:
-        await registry.publish(db, two, uid)
+        await reviewed_publish(db, two, uid)
     await registry.refresh(force=True)
     assert skills.library().skills["demo-skill"].meta.version == "2"
     async with session_scope() as db:
@@ -121,7 +126,7 @@ async def test_an_invalid_version_cannot_be_published_and_the_last_generation_st
     sk = skills.load(str(tmp_path)).skills["demo-skill"]
     async with session_scope() as db:
         with pytest.raises(registry.PublishError):
-            await registry.publish(db, sk.digest, uid)
+            await reviewed_publish(db, sk.digest, uid)
     assert (await active()).generation == before.generation
 
 
@@ -136,7 +141,7 @@ async def test_a_duplicate_detection_rule_is_refused_at_publication(tmp_path):
     before = await active()
     async with session_scope() as db:
         with pytest.raises(registry.PublishError, match="declared by both"):
-            await registry.publish(db, sk.digest, uid)
+            await reviewed_publish(db, sk.digest, uid)
     assert (await active()).generation == before.generation
 
 
@@ -149,10 +154,10 @@ async def test_replacing_a_builtin_is_explicit_twice(tmp_path):
     uid = await make_user(f"o-{uuid.uuid4().hex[:6]}@example.com", ["admin"])
     async with session_scope() as db:
         with pytest.raises(registry.PublishError, match="allow overriding"):
-            await registry.publish(db, sk.digest, uid)
+            await reviewed_publish(db, sk.digest, uid)
         db.add(SkillPolicy(name="crashloop-triage", enabled=True, allow_override=True))
         await db.flush()
-        await registry.publish(db, sk.digest, uid)
+        await reviewed_publish(db, sk.digest, uid)
 
 
 async def test_a_process_keeps_the_last_valid_generation_when_a_new_one_cannot_load():

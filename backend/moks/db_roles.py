@@ -20,7 +20,7 @@ APPEND = "SELECT, INSERT"
 
 ROLES = ("moks_api", "moks_worker", "moks_executor", "moks_backup", "moks_terminal")
 
-_API_RW = ("improvement_proposals", "users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_events", "evidence",
+_API_RW = ("retrieval_feedback", "improvement_proposals", "users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_events", "evidence",
            "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks", "embedding_indexes", "conversations", "conversation_participants", "conversation_reads", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations",
            "conversation_messages", "backup_stores", "database_backups", "database_backup_schedules", "skill_policies", "detection_policies", "detection_states", "maintenance_windows", "saved_queries",
            "diagnostic_sessions", "diagnostic_commands", "alert_events", "eval_runs", "index_outbox", "llm_reservations", "component_versions")
@@ -28,7 +28,7 @@ _WORKER_RW = ("search_backend_status", "llm_usage", "investigations", "investiga
               "embedding_indexes", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations", "conversations", "conversation_participants", "conversation_messages", "detection_runs", "detection_states", "alert_events", "eval_runs", "index_outbox", "llm_reservations", "component_versions")
 _EXECUTOR_RW = ("diagnostic_sessions", "diagnostic_commands", "incidents", "incident_events", "component_versions")
 
-TABLES = ("search_backend_status", "improvement_proposals", "users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_checkpoints", "investigation_events", "evidence", "audit_events",
+TABLES = ("retrieval_feedback", "search_backend_status", "improvement_proposals", "users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_checkpoints", "investigation_events", "evidence", "audit_events",
           "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks", "embedding_indexes", "conversations", "conversation_participants", "conversation_reads", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations",
           "conversation_messages", "backup_runs", "backup_stores", "database_backups", "database_backup_schedules", "skill_policies", "detection_policies", "detection_runs", "detection_states", "maintenance_windows",
           "saved_queries", "index_outbox", "llm_reservations", "component_versions", "action_plans", "approvals", "diagnostic_sessions", "diagnostic_commands", "terminal_sessions", "alert_events", "eval_runs", "alembic_version")

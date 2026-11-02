@@ -51,7 +51,7 @@ Mitigations for hostPath: `nodeName` pins the pod to the node holding its data, 
 - **Monitoring.** The worker probes each minute, records the result for the admin page (API pods cannot ask), and exports `moks_search_backend{metric=...}`. Alerts and dashboard panels are in `deploy/grafana`. The exporter plugin adds JVM and index detail.
 - **Admin.** Knowledge > Index health > Search backend, for holders of `admin.llm`: backend, generation, connection health, counts, model and dimensions, retrieval modes and fallbacks, backfill, generations, last snapshot.
 
-Application logs stay in Loki. Knowledge indexes are never mixed with operational logs. OpenSearch Dashboards for `moks-search` is not built.
+Application logs stay in Loki. Knowledge indexes are never mixed with operational logs.
 
 ## Setup, in order
 
@@ -158,6 +158,40 @@ scripts/opensearch-migrate.sh activate moks-chunks-xxxxxxxx
 ```
 
 This refuses a generation built with another embedding model. Rollback to Pinecone or PostgreSQL needs a `rag.backend` change and a `moks reindex`.
+
+## OpenSearch Dashboards for administrators
+
+**Engineers do not need this.** The Knowledge Explorer is the way to browse knowledge, under MOKS access control. Dashboards is for administrators looking at the cluster itself.
+
+> **Dashboards does not inherit MOKS RBAC.** OpenSearch knows nothing of MOKS bindings. Anyone who signs in sees every chunk their OpenSearch role allows, across all environments and namespaces, including quarantined and archived documents. Give these logins only to people cleared for all knowledge.
+
+Optional and off by default: `rag.opensearch.secure.dashboards`. It needs `moks-search`, and never touches the original cluster or the `rag.opensearch.dashboards` block that serves it.
+
+| | |
+| --- | --- |
+| Reach | ClusterIP. Port-forward first; ingress is optional |
+| Server identity | `moks_dashboards`, mapped to the built-in `kibana_server`. It never reaches a browser |
+| People | `moks_viewer`: reads `moks-chunks-*` without the `embedding` field, read-only mode. `moks_admin` still exists for administration |
+| TLS | `verificationMode: full` against the private CA. The pod mounts `ca.crt` and no key |
+| Anonymous access | Refused: the security plugin has `anonymous_auth_enabled: false` |
+| Network | May reach `moks-search:9200` and DNS. Nothing may reach it except through a port-forward, or from the ingress namespaces if ingress is on |
+| Image | Pinned by digest, on the server's version |
+
+To turn it on, with `moks-search` running:
+
+1. If `moks-search-users` already exists from before this was added, it lacks these identities. Delete all the Secrets and rerun `scripts/opensearch-secrets.sh`, which issues new passwords for everything. On a fresh install, step 3 above already made them.
+2. Set `rag.opensearch.secure.dashboards.enabled: true` in `values-minikube.yaml`, push, then `argocd app sync moks-foundation moks-opensearch`. The security Job loads the new role and users.
+3. Connect and sign in as `moks_viewer`:
+
+```sh
+kubectl --context mk4 -n moks get secret moks-search-viewer-login -o jsonpath='{.data.password}' | base64 -d; echo
+kubectl --context mk4 -n moks port-forward svc/moks-search-dashboards 5601
+# open http://localhost:5601 and create the index pattern moks-chunks-*
+```
+
+**Ingress is optional.** `dashboards.ingress.enabled: true` serves it at `https://<host>/opensearch` with `server.basePath`, `rewriteBasePath` and a secure cookie, and then sync `moks-routing` too. The path is what the read-only API route uses today, so the chart refuses both at once: turn `publicRoute` off, or choose another `ingress.path`. Everything there still needs an OpenSearch login, and it is reachable from the internet, so port-forward is the better default.
+
+Not yet run: this deployment has been rendered and its settings tested, but Dashboards has not started against a real `moks-search`, and neither the `${VAR}` password references nor the base path have been exercised by a running server. Check both on first use.
 
 ## Backup and restore
 

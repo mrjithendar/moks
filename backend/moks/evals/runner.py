@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 from sqlalchemy import select
 
+from .. import skills
 from ..db import session_scope
 from ..models import AUTOMATION_USER_ID, Environment, EvalRun, Evidence, Investigation, RoleBinding
 from ..orchestrator.engine import Investigator
@@ -69,7 +70,8 @@ def score_case(case: dict, inv: Investigation, evidence_refs: set[str]) -> dict:
         checks["fact_phrases"] = all(p.lower() in facts for p in exp["fact_contains"])
     if exp.get("forbid"):
         checks["no_forbidden_text"] = not any(p.lower() in text for p in exp["forbid"])
-    checks["citations_valid"] = all(f.get("evidence") and set(f["evidence"]) <= evidence_refs for f in rep.get("observed_facts", []))
+    if rep.get("observed_facts"):  # a report with no facts has cited nothing, which is no evidence its citations are good
+        checks["citations_valid"] = all(f.get("evidence") and set(f["evidence"]) <= evidence_refs for f in rep["observed_facts"])
     checks["nothing_marked_verified"] = not any(c.get("verified") for c in rep.get("suspected_causes", []))
     if "max_high_findings" in exp:
         checks["no_false_positives"] = sum(1 for f in rep.get("findings", []) if f["severity"] == "high") <= exp["max_high_findings"]
@@ -87,17 +89,48 @@ async def start(dataset: str, mode: str, created_by=None) -> uuid.UUID:
         return run.id
 
 
+async def _execute_skills(data: dict, run_id: uuid.UUID) -> list[dict]:
+    """Each `executions` case runs through the real orchestrator and tool executor against recorded state, so what
+    is checked is what a skill did, not what it planned. No cluster and no model."""
+    if not data.get("executions"):
+        return []
+    env_id = await _eval_env("eval-skills")
+    out = []
+    token = access.enter_realm(access.EVALUATION)
+    try:
+        for case in data["executions"]:
+            now = datetime.now(timezone.utc)
+            async with session_scope() as db:
+                inv = Investigation(created_by=AUTOMATION_USER_ID, environment_id=env_id, namespace=case["namespace"], question=case["question"], time_from=now - timedelta(minutes=30), time_to=now,
+                                    status="running", trigger="eval", requested_skill=case.get("requested"))
+                db.add(inv)
+                await db.flush()
+                inv_id = inv.id
+            pins = {n: s.digest for n, s in skills.library().skills.items()}
+            await Investigator(inv_id, f"eval-{run_id}", connectors_override={"kubernetes": (None, FixtureKubernetes(case))}, use_llm=False).run()
+            async with session_scope() as db:
+                inv = await db.get(Investigation, inv_id)
+                report = inv.report or {}
+            out.append({"case": case, "pins": pins, "report": report, "run": next((r for r in report.get("skill_runs") or [] if r["skill"] == case["skill"]), None)})
+    finally:
+        access.leave_realm(token)
+    return out
+
+
 async def execute(run_id: uuid.UUID) -> dict[str, Any]:
     async with session_scope() as db:
         run = await db.get(EvalRun, run_id)
         dataset, mode = run.dataset, run.mode
     data = load(dataset)
     if data.get("kind") in ("rag", "skills", "rerank"):
-        out = await {"rag": lambda: gates.run_rag(data, run_id), "skills": lambda: gates.run_skills(data), "rerank": lambda: rerank_eval.run(data, run_id)}[data["kind"]]()
+        async def skills_run() -> dict:
+            return await gates.run_skills(data, await _execute_skills(data, run_id))
+
+        out = await {"rag": lambda: gates.run_rag(data, run_id), "skills": skills_run, "rerank": lambda: rerank_eval.run(data, run_id)}[data["kind"]]()
         async with session_scope() as db:
             run = await db.get(EvalRun, run_id)
             run.results, run.score, run.status, run.finished_at = out["results"], Decimal(str(out["score"])), "completed", datetime.now(timezone.utc)
-            run.gates, run.versions = out["gates"], {**gates.versions(data), "metrics": out["metrics"]}
+            run.gates, run.versions = out["gates"], {**gates.versions(data), "model": out["metrics"].get("model"), "metrics": out["metrics"]}
         return {"score": out["score"], "gates_passed": gates.gates_ok(out["gates"])}
     env_id = await _eval_env(f"eval-{dataset}")
     results = []

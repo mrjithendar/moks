@@ -3,4 +3,7 @@ moks_search: {users: [moks_search]}
 moks_indexer: {users: [moks_indexer]}
 moks_lifecycle: {users: [moks_lifecycle]}
 moks_monitor: {users: [moks_monitor]}
+kibana_server: {users: [moks_dashboards]}   # Dashboards' own identity: its saved objects and health, no document reads
+kibana_user: {users: [moks_viewer]}
+moks_knowledge_viewer: {users: [moks_viewer]}
 all_access: {users: [moks_admin]}   # people, by hand, and audited

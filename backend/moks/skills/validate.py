@@ -23,6 +23,11 @@ def _known_findings() -> set[str]:
     return found
 
 
+RESOURCE_KINDS = {"Pod", "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "CronJob", "Service", "Ingress", "Node", "Namespace", "PersistentVolumeClaim", "ConfigMap", "Secret", "HPA", "HorizontalPodAutoscaler",
+                  "VirtualService", "Gateway", "Application", "Cluster", "Volume", "Alert"}
+FROM_FINDINGS = {"pod", "workload", "deployment", "service", "resource"}  # only a step that iterates over findings can fill these
+
+
 def _is_finding(name: str, known: set[str]) -> bool:
     return name in known or name.startswith("event_")  # one per Kubernetes warning reason
 
@@ -61,12 +66,24 @@ def validate(sk: "Skill", others: dict[str, "Skill"] | None = None) -> list[dict
     ids = [s.id for s in sk.meta.steps if s.id]
     if len(ids) != len(set(ids)):
         add("error", "steps", "step ids must be unique")
+    earlier: set[str] = set()
     for i, step in enumerate(sk.meta.steps):
         where = f"steps[{i}]"
         _check_args(step.tool, step.args, where, add)
         unknown = template_vars(step.args) - VARS
         if unknown:
             add("error", where, f"unknown template variables {sorted(unknown)}")
+        if step.if_step and step.if_step.step not in earlier:
+            add("error", where, f"if_step names {step.if_step.step}, which is not an earlier step")
+        if step.id:
+            earlier.add(step.id)
+        if step.unless_finding and not _is_finding(step.unless_finding, known):
+            add("error", where, f"unless_finding: no detector produces finding {step.unless_finding}")
+        if step.requires_finding and step.requires_finding == step.unless_finding:
+            add("error", where, "a step cannot both need and refuse the same finding")
+        unfilled = template_vars(step.args) & FROM_FINDINGS
+        if unfilled and not step.for_each:
+            add("warning", where, f"{sorted(unfilled)} come from a finding, and this step does not iterate over one, so it can only be skipped")
         if step.when_question:
             try:
                 re.compile(step.when_question)
@@ -95,6 +112,12 @@ def validate(sk: "Skill", others: dict[str, "Skill"] | None = None) -> list[dict
         for name in r.params:
             if name not in fields:
                 add("error", where, f"{r.action} has no parameter {name}")
+        kind = r.target.partition("/")[0] if "/" in r.target else None
+        if kind and kind not in CATALOG[r.action].target_kinds:
+            add("error", where, f"{r.action} acts on {', '.join(CATALOG[r.action].target_kinds)}, not {kind}")
+        missing = [name for name, f in fields.items() if f.is_required() and name not in r.params]
+        if missing:
+            add("info", where, f"{r.action} needs {', '.join(missing)} from the finding when proposed; without it nothing is suggested")
     for i, item in enumerate(sk.meta.evidence_required):
         if isinstance(item, EvidenceCheck) and item.tool not in REGISTRY:
             add("error", f"evidence_required[{i}]", f"unknown tool {item.tool}")
@@ -105,6 +128,29 @@ def validate(sk: "Skill", others: dict[str, "Skill"] | None = None) -> list[dict
             add("error", f"verification[{i}]", f"no detector produces finding {item.finding}")
         if isinstance(item, str):
             add("info", f"verification[{i}]", "guidance only: not checked by MOKS")
+    for i, item in enumerate(sk.meta.recovery_validation):
+        if isinstance(item, VerificationCheck) and not _is_finding(item.finding, known):
+            add("error", f"recovery_validation[{i}]", f"no detector produces finding {item.finding}")
+        if isinstance(item, str):
+            add("info", f"recovery_validation[{i}]", "guidance only: not checked by MOKS")
+    for i, h in enumerate(sk.meta.hypotheses):
+        for name in [*h.supported_by, *h.contradicted_by]:
+            if not _is_finding(name, known):
+                add("error", f"hypotheses[{i}]", f"no detector produces finding {name}")
+    for i, c in enumerate(sk.meta.preconditions):
+        if not _is_finding(c.finding, known):
+            add("error", f"preconditions[{i}]", f"no detector produces finding {c.finding}")
+    for i, item in enumerate(sk.meta.inputs):
+        if item.name not in VARS:
+            add("error", f"inputs[{i}]", f"{item.name} is not something MOKS can supply")
+    for kind in sk.meta.resource_types:
+        if kind not in RESOURCE_KINDS and not kind[:1].islower():
+            add("warning", "resource_types", f"{kind} is not a resource kind MOKS recognises, so it can never match")
+    for pattern in sk.meta.environments:
+        if not re.fullmatch(r"[a-z0-9*?\-]{1,100}", pattern):
+            add("error", "environments", f"{pattern!r} is not an environment pattern")
+    if not sk.meta.environments:
+        add("error", "environments", "a skill with no environments can never run; use ['*'] for all")
     for name, q in sk.meta.queries.items():
         unknown = template_vars(q.query) - VARS
         if unknown:
@@ -127,6 +173,14 @@ def validate(sk: "Skill", others: dict[str, "Skill"] | None = None) -> list[dict
                 if rule.id in seen:
                     add("error", "detection", f"rule {rule.id} is also declared by {other.name}")
     return out
+
+
+def validate_set(skills: dict[str, "Skill"]) -> list[dict[str, str]]:
+    """The complete proposed generation, as one thing: each skill against all the others."""
+    issues: list[dict[str, str]] = []
+    for sk in skills.values():
+        issues += [{**i, "skill": sk.name, "version": sk.meta.version} for i in validate(sk, skills)]
+    return issues
 
 
 def errors(issues: list[dict[str, str]]) -> list[str]:

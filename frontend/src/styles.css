@@ -482,3 +482,28 @@ select.manage { padding: 4px 6px; font-size: 12px; }
   main label.inline { min-height: 44px; }
   main input[type="checkbox"], main input[type="radio"] { width: 24px; height: 24px; }
 }
+
+/* Knowledge Explorer, retrieval test and skills */
+.ke-more { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: var(--sp-2, 10px); }
+.ke-section { border-top: 1px solid var(--border-soft); padding: 8px 0; min-width: 0; }
+.ke-section > summary { cursor: pointer; font-weight: 600; font-size: 14px; min-height: 28px; }
+.ke-section > .stack { margin-top: 8px; }
+.ke-chunk { border: 1px solid var(--border-soft); border-radius: 8px; padding: 6px 10px; min-width: 0; }
+.ke-chunk > summary { cursor: pointer; font-size: 13px; }
+.ke-preview { max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ke-diff { max-height: 70vh; overflow: auto; }
+.ke-diff .add { color: var(--ok, #1a7f37); }
+.ke-diff .del { color: var(--bad, #c62828); }
+.ke-variants { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; align-items: start; }
+.ke-variant { min-width: 0; }
+.ke-hit { border-top: 1px solid var(--border-soft); padding-top: 8px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ke-contract { display: grid; grid-template-columns: max-content minmax(0, 1fr) minmax(0, 1fr); gap: 8px; align-items: baseline; }
+button.link { background: none; border: 0; padding: 0; min-height: 0; color: var(--accent); text-decoration: underline; cursor: pointer; font: inherit; }
+@media (max-width: 700px) {
+  .ke-contract { grid-template-columns: max-content minmax(0, 1fr); }
+  .ke-contract .muted { grid-column: 2; }
+}
+@media (max-width: 900px) {  /* flex drops the native marker, so a phone needs its own sign that this opens */
+  details > summary::before { content: "▸"; flex: none; }
+  details[open] > summary::before { content: "▾"; }
+}

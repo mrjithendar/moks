@@ -8,6 +8,33 @@ fixtures:
   oomkilled: {question: "pods are oomkilled", findings: [oomkilled], connectors: [kubernetes, prometheus]}
   failed-rollout: {question: "the rollout is stuck", findings: [workload_unavailable, recent_rollout], connectors: [kubernetes]}
   telemetry-outage: {question: "telemetry looks wrong, scrape targets down", findings: [], connectors: [kubernetes, prometheus]}
+executions:
+  - id: crashloop-really-runs-its-steps
+    skill: crashloop-triage
+    question: Why is payments crashing?
+    namespace: moks-lab
+    fixture: &crashloop
+      pods:
+        - {name: payments-5c4-z9, labels: {app: payments}, waiting: CrashLoopBackOff, last: Error, exit_code: 78, restarts: 9}
+      deployments:
+        - {name: payments, replicas: 1, ready: 0}
+      logs: {"payments-5c4-z9": "{\"level\":\"fatal\",\"event\":\"config_invalid\",\"message\":\"invalid PAYMENT_MODE=lve\"}\n"}
+      events:
+        - {reason: BackOff, object: Pod/payments-5c4-z9, message: Back-off restarting failed container}
+    expect: {executed: [k8s_pod_logs, k8s_describe_pod], outcome: complete}
+  - id: required-evidence-missing-prevents-verification
+    skill: crashloop-triage
+    question: Why is payments crashing?
+    namespace: moks-lab
+    fail_tools: [pod_logs]
+    fixture: *crashloop
+    expect: {skipped: [k8s_pod_logs], outcome: incomplete, withheld: [crashloop], never_authorizes: true}
+  - id: a-skill-that-does-not-apply-does-not-run
+    skill: oomkilled-memory
+    question: Why is payments crashing?
+    namespace: moks-lab
+    fixture: *crashloop
+    expect: {not_selected: true}
 cases:
   - id: selects-the-matching-skill
     fixture: crashloop-config

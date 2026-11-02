@@ -93,8 +93,8 @@ customSkills:
     The payment provider times out under load; check `payment timeout` lines before blaming checkout itself. ...
 ```
 
-After a ConfigMap change, roll the API and worker pods, or use **SRE skills → Reload**
-(administrators; recorded in the audit log).
+After a ConfigMap change, roll the API and worker pods, or use **SRE skills → Register from files**
+(recorded in the audit log). Either only registers versions: nothing changes until one is reviewed and published.
 
 ## Trust model
 
@@ -136,6 +136,18 @@ detection:
 A skill that needs a connector an environment lacks is skipped, and the report and the Skills page say why.
 
 
+## Publication
+
+Five separate steps, and each is recorded:
+
+1. **Registration.** A file becomes an immutable version, named by its digest. Nothing runs it.
+2. **Validation.** Every version is checked when registered. **Check the whole generation** validates the complete proposed set and changes nothing: tool and argument schemas, template variables, duplicate rule identities, environment patterns, resource kinds, whether each remediation's target suits its action, and hypotheses, preconditions and inputs.
+3. **Review.** `skills.review` records that someone read this exact text. A new version must be read again. Built-ins are reviewed in Git, and their release names a reason.
+4. **Publication.** `skills.publish` makes a new generation. Publication validates the whole set again, and a set that fails leaves the current generation running.
+5. **Runtime and rollback.** Processes follow the active generation. Starting a process publishes nothing and reads no local skill once a generation exists. A process that cannot load one keeps its last valid generation; with none to keep, it runs no skills and reports why, rather than trusting its image. Rollback publishes an earlier version as a new generation.
+
+The same person may review and publish, because some installations have one administrator. The audit log shows both.
+
 ## Registry and generations
 
 A skill's stable ID is its `name`. Each exact file is an immutable version, named by the SHA-256 of its text, and a
@@ -168,7 +180,7 @@ from a disabled rule proves nothing. Replacing a skill does not affect a run in 
 
 `ready`, `partial` (some steps cannot run), `unavailable`, or `unknown` (something could not be checked). Unknown telemetry
 is never reported as present, and a capped metric list cannot prove a metric is absent. Eligibility is decided before
-ranking, so an unavailable skill cannot take a place from one that can run. Operators can name a skill with `skill` when
+ranking, in one function investigations and evaluations share (`skills/selection.py`), so an unavailable skill cannot take a place from one that can run. A metric counts as present only if it reported in the last hour. A skill not written for the resource a run is about reads `partial`. Operators can name a skill with `skill` when
 starting an investigation. No semantic selection is used: nothing has shown it would improve on these rules.
 
 ## Validation at publication
@@ -184,9 +196,30 @@ regular expressions, remediation actions and parameters, evidence and verificati
 | `verification: {finding, expect}` | Yes, against the run's findings |
 | `steps[].required` | Yes: a skipped required step is a reported gap |
 | plain-text `evidence_required` or `verification` | No: labeled guidance only |
-| `recovery_validation` | No: guidance only. The action plan's own validation is what runs |
+| `preconditions: {finding, expect}` | Yes: checked before the first step. Unmet, nothing runs and the reason is recorded |
+| `inputs: {name, required}` | Yes when required: a missing one stops the skill |
+| `outputs` | No: describes what to expect |
+| `steps[].requires_finding`, `unless_finding`, `if_step` | Yes: branches, and each branch not taken is recorded with why |
+| `steps[].stop_if_finding` + `escalate` | Yes: stops the skill and tells a person what to do |
+| `hypotheses[].supported_by`, `contradicted_by` | Reported as supported, contradicted or untested. A contradiction outranks support. Never a conclusion |
+| `budget: {max_tool_calls, max_seconds, max_tokens}` | Yes: checked between steps. Tokens are estimated from what tools returned. Reaching one is recorded |
+| `evidence_required[].optional` | Reported, and not a gap |
+| `recovery_validation: {finding, expect}` | Passed to a proposed action as what to check afterwards. The action plan's own validation is what runs |
+| plain-text `recovery_validation` | No: guidance only |
 
 Every run records selection reasons, each step as executed, failed or skipped with a reason, tool errors, evidence
 references, check results, and budget exhaustion. Skills get a fair share of the tool budget, and what was asked for runs first.
+
+**Missing required evidence prevents a verified conclusion.** If a skill has a gap, the findings it takes responsibility for move to `withheld_findings`, with the reason. They stay findings, and they are not reported as verified. An earlier failed call does not satisfy a required step.
+
+**Skill confidence authorizes nothing.** A skill can propose an allowlisted action. It carries `evidence_complete`, and execution stays behind action plans, policy and approval.
+
+The Skills page marks each contract line as enforced or guidance from what the server says, and shows readiness with what to do about it, evaluation results, version diffs, generation history and execution traces.
+
+## Learning from incidents
+
+An engineer proposes a runbook or a complete `SKILL.md` from a finished investigation, citing live evidence, with a regression fixture. It is redacted when saved. Someone else reviews it under **Knowledge review**: a reviewer of that scope for a runbook, `skills.review` for a skill. Approval makes a draft and nothing more. A runbook becomes a `draft` document nobody can retrieve, and a skill becomes an unpublished `proposal` version that nothing runs. Each then goes through the normal review and publication.
+
+Retrieved documents, logs and model conclusions never become trusted skills on their own.
 
 Example: [examples/checkout-502-triage/SKILL.md](examples/checkout-502-triage/SKILL.md).
