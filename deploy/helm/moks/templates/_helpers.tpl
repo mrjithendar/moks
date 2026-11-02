@@ -83,6 +83,10 @@ volumes:
   - name: credentials
     secret: {secretName: {{ $credentials }}, defaultMode: 0400}
   {{- end }}
+  {{- if and (include "moks.searchActive" .root) (has .component (list "api" "worker")) }}
+  - name: search-ca
+    secret: {secretName: {{ .root.Values.rag.opensearch.secure.secrets.tls }}, items: [{key: ca.crt, path: ca.crt}]}   # never the node's key
+  {{- end }}
 {{- end -}}
 
 {{- define "moks.volumeMounts" -}}
@@ -98,6 +102,9 @@ volumeMounts:
   {{- end }}
   {{- if $credentials }}
   - {name: credentials, mountPath: /var/run/moks-credentials, readOnly: true}
+  {{- end }}
+  {{- if and (include "moks.searchActive" .root) (has .component (list "api" "worker")) }}
+  - {name: search-ca, mountPath: /var/run/moks-search, readOnly: true}
   {{- end }}
 {{- end -}}
 
@@ -129,4 +136,49 @@ initContainers:
 {{- else }}
 - {kind: ServiceAccount, name: {{ .Values.serviceAccount.name }}, namespace: {{ .Release.Namespace }}}
 {{- end }}
+{{- end -}}
+
+{{/* opensearch.yml for moks-search: the chart's file, then what depends on values. */}}
+{{- define "moks.searchConfig" -}}
+{{- $secure := .Values.rag.opensearch.secure -}}
+{{ .Files.Get "files/opensearch/opensearch.yml" }}
+node.store.allow_mmap: {{ $secure.allowMmap }}
+{{- with $secure.diskWatermarks }}
+cluster.routing.allocation.disk.watermark.low: {{ required "diskWatermarks.low" .low | quote }}
+cluster.routing.allocation.disk.watermark.high: {{ required "diskWatermarks.high" .high | quote }}
+cluster.routing.allocation.disk.watermark.flood_stage: {{ required "diskWatermarks.floodStage" .floodStage | quote }}
+{{- end }}
+{{- if $secure.pluginsInstalled }}
+prometheus.indices: false   # per-index labels would multiply with every generation
+{{- end }}
+{{- if $secure.snapshots.enabled }}
+s3.client.default.endpoint: {{ required "snapshots.endpoint" $secure.snapshots.endpoint | quote }}
+s3.client.default.region: {{ $secure.snapshots.region | quote }}
+s3.client.default.path_style_access: {{ $secure.snapshots.pathStyle }}
+{{- end }}
+{{- end -}}
+
+{{- define "moks.searchSecurityFiles" -}}
+[{{ range $i, $f := list "config" "roles" "roles_mapping" "action_groups" "tenants" "nodes_dn" "allowlist" "audit" }}{{ if $i }}, {{ end }}{key: {{ $f }}.yml, path: {{ $f }}.yml}{{ end }}]
+{{- end -}}
+
+{{/* Who a component is to moks-search. An API pod gets the search identity and no other. */}}
+{{- define "moks.searchIdentities" -}}
+{{- $clients := .root.Values.rag.opensearch.secure.secrets.clients -}}
+- {name: MOKS_OPENSEARCH_USERNAME, value: moks_search}
+- name: MOKS_OPENSEARCH_PASSWORD
+  valueFrom: {secretKeyRef: {name: {{ $clients }}, key: search-password}}
+{{- if ne .component "api" }}
+- {name: MOKS_OPENSEARCH_INDEX_USERNAME, value: moks_indexer}
+- name: MOKS_OPENSEARCH_INDEX_PASSWORD
+  valueFrom: {secretKeyRef: {name: {{ $clients }}, key: index-password}}
+- {name: MOKS_OPENSEARCH_LIFECYCLE_USERNAME, value: moks_lifecycle}
+- name: MOKS_OPENSEARCH_LIFECYCLE_PASSWORD
+  valueFrom: {secretKeyRef: {name: {{ $clients }}, key: lifecycle-password}}
+{{- end }}
+{{- end -}}
+
+{{/* True once search and indexing use moks-search. */}}
+{{- define "moks.searchActive" -}}
+{{- if and (eq .Values.rag.backend "opensearch") .Values.rag.opensearch.secure.active -}}true{{- end -}}
 {{- end -}}

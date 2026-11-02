@@ -44,6 +44,20 @@ resource "aws_ecr_repository" "reranker" {
   }
 }
 
+resource "aws_ecr_repository" "opensearch" {
+  name                 = "${var.repository_name}-opensearch"
+  image_tag_mutability = "IMMUTABLE" # commit tags only: the chart pins a digest, and nothing moves a tag
+  force_delete         = false
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
 resource "aws_ecr_lifecycle_policy" "moks" {
   repository = aws_ecr_repository.moks.name
   policy = jsonencode({

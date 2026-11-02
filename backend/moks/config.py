@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     opensearch_lifecycle_password: str = Field(default="", repr=False)
     # Names the cluster an index generation lives in. Empty is the original cluster. Generations are kept per
     # cluster, so a second cluster can be filled, checked and reverted to without touching the first.
-    opensearch_cluster: str = ""
+    opensearch_cluster: str = Field(default="", pattern=r"^[a-z0-9]{0,9}$")
     # true in the migration Job: this process fills a cluster that search does not use yet.
     opensearch_standby: bool = False
     opensearch_compare_url: str = ""   # the cluster `moks opensearch compare` reads as the old side

@@ -27,7 +27,19 @@ data:
   {{- end }}
   MOKS_RAG_BACKEND: {{ has .Values.rag.backend (list "opensearch" "pinecone") | ternary .Values.rag.backend "postgres" | quote }}
   {{- if eq .Values.rag.backend "opensearch" }}
+  {{- if .Values.rag.opensearch.secure.active }}
+  MOKS_OPENSEARCH_URL: "https://moks-search:9200"
+  MOKS_OPENSEARCH_CLUSTER: {{ .Values.rag.opensearch.secure.cluster | quote }}
+  MOKS_OPENSEARCH_CA_FILE: /var/run/moks-search/ca.crt
+  {{- with .Values.rag.opensearch.secure.snapshots }}
+  {{- if .enabled }}
+  MOKS_OPENSEARCH_SNAPSHOT_REPOSITORY: {{ .repository | quote }}
+  MOKS_OPENSEARCH_SNAPSHOT_POLICY: {{ .policy | quote }}
+  {{- end }}
+  {{- end }}
+  {{- else }}
   MOKS_OPENSEARCH_URL: {{ .Values.rag.opensearch.url | default "http://moks-opensearch:9200" | quote }}
+  {{- end }}
   {{- with .Values.rag.opensearch.awsRegion }}
   MOKS_OPENSEARCH_AWS_REGION: {{ . | quote }}
   {{- end }}

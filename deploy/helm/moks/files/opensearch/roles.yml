@@ -1,0 +1,58 @@
+_meta: {type: roles, config_version: 2}
+
+# API pods. Reads the knowledge indexes and nothing else, so a compromised API cannot change what
+# anyone is told, and cannot read another index.
+moks_search:
+  cluster_permissions: []
+  index_permissions:
+    - index_patterns: ["moks-chunks-*"]
+      allowed_actions: ["indices:data/read/search*"]
+
+# Worker: applies outbox events and backfills. Writes documents; cannot create or delete an index.
+moks_indexer:
+  # The two read/scroll actions are cluster-level: delete_by_query needs them, and without them deletions fail.
+  cluster_permissions: ["indices:data/write/bulk", "indices:data/write/bulk*", "indices:data/read/scroll", "indices:data/read/scroll/clear"]
+  index_permissions:
+    - index_patterns: ["moks-chunks-*"]
+      allowed_actions:
+        - "indices:data/write/index"
+        - "indices:data/write/bulk*"
+        - "indices:data/write/delete"
+        - "indices:data/write/delete/byquery"
+        - "indices:data/write/update/byquery"
+        - "indices:data/read/search*"
+        - "indices:admin/refresh*"
+
+# Worker and migration Job: index generations, cluster state and snapshots. Limited to moks-chunks-*,
+# so it cannot touch the security index or anything else.
+moks_lifecycle:
+  cluster_permissions:
+    - "cluster:monitor/health"
+    - "cluster:monitor/main"
+    - "cluster:monitor/nodes/stats"
+    - "cluster:monitor/state"
+    - "cluster:admin/repository/get"
+    - "cluster:admin/repository/put"
+    - "cluster:admin/repository/verify"
+    - "cluster:admin/snapshot/get"
+    - "cluster:admin/snapshot/create"
+    - "cluster:admin/snapshot/delete"
+    - "cluster:admin/snapshot/status"
+    - "cluster:admin/opensearch/snapshot_management/*"
+  index_permissions:
+    - index_patterns: ["moks-chunks-*"]
+      allowed_actions:
+        - "indices:admin/create"
+        - "indices:admin/delete"
+        - "indices:admin/exists"
+        - "indices:admin/get"
+        - "indices:admin/mappings/get"
+        - "indices:monitor/*"
+        - "indices:data/read/search*"
+
+# Prometheus. Metrics only: no document text.
+moks_monitor:
+  cluster_permissions: ["cluster:monitor/*", "cluster:admin/snapshot/get", "cluster:admin/repository/get"]
+  index_permissions:
+    - index_patterns: ["*"]
+      allowed_actions: ["indices:monitor/*"]

@@ -18,7 +18,7 @@ class Fake:
         self.fail = 0
         self.before_write = None
 
-    async def ensure_index(self, name, dims):
+    async def ensure_index(self, name, dims, model_key=""):
         self.docs.setdefault(name, {})
 
     def _maybe_fail(self):

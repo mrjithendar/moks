@@ -42,7 +42,7 @@ async def test_json_and_bulk_requests_are_signed_over_their_exact_bodies(creds):
 
     def handler(request):
         seen.append(request)
-        return httpx.Response(200, json={"errors": False})
+        return httpx.Response(200, json={"errors": False, "items": [{"index": {"status": 201}} for _ in request.content.decode().splitlines()[1::2]]})
     os_ = backend(handler)
     await os_._req("POST", "/idx/_search", {"query": {"match_all": {}}})
     await os_._req("POST", "/_bulk?refresh=wait_for", ndjson='{"index":{}}\n{"a":1}\n')
@@ -62,7 +62,7 @@ async def test_ensure_index_keeps_its_vector_mapping_when_signed(creds):
     bodies = []
 
     def handler(request):
-        if request.method == "HEAD":
+        if request.method == "GET":
             return httpx.Response(404)
         bodies.append(json.loads(request.content))
         return httpx.Response(200, json={})
@@ -92,7 +92,7 @@ def test_signing_refuses_a_password_alongside_it_and_plain_http(url, kw):
 
 async def test_self_hosted_opensearch_still_uses_basic_auth():
     seen = []
-    os_ = OpenSearchBackend("http://os:9200", "u", "p", transport=httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200, json={})))
+    os_ = OpenSearchBackend("https://os:9200", "u", "p", transport=httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200, json={})))
     await os_._req("GET", "/_cluster/health")
     await os_.aclose()
     assert seen[0].headers["Authorization"].startswith("Basic ")

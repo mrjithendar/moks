@@ -328,7 +328,7 @@ async def test_opensearch_backend_contract():
             return httpx.Response(404)
         if req.url.path.endswith("/_search"):
             return httpx.Response(200, json={"hits": {"hits": [{"_source": {"chunk_id": "c1"}}]}})
-        return httpx.Response(200, json={"errors": False})
+        return httpx.Response(200, json={"errors": False, "items": [{"index": {"status": 201}}]})
 
     os_ = OpenSearchBackend("http://os:9200", transport=httpx.MockTransport(h))
     await os_.ensure_index("moks-chunks-x", 8)

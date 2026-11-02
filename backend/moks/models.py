@@ -513,8 +513,18 @@ class EmbeddingIndex(Base):
     build_watermark: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # outbox position when the build began
     build_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # who owns this build
     activation: Mapped[str | None] = mapped_column(String(20), nullable=True)  # complete | degraded, decided from recorded coverage
+    mapping_version: Mapped[int] = mapped_column(Integer, default=1)  # which fields this generation's documents carry
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # starts the retention window, nothing else does
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SearchBackendStatus(Base):
+    """The worker's latest look at a search cluster. API pods hold no identity that may ask, so they read this."""
+    __tablename__ = "search_backend_status"
+    backend: Mapped[str] = mapped_column(String(20), primary_key=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    state: Mapped[dict] = mapped_column(JSONB, default=dict)
 
 
 class Conversation(Base):

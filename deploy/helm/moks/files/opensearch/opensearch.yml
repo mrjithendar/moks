@@ -1,0 +1,33 @@
+# moks-search: one node, security on, TLS on both layers. Persistence only: there is no second copy of anything.
+cluster.name: moks-search
+network.host: 0.0.0.0
+discovery.type: single-node
+cluster.default_number_of_replicas: 0   # system indexes default to a replica one node can never place, which holds health at yellow
+bootstrap.memory_lock: false
+
+plugins.security.ssl.transport.pemcert_filepath: tls/tls.crt
+plugins.security.ssl.transport.pemkey_filepath: tls/tls.key
+plugins.security.ssl.transport.pemtrustedcas_filepath: tls/ca.crt
+plugins.security.ssl.transport.enforce_hostname_verification: false
+plugins.security.ssl.http.enabled: true
+plugins.security.ssl.http.pemcert_filepath: tls/tls.crt
+plugins.security.ssl.http.pemkey_filepath: tls/tls.key
+plugins.security.ssl.http.pemtrustedcas_filepath: tls/ca.crt
+
+# Only the first start reads config/opensearch-security. After that the security index is the
+# authority, and the moks-search-security Job (securityadmin) is the one way to change it.
+plugins.security.allow_default_init_securityindex: true
+plugins.security.authcz.admin_dn: ["CN=moks-search-admin,O=moks"]
+plugins.security.nodes_dn: ["CN=moks-search,O=moks"]
+plugins.security.restapi.roles_enabled: []
+# To the pod log, not an index: daily audit indexes would grow on a disk this cluster shares.
+plugins.security.audit.type: log4j
+plugins.security.audit.config.log4j.logger_name: audit
+plugins.security.audit.config.log4j.level: INFO
+plugins.security.audit.config.disabled_rest_categories: [AUTHENTICATED, GRANTED_PRIVILEGES]
+plugins.security.audit.config.disabled_transport_categories: [AUTHENTICATED, GRANTED_PRIVILEGES]
+plugins.security.enable_snapshot_restore_privilege: true
+plugins.security.check_snapshot_restore_write_privileges: true
+
+# Knowledge indexes are named by MOKS. Nothing should appear because a write mistyped a name.
+action.auto_create_index: false

@@ -13,6 +13,7 @@
   moks terminal                      run the terminal gateway (pods in the terminal namespace only)
   moks eval DATASET [--mode rules|llm]  run an evaluation dataset and print scores
   moks reindex                       rebuild the knowledge index for the active embedding model
+  moks opensearch <step>             build, sync, validate, compare, activate and snapshot index generations (docs/OPENSEARCH.md)
   moks skills register|bootstrap|release   record, first-install or publish skills; never automatic
 """
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import json
 import os
 import sys
 from pathlib import Path
@@ -340,6 +342,39 @@ async def _reindex() -> None:
         print(await service.reindex(db))
 
 
+async def _opensearch(a) -> None:
+    from .config import get_settings
+    from .db import session_scope
+    from .rag import service
+
+    if a.opensearch_cmd == "status":
+        result: dict = {"backend": service.backend_name(), "live": service.is_live(), "cluster": await service.external().status()}
+    elif a.opensearch_cmd == "build":
+        async with session_scope() as db:
+            result = await service.reindex(db)
+    elif a.opensearch_cmd == "sync":
+        result = await service.sync_generation(a.limit)
+        if service.is_live():
+            result |= await service.adopt_generation()
+    elif a.opensearch_cmd == "validate":
+        result = await service.validate_generation()
+    elif a.opensearch_cmd == "compare":
+        result = await service.compare_generations(a.query or [], a.limit)
+    elif a.opensearch_cmd == "activate":
+        async with session_scope() as db:
+            result = await service.activate_generation(db, a.index)
+        result |= await service.sync_generation()
+        result |= await service.adopt_generation()
+    else:
+        s = get_settings()
+        if not s.opensearch_snapshot_repository:
+            raise SystemExit("MOKS_OPENSEARCH_SNAPSHOT_REPOSITORY is not set")
+        result = await service.external().configure_snapshots(s.opensearch_snapshot_repository, s.opensearch_snapshot_policy, a.bucket, a.base_path, a.schedule, a.keep, a.retain)
+    print(json.dumps(result, indent=2, default=str))
+    if result.get("ok") is False:
+        raise SystemExit(1)
+
+
 async def _backup_run(dump: str, manifest_path: str | None = None) -> None:
     from datetime import datetime, timezone
 
@@ -474,6 +509,23 @@ def main(argv: list[str] | None = None) -> None:
     ev.add_argument("dataset")
     ev.add_argument("--mode", choices=["rules", "llm"], default="rules")
     sub.add_parser("reindex")
+    os_ = sub.add_parser("opensearch").add_subparsers(dest="opensearch_cmd", required=True)
+    os_.add_parser("status", help="what the configured cluster says about itself")
+    os_.add_parser("build", help="fill a new generation from PostgreSQL; with MOKS_OPENSEARCH_STANDBY search does not move")
+    ops = os_.add_parser("sync", help="write what the active generation missed")
+    ops.add_argument("--limit", type=int, default=5000)
+    os_.add_parser("validate", help="check the active generation; exits 1 unless every check passes")
+    opc = os_.add_parser("compare", help="overlap of keyword results between the old and new cluster")
+    opc.add_argument("--query", action="append")
+    opc.add_argument("--limit", type=int, default=25)
+    opa = os_.add_parser("activate", help="switch back to a retained generation, then sync it")
+    opa.add_argument("index")
+    opn = os_.add_parser("snapshots", help="register the snapshot repository and schedule")
+    opn.add_argument("--bucket", required=True)
+    opn.add_argument("--base-path", default="opensearch")
+    opn.add_argument("--schedule", default="0 3 * * *")
+    opn.add_argument("--keep", type=int, default=14)
+    opn.add_argument("--retain", default="30d")
     sk = sub.add_parser("skills").add_subparsers(dest="skills_cmd", required=True)
     sk.add_parser("register", help="record the skills in this image; publishes nothing")
     sk.add_parser("bootstrap", help="first install: publish the image's built-ins if no generation exists")
@@ -527,6 +579,8 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_eval(a.dataset, a.mode))
     elif a.cmd == "reindex":
         asyncio.run(_reindex())
+    elif a.cmd == "opensearch":
+        asyncio.run(_opensearch(a))
     elif a.cmd == "skills":
         asyncio.run(_skills(a))
     elif a.cmd == "backup":

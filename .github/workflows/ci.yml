@@ -191,14 +191,13 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
       - id: ecr
         uses: aws-actions/amazon-ecr-login@v2
-      - uses: docker/setup-buildx-action@v4
-      - name: Build, smoke-test and push for arm64 and amd64
+      - name: Build, smoke-test and push
         working-directory: reranker
         run: |
           IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:${{ github.sha }}"
-          docker build --build-arg GIT_COMMIT=${{ github.sha }} -t smoke .
+          docker build --build-arg GIT_COMMIT=${{ github.sha }} -t "$IMAGE" .
           # No network, so a runtime download would fail here rather than in production.
-          docker run -d --name smoke -e RERANKER_TOKEN=ci -e RERANKER_METRICS_PORT=0 --network none --read-only --tmpfs /tmp --user 10001:10001 smoke
+          docker run -d --name smoke -e RERANKER_TOKEN=ci -e RERANKER_METRICS_PORT=0 --network none --read-only --tmpfs /tmp --user 10001:10001 "$IMAGE"
           docker exec smoke python -c "
           import time, urllib.request
           for _ in range(60):
@@ -210,10 +209,45 @@ jobs:
               raise SystemExit('never ready')
           "
           docker rm -f smoke
-          docker images smoke --format 'image size {{ .Size }}' >> "$GITHUB_STEP_SUMMARY"
+          docker images "$IMAGE" --format 'image size {{ .Size }}' >> "$GITHUB_STEP_SUMMARY"
+          docker push "$IMAGE"
+          DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2)"
           LATEST="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
-          docker buildx build --platform linux/arm64,linux/amd64 --provenance=false --build-arg GIT_COMMIT=${{ github.sha }} --metadata-file meta.json --push -t "$IMAGE" -t "$LATEST" .
-          echo "pushed $IMAGE and $LATEST ($(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")). Restart moks-reranker to run it." >> "$GITHUB_STEP_SUMMARY"
+          docker tag "$IMAGE" "$LATEST"
+          docker push "$LATEST"
+          echo "pushed $IMAGE and $LATEST ($DIGEST). Restart moks-reranker to run it." >> "$GITHUB_STEP_SUMMARY"
+
+  # moks-search with its S3 and metrics plugins. A digest in values moves the cluster, so this changes nothing
+  # until rag.opensearch.secure.image is set to what it reports. Needs the moks-opensearch ECR repository.
+  opensearch-image:
+    if: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      REPOSITORY: moks-opensearch
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: moks-opensearch-ci-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v4
+      - name: Build, smoke-test and push for arm64 and amd64
+        working-directory: deploy/opensearch
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:${{ github.sha }}"
+          docker build -t smoke .
+          docker run --rm smoke bin/opensearch-plugin list | tee plugins
+          grep -q repository-s3 plugins && grep -q prometheus-exporter plugins
+          docker buildx build --platform linux/arm64,linux/amd64 --provenance=false --metadata-file meta.json --push -t "$IMAGE" .
+          echo "pushed $IMAGE ($(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])"))." >> "$GITHUB_STEP_SUMMARY"
 
   # Built and pushed on every push to the default branch. Sessions run a digest, so this changes nothing
   # until the chart's terminal.image.digest is moved to what this reports.

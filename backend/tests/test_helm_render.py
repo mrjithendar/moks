@@ -341,7 +341,21 @@ def test_opensearch_public_route_is_read_only_behind_a_login():
     assert {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "traefik"}}} in rules[1]["from"]
 
 
-@pytest.mark.parametrize("sets", [("rag.opensearch.publicRoute.enabled=false",), ("rag.opensearch.url=https://d.example", "rag.opensearch.awsRegion=us-east-1")])
+def test_opensearch_dashboards_has_its_own_login_and_a_writable_config():
+    docs = render("values-minikube.yaml")
+    pod = of(docs, "Deployment", "moks-opensearch-dashboards")["spec"]["template"]["spec"]
+    env = {e["name"]: e["value"] for e in pod["containers"][0]["env"]}
+    assert env["SERVER_BASEPATH"] == "/opensearch-dashboards" and env["SERVER_REWRITEBASEPATH"] == "true"
+    assert env["OPENSEARCH_HOSTS"] == '["http://moks-opensearch:9200"]' and env["DISABLE_SECURITY_DASHBOARDS_PLUGIN"] == "true"
+    assert ":" + "3.9.0" in pod["containers"][0]["image"] and ":3.9.0" in of(docs, "StatefulSet", "moks-opensearch")["spec"]["template"]["spec"]["containers"][0]["image"]
+    assert not pod["containers"][0].get("volumeMounts") and pod["automountServiceAccountToken"] is False
+    route = of(docs, "IngressRoute", "opensearch-dashboards")["spec"]["routes"][0]
+    assert [m["name"] for m in route["middlewares"]] == ["opensearch-dashboards-auth"]
+    assert of(docs, "Middleware", "opensearch-dashboards-auth")["spec"]["basicAuth"]["secret"] == "moks-opensearch-dashboards-auth"
+    assert {"podSelector": {"matchLabels": {"app": "moks-opensearch-dashboards"}}} in of(docs, "NetworkPolicy", "moks-opensearch")["spec"]["ingress"][2]["from"]
+
+
+@pytest.mark.parametrize("sets", [("rag.opensearch.publicRoute.enabled=false", "rag.opensearch.dashboards.enabled=false"), ("rag.opensearch.url=https://d.example", "rag.opensearch.awsRegion=us-east-1")])
 def test_opensearch_stays_private_unless_the_bundled_pod_is_published(sets):
     docs = render("values-minikube.yaml", *sets)
     assert not any(d["kind"] == "IngressRoute" or d["metadata"]["name"].startswith("opensearch-") for d in docs)
@@ -361,3 +375,89 @@ def test_watermarks_stay_out_of_the_chart_unless_asked_for():
     env = of(render("values-minikube.yaml", "rag.opensearch.diskWatermarks=null"), "StatefulSet", "moks-opensearch")["spec"]["template"]["spec"]["containers"][0]["env"]
     assert not [e for e in env if "watermark" in e["name"]]
 
+
+
+SECURE = ("rag.opensearch.secure.enabled=true",)
+ACTIVE = (*SECURE, "rag.opensearch.secure.active=true", "rag.opensearch.publicRoute.enabled=false", "rag.opensearch.dashboards.enabled=false")
+
+
+def test_the_secured_cluster_is_off_on_mk4_until_asked_for():
+    docs = render("values-minikube.yaml")
+    assert not any(d["metadata"]["name"].startswith("moks-search") for d in docs)
+    assert of(docs, "ConfigMap", "moks-config")["data"]["MOKS_OPENSEARCH_URL"] == "http://moks-opensearch:9200"
+
+
+def test_enabling_it_deploys_beside_the_old_pod_and_moves_nothing():
+    docs = render("values-minikube.yaml", *SECURE)
+    assert of(docs, "StatefulSet", "moks-search") and of(docs, "StatefulSet", "moks-opensearch")
+    assert of(docs, "ConfigMap", "moks-config")["data"]["MOKS_OPENSEARCH_URL"] == "http://moks-opensearch:9200"
+    ops = of(docs, "CronJob", "moks-search-ops")["spec"]
+    env = {e["name"]: e.get("value") for e in ops["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert ops["suspend"] is True and env["MOKS_OPENSEARCH_STANDBY"] == "true" and env["MOKS_OPENSEARCH_CLUSTER"] == "secure"
+
+
+def test_the_secured_pod_is_hardened_and_never_disables_security():
+    docs = render("values-minikube.yaml", *SECURE)
+    sts = of(docs, "StatefulSet", "moks-search")["spec"]
+    spec = sts["template"]["spec"]
+    c = spec["containers"][0]
+    env = {e["name"]: e.get("value") for e in c["env"]}
+    assert "DISABLE_SECURITY_PLUGIN" not in env and env["DISABLE_INSTALL_DEMO_CONFIG"] == "true"
+    assert c["startupProbe"]["httpGet"]["scheme"] == "HTTPS" and c["readinessProbe"] and c["livenessProbe"]["tcpSocket"]
+    assert "@sha256:" in c["image"] and c["securityContext"]["capabilities"]["drop"] == ["ALL"] and spec["securityContext"]["runAsNonRoot"]
+    assert spec["nodeSelector"] == {"kubernetes.io/hostname": "mk4-m02"} and spec["terminationGracePeriodSeconds"] >= 60
+    assert sts["persistentVolumeClaimRetentionPolicy"] == {"whenDeleted": "Retain", "whenScaled": "Retain"}
+    assert not any(i.get("securityContext", {}).get("privileged") for i in spec["initContainers"])
+    config = of(docs, "ConfigMap", "moks-search-config")["data"]["opensearch.yml"]
+    assert "plugins.security.ssl.http.enabled: true" in config and "plugins.security.disabled" not in config and "action.auto_create_index: false" in config
+
+
+def test_the_secured_service_is_internal_and_reachable_only_by_those_who_use_it():
+    docs = render("values-minikube.yaml", *SECURE)
+    assert of(docs, "Service", "moks-search")["spec"]["type"] == "ClusterIP"
+    assert not any(d["kind"] in ("Ingress", "IngressRoute") and "moks-search" in str(d["spec"]) for d in docs)
+    np = of(docs, "NetworkPolicy", "moks-search")["spec"]
+    who = np["ingress"][0]["from"]
+    assert who[0]["podSelector"]["matchExpressions"][1]["values"] == ["api", "worker", "search-ops"] and np["egress"] == []
+    assert {"to": [{"podSelector": {"matchLabels": {"app": "moks-search"}}}], "ports": [{"port": 9200, "protocol": "TCP"}]} in of(docs, "NetworkPolicy", "moks")["spec"]["egress"]
+
+
+def test_at_cutover_each_component_gets_its_own_identity():
+    docs = render("values-minikube.yaml", *ACTIVE)
+    data = of(docs, "ConfigMap", "moks-config")["data"]
+    assert data["MOKS_OPENSEARCH_URL"] == "https://moks-search:9200" and data["MOKS_OPENSEARCH_CLUSTER"] == "secure"
+
+    def names(deployment):
+        return {e["name"] for e in of(docs, "Deployment", deployment)["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert "MOKS_OPENSEARCH_PASSWORD" in names("moks-api") and "MOKS_OPENSEARCH_INDEX_PASSWORD" not in names("moks-api") and "MOKS_OPENSEARCH_LIFECYCLE_PASSWORD" not in names("moks-api")
+    assert {"MOKS_OPENSEARCH_INDEX_PASSWORD", "MOKS_OPENSEARCH_LIFECYCLE_PASSWORD"} <= names("moks-worker")
+    volume = next(v for v in of(docs, "Deployment", "moks-api")["spec"]["template"]["spec"]["volumes"] if v["name"] == "search-ca")
+    assert volume["secret"]["items"] == [{"key": "ca.crt", "path": "ca.crt"}]  # never tls.key
+
+
+def test_the_old_public_route_blocks_cutover():
+    with pytest.raises(subprocess.CalledProcessError) as e:
+        render("values-minikube.yaml", *SECURE, "rag.opensearch.secure.active=true")
+    assert "publicRoute" in str(e.value.stderr)
+
+
+def test_the_old_dashboards_block_cutover():
+    with pytest.raises(subprocess.CalledProcessError) as e:
+        render("values-minikube.yaml", *SECURE, "rag.opensearch.secure.active=true", "rag.opensearch.publicRoute.enabled=false", "rag.opensearch.dashboards.enabled=true")
+    assert "rag.opensearch.dashboards" in str(e.value.stderr)
+
+
+def test_snapshots_need_the_image_that_has_the_plugin():
+    with pytest.raises(subprocess.CalledProcessError) as e:
+        render("values-minikube.yaml", *SECURE, "rag.opensearch.secure.snapshots.enabled=true")
+    assert "pluginsInstalled" in str(e.value.stderr)
+    docs = render("values-minikube.yaml", *SECURE, "rag.opensearch.secure.snapshots.enabled=true", "rag.opensearch.secure.pluginsInstalled=true", "rag.opensearch.secure.snapshots.endpoint=https://x.r2.cloudflarestorage.com")
+    spec = of(docs, "StatefulSet", "moks-search")["spec"]["template"]["spec"]
+    assert [i["name"] for i in spec["initContainers"]] == ["volume-permissions", "keystore"]
+    assert any(r.get("ports") == [{"port": 443, "protocol": "TCP"}] for r in of(docs, "NetworkPolicy", "moks-search")["spec"]["egress"])
+
+
+def test_no_chart_file_holds_a_credential():
+    from pathlib import Path
+    for f in (Path(__file__).parents[2] / "deploy/helm/moks/files/opensearch").iterdir():
+        assert "$2" not in f.read_text() and "hash:" not in f.read_text() and "BEGIN" not in f.read_text()

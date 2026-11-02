@@ -36,6 +36,9 @@ spec:
           {{- include "moks.env" (dict "root" . "component" "api") | nindent 10 }}
           env:
             - {name: FORWARDED_ALLOW_IPS, value: "*"}  # only Traefik can reach :8080 (NetworkPolicy)
+            {{- if include "moks.searchActive" . }}
+            {{- include "moks.searchIdentities" (dict "root" . "component" "api") | nindent 12 }}
+            {{- end }}
           {{- include "moks.containerSecurity" . | nindent 10 }}
           {{- include "moks.volumeMounts" (dict "root" . "component" "api") | nindent 10 }}
           startupProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 3, failureThreshold: 40}

@@ -126,7 +126,7 @@ async def test_inexact_filters_expand_within_a_bound_and_the_final_check_decides
     pools = []
 
     class Index:
-        async def vector(self, name, qv, found, k):
+        async def vector(self, name, qv, found, k, exclude=None):
             pools.append(k)
             return ([str(hidden)] * 0 + [str(uuid.uuid4()) for _ in range(k - 1)] + [str(hidden if k < 100 else readable)]), False
 
@@ -480,7 +480,7 @@ class Index:
     def __init__(self):
         self.docs, self.fail, self.counts, self.during = {}, 0, {}, None
 
-    async def ensure_index(self, name, dims):
+    async def ensure_index(self, name, dims, model_key=""):
         pass
 
     async def delete_document(self, name, document_id):

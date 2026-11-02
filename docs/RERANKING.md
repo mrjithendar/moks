@@ -43,7 +43,7 @@ CI builds on every push to `master` and pushes the commit tag and `latest`. The 
 
 **Rollback:** point `latest` at an earlier commit tag and restart, or set `reranker.image.digest`.
 
-The pinned requirements resolve for Python 3.12 on `linux/amd64` (298 MB of wheels) and `linux/arm64` (257 MB). The CI job `reranker-image` builds it and passed its smoke test, which starts it with `--network none`, `--read-only` and a non-root user.
+The pinned requirements resolve for Python 3.12 on `linux/arm64` (257 MB of wheels) and `linux/amd64` (298 MB). The CI job `reranker-image` builds arm64 only, like the main image, because every mk4 node is arm64 and installing torch for amd64 under emulation added 12 minutes. It passed its smoke test, which starts it with `--network none`, `--read-only` and a non-root user.
 
 ## Measurements
 

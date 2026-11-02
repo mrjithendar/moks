@@ -8,3 +8,18 @@
       port: 9464
   relabel_configs:
     - {target_label: service, replacement: moks}
+
+# moks-search, once its image has the exporter (docs/OPENSEARCH.md). The worker's moks_search_backend gauges
+# need only the job above. This one needs the moks_monitor password and the CA in a Secret mounted into
+# Prometheus, and NetworkPolicy already allows the monitoring namespace. It carries no document text.
+- job_name: moks-search
+  scheme: https
+  metrics_path: /_prometheus/metrics
+  basic_auth:
+    username: moks_monitor
+    password_file: /etc/prometheus/moks-search/monitor-password
+  tls_config:
+    ca_file: /etc/prometheus/moks-search/ca.crt
+    server_name: moks-search
+  static_configs:
+    - targets: [moks-search.moks.svc.cluster.local:9200]

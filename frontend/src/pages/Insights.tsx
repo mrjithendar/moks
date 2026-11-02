@@ -69,8 +69,50 @@ function IndexHealth({ s }: { s: any }) {
       </div>
       {s.index?.activation === "degraded" && <div className="alert warn small">The active index is degraded: {s.index.incomplete_documents} documents are incomplete. {s.index.incomplete_sample?.[0]?.reason}</div>}
       {e.missing > 0 && <div className="alert warn small">{e.missing} documents are searchable by keyword only because embedding failed. MOKS retries them on its own once embedding works.</div>}
+      <SearchBackend />
       <RerankingStatus />
       {s.reindex_progress && <div className="small muted">Reindex running: {s.reindex_progress.chunks} of {s.reindex_progress.of} passages copied.</div>}
+    </div>
+  );
+}
+
+function SearchBackend() {
+  const { can } = useAuth();
+  const r = useLoad(() => (can("admin.llm") ? api<any>("/knowledge/backend") : Promise.resolve(null)), []);
+  const d = r.data;
+  if (!d) return null;
+  const p = d.probe, active = d.generations.find((g: any) => g.serving), snap = p?.snapshots, c = d.coverage;
+  const fallbacks = Object.entries(d.retrieval.fallbacks) as [string, number][];
+  const modes = Object.entries(d.retrieval.modes) as [string, number][];
+  const health = !p ? "not probed yet" : !p.reachable ? "unreachable" : p.health;
+  return (
+    <div className="stack">
+      <h3>Search backend</h3>
+      <div className="stat-row">
+        <Stat value={health} label={d.cluster ? `cluster ${d.cluster}` : d.backend} />
+        <Stat value={active?.index ?? "—"} label="active generation" />
+        <Stat value={active ? (active.dimensions ? `${active.dimensions}` : "keyword only") : "—"} label={active?.model ?? "embedding model"} />
+        <Stat value={c ? `${c.chunks_written} of ${c.chunks_expected}` : "—"} label="chunks in this generation" />
+        <Stat value={c ? `${c.vectors_written} of ${c.vectors_expected}` : "—"} label="vectors in this generation" />
+        <Stat value={d.backfill_eligible} label="documents waiting for vector backfill" />
+      </div>
+      {p?.error && <div className="alert warn small">{p.error}</div>}
+      {p?.read_only && <div className="alert warn small">OpenSearch has blocked writes, usually because the disk passed the flood-stage watermark. Index changes wait in the outbox.</div>}
+      {d.url && !d.tls_verified && <div className="alert warn small">This connection is not TLS-verified{d.authenticated ? "" : " and has no login"}. See docs/OPENSEARCH.md.</div>}
+      {p && <div className="small muted">
+        Checked {new Date(p.checked_at).toLocaleString()}{p.version ? `, OpenSearch ${p.version}` : ""}
+        {p.heap_used_percent != null ? `, heap ${p.heap_used_percent}%` : ""}
+        {p.disk_free_bytes != null ? `, ${(p.disk_free_bytes / 1e9).toFixed(1)} GB free on its disk` : ""}
+        {p.unassigned_shards ? `, ${p.unassigned_shards} unassigned shards` : ""}.
+      </div>}
+      <div className="small muted">
+        {snap ? (snap.error ? `Snapshots: ${snap.error}` : `Last successful snapshot: ${snap.last_success_at ?? "none yet"}${snap.latest_state && snap.latest_state !== "SUCCESS" ? `, latest ${snap.latest_state}` : ""}.`) : "Snapshots are not configured. The index can be rebuilt from PostgreSQL."}
+      </div>
+      {modes.length > 0 && <div className="small muted">Retrieval in this API process: {modes.map(([k, v]) => `${k} ${v}`).join(", ")}.</div>}
+      {fallbacks.length > 0 && <div className="small">Fallbacks: {fallbacks.map(([k, v]) => `${k} (${v})`).join("; ")}.</div>}
+      {d.generations.length > 1 && <details className="small"><summary>Index generations</summary>
+        <ul>{d.generations.map((g: any) => <li key={`${g.backend}/${g.index}`}>{g.index} ({g.backend}): {g.status}{g.serving ? ", serving" : ""}, {g.chunks} chunks, mapping v{g.mapping_version}{g.retired_at ? `, retired ${new Date(g.retired_at).toLocaleDateString()}` : ""}</li>)}</ul>
+      </details>}
     </div>
   );
 }

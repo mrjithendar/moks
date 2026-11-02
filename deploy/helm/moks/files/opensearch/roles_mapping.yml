@@ -1,0 +1,6 @@
+_meta: {type: rolesmapping, config_version: 2}
+moks_search: {users: [moks_search]}
+moks_indexer: {users: [moks_indexer]}
+moks_lifecycle: {users: [moks_lifecycle]}
+moks_monitor: {users: [moks_monitor]}
+all_access: {users: [moks_admin]}   # people, by hand, and audited

@@ -87,6 +87,12 @@ Namespace `moks` itself is not rendered by the chart: the old Application's `man
 | opensearch | NetworkPolicy | moks | `moks-opensearch` | if enabled | if enabled |
 | opensearch | Service | moks | `moks-opensearch` | if enabled | if enabled |
 | opensearch | StatefulSet | moks | `moks-opensearch` | if enabled | if enabled |
+| opensearch | ConfigMap | moks | `moks-search-config` | if enabled | if enabled |
+| opensearch | CronJob | moks | `moks-search-ops` | if enabled | if enabled |
+| opensearch | Job (PostSync hook) | moks | `moks-search-security` | if enabled | if enabled |
+| opensearch | NetworkPolicy | moks | `moks-search` | if enabled | if enabled |
+| opensearch | Service | moks | `moks-search` | if enabled | if enabled |
+| opensearch | StatefulSet | moks | `moks-search` | if enabled | if enabled |
 | api | Deployment | moks | `moks-api` | moks-portal | roboshop-demo-moks-portal |
 | api | PodDisruptionBudget | moks | `moks-api` | moks-portal | - |
 | api | Service | moks | `moks-api` | moks-portal | roboshop-demo-moks-portal |

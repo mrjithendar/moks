@@ -347,6 +347,7 @@ class OpenSearchBackend:
             action: dict[str, Any] = {"_index": index_name, "_id": r["chunk_id"]}
             if "content_revision" in r:
                 action |= {"version": r["content_revision"], "version_type": "external_gte"}
+                doc["has_vector"] = bool(embeddings)
             if embeddings:
                 doc["embedding"] = embeddings[i]
             lines.append(json.dumps({"index": action}))
@@ -355,7 +356,7 @@ class OpenSearchBackend:
             return result
         resp = await self._req("POST", "/_bulk?refresh=wait_for", ndjson="\n".join(lines) + "\n", via=self.index_client)
         items = [next(iter(it.values())) for it in resp.get("items") or []]
-        if len(items) != len(rows) and (resp.get("errors") or items):
+        if len(items) != len(rows):
             raise ConnectorError("bad_request", f"OpenSearch answered {len(items)} items for a bulk of {len(rows)}")
         for row, item in zip(rows, items):
             error = item.get("error")
@@ -366,10 +367,6 @@ class OpenSearchBackend:
                 result.first_error = result.first_error or json.dumps(error)[:300]
             else:
                 result.written += 1
-        if resp.get("errors") and not items:
-            raise ConnectorError("bad_request", "OpenSearch reported bulk errors without saying which items failed")
-        if not items:
-            result.written = len(rows)
         result.vectors = result.written if embeddings else 0
         OPENSEARCH_BULK_ITEMS.labels("written").inc(result.written)
         OPENSEARCH_BULK_ITEMS.labels("superseded").inc(result.superseded)
@@ -514,7 +511,7 @@ class PineconeBackend:
     async def health(self) -> dict:
         return await self._req("GET", f"{self.CONTROL}/indexes")
 
-    async def ensure_index(self, name: str, dims: int | None) -> None:
+    async def ensure_index(self, name: str, dims: int | None, model_key: str = "") -> None:
         if not dims:
             return  # keyword-only: nothing to store here
         info = await self._describe(name)
@@ -558,11 +555,12 @@ class PineconeBackend:
     async def count_document(self, index_name: str, document_id: uuid.UUID) -> int | None:
         return None  # Pinecone cannot count by metadata; revision tracking is what is available
 
-    async def vector(self, index_name: str, embedding: list[float], found: list[access.Grant], k: int) -> tuple[list[str], bool]:
+    async def vector(self, index_name: str, embedding: list[float], found: list[access.Grant], k: int, exclude: dict | None = None) -> tuple[list[str], bool]:
         host = await self._host(index_name)
         if not host:
             return [], True
         flt, exact = access.pinecone(found)
+        exact = exact and not any((exclude or {}).values())  # metadata has no source id, so the final check removes these
         body: dict[str, Any] = {"vector": embedding, "topK": k, "namespace": self.NAMESPACE, "includeMetadata": False, "includeValues": False}
         if flt:
             body["filter"] = flt

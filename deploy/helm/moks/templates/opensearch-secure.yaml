@@ -1,0 +1,297 @@
+{{- $secure := .Values.rag.opensearch.secure -}}
+{{- if $secure.active -}}
+{{- if not $secure.enabled }}{{ fail "rag.opensearch.secure.active needs rag.opensearch.secure.enabled" }}{{ end -}}
+{{- if .Values.rag.opensearch.publicRoute.enabled }}{{ fail "rag.opensearch.publicRoute reaches the old unauthenticated pod, which stops following PostgreSQL at cutover. Turn it off first (docs/OPENSEARCH.md)." }}{{ end -}}
+{{- if .Values.rag.opensearch.dashboards.enabled }}{{ fail "rag.opensearch.dashboards reaches the old unauthenticated pod, and cannot follow moks-search without TLS and a login. Turn it off first (docs/OPENSEARCH.md)." }}{{ end -}}
+{{- end -}}
+{{- if and $secure.snapshots.enabled (not $secure.pluginsInstalled) }}{{ fail "rag.opensearch.secure.snapshots needs the image from deploy/opensearch/Dockerfile and pluginsInstalled: true" }}{{ end -}}
+{{- if and $secure.enabled (eq .Values.rag.backend "opensearch") -}}
+{{- if .Values.rag.opensearch.url }}{{ fail "rag.opensearch.secure is the bundled cluster; rag.opensearch.url names an external one" }}{{ end -}}
+{{- if include "moks.inGroup" (dict "root" . "group" "opensearch") }}
+{{- $heap := $secure.heapSize }}
+{{- $config := tpl (include "moks.searchConfig" .) . }}
+# The secured cluster (docs/OPENSEARCH.md). One node: persistence, no redundancy. Files here are the
+# chart's; passwords and keys come from Secrets created by scripts/opensearch-secrets.sh.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moks-search-config
+  labels: {{- include "moks.labels" . | nindent 4 }}
+data:
+  opensearch.yml: |
+    {{- $config | nindent 4 }}
+  {{- range tuple "config" "roles" "roles_mapping" "action_groups" "tenants" "nodes_dn" "allowlist" "audit" }}
+  {{ . }}.yml: |
+    {{- $.Files.Get (printf "files/opensearch/%s.yml" .) | nindent 4 }}
+  {{- end }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: moks-search
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  serviceName: moks-search
+  replicas: 1
+  # Deleting or scaling this workload keeps the volume. Deleting the data is docs/OPENSEARCH.md, on purpose.
+  persistentVolumeClaimRetentionPolicy: {whenDeleted: Retain, whenScaled: Retain}
+  selector: {matchLabels: {app: moks-search}}
+  template:
+    metadata:
+      labels: {app: moks-search}
+      annotations:
+        checksum/config: {{ $config | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120   # flushes on SIGTERM; a kill mid-write only costs translog replay
+      {{- with $secure.nodeName }}
+      nodeSelector: {kubernetes.io/hostname: {{ . }}}
+      {{- end }}
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      {{- if or $secure.fixVolumePermissions $secure.snapshots.enabled }}
+      initContainers:
+        {{- if $secure.fixVolumePermissions }}
+        # hostPath ignores fsGroup. Root, for this one chown; not privileged, CHOWN and FOWNER only.
+        - name: volume-permissions
+          image: {{ $secure.image }}
+          command: [sh, -c, "chown 1000:1000 /mnt/data"]
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL], add: [CHOWN, FOWNER]}
+          resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {cpu: 100m, memory: 64Mi}}
+          volumeMounts: [{name: data, mountPath: /mnt/data}]
+        {{- end }}
+        {{- if $secure.snapshots.enabled }}
+        # The S3 client reads credentials only from the keystore, so the keystore is built from the Secret at each start.
+        - name: keystore
+          image: {{ $secure.image }}
+          command:
+            - sh
+            - -ec
+            - |
+              export OPENSEARCH_PATH_CONF=/keystore
+              cp /usr/share/opensearch/config/jvm.options /keystore/
+              bin/opensearch-keystore create
+              printf %s "$S3_ACCESS_KEY" | bin/opensearch-keystore add --stdin --force s3.client.default.access_key
+              printf %s "$S3_SECRET_KEY" | bin/opensearch-keystore add --stdin --force s3.client.default.secret_key
+          env:
+            - name: S3_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: {{ $secure.snapshots.credentialsSecret }}, key: access-key}}
+            - name: S3_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: {{ $secure.snapshots.credentialsSecret }}, key: secret-key}}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 500m, memory: 512Mi}}
+          volumeMounts: [{name: keystore, mountPath: /keystore}]
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: opensearch
+          image: {{ $secure.image }}
+          env:
+            - {name: OPENSEARCH_JAVA_OPTS, value: "-Xms{{ $heap }} -Xmx{{ $heap }}"}
+            - {name: DISABLE_INSTALL_DEMO_CONFIG, value: "true"}   # no demo certificates or users, ever
+            - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
+          ports: [{name: https, containerPort: 9200}]
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+          # This path answers without a login, and only says whether security has initialized.
+          startupProbe:
+            httpGet: {scheme: HTTPS, path: /_plugins/_security/health, port: https}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {scheme: HTTPS, path: /_plugins/_security/health, port: https}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # The port, not the API: a slow or red cluster recovers better without a restart.
+          livenessProbe:
+            tcpSocket: {port: https}
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources: {{- toYaml $secure.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /usr/share/opensearch/data}
+            - {name: config, mountPath: /usr/share/opensearch/config/opensearch.yml, subPath: opensearch.yml, readOnly: true}
+            - {name: tls, mountPath: /usr/share/opensearch/config/tls, readOnly: true}
+            - {name: security, mountPath: /usr/share/opensearch/config/opensearch-security, readOnly: true}
+            {{- if $secure.snapshots.enabled }}
+            - {name: keystore, mountPath: /usr/share/opensearch/config/opensearch.keystore, subPath: opensearch.keystore}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap: {name: moks-search-config}
+        - name: tls
+          secret: {secretName: {{ $secure.secrets.tls }}, defaultMode: 0440}
+        - name: security
+          projected:
+            defaultMode: 0440
+            sources:
+              - configMap: {name: moks-search-config, items: {{ include "moks.searchSecurityFiles" . }}}
+              - secret: {name: {{ $secure.secrets.users }}, items: [{key: internal_users.yml, path: internal_users.yml}]}
+        {{- if $secure.snapshots.enabled }}
+        - name: keystore
+          emptyDir: {sizeLimit: 16Mi, medium: Memory}
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        annotations: {argocd.argoproj.io/sync-options: "Prune=false,Delete=false"}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: {{ $secure.storage }}}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moks-search
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {app: moks-search}
+  ports: [{name: https, port: 9200, targetPort: https}]
+---
+{{- if .Values.networkPolicy.enabled }}
+# The API and worker, the jobs below, and Prometheus. Nothing else, including other MOKS components.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: moks-search
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app: moks-search}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [moks]}
+              - {key: component, operator: In, values: [api, worker, search-ops]}
+        - podSelector: {matchLabels: {app: moks-search-admin}}
+        {{- range .Values.networkPolicy.metricsNamespaces }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ . }}}}
+        {{- end }}
+      ports: [{port: 9200, protocol: TCP}]
+  {{- if $secure.snapshots.enabled }}
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+      ports: [{port: 443, protocol: TCP}]
+  {{- else }}
+  egress: []
+  {{- end }}
+---
+{{- end }}
+# Loads roles and users into the security index after each sync. The only holder of the admin certificate.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: moks-search-security
+  labels: {{- include "moks.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata: {labels: {app: moks-search-admin}}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext: {runAsUser: 1000, runAsGroup: 1000, runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: securityadmin
+          image: {{ $secure.image }}
+          env:
+            - {name: OPENSEARCH_JAVA_HOME, value: /usr/share/opensearch/jdk}
+          command:
+            - sh
+            - -ec
+            - |
+              until curl -fsS --cacert /admin/ca.crt https://moks-search:9200/_plugins/_security/health; do sleep 5; done
+              exec plugins/opensearch-security/tools/securityadmin.sh -cd /security -h moks-search -cn moks-search \
+                -cacert /admin/ca.crt -cert /admin/tls.crt -key /admin/tls.key
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
+          volumeMounts:
+            - {name: admin, mountPath: /admin, readOnly: true}
+            - {name: security, mountPath: /security, readOnly: true}
+      volumes:
+        - name: admin
+          secret: {secretName: {{ $secure.secrets.adminTls }}, defaultMode: 0440}
+        - name: security
+          projected:
+            defaultMode: 0440
+            sources:
+              - configMap: {name: moks-search-config, items: {{ include "moks.searchSecurityFiles" . }}}
+              - secret: {name: {{ $secure.secrets.users }}, items: [{key: internal_users.yml, path: internal_users.yml}]}
+---
+# Never fires: scripts/opensearch-migrate.sh creates a Job from it for one step at a time, against this
+# cluster, as the lifecycle identity. Until cutover it runs as a standby, so search does not move.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: moks-search-ops
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  schedule: "0 0 31 2 *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata: {labels: {app: moks, component: search-ops}}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "moks.serviceAccount" (dict "root" . "component" "worker") }}
+          {{- include "moks.podSecurity" . | nindent 10 }}
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: ops
+              image: {{ include "moks.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args: [opensearch, status]
+              {{- include "moks.env" (dict "root" . "component" "worker") | nindent 14 }}
+              env:
+                - {name: MOKS_OPENSEARCH_URL, value: "https://moks-search:9200"}
+                - {name: MOKS_OPENSEARCH_CLUSTER, value: {{ $secure.cluster | quote }}}
+                - {name: MOKS_OPENSEARCH_CA_FILE, value: /var/run/moks-search/ca.crt}
+                - {name: MOKS_OPENSEARCH_STANDBY, value: {{ not $secure.active | quote }}}
+                - {name: MOKS_OPENSEARCH_COMPARE_URL, value: "http://moks-opensearch:9200"}
+                {{- if $secure.snapshots.enabled }}
+                - {name: MOKS_OPENSEARCH_SNAPSHOT_REPOSITORY, value: {{ $secure.snapshots.repository | quote }}}
+                - {name: MOKS_OPENSEARCH_SNAPSHOT_POLICY, value: {{ $secure.snapshots.policy | quote }}}
+                {{- end }}
+                {{- include "moks.searchIdentities" (dict "root" . "component" "worker") | nindent 16 }}
+              {{- include "moks.containerSecurity" . | nindent 14 }}
+              resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
+              volumeMounts:
+                - {name: tmp, mountPath: /tmp}
+                - {name: search-ca, mountPath: /var/run/moks-search, readOnly: true}
+          volumes:
+            - name: tmp
+              emptyDir: {sizeLimit: 64Mi}
+            - name: search-ca
+              secret: {secretName: {{ $secure.secrets.tls }}, items: [{key: ca.crt, path: ca.crt}]}
+{{- end }}
+{{- end }}

@@ -132,9 +132,11 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
         await service.drain_outbox()
         if tick % 60 == 0:
             await service.backfill_vectors()
+            await service.probe_backend()
         if tick % 600 == 0:
             await service.reconcile_index()
             await service.verify_index()
+            await service.sync_generation(50)
             await service.cleanup_evaluations()
 
     outbox: asyncio.Task | None = None

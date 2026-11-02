@@ -157,6 +157,12 @@ async def status(ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depend
     return await service.stats(db)
 
 
+@router.get("/backend")
+async def backend_status(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    """Index generations and cluster state. Only for those who may rebuild the index."""
+    return await service.backend_report(db)
+
+
 @router.get("/reranking")
 async def reranking_status(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Configured state, the service's own answer, this process's counters, and the latest comparison."""

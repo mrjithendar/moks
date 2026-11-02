@@ -28,11 +28,11 @@ from ..connectors.base import ConnectorError
 from ..db import session_scope
 from ..llm import budget
 from ..llm.providers import LLMError, provider_for
-from ..models import Chunk, Document, DocumentIndexState, EmbeddingIndex, IndexOutbox, KnowledgeSource, LLMConfig
-from ..observability import RETRIEVAL_LATENCY
+from ..models import Chunk, Document, DocumentIndexState, EmbeddingIndex, IndexOutbox, KnowledgeSource, LLMConfig, SearchBackendStatus
+from ..observability import RETRIEVAL_FALLBACKS, RETRIEVAL_LATENCY, RETRIEVAL_MODES, SEARCH_BACKEND
 from ..rbac import Principal
 from . import access, rerank as reranking
-from .backends import OpenSearchBackend, PineconeBackend, PostgresBackend, rrf
+from .backends import MAPPING_VERSION, OpenSearchBackend, PineconeBackend, PostgresBackend, rrf
 from .query import parts, understand
 from .chunking import MAX_CHUNKS, PIPELINE_VERSION, chunk, kind_of, lifecycle_of, title_of
 from .secrets import clean, exclusion_reason
@@ -55,7 +55,9 @@ def opensearch() -> OpenSearchBackend:
     if _opensearch is None:
         s = get_settings()
         _opensearch = OpenSearchBackend(s.opensearch_url, s.opensearch_username, s.opensearch_password, s.opensearch_verify_tls,
-                                        aws_region=s.opensearch_aws_region)
+                                        aws_region=s.opensearch_aws_region, ca_file=s.opensearch_ca_file, search_timeout=s.opensearch_search_timeout_seconds,
+                                        index_auth=(s.opensearch_index_username, s.opensearch_index_password) if s.opensearch_index_username else None,
+                                        lifecycle_auth=(s.opensearch_lifecycle_username, s.opensearch_lifecycle_password) if s.opensearch_lifecycle_username else None)
     return _opensearch
 
 
@@ -70,13 +72,28 @@ def pinecone() -> PineconeBackend:
 def external(name: str | None = None):
     """The index outside PostgreSQL, if any. Both kinds offer the same index lifecycle."""
     name = name or backend_name()
-    return opensearch() if name == "opensearch" else pinecone() if name == "pinecone" else None
+    return opensearch() if is_opensearch(name) else pinecone() if name == "pinecone" else None
+
+
+def is_opensearch(name: str) -> bool:
+    return name == "opensearch" or name.startswith("opensearch-")
 
 
 def backend_name() -> str:
     """An evaluation has its own backend name, so it has its own index rows, and external() is None:
-    it cannot reach an operational index or leave work in the outbox."""
-    return "evaluation" if access.realm() == access.EVALUATION else get_settings().rag_backend
+    it cannot reach an operational index or leave work in the outbox. A second OpenSearch cluster has
+    its own name too, so each cluster keeps its own active generation, and moving between them is a
+    configuration change that leaves the other cluster's record intact."""
+    if access.realm() == access.EVALUATION:
+        return "evaluation"
+    s = get_settings()
+    return f"opensearch-{s.opensearch_cluster}" if s.rag_backend == "opensearch" and s.opensearch_cluster else s.rag_backend
+
+
+def is_live() -> bool:
+    """False in the migration Job, which fills a cluster search has not moved to. What documents say about
+    vectors describes the index search uses, so a standby build leaves that alone."""
+    return not get_settings().opensearch_standby
 
 
 async def embedding_config(db: AsyncSession) -> LLMConfig | None:
@@ -125,12 +142,12 @@ async def ensure_index(db: AsyncSession) -> EmbeddingIndex:
             log.warning("index created keyword-only", extra={"event": "embedding_failed", "errorType": type(exc).__name__})
             cfg = None
     idx = EmbeddingIndex(backend=backend_name(), llm_config_id=cfg.id if cfg else None, model_key=model_key(cfg),
-                         dimensions=dims, index_name="", status="active", activated_at=datetime.now(timezone.utc), error=error)
+                         dimensions=dims, index_name="", status="active", activated_at=datetime.now(timezone.utc), error=error, mapping_version=MAPPING_VERSION)
     db.add(idx)
     await db.flush()
     idx.index_name = f"moks-chunks-{str(idx.id)[:8]}"
     if external():  # idempotent, and an empty index left by a rollback holds nothing
-        await external().ensure_index(idx.index_name, idx.dimensions)
+        await external().ensure_index(idx.index_name, idx.dimensions, idx.model_key)
     return idx
 
 
@@ -160,10 +177,29 @@ async def _embed(db: AsyncSession, idx: EmbeddingIndex, texts: list[str], tries:
     return out
 
 
-def _row(c: Chunk, d: Document, src: KnowledgeSource) -> dict:
-    return {"chunk_id": str(c.id), "document_id": str(d.id), "environment": d.environment, "namespace": d.namespace,
-            "repository": (src.config or {}).get("repository") or src.name, "service": d.service or "", "path": d.path,
-            "heading": c.heading, "text": c.text}
+def _when(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _applies_to(src: KnowledgeSource) -> list[str]:
+    return sorted({str(v) for values in (src.applies_to or {}).values() for v in (values if isinstance(values, list) else [values]) if v})
+
+
+def _row(c: Chunk, d: Document, src: KnowledgeSource, idx: EmbeddingIndex | None = None) -> dict:
+    """One chunk as this generation stores it. An older generation keeps the fields it was mapped for.
+    PostgreSQL decides what is readable: lifecycle, trust and classification here say what was true at the
+    last write, so they describe a chunk and never grant or deny anything."""
+    row = {"chunk_id": str(c.id), "document_id": str(d.id), "environment": d.environment, "namespace": d.namespace,
+           "repository": (src.config or {}).get("repository") or src.name, "service": d.service or "", "path": d.path,
+           "heading": c.heading, "text": c.text}
+    if idx is None or (idx.mapping_version or 1) < 2:
+        return row
+    return row | {"source_id": str(d.source_id), "realm": d.realm, "applies_to": _applies_to(src), "owner": d.owner or src.owner or "", "team": src.team or "",
+                  "lifecycle": d.lifecycle, "classification": src.classification or "", "trust": d.trust, "kind": d.kind, "git_revision": d.revision or "",
+                  "content_revision": d.content_revision, "content_hash": d.content_hash, "text_hash": c.text_hash or "", "ord": c.ord, "start_line": c.start_line, "end_line": c.end_line,
+                  "start_offset": c.start_offset, "end_offset": c.end_offset, "identifiers": identifiers(f"{c.heading}\n{d.path}\n{c.text}")[:200],
+                  "document_updated_at": _when(d.updated_at), "checked_at": _when(d.checked_at), "indexed_at": _when(datetime.now(timezone.utc)),
+                  "embedding_model": idx.model_key, "embedding_dimensions": idx.dimensions}
 
 
 CHUNK_NS = uuid.UUID("9c1a7b52-6d7e-4b0a-9f55-2f6f6c3f2a11")
@@ -305,18 +341,26 @@ async def remove_document(db: AsyncSession, doc: Document) -> None:
 async def _write_document(db: AsyncSession, idx: EmbeddingIndex, document_id: uuid.UUID, revision: int | None = None) -> None:
     """Make one external index match PostgreSQL for one document. Replaying this is harmless."""
     ext = external()
-    await ext.delete_document(idx.index_name, document_id)
     # populate_existing: a long reindex session must not record a revision it read before the document changed
     row = (await db.execute(select(Document, KnowledgeSource).join(KnowledgeSource, KnowledgeSource.id == Document.source_id).where(Document.id == document_id).execution_options(populate_existing=True))).first()
     if row is None or row[0].status != "active":
+        await ext.delete_document(idx.index_name, document_id)  # the tombstone: PostgreSQL stopped returning it at commit
         await db.execute(delete(DocumentIndexState).where(DocumentIndexState.document_id == document_id, DocumentIndexState.index_id == idx.id))
         return
     doc, src = row
     chunks = (await db.execute(select(Chunk).where(Chunk.document_id == doc.id).order_by(Chunk.ord))).scalars().all()
     embeddings, error = await _try_embed(db, idx, chunks)
+    held = await db.get(DocumentIndexState, (document_id, idx.id))
+    if error and held is not None and held.revision == (revision or doc.content_revision) and held.chunks == len(chunks) and held.vectors:
+        return  # the same content is already there with its vectors: an outage must not replace them with nothing
+    prune_after = getattr(ext, "keeps_old_chunks", False)
+    if not prune_after:
+        await ext.delete_document(idx.index_name, document_id)
     if chunks:
-        await ext.index_chunks(idx.index_name, [_row(c, doc, src) for c in chunks], embeddings)
-    if idx.status == "active":  # a build in progress says nothing about what search can use today
+        await ext.index_chunks(idx.index_name, [_row(c, doc, src, idx) for c in chunks], embeddings)
+    if prune_after:
+        await ext.delete_document(idx.index_name, document_id, keep=[str(c.id) for c in chunks])
+    if idx.status == "active" and is_live():  # a build in progress says nothing about what search can use today
         _note_vectors(doc, idx, embeddings is not None, error)
     await _note_index(db, doc.id, idx, revision or doc.content_revision, len(chunks), len(embeddings or []), error=error)
 
@@ -397,6 +441,76 @@ async def reconcile_index() -> int:
         return len(rows)
 
 
+async def sync_generation(limit: int = 200) -> dict[str, int]:
+    """Bring the active generation level with PostgreSQL, from the per-generation record alone. Outbox
+    positions are not needed, so this also recovers a generation that missed changes while it was not the
+    one in use: after a cutover, a rollback, or a restored snapshot. Bounded, and stops at the first failure."""
+    result = {"written": 0, "removed": 0, "failed": 0, "deferred": 0, "remaining": 0}
+    if not external():
+        return result
+    async with session_scope() as db:
+        idx = await active_index(db)
+        if idx is None:
+            return result
+        index_id, gaps = idx.id, await _coverage(db, idx)
+        orphans = (await db.execute(select(DocumentIndexState.document_id).join(Document, Document.id == DocumentIndexState.document_id, isouter=True)
+                                    .where(DocumentIndexState.index_id == index_id, (Document.id.is_(None)) | (Document.status != "active")))).scalars().all()
+    work = [(d, "removed") for d in orphans] + [(d, "written") for d in gaps]
+    for document_id, outcome in work[:limit]:
+        try:
+            async with session_scope() as db:
+                if not await _lock_document(db, document_id):
+                    result["deferred"] += 1
+                    continue
+                await _write_document(db, await db.get(EmbeddingIndex, index_id), document_id)
+                result[outcome] += 1
+        except ConnectorError as exc:
+            log.warning("generation sync stopped", extra={"event": "generation_sync_failed", "errorType": exc.kind})
+            result["failed"] += 1
+            break
+    async with session_scope() as db:
+        result["remaining"] = len(await _coverage(db, await db.get(EmbeddingIndex, index_id)))
+    return result
+
+
+async def adopt_generation() -> dict[str, int]:
+    """After a cutover or rollback: what documents say about vectors now describes this generation."""
+    async with session_scope() as db:
+        idx = await active_index(db)
+        if idx is None:
+            return {"incomplete": 0}
+        gaps = await _coverage(db, idx)
+        await _adopt_states(db, idx, gaps)
+        await _settle_activation(db, idx)
+        return {"incomplete": len(gaps)}
+
+
+async def activate_generation(db: AsyncSession, index_name: str) -> dict:
+    """Switch back to a retained generation in one transaction, after checking it can serve the current
+    embedding model. It missed whatever changed since it was retired, so follow with sync_generation."""
+    target = (await db.execute(select(EmbeddingIndex).where(EmbeddingIndex.backend == backend_name(), EmbeddingIndex.index_name == index_name))).scalar_one_or_none()
+    if target is None or target.status != "retired":
+        raise ConnectorError("conflict", f"{index_name} is not a retired generation of {backend_name()}")
+    cfg = await embedding_config(db)
+    if cfg and target.dimensions and target.model_key != model_key(cfg):
+        raise ConnectorError("config", f"{index_name} holds vectors from {target.model_key}, and the active embedding model is {model_key(cfg)}; a query vector would not compare")
+    ext = external()
+    if ext is not None:
+        found = await ext.mapping(index_name) if hasattr(ext, "mapping") else {}
+        if found is None:
+            raise ConnectorError("config", f"{index_name} no longer exists; run a reindex")
+        if hasattr(ext, "mapping") and ((found.get("properties") or {}).get("embedding") or {}).get("dimension") != target.dimensions:
+            raise ConnectorError("config", f"{index_name} does not have the vector size its record says")
+    await db.execute(text("LOCK TABLE index_outbox IN EXCLUSIVE MODE"))
+    current = await active_index(db)
+    now = datetime.now(timezone.utc)
+    if current:
+        current.status, current.cleanup_pending, current.retired_at = "retired", True, now
+        await db.flush()
+    target.status, target.cleanup_pending, target.retired_at, target.activated_at = "active", False, None, now
+    return {"active": index_name, "replaced": current.index_name if current else None}
+
+
 async def verify_index(sample: int = 50) -> dict[str, int]:
     """Revisions say what should be there; this asks the index. A sample of documents whose chunk count
     differs is queued again. Pinecone cannot count by metadata, so there this checks nothing and says so."""
@@ -464,7 +578,7 @@ async def retry_dead(document_id: uuid.UUID | None = None, limit: int = 200) -> 
 
 
 async def _index_batch(db: AsyncSession, new: EmbeddingIndex, batch: list) -> None:
-    rows = [_row(c, d, src) for c, d, src in batch]
+    rows = [_row(c, d, src, new) for c, d, src in batch]
     embs = await _embed(db, new, [f"{r['heading']}\n{r['text']}" for r in rows], tries=REINDEX_EMBED_TRIES)
     if external():
         await external().index_chunks(new.index_name, rows, embs)
@@ -536,6 +650,19 @@ async def _catch_up(db: AsyncSession, new: EmbeddingIndex, caught: int) -> int:
     raise ConnectorError("conflict", "changes kept arriving faster than the reindex could catch up; it will need another run")
 
 
+async def _bytes_needed(db: AsyncSession, dims: int | None) -> int:
+    """A generous guess: the 1,942 chunks on mk4 took 25 KB each at 3072 dimensions, including the graph."""
+    chunks = (await db.execute(select(func.count()).select_from(Chunk))).scalar_one()
+    return chunks * (8_000 + (dims or 0) * 12)
+
+
+async def _adopt_states(db: AsyncSession, idx: EmbeddingIndex, gaps: dict[uuid.UUID, str]) -> None:
+    """Each document's state comes from what was recorded for this generation; none is assumed."""
+    await db.execute(update(Document).where(Document.status == "active", Document.realm == access.realm()).values(vector_state="complete" if idx.dimensions else "not_applicable", vector_error=None))
+    for document_id, why in gaps.items():
+        await db.execute(update(Document).where(Document.id == document_id).values(vector_state="missing" if idx.dimensions else "not_applicable", vector_error=why[:300]))
+
+
 async def reindex(db: AsyncSession, job_id: uuid.UUID | None = None) -> dict:
     """Build a new index version beside the active one, then switch in one committed transaction.
     Search uses the old index until that commit. A failed build leaves the old index active. The
@@ -553,7 +680,7 @@ async def reindex(db: AsyncSession, job_id: uuid.UUID | None = None) -> dict:
     await db.commit()
     dims = await embedding_dimensions(cfg) if cfg else None
     new = EmbeddingIndex(backend=backend_name(), llm_config_id=cfg.id if cfg else None, model_key=model_key(cfg),
-                         dimensions=dims, index_name="", status="building", heartbeat_at=datetime.now(timezone.utc), build_job_id=job_id,
+                         dimensions=dims, index_name="", status="building", heartbeat_at=datetime.now(timezone.utc), build_job_id=job_id, mapping_version=MAPPING_VERSION,
                          build_watermark=(await db.execute(select(func.coalesce(func.max(IndexOutbox.id), 0)))).scalar_one())
     db.add(new)
     try:
@@ -567,7 +694,9 @@ async def reindex(db: AsyncSession, job_id: uuid.UUID | None = None) -> dict:
     done: set = set()
     try:
         if external():
-            await external().ensure_index(new.index_name, new.dimensions)
+            if hasattr(external(), "preflight"):
+                await external().preflight(await _bytes_needed(db, new.dimensions))
+            await external().ensure_index(new.index_name, new.dimensions, new.model_key)
         while True:  # the second pass catches documents indexed while the first ran
             rows = await _pending_rows(db, done)
             if not rows:
@@ -601,15 +730,13 @@ async def reindex(db: AsyncSession, job_id: uuid.UUID | None = None) -> dict:
     old = await active_index(db)
     old_name = old.index_name if old else None
     if old:
-        old.status, old.cleanup_pending = "retired", True
+        old.status, old.cleanup_pending, old.retired_at = "retired", True, datetime.now(timezone.utc)
         await db.flush()
     new.status, new.activated_at, new.chunk_count = "active", datetime.now(timezone.utc), len(done)
     new.activation = "degraded" if gaps else "complete"
     new.error = f"activated with {len(gaps)} incomplete documents" if gaps else None
-    # Each document's state comes from what was recorded for this generation; none is assumed.
-    await db.execute(update(Document).where(Document.status == "active", Document.realm == access.realm()).values(vector_state="complete" if new.dimensions else "not_applicable", vector_error=None))
-    for document_id, why in gaps.items():
-        await db.execute(update(Document).where(Document.id == document_id).values(vector_state="missing" if new.dimensions else "not_applicable", vector_error=why[:300]))
+    if is_live():
+        await _adopt_states(db, new, gaps)
     result = {"index": new.index_name, "model": new.model_key, "chunks": len(done), "replaced": old_name, "activation": new.activation, "incomplete_documents": len(gaps)}
     await db.commit()
     return result
@@ -628,14 +755,21 @@ async def cleanup_evaluations(older_than: timedelta = EVAL_ABANDONED) -> int:
 
 async def cleanup_retired() -> int:
     """Delete physical indexes of retired or failed versions. Safe to retry: the row keeps
-    cleanup_pending until the delete succeeds, and the active index is never selected."""
+    cleanup_pending until the delete succeeds, and the active index is never selected. A retired
+    generation is kept for the retention window so it can be activated again; age alone never touches
+    an active index. A generation in another cluster is left for a process that can reach that cluster."""
+    keep_from = datetime.now(timezone.utc) - timedelta(hours=get_settings().rag_retired_retention_hours)
     async with session_scope() as db:
         rows = (await db.execute(select(EmbeddingIndex).where(EmbeddingIndex.cleanup_pending.is_(True), EmbeddingIndex.status != "active",
                                                               EmbeddingIndex.status != "building").with_for_update(skip_locked=True))).scalars().all()
         done = 0
         for idx in rows:
+            if idx.status == "retired" and idx.retired_at and idx.retired_at > keep_from:
+                continue
+            if is_opensearch(idx.backend) and idx.backend != backend_name():
+                continue
             try:
-                if idx.backend in ("opensearch", "pinecone") and idx.index_name:
+                if (is_opensearch(idx.backend) or idx.backend == "pinecone") and idx.index_name:
                     await external(idx.backend).drop_index(idx.index_name)
                 elif idx.backend == "postgres" and await PostgresBackend(db).has_vector():
                     await db.execute(text("DELETE FROM chunk_embeddings WHERE index_id = :i"), {"i": idx.id})
@@ -704,13 +838,27 @@ def _judge(query: str, tokens: list[str], results: list[dict]) -> dict:
     return {"state": "supported", "reason": "The passages contain the terms searched for. That is not proof they answer the question."}
 
 
+EXCLUDE_LIMIT = 1000
+
+
+async def _unsearchable(db: AsyncSession) -> tuple[dict, bool]:
+    """Sources and documents PostgreSQL has taken out of search, as of now. Bounded: past the limit the
+    index filter is incomplete and says so, and the authoritative check still removes the rest."""
+    sources = (await db.execute(select(KnowledgeSource.id).where(KnowledgeSource.lifecycle != "active", KnowledgeSource.realm == access.realm()).limit(EXCLUDE_LIMIT + 1))).scalars().all()
+    documents = (await db.execute(select(Document.id).where(Document.status == "active", Document.lifecycle != "active", Document.realm == access.realm()).limit(EXCLUDE_LIMIT + 1))).scalars().all()
+    complete = len(sources) <= EXCLUDE_LIMIT and len(documents) <= EXCLUDE_LIMIT
+    return {"sources": [str(i) for i in sources[:EXCLUDE_LIMIT]], "documents": [str(i) for i in documents[:EXCLUDE_LIMIT]]}, complete
+
+
 async def _rankings(db: AsyncSession, query: str, tokens: list[str], found: list, pool: int, idx: EmbeddingIndex | None, qv: list[float] | None) -> tuple[list[list[str]], bool, str | None]:
     """Each ranker's candidates, whether every one of them came through a complete filter, and why any fell back."""
     rankings, exact, reason = [], True, None
     pg = PostgresBackend(db)
-    if backend_name() == "opensearch":
+    exclude: dict = {}
+    if is_opensearch(backend_name()):
+        exclude, exact = await _unsearchable(db)
         try:
-            ranked, ok = await opensearch().keyword(idx.index_name, query, found, pool)
+            ranked, ok = await opensearch().keyword(idx.index_name, query, found, pool, exclude, tokens)
             rankings.append(ranked)
             exact = exact and ok
         except ConnectorError as exc:
@@ -726,7 +874,7 @@ async def _rankings(db: AsyncSession, query: str, tokens: list[str], found: list
     if qv is not None and idx is not None:
         if external():
             try:
-                ranked, ok = await external().vector(idx.index_name, qv, found, pool)
+                ranked, ok = await external().vector(idx.index_name, qv, found, pool, exclude)
                 rankings.append(ranked)
                 exact = exact and ok
             except ConnectorError as exc:
@@ -764,7 +912,7 @@ async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8,
     if not found:
         return {**empty, "mode": "none", "note": "you have no knowledge access for this scope"}
     idx = await active_index(db)
-    if backend_name() == "opensearch" and idx is None:
+    if is_opensearch(backend_name()) and idx is None:
         return {**empty, "mode": "empty", "note": "nothing has been indexed yet"}
     tokens = identifiers(query)
     qv, reason = await _query_vector(db, principal, query, idx)
@@ -811,6 +959,7 @@ async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8,
         await _attach_neighbors(db, results)
     _flag_conflicts(results)
     RETRIEVAL_LATENCY.labels(backend_name()).observe(time.monotonic() - start)
+    _note_retrieval(mode, reason)
     judged = _judge(query, tokens, results)
     out = {"results": results, "mode": mode, "index": idx.index_name if idx else None, "evidence": judged, "abstain": judged["state"] != "supported", "score_note": SCORE_NOTE,
            "understanding": understand(query, tokens),
@@ -820,6 +969,17 @@ async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8,
     if reason:
         out["fallback_reason"] = reason
     return out
+
+
+RETRIEVAL_SEEN: dict[str, dict[str, int]] = {"modes": {}, "fallbacks": {}}  # this process since it started, for the admin page
+
+
+def _note_retrieval(mode: str, reason: str | None) -> None:
+    RETRIEVAL_MODES.labels(mode).inc()
+    RETRIEVAL_SEEN["modes"][mode] = RETRIEVAL_SEEN["modes"].get(mode, 0) + 1
+    if reason:
+        RETRIEVAL_FALLBACKS.labels(reason[:80]).inc()
+        RETRIEVAL_SEEN["fallbacks"][reason] = RETRIEVAL_SEEN["fallbacks"].get(reason, 0) + 1
 
 
 def _score(allowed: list, query: str, tokens: list[str], service: str | None, now: datetime) -> list:
@@ -1026,6 +1186,151 @@ async def stats(db: AsyncSession) -> dict:
                       "activation": idx.activation, "incomplete_documents": len(gaps), "incomplete_sample": [{"document_id": str(d), "reason": why} for d, why in list(gaps.items())[:10]],
                       "note": idx.error, "reindex_needed": bool(cfg and idx.model_key != model_key(cfg))} if idx else None,
             "reindex_running": building is not None, "reindex_progress": {"chunks": building.chunk_count, "of": chunks} if building else None}
+
+
+async def _generation_counts(db: AsyncSession, index_id: uuid.UUID) -> dict:
+    row = (await db.execute(select(func.count(), func.coalesce(func.sum(DocumentIndexState.chunks), 0), func.coalesce(func.sum(DocumentIndexState.expected_chunks), 0),
+                                   func.coalesce(func.sum(DocumentIndexState.vectors), 0), func.coalesce(func.sum(DocumentIndexState.expected_vectors), 0))
+                            .where(DocumentIndexState.index_id == index_id))).one()
+    return {"documents": row[0], "chunks_written": row[1], "chunks_expected": row[2], "vectors_written": row[3], "vectors_expected": row[4]}
+
+
+async def backend_report(db: AsyncSession) -> dict:
+    """For administrators. Connection facts come from the worker's probe, because API pods cannot ask."""
+    s = get_settings()
+    name = backend_name()
+    rows = (await db.execute(select(EmbeddingIndex).where(EmbeddingIndex.status.in_(("active", "building", "retired"))).order_by(EmbeddingIndex.created_at.desc()).limit(20))).scalars().all()
+    active = next((r for r in rows if r.backend == name and r.status == "active"), None)
+    probe = await db.get(SearchBackendStatus, name)
+    backfill = (await db.execute(select(func.count()).select_from(Document).where(Document.realm == access.realm(), Document.status == "active", Document.vector_state.in_(("missing", "unknown")),
+                                                                                  Document.content_revision == Document.indexed_revision))).scalar_one()
+    return {"backend": name, "cluster": s.opensearch_cluster or None, "url": s.opensearch_url if is_opensearch(name) else None, "tls_verified": s.opensearch_url.startswith("https://") and s.opensearch_verify_tls,
+            "authenticated": bool(s.opensearch_username or s.opensearch_aws_region), "activation_policy": s.rag_activation, "retention_hours": s.rag_retired_retention_hours,
+            "probe": {"checked_at": probe.checked_at.isoformat(), **probe.state} if probe else None, "backfill_eligible": backfill,
+            "coverage": await _generation_counts(db, active.id) if active else None, "retrieval": RETRIEVAL_SEEN,
+            "generations": [{"backend": r.backend, "index": r.index_name, "status": r.status, "activation": r.activation, "model": r.model_key, "dimensions": r.dimensions, "chunks": r.chunk_count, "mapping_version": r.mapping_version,
+                             "activated_at": _when(r.activated_at), "retired_at": _when(r.retired_at), "cleanup_pending": r.cleanup_pending, "serving": r.backend == name and r.status == "active"} for r in rows]}
+
+
+async def probe_backend() -> dict | None:
+    """Recorded for the admin page and exported for Prometheus, from the one component allowed to look."""
+    ext, name = external(), backend_name()
+    if not hasattr(ext, "status"):
+        return None
+    s = get_settings()
+    state = await ext.status()
+    if state["reachable"] and s.opensearch_snapshot_repository:
+        try:
+            state["snapshots"] = await ext.snapshots(s.opensearch_snapshot_repository)
+        except ConnectorError as exc:
+            state["snapshots"] = {"repository": s.opensearch_snapshot_repository, "error": exc.message[:200]}
+    async with session_scope() as db:
+        await db.execute(insert(SearchBackendStatus).values(backend=name, state=state).on_conflict_do_update(index_elements=["backend"], set_={"state": state, "checked_at": func.now()}))
+        report = await stats(db)
+    gauges = {"up": state["reachable"], "health": {"green": 2, "yellow": 1}.get(state["health"], 0), "read_only": state["read_only"], "unassigned_shards": state["unassigned_shards"],
+              "heap_used_percent": state["heap_used_percent"], "disk_free_bytes": state["disk_free_bytes"], "disk_total_bytes": state["disk_total_bytes"], "search_rejected_total": state["search_rejected"],
+              "write_rejected_total": state["write_rejected"], "gc_seconds_total": state["gc_seconds"], "outbox_pending": report["outbox"]["pending"] + report["outbox"]["retrying"], "outbox_dead": report["outbox"]["dead"],
+              "documents_behind": report["outbox"]["documents_behind"], "vector_coverage": report["embedding"]["coverage"], "reindex_running": report["reindex_running"],
+              "last_snapshot_seconds": ((state.get("snapshots") or {}).get("last_success_ms") or 0) / 1000 or None}
+    for metric, value in gauges.items():
+        if value is not None:
+            SEARCH_BACKEND.labels(name, metric).set(float(value))
+    return state
+
+
+async def validate_generation(sample: int = 5) -> dict:
+    """Run before activation. Every check reads the real cluster and the record; nothing here writes
+    a document. `ok` is true only when all of them pass, and a skipped check is listed as skipped."""
+    ext = external()
+    checks: dict[str, dict] = {}
+
+    def check(name: str, ok: bool | None, detail: Any = None) -> None:
+        checks[name] = {"ok": ok, "detail": detail}
+
+    async with session_scope() as db:
+        idx = await active_index(db)
+        if idx is None or not hasattr(ext, "mapping"):
+            return {"ok": False, "checks": {"generation": {"ok": False, "detail": "no active OpenSearch generation for this cluster"}}}
+        name, dims = idx.index_name, idx.dimensions
+        mapping = await ext.mapping(name) or {}
+        meta = mapping.get("_meta") or {}
+        check("mapping_version", meta.get("mapping_version") == MAPPING_VERSION, meta.get("mapping_version"))
+        check("mapping_strict", mapping.get("dynamic") == "strict", mapping.get("dynamic"))
+        check("dimensions", ((mapping.get("properties") or {}).get("embedding") or {}).get("dimension") == dims, dims)
+        gaps = await _coverage(db, idx)
+        check("coverage", not gaps, {"incomplete": len(gaps), "first": next(iter(gaps.values()), None)})
+        want = (await db.execute(select(func.count()).select_from(Chunk).join(Document, Document.id == Chunk.document_id).where(Document.status == "active", Document.realm == access.realm()))).scalar_one()
+        held = await ext.count(name)
+        check("chunk_count", held == want, {"index": held, "postgres": want})
+        if dims:
+            with_vectors = await ext.count(name, {"exists": {"field": "embedding"}})
+            check("vector_count", with_vectors == want, {"index": with_vectors, "postgres": want})
+        rows = (await db.execute(select(Chunk, Document).join(Document, Document.id == Chunk.document_id).where(Document.status == "active", Document.realm == access.realm(), Document.lifecycle == "active")
+                                 .order_by(func.random()).limit(sample * 8))).all()
+        everyone = [access.Grant("*", "*")]
+        probes = [(str(c.id), found[0]) for c, d in rows for found in [identifiers(c.text)] if found][:sample]
+        missed = []
+        for chunk, token in probes:
+            ranked, _ = await ext.keyword(name, token, everyone, 100, None, [token])
+            if chunk not in ranked:
+                missed.append(token)
+        check("exact_identifiers", (not missed) if probes else None, {"tried": len(probes), "missed": missed} if probes else "no identifiers to try")
+        ranked, _ = await ext.keyword(name, "the", [access.Grant("moks-no-such-environment", "moks-no-such-namespace")], 100)
+        leaked = (await db.execute(select(func.count()).select_from(Chunk).join(Document, Document.id == Chunk.document_id).where(Chunk.id.in_([uuid.UUID(c) for c in ranked]), Document.environment != "*", Document.namespace != "*"))).scalar_one() if ranked else 0
+        check("scope_filter", leaked == 0, {"returned": len(ranked), "outside_scope": leaked})
+        cfg = await embedding_config(db)
+        if dims and cfg and idx.model_key == model_key(cfg) and rows:
+            c, _ = rows[0]
+            try:
+                vec = (await budget.embed(provider_for(cfg), cfg, [f"{c.heading}\n{c.text}"], purpose="dimension_probe"))[0]
+                ranked, _ = await ext.vector(name, vec, everyone, 10)
+                check("vector_search", str(c.id) in ranked, {"results": len(ranked)})
+            except LLMError as exc:
+                check("vector_search", False, f"cannot embed a query: {exc.kind}")
+        else:
+            check("vector_search", None, "skipped: this generation has no vectors, or its model is not the active one")
+    check("search_identity_cannot_write", await _write_refused(ext), None)
+    return {"ok": all(c["ok"] is not False for c in checks.values()), "index": name, "backend": backend_name(), "checks": checks}
+
+
+async def _write_refused(ext) -> bool | None:
+    """Only meaningful when writes use a different identity from search."""
+    if ext.index_client is ext.client:
+        return None
+    probe = "moks-chunks-validate-probe"
+    try:
+        await ext._req("PUT", f"/{probe}", {}, via=ext.search_client)
+    except ConnectorError as exc:
+        return exc.kind == "auth"
+    await ext.drop_index(probe)
+    return False
+
+
+async def compare_generations(queries: list[str], limit: int = 25) -> dict:
+    """Temporary and read-only: the same queries against the old and new cluster, reporting overlap only. Uses no
+    user's identity and returns no text, so it cannot show anything to anyone."""
+    s = get_settings()
+    if not s.opensearch_compare_url:
+        raise ConnectorError("config", "MOKS_OPENSEARCH_COMPARE_URL is not set")
+    old_side = OpenSearchBackend(s.opensearch_compare_url, search_timeout=10)
+    new_side = external()
+    async with session_scope() as db:
+        new = await active_index(db)
+        old = (await db.execute(select(EmbeddingIndex).where(EmbeddingIndex.backend == "opensearch", EmbeddingIndex.status == "active"))).scalar_one_or_none()
+        if not queries:
+            queries = list(dict.fromkeys((await db.execute(select(Chunk.heading).where(Chunk.heading != "").order_by(func.random()).limit(limit * 3))).scalars().all()))
+    if new is None or old is None:
+        raise ConnectorError("config", "both clusters need an active generation to compare")
+    everyone, rows = [access.Grant("*", "*")], []
+    try:
+        for q in queries[:min(limit, 50)]:
+            a, _ = await old_side.keyword(old.index_name, q, everyone, 10)
+            b, _ = await new_side.keyword(new.index_name, q, everyone, 10, None, identifiers(q))
+            rows.append({"query": q[:80], "old": len(a), "new": len(b), "overlap": len(set(a) & set(b))})
+    finally:
+        await old_side.aclose()
+    hits = [r for r in rows if r["old"]]
+    return {"queries": len(rows), "new_empty_where_old_answered": sum(1 for r in hits if not r["new"]), "mean_overlap_at_10": round(sum(r["overlap"] / r["old"] for r in hits) / len(hits), 3) if hits else None, "rows": rows}
 
 
 async def mark_indexed_now(db: AsyncSession, source: KnowledgeSource, status: str, error: str | None = None) -> None:

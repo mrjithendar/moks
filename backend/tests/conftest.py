@@ -20,6 +20,7 @@ _base = ADMIN_URL.rsplit("/", 1)[0]
 STATIC = Path(__file__).parent / "fixtures" / "static"
 
 os.environ.update({
+    "MOKS_RAG_RETIRED_RETENTION_HOURS": "0",  # a test about retention sets its own
     "MOKS_ENV": "development",
     "MOKS_AUTH_MODE": "dev",
     "MOKS_DATABASE_URL": f"{_base.replace('postgresql://', 'postgresql+asyncpg://')}/{DB_NAME}",

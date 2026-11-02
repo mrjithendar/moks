@@ -30,6 +30,8 @@ class FakeOS:
             self.indexes[name] = json.loads(req.content)
             return httpx.Response(200, json={})
         if req.method == "GET" and "_mapping" in req.url.path:
+            if name not in self.indexes:
+                return httpx.Response(404, json={})
             return httpx.Response(200, json={name: {"mappings": self.indexes[name]["mappings"]}})
         if req.method == "DELETE":
             if self.fail_delete:
@@ -39,10 +41,11 @@ class FakeOS:
             return httpx.Response(200, json={})
         if "_bulk" in req.url.path:
             if self.fail_bulk:
-                return httpx.Response(200, json={"errors": True, "items": [{"index": {"error": "x"}}]})
-            for line in req.content.decode().splitlines()[1::2]:
+                return httpx.Response(200, json={"errors": True, "items": [{"index": {"status": 400, "error": {"type": "x"}}} for _ in req.content.decode().splitlines()[1::2]]})
+            lines = req.content.decode().splitlines()[1::2]
+            for line in lines:
                 self.docs.setdefault("all", []).append(json.loads(line))
-            return httpx.Response(200, json={"errors": False})
+            return httpx.Response(200, json={"errors": False, "items": [{"index": {"status": 201}} for _ in lines]})
         return httpx.Response(200, json={"hits": {"hits": []}})
 
 
@@ -59,7 +62,7 @@ class Embedder:
 @pytest.fixture
 async def os_(monkeypatch):
     fake = FakeOS()
-    monkeypatch.setattr(service, "_opensearch", OpenSearchBackend("http://os:9200", transport=httpx.MockTransport(fake)))
+    monkeypatch.setattr(service, "_opensearch", OpenSearchBackend("https://os:9200", transport=httpx.MockTransport(fake)))
     monkeypatch.setattr(service, "backend_name", lambda: "opensearch")
     async with session_scope() as db:
         await db.execute(delete(EmbeddingIndex).where(EmbeddingIndex.backend == "opensearch"))

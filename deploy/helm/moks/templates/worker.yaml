@@ -45,6 +45,9 @@ spec:
           env:
             - {name: MOKS_WORKER_CLASSES, value: {{ $pool.classes | quote }}}
             - {name: MOKS_WORKER_CAPACITY, value: {{ $pool.capacity | quote }}}
+            {{- if include "moks.searchActive" . }}
+            {{- include "moks.searchIdentities" (dict "root" . "component" "worker") | nindent 12 }}
+            {{- end }}
           {{- include "moks.containerSecurity" . | nindent 10 }}
           {{- include "moks.volumeMounts" (dict "root" . "component" "worker") | nindent 10 }}
           livenessProbe: {tcpSocket: {port: metrics}, periodSeconds: 20, failureThreshold: 3}

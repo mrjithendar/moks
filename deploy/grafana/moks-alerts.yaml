@@ -33,3 +33,69 @@ groups:
         annotations:
           summary: The MOKS database has used over 85% of its volume
           description: PostgreSQL stops accepting writes when the volume fills, and this StorageClass cannot expand.
+  # From the worker's probe, so these work without the exporter. A missing series means no worker is probing.
+  - name: moks-search
+    rules:
+      - alert: MoksSearchDown
+        expr: moks_search_backend{metric="up"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: The worker cannot reach the search cluster
+          description: Search falls back to PostgreSQL keyword search and says so. Indexing waits in the outbox.
+      - alert: MoksSearchNotGreen
+        expr: moks_search_backend{metric="health"} < 2
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: Search cluster health is not green}
+      - alert: MoksSearchWriteBlocked
+        expr: moks_search_backend{metric="read_only"} == 1
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: OpenSearch has blocked writes
+          description: Usually the flood-stage watermark. All mk4 nodes share one disk. The block lifts when disk frees.
+      - alert: MoksSearchDiskLow
+        expr: moks_search_backend{metric="disk_free_bytes"} < 5e9
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: Under 5 GB free on the disk OpenSearch shares}
+      - alert: MoksSearchHeapHigh
+        expr: moks_search_backend{metric="heap_used_percent"} > 85
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: OpenSearch heap above 85% for 15 minutes}
+      - alert: MoksSearchRejecting
+        expr: rate(moks_search_backend{metric=~"search_rejected_total|write_rejected_total"}[10m]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: OpenSearch is rejecting requests}
+      - alert: MoksIndexDeadLetters
+        expr: moks_search_backend{metric="outbox_dead"} > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Index changes gave up after all retries
+          description: Search still answers from PostgreSQL's truth. Retry from Knowledge after fixing the cause.
+      - alert: MoksIndexFallingBehind
+        expr: moks_search_backend{metric="documents_behind"} > 0
+        for: 30m
+        labels: {severity: warning}
+        annotations: {summary: Documents have been behind the index for 30 minutes}
+      - alert: MoksVectorCoverageLow
+        expr: moks_search_backend{metric="vector_coverage"} < 0.95
+        for: 1h
+        labels: {severity: warning}
+        annotations: {summary: Under 95% of documents have vectors; search is keyword only for the rest}
+      - alert: MoksSnapshotOverdue
+        expr: moks_search_backend{metric="last_snapshot_seconds"} > 0 and time() - moks_search_backend{metric="last_snapshot_seconds"} > 129600
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: No successful OpenSearch snapshot for 36 hours
+          description: The index can still be rebuilt from PostgreSQL, at the cost of re-embedding everything.
+      - alert: MoksRetrievalFallingBack
+        expr: rate(moks_retrieval_fallbacks_total[15m]) > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: Searches are being answered with less than was asked for}

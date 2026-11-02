@@ -1,0 +1,2 @@
+_meta: {type: audit, config_version: 2}
+config: {enabled: true, audit: {}, compliance: {enabled: false}}

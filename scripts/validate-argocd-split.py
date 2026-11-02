@@ -49,6 +49,8 @@ SCENARIOS = {
     "rag-pinecone": (["--set", "rag.backend=pinecone"], set(), {"opensearch"}),
     "rag-opensearch-bundled": (OPENSEARCH, {"opensearch"}, set()),
     "rag-opensearch-managed": (OPENSEARCH + ["--set", "rag.opensearch.url=https://search.example", "--set", "rag.opensearch.awsRegion=us-east-1"], set(), {"opensearch"}),
+    "rag-opensearch-secure": (OPENSEARCH + ["--set", "rag.opensearch.secure.enabled=true"], {"opensearch", "foundation"}, set()),
+    "rag-opensearch-secure-active": (OPENSEARCH + ["--set", "rag.opensearch.publicRoute.enabled=false", "--set", "rag.opensearch.dashboards.enabled=false", "--set", "rag.opensearch.secure.enabled=true", "--set", "rag.opensearch.secure.active=true"], {"opensearch", "foundation", "api", "worker"}, set()),
     "worker-pools": (POOLS, {"worker"}, set()),
     "worker-pools-split": (POOLS + SPLIT, {"worker", "migrate"}, set()),
     "backup": (BACKUP, {"backup"}, set()),
