@@ -435,6 +435,14 @@ def test_at_cutover_each_component_gets_its_own_identity():
     assert volume["secret"]["items"] == [{"key": "ca.crt", "path": "ca.crt"}]  # never tls.key
 
 
+def test_the_original_pod_goes_only_after_cutover_and_only_when_asked():
+    docs = render("values-minikube.yaml", *ACTIVE, "rag.opensearch.secure.retireOriginal=true")
+    assert not any(d["metadata"]["name"] == "moks-opensearch" for d in docs) and of(docs, "StatefulSet", "moks-search")
+    with pytest.raises(subprocess.CalledProcessError) as e:
+        render("values-minikube.yaml", *SECURE, "rag.opensearch.secure.retireOriginal=true")
+    assert "set active first" in str(e.value.stderr)
+
+
 def test_the_old_public_route_blocks_cutover():
     with pytest.raises(subprocess.CalledProcessError) as e:
         render("values-minikube.yaml", *SECURE, "rag.opensearch.secure.active=true")

@@ -167,6 +167,7 @@ rag:
     secure:
       enabled: false
       active: false
+      retireOriginal: false   # stops rendering the pod above, once active has soaked. Its volume stays until you delete it.
       cluster: secure      # names its generations in PostgreSQL, apart from the original cluster's
       # The upstream image: security and TLS, no snapshots, no Prometheus exporter. To have those, set this to
       # the digest CI reports for deploy/opensearch/Dockerfile, and pluginsInstalled to true.

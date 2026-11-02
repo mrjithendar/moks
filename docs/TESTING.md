@@ -243,3 +243,16 @@ covered by tests with simulated services (`test_rag_governance.py`, `test_pineco
 `test_llm_providers.py` covers each provider's request and response shape with the network simulated: no call reaches
 a real model. Query drafts use a stand-in model. `format_query` and scoped label lookups were checked by hand against mk4's
 Prometheus and Loki.
+
+## OpenSearch
+
+`tests/test_opensearch_contract.py` and the render tests need no server. `tests/test_opensearch_real.py` is skipped unless pointed at a real cluster running the chart's own security files, and uses throwaway `moks-chunks-test-*` indexes only:
+
+```sh
+scripts/opensearch-secrets.sh --files /tmp/os-creds
+# Start OpenSearch 3.9.0 with deploy/helm/moks/files/opensearch/, those certificates in config/tls and internal_users.yml, and path.repo set.
+MOKS_TEST_OPENSEARCH_URL=https://localhost:9200 MOKS_TEST_OPENSEARCH_CREDS=/tmp/os-creds MOKS_TEST_OPENSEARCH_REPO=/allowed/repo \
+  pytest tests/test_opensearch_real.py
+```
+
+Never point it at a cluster that serves anyone. It does not replace a run on mk4.

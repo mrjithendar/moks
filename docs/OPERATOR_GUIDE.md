@@ -297,6 +297,10 @@ kubectl --context mk4 -n moks rollout status deploy/moks-opensearch-dashboards -
 Sign in, open **Dashboards Management > Index patterns**, create `moks-chunks-*`, then use **Discover**. To remove
 it, set `rag.opensearch.dashboards.enabled: false` and delete the objects by hand, because syncs here never prune.
 
+## The secured OpenSearch cluster
+
+[OPENSEARCH.md](OPENSEARCH.md) has setup, cutover, rollback and recovery for `moks-search`. The route above and any Dashboards route reach the original unauthenticated pod, and the chart refuses to cut over while they are on.
+
 ## Using Amazon OpenSearch Service
 
 This keeps BM25 and k-NN search in a managed domain instead of a pod. Requests are signed with the AWS

@@ -95,7 +95,7 @@ backends does not move vectors: run a reindex afterwards, which pays to embed ev
   tested with a scripted server. Claude on Bedrock was checked with the real SDK against a local server only.
 - Database backups have not run on mk4. `pg_dump` and the content listing ran against a local PostgreSQL 17, the exec stream against a simulated one, and the MongoDB commands have run against nothing. Portal restore of databases does not exist.
 - Amazon OpenSearch Service signing was tested against recomputed signatures, not a real domain. The
-  OpenSearch index and query calls have only run against a simulated server. OpenSearch Serverless is not supported.
+  OpenSearch Serverless is not supported. Self-managed index and query calls have run against a real 3.9.0 server on a Mac; `moks-search` has not run on mk4 ([OPENSEARCH.md](OPENSEARCH.md)).
 - Token counts come from provider responses. Cost is an estimate from prices an admin
   configures; nothing is fetched from a pricing API.
 - Responses stream as structured progress events. The final report arrives whole, not
@@ -149,3 +149,14 @@ Not verified:
 ## Reranking
 
 Off by default. See [RERANKING.md](RERANKING.md) for what was measured. The container image has never been built, the service has never run on a cluster, and its quality numbers come from a small synthetic dataset with keyword candidates only.
+
+## OpenSearch (2026-11-02)
+
+- **Single node, single disk.** Persistence only. Nothing here survives loss of the mk4 host except what snapshots or PostgreSQL backups hold.
+- **The live cluster is still unauthenticated** until `docs/OPENSEARCH.md` is carried out. Its public read route and Dashboards, where enabled, bypass MOKS document access.
+- **Never run on mk4:** `moks-search`, its image, Argo CD hook, NetworkPolicy and probes as rendered, and the worker's probe. Enforcement of NetworkPolicy by kindnet is unproven.
+- **Snapshots to R2 are unverified.** The plugin, policy and restore ran against a filesystem repository only.
+- **The custom image is built but has never started a cluster.** CI builds it and confirms both plugins are listed; separately, the same plugins ran in the 3.9.0 tarball.
+- **Rankings differ from the original cluster,** because prose is stemmed and identifiers have their own field. No evaluation on real questions has been run, so no relevance gain is claimed.
+- **Lifecycle, classification and trust in the index** are as of the last write. PostgreSQL decides. Stale-content exclusion runs only in the final check, so it can cost candidates, within the bounded expansion.
+- **Not built:** OpenSearch Dashboards for `moks-search`, and an automatic scheduled restore drill.

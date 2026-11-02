@@ -77,6 +77,8 @@ PostgreSQL is the authority. Each change adds an outbox event in its own transac
   (OpenSearch only: Pinecone cannot count by metadata).
 - Dead events are retried one document at a time or in a bounded batch, and every retry is audited.
 
+Deletion and replacement run write-first: new chunks go in, fenced by content revision, then old ones are pruned, and every bulk item's result is read. `sync_generation` repairs a generation from `document_index_state` alone, which is also how a generation catches up after a cutover or rollback. [OPENSEARCH.md](OPENSEARCH.md) covers deployment, migration and recovery.
+
 ## Retrieval
 
 Results are fused from keyword, vector and exact-identifier rankings with RRF, then adjusted after authorization by

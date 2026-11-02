@@ -4,6 +4,7 @@
 {{- if .Values.rag.opensearch.publicRoute.enabled }}{{ fail "rag.opensearch.publicRoute reaches the old unauthenticated pod, which stops following PostgreSQL at cutover. Turn it off first (docs/OPENSEARCH.md)." }}{{ end -}}
 {{- if .Values.rag.opensearch.dashboards.enabled }}{{ fail "rag.opensearch.dashboards reaches the old unauthenticated pod, and cannot follow moks-search without TLS and a login. Turn it off first (docs/OPENSEARCH.md)." }}{{ end -}}
 {{- end -}}
+{{- if and $secure.retireOriginal (not $secure.active) }}{{ fail "rag.opensearch.secure.retireOriginal removes the cluster search is using; set active first" }}{{ end -}}
 {{- if and $secure.snapshots.enabled (not $secure.pluginsInstalled) }}{{ fail "rag.opensearch.secure.snapshots needs the image from deploy/opensearch/Dockerfile and pluginsInstalled: true" }}{{ end -}}
 {{- if and $secure.enabled (eq .Values.rag.backend "opensearch") -}}
 {{- if .Values.rag.opensearch.url }}{{ fail "rag.opensearch.secure is the bundled cluster; rag.opensearch.url names an external one" }}{{ end -}}
