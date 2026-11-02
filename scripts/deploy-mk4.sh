@@ -32,7 +32,7 @@ investigations() {
 
 step "Preflight (read-only)"
 kc get node mk4-m04 -o name > /dev/null
-argocd app list -o name > /dev/null || die "argocd is not logged in; run: argocd relogin"
+argocd app list -o name > /dev/null || die "argocd is not logged in; run: argocd login jithendar.com --grpc-web --grpc-web-root-path /argocd --username admin"
 git -C "$REPO" fetch -q origin
 git -C "$REPO" diff --quiet origin/master -- deploy/helm/moks deploy/argocd/minikube deploy/argocd/project-root.yaml \
   || die "Argo CD reads origin/master, which differs from this checkout. Push first."
