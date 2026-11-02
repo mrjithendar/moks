@@ -9,6 +9,7 @@ from pydantic import Field
 
 from ..connectors.base import ConnectorError
 from ..connectors.finops import allocate, parse_cpu, parse_mem, rightsize
+from ..connectors.loki import logql_escape
 from ..db import session_scope
 from ..rbac import P
 from .contracts import K8S_NAME, ToolArgs, ToolContext, ToolResult, ToolSpec
@@ -255,7 +256,8 @@ async def _usage(ctx: ToolContext, namespaces: list[str], days: int) -> tuple[di
     prom = ctx.connector("prometheus")
     rng = f"{days * 24}h"
     step = "5m" if days <= 2 else "15m"
-    ns = namespaces[0] if len(namespaces) == 1 else "^(" + "|".join(re.escape(n) for n in namespaces) + ")$"
+    # re.escape writes \- for -, which a PromQL string only accepts once its backslash is escaped.
+    ns = namespaces[0] if len(namespaces) == 1 else "^(" + logql_escape("|".join(re.escape(n) for n in namespaces)) + ")$"
     sel = (f'namespace="{ns}"' if len(namespaces) == 1 else f'namespace=~"{ns}"') + ', container!="", container!="POD"'
     queries = {
         "cpu_avg": f"avg_over_time(sum by (namespace, pod, container) (rate(container_cpu_usage_seconds_total{{{sel}}}[5m]))[{rng}:{step}])",

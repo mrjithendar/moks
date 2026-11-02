@@ -160,6 +160,23 @@ async def _rightsizing(monkeypatch, usage: dict):
     return await finops_rightsizing(None, phase2.AllocArgs(namespace="shop", days=7))
 
 
+async def test_usage_writes_namespace_regex_prometheus_can_parse():
+    sent = []
+
+    class Prom:
+        async def instant(self, q, at):
+            sent.append(q)
+            return {"series": []}
+
+    class Ctx:
+        def connector(self, name):
+            return Prom()
+
+    await phase2._usage(Ctx(), ["moks-lab", "kube-system"], 7)
+    assert len(sent) == 5
+    assert all('namespace=~"^(moks\\\\-lab|kube\\\\-system)$"' in q for q in sent)  # a bare \- is a PromQL parse error
+
+
 async def test_rightsizing_refuses_to_treat_missing_usage_as_zero(monkeypatch):
     with pytest.raises(ConnectorError) as err:
         await _rightsizing(monkeypatch, {"cpu_p95": {}, "mem_max": {}, "samples": {}})
