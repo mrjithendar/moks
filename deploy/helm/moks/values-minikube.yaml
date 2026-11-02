@@ -95,7 +95,7 @@ executor:
 
 databaseBackups:
   enabled: true
-  namespaces: [moks, jithendar, roboshop-ai]
+  namespaces: [moks, jithendar]   # namespaces must exist; roboshop-ai on mk4 only holds ecr-refresh
 
 diagnostics:
   enabled: true

@@ -348,12 +348,12 @@ The resource counts must add up to what the old Application tracked, which is 33
 
 ### mk4 with no running portal
 
-If `moks-portal` is gone, as on 2026-11-01, nothing is adopted. This is a fresh install onto kept data, so skip sections 3 and 5. Pods will start, and each `adopt` step will show real changes rather than an empty diff.
+If `moks-portal` is gone, as on 2026-11-01, nothing is adopted. This is a fresh install onto kept data, so skip sections 3 and 5. Pods will start, and each `adopt` step will show real changes rather than an empty diff. `scripts/deploy-mk4.sh` runs everything in this section in order, after a read-only `--check`, and retires the `roboshop-demo-moks-*` Applications left by the deleted EKS cluster.
 
-Three things block it, and fixing them is a decision about mk4:
+Three things block it:
 
-- **Namespaces `roboshop-ai` and `moks-lab` are missing**, but `values-minikube.yaml` still writes Roles there (`databaseBackups.namespaces`, `executor.namespaces`, `terminal.kubernetes.namespaces`), so the executor and terminal syncs fail. Create them, or remove them from the values.
-- **`ecr-pull` may have expired.** Its refresher ran from `roboshop-ai`, and ECR tokens last 12 hours. Refresh the Secret by hand as in the [operator guide](OPERATOR_GUIDE.md), or new pods will not pull.
+- **Namespace `moks-lab` is missing**, but `values-minikube.yaml` writes Roles there (`executor.namespaces`, `terminal.kubernetes.namespaces`), so the executor and terminal syncs fail. `lab/00-namespace.yaml` creates it.
+- **`ecr-pull` has expired.** ECR tokens last 12 hours, and the refresher, `roboshop-ai/ecr-refresh` from the tools repository, is gone with its namespace. Recreate the namespace and `roboshop-secrets`, which hold only the refresher on mk4, then install the CronJob and run it once, or new pods will not pull.
 - **`data-moks-postgres-0` holds the only copy of the mk4 investigations, and its PV has reclaim policy `Delete`.** Deleting the claim or the namespace loses them. It binds to the new StatefulSet by name, on `mk4-m04`. Switch it to `Retain` first, as in section 2.
 
 `data-moks-opensearch-0` is unused while `rag.backend` is `pinecone`. Leave it.

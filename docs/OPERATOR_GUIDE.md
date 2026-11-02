@@ -43,10 +43,9 @@ kubectl --context mk4 -n moks create secret docker-registry ecr-pull \
   --docker-password="$(aws ecr get-login-password --region us-east-1)"
 ```
 
-In the **tools** repository, add `moks` to the `TARGET_NAMESPACES` env of
-`minikube/ecr-refresh/roboshop-ai-ecr-refresh-cronjob.yaml`. The chart already creates the
-`ecr-refresh` Role and RoleBinding in `moks` (`ecrRefresh.enabled`). Commit and apply that change
-the way you apply the tools repository.
+The `ecr-refresh` CronJob in the **tools** repository (`deploy/minikube/ecr-refresh`) covers every
+namespace except Kubernetes' own, so `moks` needs no change there. If `roboshop-ai` is missing, the
+CronJob is too, and tokens expire within 12 hours; `scripts/deploy-mk4.sh` restores it.
 
 ## 3. Secrets (never committed)
 
@@ -92,6 +91,10 @@ roboshop-ai, `kubectl apply` of a changed project or root is what updates its li
 the root is what updates a child's.
 
 ### roboshop-demo (EKS)
+
+**Retired on 2026-11-02:** the cluster was deleted and MOKS runs on mk4 only (`scripts/deploy-mk4.sh`).
+`values-eks.yaml` and `deploy/argocd/eks` stay for a rebuild; nothing live reads them, and the rest of
+this section applies only if the cluster comes back.
 
 Argo CD on mk4 deploys MOKS to the EKS cluster as `roboshop-demo-moks-root` and its children, in
 project `moks-eks`, with `values-eks.yaml`. They read `master`, so push the chart first. This is a

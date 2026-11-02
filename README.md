@@ -33,7 +33,7 @@ real API server.
 ```text
 backend/          FastAPI app, worker, connectors, tools, orchestrator, migrations, tests
 frontend/         React portal
-deploy/helm/moks  Helm chart (values-minikube.yaml for mk4, values-eks.yaml for roboshop-demo)
+deploy/helm/moks  Helm chart (values-minikube.yaml for mk4; values-eks.yaml is unused since roboshop-demo was deleted)
 deploy/argocd     AppProjects, root and child Applications per environment
 deploy/secrets    Secret templates (no real values)
 deploy/terraform  AWS: ECR repo, GitHub OIDC CI role, MOKS runtime IAM user (Bedrock)
@@ -41,7 +41,7 @@ deploy/rbac, iam  Kubernetes RBAC and AWS IAM examples
 deploy/grafana    Dashboard JSON and Prometheus scrape job
 lab/              Four reproducible incidents with expected evidence and fixes
 dev/              Local run script and seed
-scripts/          create-secrets, backup
+scripts/          create-secrets, backup, deploy-mk4
 docs/             Architecture, security/RBAC, connectors, operator guide, testing, limitations
 ```
 
