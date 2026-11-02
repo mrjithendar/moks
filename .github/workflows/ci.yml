@@ -157,6 +157,56 @@ jobs:
           docker push "$LATEST"
           echo "pushed $IMAGE and $LATEST ($DIGEST). Restart mk4 to run it; see docs/RELEASES.md." >> "$GITHUB_STEP_SUMMARY"
 
+  reranker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with: {python-version: "3.12"}
+      - name: Service tests
+        working-directory: reranker
+        run: |
+          pip install -r requirements-test.txt
+          python -m pytest tests -q
+
+  # Sets nothing live: the chart runs a digest, and reranker.image.digest stays empty until an operator sets it.
+  reranker-image:
+    if: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    needs: [reranker]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      REPOSITORY: moks-reranker
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: moks-reranker-ci-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v4
+      - name: Build, smoke-test and push for arm64 and amd64
+        working-directory: reranker
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:${{ github.sha }}"
+          docker build --build-arg GIT_COMMIT=${{ github.sha }} -t smoke .
+          docker run -d --name smoke -e RERANKER_TOKEN=ci -e RERANKER_METRICS_PORT=0 -p 8090:8090 --network none --read-only --tmpfs /tmp smoke
+          docker rm -f smoke
+          docker run -d --name smoke -e RERANKER_TOKEN=ci -e RERANKER_METRICS_PORT=0 -p 8090:8090 --read-only --tmpfs /tmp smoke
+          for i in $(seq 1 60); do curl -fsS localhost:8090/readyz && break; sleep 2; done
+          curl -fsS localhost:8090/readyz
+          docker rm -f smoke
+          docker images smoke --format 'image size {{ .Size }}' >> "$GITHUB_STEP_SUMMARY"
+          docker buildx build --platform linux/arm64,linux/amd64 --provenance=false --build-arg GIT_COMMIT=${{ github.sha }} --metadata-file meta.json --push -t "$IMAGE" .
+          echo "pushed $IMAGE. Set reranker.image.digest to $(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")" >> "$GITHUB_STEP_SUMMARY"
+
   # Built and pushed on every push to the default branch. Sessions run a digest, so this changes nothing
   # until the chart's terminal.image.digest is moved to what this reports.
   terminal-image:

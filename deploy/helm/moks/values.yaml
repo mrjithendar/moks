@@ -1,7 +1,7 @@
 # Defaults. Environment-specific files (values-minikube.yaml, values-eks.yaml) override these.
 
 # What to render: all, or one of foundation, database, migrate, opensearch, api, worker, executor,
-# terminal, routing, backup. Each child Argo CD Application sets its own group as a parameter and
+# terminal, reranker, routing, backup. Each child Argo CD Application sets its own group as a parameter and
 # shares the environment's values file, so shared checksums match. See docs/ARGOCD_APP_SPLIT.md.
 resourceGroup: all
 
@@ -183,6 +183,39 @@ diagnostics:
   quota: {pods: "5", cpu: "1", memory: 1Gi}
 
 # Web terminal (docs/TERMINAL.md). Off, and nobody holds the terminal role until an admin grants it.
+# Internal PyTorch reranking (docs/RERANKING.md). enabled deploys the service; client.enabled makes
+# search use it. They are separate so it can run and be evaluated before anyone's results change.
+reranker:
+  enabled: false
+  image:
+    repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-reranker
+    digest: ""              # required: this runs a pinned image, whose build pins the model
+  model:                    # must equal what the service reports, or search keeps its existing order
+    id: cross-encoder/ms-marco-MiniLM-L6-v2
+    revision: 233902d25c440f23af6f7d6e94d2946bac0bee0a
+  tokenSecret: moks-reranker-secrets  # key MOKS_CRED_RERANKER_TOKEN; the same key goes in the API and worker Secrets
+  replicas: 1
+  threads: 2
+  batchSize: 16
+  concurrency: 1
+  queue: 4
+  maxCandidates: 30
+  maxQueryChars: 1000
+  maxPassageChars: 2000
+  drainSeconds: 20
+  # PROVISIONAL: from an arm64 Mac (peak about 480 MiB, under 1 CPU-second per request). Measure on the
+  # cluster before relying on these. docs/RERANKING.md has the method.
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "2", memory: 1Gi}
+  client:
+    enabled: false
+    candidates: 30
+    results: 12
+    timeoutMs: 1500
+    maxQueryChars: 1000
+    maxPassageChars: 2000
+
 terminal:
   enabled: false
   namespace: moks-terminals

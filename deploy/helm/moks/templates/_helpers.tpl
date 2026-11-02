@@ -5,7 +5,7 @@
      Returns "true" or nothing, and refuses a typo rather than rendering an empty Application. */}}
 {{- define "moks.inGroup" -}}
 {{- $selected := toString .root.Values.resourceGroup -}}
-{{- if not (has $selected (list "all" "foundation" "database" "migrate" "opensearch" "api" "worker" "executor" "terminal" "routing" "backup")) -}}
+{{- if not (has $selected (list "all" "foundation" "database" "migrate" "opensearch" "api" "worker" "executor" "terminal" "reranker" "routing" "backup")) -}}
 {{- fail (printf "resourceGroup %q is not a resource group; see docs/ARGOCD_APP_SPLIT.md" $selected) -}}
 {{- end -}}
 {{- if or (eq $selected "all") (eq $selected .group) -}}true{{- end -}}

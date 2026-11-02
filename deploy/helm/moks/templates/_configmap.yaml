@@ -32,6 +32,17 @@ data:
   MOKS_OPENSEARCH_AWS_REGION: {{ . | quote }}
   {{- end }}
   {{- end }}
+  {{- if .Values.reranker.enabled }}
+  MOKS_RAG_RERANK_ENABLED: {{ .Values.reranker.client.enabled | quote }}
+  MOKS_RAG_RERANK_URL: "http://moks-reranker.{{ .Release.Namespace }}.svc.cluster.local:8090"
+  MOKS_RAG_RERANK_MODEL: {{ .Values.reranker.model.id | quote }}
+  MOKS_RAG_RERANK_REVISION: {{ .Values.reranker.model.revision | quote }}
+  MOKS_RAG_RERANK_CANDIDATES: {{ .Values.reranker.client.candidates | quote }}
+  MOKS_RAG_RERANK_RESULTS: {{ .Values.reranker.client.results | quote }}
+  MOKS_RAG_RERANK_TIMEOUT_MS: {{ .Values.reranker.client.timeoutMs | quote }}
+  MOKS_RAG_RERANK_MAX_QUERY_CHARS: {{ .Values.reranker.client.maxQueryChars | quote }}
+  MOKS_RAG_RERANK_MAX_PASSAGE_CHARS: {{ .Values.reranker.client.maxPassageChars | quote }}
+  {{- end }}
   {{- if eq .Values.rag.backend "pinecone" }}
   MOKS_PINECONE_CLOUD: {{ .Values.rag.pinecone.cloud | quote }}
   MOKS_PINECONE_REGION: {{ .Values.rag.pinecone.region | quote }}

@@ -133,3 +133,7 @@ networkPolicy:
   inCluster:
     - namespace: istio-system
       ports: [80, 15012]   # kiali-prometheus, istiod for the sidecars
+
+# Off until docs/RERANKING.md's gates pass on real questions. Set reranker.enabled and image.digest to run it.
+reranker:
+  enabled: false

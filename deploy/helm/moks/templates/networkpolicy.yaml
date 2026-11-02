@@ -30,6 +30,10 @@ spec:
     - to: [{podSelector: {matchLabels: {app: moks-opensearch}}}]
       ports: [{port: 9200, protocol: TCP}]
     {{- end }}
+    {{- if .Values.reranker.enabled }}
+    - to: [{podSelector: {matchLabels: {app: moks-reranker}}}]
+      ports: [{port: 8090, protocol: TCP}]
+    {{- end }}
     {{- with .Values.networkPolicy.apiServer.cidrs }}
     - to:
         {{- range . }}

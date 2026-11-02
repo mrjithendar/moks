@@ -68,10 +68,13 @@ step "ECR pull secrets: tokens last 12 hours, so the refresher has to run before
 kc create namespace roboshop-ai --dry-run=client -o yaml | kc apply -f -
 kc -n roboshop-ai get secret roboshop-secrets -o name > /dev/null 2>&1 || kc apply -f "$REPO/roboshop-secrets.yaml"
 kc kustomize "$TOOLS/deploy/minikube/ecr-refresh" | kc apply -f -
-job="ecr-refresh-$(date +%s)"
-kc -n roboshop-ai create job --from=cronjob/ecr-refresh "$job"
-kc -n roboshop-ai wait --for=condition=Complete "job/$job" --timeout=300s \
-  || die "ecr-refresh failed; see: kubectl --context mk4 -n roboshop-ai logs job/$job --all-containers"
+refresh_ecr() {
+  local job="ecr-refresh-$(date +%s)"
+  kc -n roboshop-ai create job --from=cronjob/ecr-refresh "$job"
+  kc -n roboshop-ai wait --for=condition=Complete "job/$job" --timeout=300s \
+    || die "ecr-refresh failed; see: kubectl --context mk4 -n roboshop-ai logs job/$job --all-containers"
+}
+refresh_ecr
 
 step "Clear the leftover moks-portal tracking on Namespace/velero"
 tracked="$(mktemp)"
@@ -103,6 +106,9 @@ step "Application components"
 for group in api worker executor terminal routing; do
   sync "$group"
 done
+
+step "ECR pull secrets again: the terminal and diagnostics namespaces only exist now"
+refresh_ecr
 
 step "Verify"
 after="$(investigations)"

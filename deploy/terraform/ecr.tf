@@ -30,6 +30,20 @@ resource "aws_ecr_repository" "terminal" {
   }
 }
 
+resource "aws_ecr_repository" "reranker" {
+  name                 = "${var.repository_name}-reranker"
+  image_tag_mutability = "IMMUTABLE" # the chart runs a digest, and a model lives in the image
+  force_delete         = false
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
 resource "aws_ecr_lifecycle_policy" "moks" {
   repository = aws_ecr_repository.moks.name
   policy = jsonencode({

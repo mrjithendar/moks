@@ -1,0 +1,138 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "reranker") }}
+{{- with .Values.reranker }}
+{{- if .enabled }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (toString .image.digest)) -}}{{- fail "reranker.image.digest must be sha256:<64 hex characters>: this service runs a pinned image" -}}{{- end }}
+# Internal text reranking (docs/RERANKING.md). No Ingress, no VirtualService, no Kubernetes API access
+# and no outbound network: the model is in the image, and this pod only ever answers the API and worker.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: moks-reranker
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moks-reranker
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {app: moks-reranker}
+  ports:
+    - {name: http, port: 8090, targetPort: 8090}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moks-reranker
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: reranker
+spec:
+  replicas: {{ .replicas }}
+  selector:
+    matchLabels: {app: moks-reranker}
+  template:
+    metadata:
+      labels: {app: moks-reranker}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+    spec:
+      serviceAccountName: moks-reranker
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ add .drainSeconds 10 }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: reranker
+          image: {{ .image.repository }}@{{ .image.digest }}
+          imagePullPolicy: IfNotPresent
+          {{- include "moks.containerSecurity" $ | nindent 10 }}
+          env:
+            - {name: RERANKER_THREADS, value: {{ .threads | quote }}}
+            - {name: RERANKER_BATCH_SIZE, value: {{ .batchSize | quote }}}
+            - {name: RERANKER_CONCURRENCY, value: {{ .concurrency | quote }}}
+            - {name: RERANKER_QUEUE, value: {{ .queue | quote }}}
+            - {name: RERANKER_MAX_CANDIDATES, value: {{ .maxCandidates | quote }}}
+            - {name: RERANKER_MAX_QUERY_CHARS, value: {{ .maxQueryChars | quote }}}
+            - {name: RERANKER_MAX_PASSAGE_CHARS, value: {{ .maxPassageChars | quote }}}
+            - {name: RERANKER_DRAIN_SECONDS, value: {{ .drainSeconds | quote }}}
+            - name: RERANKER_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ .tokenSecret }}, key: MOKS_CRED_RERANKER_TOKEN}
+          ports:
+            - {name: http, containerPort: 8090}
+            - {name: metrics, containerPort: 9464}
+          startupProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 20
+          resources: {{- toYaml .resources | nindent 12 }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
+{{- if $.Values.networkPolicy.enabled }}
+---
+# Only the API and the worker reach this. It starts nothing outbound, so it needs no egress at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: moks-reranker
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app: moks-reranker}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: moks, component: api}}
+        - podSelector: {matchLabels: {app: moks, component: worker}}
+      ports: [{port: 8090, protocol: TCP}]
+    {{- with $.Values.networkPolicy.metricsNamespaces }}
+    - from:
+        {{- range . }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ . }}}}
+        {{- end }}
+      ports: [{port: 9464, protocol: TCP}]
+    {{- end }}
+  egress: []
+{{- end }}
+{{- if $.Values.istio.mtls }}
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: moks-reranker
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {app: moks-reranker}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/{{ $.Release.Namespace }}/sa/{{ include "moks.serviceAccount" (dict "root" $ "component" "api") }}
+              - cluster.local/ns/{{ $.Release.Namespace }}/sa/{{ include "moks.serviceAccount" (dict "root" $ "component" "worker") }}
+      to:
+        - operation:
+            ports: ["8090"]
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

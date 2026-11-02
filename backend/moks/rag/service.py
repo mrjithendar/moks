@@ -31,7 +31,7 @@ from ..llm.providers import LLMError, provider_for
 from ..models import Chunk, Document, DocumentIndexState, EmbeddingIndex, IndexOutbox, KnowledgeSource, LLMConfig
 from ..observability import RETRIEVAL_LATENCY
 from ..rbac import Principal
-from . import access
+from . import access, rerank as reranking
 from .backends import OpenSearchBackend, PineconeBackend, PostgresBackend, rrf
 from .query import parts, understand
 from .chunking import MAX_CHUNKS, PIPELINE_VERSION, chunk, kind_of, lifecycle_of, title_of
@@ -756,7 +756,7 @@ async def _query_vector(db: AsyncSession, principal: Principal, query: str, idx:
 
 
 async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8, environment: str | None = None,
-                 namespace: str | None = None, service: str | None = None, neighbors: bool = False) -> dict:
+                 namespace: str | None = None, service: str | None = None, neighbors: bool = False, reranker: reranking.Reranker | None = None) -> dict:
     start = time.monotonic()
     environment, namespace = environment or None, None if namespace in (None, "*") else namespace
     found = access.grants(principal, environment, namespace)
@@ -799,7 +799,14 @@ async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8,
             break  # enough survived, or there is nothing further down
         pool = min(pool * 3, MAX_POOL)  # unreadable or retired documents crowded this page
         expanded += 1
-    results = _rerank(allowed, query, tokens, service, k, now)
+    scored = _score(allowed, query, tokens, service, now)
+    client = reranker or reranking.active()
+    applied: dict | None = None
+    if client is not None and scored:
+        scored, applied = await _apply_reranker(client, scored, query)
+    results = _select(scored, min(k, get_settings().rag_rerank_results, reranking.MAX_RESULTS) if applied else k)
+    if applied:
+        results = await _finish_reranking(db, principal, results, applied, environment, namespace)
     if neighbors:
         await _attach_neighbors(db, results)
     _flag_conflicts(results)
@@ -808,12 +815,14 @@ async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8,
     out = {"results": results, "mode": mode, "index": idx.index_name if idx else None, "evidence": judged, "abstain": judged["state"] != "supported", "score_note": SCORE_NOTE,
            "understanding": understand(query, tokens),
            "candidates": {"filtered_before_ranking": exact, "expanded": expanded, "considered": len(allowed)}}
+    if applied:
+        out["reranking"] = applied["public"]
     if reason:
         out["fallback_reason"] = reason
     return out
 
 
-def _rerank(allowed: list, query: str, tokens: list[str], service: str | None, k: int, now: datetime) -> list[dict]:
+def _score(allowed: list, query: str, tokens: list[str], service: str | None, now: datetime) -> list:
     """After authorization, so nothing unreadable can influence it. Small, explainable adjustments
     on top of the fused rank: enough to break near ties, not enough to bury a clear match."""
     wanted = {service.lower()} if service else set()
@@ -836,6 +845,68 @@ def _rerank(allowed: list, query: str, tokens: list[str], service: str | None, k
             signals["retired"] = -0.03
         scored.append((score + sum(signals.values()), signals, cid, c, d, s, state, why))
     scored.sort(key=lambda t: (-t[0], t[2]))
+    return scored
+
+
+RERANK_PER_DOCUMENT = PER_DOCUMENT + 1  # a little more than can be returned, so the model has a choice
+
+
+def _prepare(scored: list, limit: int) -> tuple[list, list]:
+    """The best-ranked passages worth a model's time: no exact repeats, and no one document filling the window."""
+    window, rest, per_doc, seen = [], [], {}, set()
+    for row in scored:
+        c, d = row[3], row[4]
+        fits = len(window) < limit and per_doc.get(d.id, 0) < RERANK_PER_DOCUMENT and (not c.text_hash or c.text_hash not in seen)
+        (window if fits else rest).append(row)
+        if fits:
+            per_doc[d.id] = per_doc.get(d.id, 0) + 1
+            seen.add(c.text_hash)
+    return window, rest
+
+
+async def _apply_reranker(client: reranking.Reranker, scored: list, query: str) -> tuple[list, dict]:
+    """Only reorders what search already authorized. An exact identifier stays ahead of anything a model
+    prefers, because matching it is the reason it was found, and a superseded document stays below a current
+    one. Whatever goes wrong, the existing order stands."""
+    window, rest = _prepare(scored, client.candidates)
+    got = await client.rerank(query, [(r[2], f"{r[3].heading}\n{r[3].text}") for r in window])
+    public = {"state": "fallback" if got.scores is None else "applied", "reason": got.reason, "model": got.model, "revision": got.revision, "candidates": got.candidates or len(window),
+              "truncated_passages": len(set(got.truncated) | set(got.clipped)), "inference_ms": got.inference_ms, "elapsed_ms": got.elapsed_ms, "note": reranking.NOTE}
+    if got.scores is None:
+        return scored, {"public": public, "chunks": {}}
+    before = {r[2]: i for i, r in enumerate(scored)}
+    ordered = sorted(window, key=lambda r: (-got.scores[r[2]], before[r[2]]))
+    pinned = sorted([r for r in ordered if "exact_identifier" in r[1]], key=lambda r: before[r[2]])
+    held = [r for r in ordered if "exact_identifier" not in r[1]]
+    final = pinned + [r for r in held if r[6] not in ("superseded", "deprecated")] + [r for r in held if r[6] in ("superseded", "deprecated")] + rest
+    partial = set(got.truncated) | set(got.clipped)
+    chunks = {r[2]: {"before": before[r[2]] + 1, "after": i + 1, "reranker_score": round(got.scores[r[2]], 4) if r[2] in got.scores else None, "pinned": "exact_identifier" in r[1], "partially_scored": r[2] in partial}
+              for i, r in enumerate(final)}
+    return final, {"public": public, "chunks": chunks}
+
+
+async def _finish_reranking(db: AsyncSession, principal: Principal, results: list[dict], applied: dict, environment: str | None, namespace: str | None) -> list[dict]:
+    """The round trip gave access and lifecycle time to change. PostgreSQL is asked again before anything is returned."""
+    for r in results:
+        if r["chunk_id"] in applied["chunks"]:
+            r["ranking"] = applied["chunks"][r["chunk_id"]]
+    if applied["public"]["state"] != "applied" or not results:
+        return results
+    rows = (await db.execute(select(Document, KnowledgeSource).join(KnowledgeSource, KnowledgeSource.id == Document.source_id).where(
+        Document.id.in_([uuid.UUID(r["document_id"]) for r in results])).execution_options(populate_existing=True))).all()
+    now = datetime.now(timezone.utc)
+    ok = set()
+    for d, s in rows:
+        usable = d.status == "active" and d.lifecycle == "active" and s.lifecycle == "active" and d.realm == access.realm() and s.realm == access.realm()
+        allowed = access.can_read(principal, d.environment, d.namespace) and access.in_request(environment, namespace, d.environment, d.namespace)
+        if usable and allowed and not (_freshness(s, d, now)[0] == "stale" and s.stale_policy == "exclude"):
+            ok.add(str(d.id))
+    kept = [r for r in results if r["document_id"] in ok]
+    applied["public"]["removed_after_recheck"] = len(results) - len(kept)
+    return kept
+
+
+def _select(scored: list, k: int) -> list[dict]:
     results: list[dict[str, Any]] = []
     per_doc: dict[uuid.UUID, int] = {}
     seen_hash: set[tuple] = set()

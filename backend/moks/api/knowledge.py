@@ -157,6 +157,21 @@ async def status(ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depend
     return await service.stats(db)
 
 
+@router.get("/reranking")
+async def reranking_status(ctx: AuthContext = Depends(needs(P.ADMIN_LLM)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    """Configured state, the service's own answer, this process's counters, and the latest comparison."""
+    from ..models import EvalRun
+    from ..rag import rerank
+
+    s = get_settings()
+    client = rerank.active()
+    run = (await db.execute(select(EvalRun).where(EvalRun.kind == "rerank", EvalRun.status == "completed").order_by(EvalRun.created_at.desc()).limit(1))).scalars().first()
+    return {"enabled": s.rag_rerank_enabled, "configured": client is not None, "model": s.rag_rerank_model or None, "revision": s.rag_rerank_revision or None,
+            "limits": {"candidates": s.rag_rerank_candidates, "timeout_ms": s.rag_rerank_timeout_ms, "max_query_chars": s.rag_rerank_max_query_chars, "max_passage_chars": s.rag_rerank_max_passage_chars},
+            "service": await client.ready() if client else None, "stats": client.stats() if client else None, "note": rerank.NOTE,
+            "evaluation": {"created_at": run.created_at.isoformat(), "gates": run.gates, "metrics": (run.versions or {}).get("metrics")} if run else None}
+
+
 @router.get("/sources")
 async def list_sources(ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> list[dict]:
     rows = (await db.execute(select(KnowledgeSource).where(KnowledgeSource.lifecycle != "deleted", KnowledgeSource.realm == "operational").order_by(KnowledgeSource.name))).scalars().all()

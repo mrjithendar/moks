@@ -24,7 +24,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CHART = ROOT / "deploy/helm/moks"
 ARGOCD = ROOT / "deploy/argocd"
-GROUPS = ["foundation", "database", "migrate", "opensearch", "api", "worker", "executor", "terminal", "routing", "backup"]
+GROUPS = ["foundation", "database", "migrate", "opensearch", "api", "worker", "executor", "terminal", "reranker", "routing", "backup"]
 CLUSTER_SCOPED = {"Namespace", "ClusterRole", "ClusterRoleBinding"}
 REPO = "https://github.com/mrjithendar/moks.git"
 TERMINAL_ON = ["--set", "terminal.enabled=true", "--set", "terminal.image.digest=sha256:" + "a" * 64, "--set", "terminal.profiles[0].name=ro",
@@ -32,6 +32,7 @@ TERMINAL_ON = ["--set", "terminal.enabled=true", "--set", "terminal.image.digest
 POOLS = ["--set-json", 'worker.pools=[{"name":"detection","classes":"detection","capacity":"detection=2","replicas":1},'
                        '{"name":"knowledge","classes":"knowledge,maintenance","capacity":"knowledge=1,maintenance=1","replicas":2}]']
 OPENSEARCH = ["--set", "rag.backend=opensearch"]
+RERANKER = ["--set", "reranker.enabled=true", "--set", "reranker.image.digest=sha256:" + "b" * 64]
 BACKUP = ["--set", "backup.enabled=true", "--set", "backup.bucket=ci"]
 SPLIT = ["--set", "secrets.split=true"]
 # name -> (extra helm arguments, groups that must render something, groups that must render nothing)
@@ -52,6 +53,8 @@ SCENARIOS = {
     "worker-pools-split": (POOLS + SPLIT, {"worker", "migrate"}, set()),
     "backup": (BACKUP, {"backup"}, set()),
     "backup-split": (BACKUP + SPLIT, {"backup", "migrate"}, set()),
+    "reranker-on": (RERANKER, {"reranker"}, set()),
+    "reranker-off": (["--set", "reranker.enabled=false"], set(), {"reranker"}),
     "custom-skills": (["--set", "customSkills.runbook=body"], {"foundation"}, set()),
     "namespaced-rbac": (["--set", "rbac.clusterWide=false", "--set", "rbac.namespaces={moks}"], set(), set()),
     "no-network-policy": (["--set", "networkPolicy.enabled=false"], set(), set()),
@@ -61,7 +64,7 @@ SCENARIOS = {
                    {"terminal", "migrate", "opensearch", "backup", "database"}, set()),
 }
 # What each optional Application needs before it may leave optional/, for the project checks.
-OPTIONAL_SCENARIO = {"migrate": "split", "opensearch": "rag-opensearch-bundled", "backup": "backup"}
+OPTIONAL_SCENARIO = {"migrate": "split", "opensearch": "rag-opensearch-bundled", "backup": "backup", "reranker": "reranker-on"}
 ENVIRONMENTS = {
     "minikube": {
         "prefix": "moks", "project": "moks", "projectFile": "minikube/project.yaml", "values": "values-minikube.yaml", "legacy": "legacy/application.yaml",

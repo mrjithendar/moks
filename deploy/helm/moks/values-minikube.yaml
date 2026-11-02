@@ -135,3 +135,7 @@ logCollector:
 
 ecrRefresh:
   enabled: true         # also add "moks" to TARGET_NAMESPACES of the ecr-refresh CronJob (tools repo)
+
+# Off until docs/RERANKING.md's gates pass on real questions. Set reranker.enabled and image.digest to run it.
+reranker:
+  enabled: false

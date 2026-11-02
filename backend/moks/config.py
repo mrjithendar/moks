@@ -67,6 +67,15 @@ class Settings(BaseSettings):
     max_tokens_per_investigation: int = 60_000
     investigation_lease_seconds: int = 120
     investigation_max_attempts: int = 2  # a crashed run resumes this many times in all
+    rag_rerank_enabled: bool = False  # stays off until docs/RERANKING.md's gates pass on real questions
+    rag_rerank_url: str = ""          # internal Service only
+    rag_rerank_model: str = ""        # must match what the service reports, or results keep their existing order
+    rag_rerank_revision: str = ""
+    rag_rerank_candidates: int = 30   # rag/rerank.py holds the ceilings, whatever is configured here
+    rag_rerank_results: int = 12
+    rag_rerank_timeout_ms: int = 1500
+    rag_rerank_max_query_chars: int = 1000
+    rag_rerank_max_passage_chars: int = 2000
     rag_decompose: bool = False  # off: the rag dataset measured no gain from it. Turn on only with a dataset that shows one.
     rag_activation: str = "strict"  # strict: a reindex with any incomplete document fails. degraded: it activates and says so.
     evidence_max_age_seconds: int = 900  # older evidence cannot back a claim about the current state without saying so

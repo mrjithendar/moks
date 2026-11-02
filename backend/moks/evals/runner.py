@@ -22,7 +22,7 @@ from ..db import session_scope
 from ..models import AUTOMATION_USER_ID, Environment, EvalRun, Evidence, Investigation, RoleBinding
 from ..orchestrator.engine import Investigator
 from ..rag import access
-from . import gates
+from . import gates, rerank_eval
 from .fixture import FixtureKubernetes
 
 DATASETS = Path(__file__).parent / "datasets"
@@ -92,8 +92,8 @@ async def execute(run_id: uuid.UUID) -> dict[str, Any]:
         run = await db.get(EvalRun, run_id)
         dataset, mode = run.dataset, run.mode
     data = load(dataset)
-    if data.get("kind") in ("rag", "skills"):
-        out = await (gates.run_rag(data, run_id) if data["kind"] == "rag" else gates.run_skills(data))
+    if data.get("kind") in ("rag", "skills", "rerank"):
+        out = await {"rag": lambda: gates.run_rag(data, run_id), "skills": lambda: gates.run_skills(data), "rerank": lambda: rerank_eval.run(data, run_id)}[data["kind"]]()
         async with session_scope() as db:
             run = await db.get(EvalRun, run_id)
             run.results, run.score, run.status, run.finished_at = out["results"], Decimal(str(out["score"])), "completed", datetime.now(timezone.utc)
