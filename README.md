@@ -33,6 +33,7 @@ real API server.
 ```text
 backend/          FastAPI app, worker, connectors, tools, orchestrator, migrations, tests
 frontend/         React portal
+reranker/         Optional internal PyTorch reranking service (docs/RERANKING.md)
 deploy/helm/moks  Helm chart (values-minikube.yaml for mk4; values-eks.yaml is unused since roboshop-demo was deleted)
 deploy/argocd     AppProjects, root and child Applications per environment
 deploy/secrets    Secret templates (no real values)
@@ -56,6 +57,7 @@ docs/             Architecture, security/RBAC, connectors, operator guide, testi
 - [SRE skills (SKILL.md)](docs/SKILLS.md)
 - [FinOps](docs/FINOPS.md)
 - [Trustworthy reports and durable investigations](docs/INVESTIGATION_DURABILITY.md)
+- [Reranking](docs/RERANKING.md): optional internal PyTorch service, off by default
 - [Testing and results](docs/TESTING.md)
 - [Status and limitations](docs/LIMITATIONS.md)
 

@@ -1,0 +1,7 @@
+tests
+__pycache__
+.pytest_cache
+*.md
+benchmark.py
+requirements-test.txt
+pytest.ini

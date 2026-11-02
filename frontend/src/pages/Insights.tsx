@@ -69,6 +69,7 @@ function IndexHealth({ s }: { s: any }) {
       </div>
       {s.index?.activation === "degraded" && <div className="alert warn small">The active index is degraded: {s.index.incomplete_documents} documents are incomplete. {s.index.incomplete_sample?.[0]?.reason}</div>}
       {e.missing > 0 && <div className="alert warn small">{e.missing} documents are searchable by keyword only because embedding failed. MOKS retries them on its own once embedding works.</div>}
+      <RerankingStatus />
       {s.reindex_progress && <div className="small muted">Reindex running: {s.reindex_progress.chunks} of {s.reindex_progress.of} passages copied.</div>}
     </div>
   );
@@ -294,6 +295,27 @@ function SourceDetail({ s, onClose }: { s: any; onClose: () => void }) {
         </Drawer>}
       </div>
     </Drawer>
+  );
+}
+
+/** Administrators only: the endpoint refuses others, and a refusal simply hides this. */
+function RerankingStatus() {
+  const { can } = useAuth();
+  const r = useLoad(() => (can("admin.llm") ? api<any>("/knowledge/reranking") : Promise.resolve(null)), []);
+  const d = r.data;
+  if (!d) return null;
+  const fallbacks = Object.entries(d.stats?.fallbacks ?? {}) as [string, number][];
+  const m = d.evaluation?.metrics;
+  return (
+    <details className="stack tight">
+      <summary>Reranking <Badge kind={d.enabled ? "ok" : "neutral"}>{d.enabled ? "enabled" : "disabled"}</Badge>
+        {d.service && <> <Badge kind={d.service.ready ? "ok" : "warn"}>{d.service.ready ? "service ready" : d.service.reachable ? "service not ready" : "service unreachable"}</Badge></>}</summary>
+      {d.model ? <div className="small muted"><Truncate text={`${d.model} @ ${d.revision?.slice(0, 12)}`} mono /></div> : <div className="small muted">No model is configured. Search uses its existing order.</div>}
+      {d.stats && <div className="small">{d.stats.applied} of {d.stats.calls} searches reranked{d.stats.average_ms != null ? `, ${d.stats.average_ms} ms on average, ${d.stats.average_candidates} candidates` : ""}. {d.stats.scope}.</div>}
+      {fallbacks.length > 0 && <div className="small">Fallbacks: {fallbacks.map(([k, v]) => `${k.replace(/_/g, " ")} ${v}`).join(", ")}{d.stats.circuit_open ? ". Paused after repeated failures." : ""}</div>}
+      {m && <div className="small">Latest comparison, off to on: nDCG@5 {m.off?.ndcg_at_5} to {m.on?.ndcg_at_5}, MRR {m.off?.mrr} to {m.on?.mrr}, recall@5 {m.off?.recall_at_5} to {m.on?.recall_at_5}, p95 {m.latency_ms?.off?.p95} to {m.latency_ms?.on?.p95} ms, {m.truncated_passages} passages partly scored. {m.recommendation}.</div>}
+      <div className="small muted">{d.note}</div>
+    </details>
   );
 }
 

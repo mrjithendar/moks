@@ -145,3 +145,7 @@ Not verified:
 - Injection evaluation checks data framing, skill integrity and tool policy with no live model, so model behavior under injection is not measured.
 - Improvement proposals stop at review: approval does not create the runbook or skill version. An approved one is applied through the normal Git and publication path by hand.
 - Skills have no diff view or per-environment readiness history in the UI, and AI drafting of skill changes was not built.
+
+## Reranking
+
+Off by default. See [RERANKING.md](RERANKING.md) for what was measured. The container image has never been built, the service has never run on a cluster, and its quality numbers come from a small synthetic dataset with keyword candidates only.

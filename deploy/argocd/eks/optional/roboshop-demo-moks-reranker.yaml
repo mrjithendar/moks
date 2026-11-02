@@ -1,5 +1,4 @@
-# Bundled OpenSearch. Move this file to ../apps/ when rag.backend is reranker without
-# rag.reranker.url, and not before. Amazon OpenSearch Service and Pinecone are never Applications.
+# Internal reranking service. Move this file to ../apps/ only when reranker.enabled is true.
 # Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
 apiVersion: argoproj.io/v1alpha1
 kind: Application

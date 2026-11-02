@@ -222,7 +222,7 @@ def check_invariants(where: str, docs: dict, owners: dict) -> None:
                 check(("ConfigMap", configmap) in names, f"{where}: {label(k)} needs ConfigMap {configmap}, which no group renders", "references")
             if refs["serviceAccount"]:
                 check(("ServiceAccount", refs["serviceAccount"]) in names, f"{where}: {label(k)} needs ServiceAccount {refs['serviceAccount']}, which no group renders", "references")
-    checksums = {pod_spec(d)[0].get("annotations", {}).get("checksum/config") for d in docs.values() if pod_spec(d) and d["kind"] == "Deployment"}
+    checksums = {pod_spec(d)[0].get("annotations", {}).get("checksum/config") for d in docs.values() if pod_spec(d) and d["kind"] == "Deployment" and references(pod_spec(d)[1])["configMaps"]}
     check(len(checksums) <= 1, f"{where}: consumers disagree on checksum/config", "checksums")
     for name in ("moks-config", "moks-seed", "moks-skills"):
         k = ("", "ConfigMap", "moks", name)

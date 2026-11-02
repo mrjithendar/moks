@@ -25,6 +25,7 @@ Three more wait in `deploy/argocd/<environment>/optional/`, because each would b
 |---|---|---|
 | migrate | `moks-migrate`, `roboshop-demo-moks-migrate` | `secrets.split` is true |
 | opensearch | `moks-opensearch`, `roboshop-demo-moks-opensearch` | `rag.backend` is `opensearch` with no `rag.opensearch.url` |
+| reranker | `moks-reranker`, `roboshop-demo-moks-reranker` | `reranker.enabled` is true (docs/RERANKING.md) |
 | backup | `moks-backup`, `roboshop-demo-moks-backup` | `backup.enabled` is true |
 
 `scripts/validate-argocd-split.py` fails if a group renders something and has no Application in `apps/`, or the reverse. Velero stays its own Application in `deploy/argocd/velero.yaml`. Pinecone and Amazon OpenSearch Service are external, so neither is an Application. The unrelated RoboShop shopping widget keeps the names `moks` and `roboshop-demo-moks`.

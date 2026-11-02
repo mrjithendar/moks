@@ -120,15 +120,17 @@ async def test_an_exact_identifier_stays_first():
 
 
 async def test_a_superseded_document_stays_below_a_current_one():
-    word = f"finch{uuid.uuid4().hex[:6]}"
+    word = "finch" + "".join(chr(97 + int(c, 16)) for c in uuid.uuid4().hex[:6])
     sid = await source()
     await write(sid, "old.md", f"---\nsuperseded_by: new.md\n---\n# Old\n{word} procedure text")
     await write(sid, "new.md", f"# New\n{word} procedure text current")
 
-    def prefer_old(ids):
-        return {c: float(i) for i, c in enumerate(ids)}
-    states = [x["freshness"]["state"] for x in (await find(word, reranker=client(ok(prefer_old))))["results"]]
-    assert states.index("superseded") == len(states) - 1
+    def prefer_old(req):
+        body = json.loads(req.content)  # a model has no idea a document was replaced
+        return httpx.Response(200, json={"results": [{"id": c["id"], "score": 50.0 if "Old" in c["text"] else -50.0} for c in body["candidates"]], "model": {"id": MODEL, "revision": REV}, "duration_ms": 1,
+                                         "truncation": {"truncated_ids": []}})
+    r = await find(word, reranker=client(prefer_old))
+    assert r["reranking"]["state"] == "applied" and [x["freshness"]["state"] for x in r["results"]][-1] == "superseded" and r["results"][0]["freshness"]["state"] != "superseded"
 
 
 async def test_diversity_survives_reranking():
@@ -217,6 +219,14 @@ async def test_unparseable_or_non_finite_output_is_refused(bad):
     await corpus(word, 1)
     r = await find(word, reranker=client(lambda req: httpx.Response(200, text=bad)))
     assert r["reranking"]["reason"] == "invalid_output"
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+async def test_a_non_finite_score_on_a_valid_id_is_refused(bad):
+    def handle(req):
+        cid = json.loads(req.content)["candidates"][0]["id"]
+        return httpx.Response(200, text='{"results": [{"id": "%s", "score": %s}], "model": {"id": "%s", "revision": "%s"}}' % (cid, bad, MODEL, REV))
+    assert (await client(handle).rerank("q", [("a", "t")])).reason == "invalid_output"
 
 
 async def test_a_changed_model_revision_is_not_trusted():

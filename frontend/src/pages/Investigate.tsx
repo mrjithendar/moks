@@ -449,8 +449,22 @@ export function EvidenceBody({ e, grafana }: { e: any; grafana?: string | null }
   );
 }
 
+/** Ranking detail stays out of the report. It is here for anyone already allowed to open this evidence. */
+function RankingDetail({ source }: { source: any }) {
+  const r = source?.reranking;
+  if (!r) return null;
+  const rows = Object.values(source.ranking ?? {}) as any[];
+  return (
+    <details className="small"><summary>Ranking detail</summary>
+      <div>{r.state === "applied" ? `Reranked ${r.candidates} passages with ${r.model} in ${r.inference_ms} ms.` : `Existing order kept (${String(r.reason).replace(/_/g, " ")}).`}{r.truncated_passages ? ` ${r.truncated_passages} passages were only partly scored.` : ""}</div>
+      {rows.length > 0 && <ul>{rows.slice(0, 12).map((x, i) => <li key={i}>position {x.before} to {x.after}{x.pinned ? ", exact identifier kept ahead" : ""}{x.partially_scored ? ", partly scored" : ""}</li>)}</ul>}
+      <div className="muted">{r.note}</div>
+    </details>
+  );
+}
+
 export function EvidenceDrawer({ e, onClose, grafana }: { e: any; onClose: () => void; grafana?: string | null }) {
-  return <Drawer title={`Evidence ${e.ref}`} onClose={onClose}><EvidenceBody e={e} grafana={grafana} /></Drawer>;
+  return <Drawer title={`Evidence ${e.ref}`} onClose={onClose}><EvidenceBody e={e} grafana={grafana} /><RankingDetail source={e.source} /></Drawer>;
 }
 
 export function EvidenceData({ tool, data }: { tool: string; data: any }) {

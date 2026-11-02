@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EvidenceKind, Report } from "./Investigate";
+import { EvidenceDrawer, EvidenceKind, Report } from "./Investigate";
 
 const base = { summary: "s", observed_facts: [], suspected_causes: [], missing_evidence: [], next_steps: [], proposed_remediation: [], generated_by: "llm" };
 const show = (over: any) => render(<MemoryRouter><Report report={{ ...base, ...over }} onCite={vi.fn()} /></MemoryRouter>);
@@ -55,5 +55,19 @@ describe("how a report says what it knows", () => {
   it("shows when a skill did not finish", () => {
     show({ skill_runs: [{ skill: "s", version: "1", digest: "abc", reasons: [], steps: [], outcome: "incomplete", gaps: ["step k8s_nodes skipped"] }] });
     expect(screen.getByText("incomplete")).toBeTruthy();
+  });
+
+  it("keeps ranking detail in the evidence view, and calls a score what it is", () => {
+    const e = { ref: "E1", tool: "kb_search", ok: true, kind: "documentation", args: {}, summary: "s", collected_at: "2026-11-02T00:00:00Z", duration_ms: 1, scope: { environment: "e", namespace: "n", from: "2026-11-02T00:00:00Z", to: "2026-11-02T01:00:00Z" }, source: { reranking: { state: "applied", candidates: 3, model: "m", inference_ms: 9, truncated_passages: 1, note: "They are not probabilities" }, ranking: { a: { before: 4, after: 1, pinned: false, partially_scored: true } } } };
+    render(<MemoryRouter><EvidenceDrawer e={e} onClose={vi.fn()} /></MemoryRouter>);
+    expect(screen.getByText("Ranking detail")).toBeTruthy();
+    expect(screen.getByText(/position 4 to 1/)).toBeTruthy();
+    expect(screen.getByText(/not probabilities/)).toBeTruthy();
+  });
+
+  it("says plainly when the existing order was kept", () => {
+    const e = { ref: "E1", tool: "kb_search", ok: true, kind: "documentation", args: {}, summary: "s", collected_at: "2026-11-02T00:00:00Z", duration_ms: 1, scope: { environment: "e", namespace: "n", from: "2026-11-02T00:00:00Z", to: "2026-11-02T01:00:00Z" }, source: { reranking: { state: "fallback", reason: "circuit_open", note: "n" } } };
+    render(<MemoryRouter><EvidenceDrawer e={e} onClose={vi.fn()} /></MemoryRouter>);
+    expect(screen.getByText(/Existing order kept \(circuit open\)/)).toBeTruthy();
   });
 });

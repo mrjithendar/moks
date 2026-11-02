@@ -1,0 +1,1010 @@
+{
+ "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+ "revision": "233902d25c440f23af6f7d6e94d2946bac0bee0a",
+ "host": "arm64 macOS, torch 2.15.0, 2 threads, Python 3.11",
+ "gates": [
+  {
+   "name": "authorization",
+   "state": "passed",
+   "passed": true,
+   "checked": 1,
+   "evidence": "live",
+   "failures": []
+  },
+  {
+   "name": "citations",
+   "state": "passed",
+   "passed": true,
+   "checked": 102,
+   "evidence": "live",
+   "failures": []
+  },
+  {
+   "name": "exact_identifier",
+   "state": "passed",
+   "passed": true,
+   "checked": 2,
+   "evidence": "live",
+   "failures": []
+  },
+  {
+   "name": "fallback",
+   "state": "passed",
+   "passed": true,
+   "checked": 30,
+   "evidence": "live",
+   "failures": []
+  },
+  {
+   "name": "no_answer",
+   "state": "passed",
+   "passed": true,
+   "checked": 3,
+   "evidence": "live",
+   "failures": []
+  },
+  {
+   "name": "ndcg_gain",
+   "state": "passed",
+   "value": 0.0656,
+   "passed": true,
+   "checked": 30,
+   "evidence": "live",
+   "failures": []
+  },
+  {
+   "name": "mrr_gain",
+   "state": "passed",
+   "value": 0.0833,
+   "passed": true,
+   "checked": 30,
+   "evidence": "live",
+   "failures": []
+  },
+  {
+   "name": "no_recall_loss",
+   "state": "passed",
+   "value": 0.0185,
+   "passed": true,
+   "checked": 30,
+   "evidence": "live",
+   "failures": []
+  },
+  {
+   "name": "diversity_kept",
+   "state": "passed",
+   "value": 1.0,
+   "passed": true,
+   "checked": 30,
+   "evidence": "live",
+   "failures": []
+  },
+  {
+   "name": "added_latency",
+   "state": "passed",
+   "value": 64.2,
+   "passed": true,
+   "checked": 30,
+   "evidence": "live",
+   "failures": []
+  }
+ ],
+ "metrics": {
+  "on": {
+   "mrr": 1.0,
+   "ndcg_at_5": 0.9945,
+   "recall_at_3": 0.9815,
+   "recall_at_5": 1.0
+  },
+  "off": {
+   "mrr": 0.9167,
+   "ndcg_at_5": 0.9289,
+   "recall_at_3": 0.9444,
+   "recall_at_5": 0.9815
+  },
+  "cases": 30,
+  "delta": {
+   "mrr": 0.0833,
+   "ndcg_at_5": 0.0656,
+   "recall_at_3": 0.0371,
+   "recall_at_5": 0.0185
+  },
+  "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+  "cost_usd": 0.0,
+  "revision": "233902d25c440f23af6f7d6e94d2946bac0bee0a",
+  "diversity": {
+   "on": 1.0,
+   "off": 1.0
+  },
+  "cost_basis": "local inference; no paid model is called",
+  "latency_ms": {
+   "on": {
+    "p50": 35.0,
+    "p95": 68.8
+   },
+   "off": {
+    "p50": 2.7,
+    "p95": 4.6
+   }
+  },
+  "by_category": {
+   "exact": {
+    "cases": 2,
+    "on_ndcg_at_5": 1.0,
+    "off_ndcg_at_5": 1.0
+   },
+   "stale": {
+    "cases": 1,
+    "on_ndcg_at_5": 1.0,
+    "off_ndcg_at_5": 1.0
+   },
+   "argocd": {
+    "cases": 4,
+    "on_ndcg_at_5": 1.0,
+    "off_ndcg_at_5": 0.9078
+   },
+   "similar": {
+    "cases": 7,
+    "on_ndcg_at_5": 1.0,
+    "off_ndcg_at_5": 1.0
+   },
+   "conflict": {
+    "cases": 1,
+    "on_ndcg_at_5": 1.0,
+    "off_ndcg_at_5": 1.0
+   },
+   "kubernetes": {
+    "cases": 7,
+    "on_ndcg_at_5": 0.9786,
+    "off_ndcg_at_5": 0.7784
+   },
+   "aws_identity": {
+    "cases": 3,
+    "on_ndcg_at_5": 1.0,
+    "off_ndcg_at_5": 1.0
+   },
+   "long_passage": {
+    "cases": 1,
+    "on_ndcg_at_5": 1.0,
+    "off_ndcg_at_5": 1.0
+   },
+   "authorization": {
+    "cases": 1,
+    "on_ndcg_at_5": 1.0,
+    "off_ndcg_at_5": 1.0
+   }
+  },
+  "inference_ms": {
+   "p50": 20.8,
+   "p95": 39.7
+  },
+  "recommendation": "eligible to enable",
+  "truncated_passages": 0
+ },
+ "results": [
+  {
+   "on": [
+    "crashloop",
+    "oom",
+    "rollback-new",
+    "pod-identity",
+    "dns"
+   ],
+   "off": [
+    "crashloop",
+    "oom",
+    "rollback-new",
+    "dns",
+    "pod-identity"
+   ],
+   "case": "k8s-restart",
+   "reason": null,
+   "category": "kubernetes",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "oom",
+    "crashloop",
+    "selector",
+    "irsa",
+    "pod-identity"
+   ],
+   "off": [
+    "crashloop",
+    "pod-identity",
+    "pending",
+    "oom",
+    "errcode"
+   ],
+   "case": "k8s-exit137",
+   "reason": null,
+   "category": "kubernetes",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 0.25,
+    "ndcg_at_5": 0.431,
+    "recall_at_3": 0.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "pending",
+    "selector",
+    "readiness",
+    "crashloop",
+    "irsa"
+   ],
+   "off": [
+    "pending",
+    "pod-identity",
+    "crashloop",
+    "selector",
+    "readiness"
+   ],
+   "case": "k8s-notscheduled",
+   "reason": null,
+   "category": "kubernetes",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "readiness",
+    "crashloop",
+    "pending",
+    "pod-identity",
+    "selector"
+   ],
+   "off": [
+    "pod-identity",
+    "readiness",
+    "pending",
+    "crashloop",
+    "irsa"
+   ],
+   "case": "k8s-503",
+   "reason": null,
+   "category": "kubernetes",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 0.85,
+    "recall_at_3": 0.5,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 0.5,
+    "ndcg_at_5": 0.387,
+    "recall_at_3": 0.5,
+    "recall_at_5": 0.5
+   }
+  },
+  {
+   "on": [
+    "imagepull",
+    "crashloop",
+    "oom",
+    "ecr-denied",
+    "irsa"
+   ],
+   "off": [
+    "imagepull",
+    "oom",
+    "irsa",
+    "crashloop",
+    "ecr-denied"
+   ],
+   "case": "k8s-registry",
+   "reason": null,
+   "category": "kubernetes",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "dns",
+    "argo-shared",
+    "readiness",
+    "selector",
+    "conflict-a"
+   ],
+   "off": [
+    "selector",
+    "dns",
+    "readiness",
+    "pod-identity",
+    "conflict-a"
+   ],
+   "case": "k8s-names",
+   "reason": null,
+   "category": "kubernetes",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 0.5,
+    "ndcg_at_5": 0.631,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "netpol",
+    "s3-denied",
+    "crashloop",
+    "irsa",
+    "rollback-old"
+   ],
+   "off": [
+    "netpol",
+    "s3-denied",
+    "irsa",
+    "crashloop",
+    "rollback-old"
+   ],
+   "case": "k8s-timeouts",
+   "reason": null,
+   "category": "kubernetes",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "irsa",
+    "pod-identity",
+    "selector",
+    "readiness",
+    "pending"
+   ],
+   "off": [
+    "irsa",
+    "pod-identity",
+    "crashloop",
+    "pending",
+    "selector"
+   ],
+   "case": "aws-webidentity",
+   "reason": null,
+   "category": "aws_identity",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "pod-identity",
+    "irsa",
+    "readiness",
+    "pending",
+    "selector"
+   ],
+   "off": [
+    "pod-identity",
+    "s3-denied",
+    "pending",
+    "readiness",
+    "crashloop"
+   ],
+   "case": "aws-wrong-identity",
+   "reason": null,
+   "category": "aws_identity",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "s3-denied",
+    "opensearch-disk",
+    "crashloop",
+    "readiness",
+    "selector"
+   ],
+   "off": [
+    "s3-denied",
+    "crashloop",
+    "pending",
+    "readiness",
+    "selector"
+   ],
+   "case": "aws-kms",
+   "reason": null,
+   "category": "aws_identity",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "argo-path",
+    "imagepull",
+    "long-tail",
+    "argo-project"
+   ],
+   "off": [
+    "argo-path",
+    "argo-project",
+    "imagepull",
+    "long-tail"
+   ],
+   "case": "argo-comparison",
+   "reason": null,
+   "category": "argocd",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "argo-shared",
+    "argo-project",
+    "argo-sync",
+    "rollback-new",
+    "cert"
+   ],
+   "off": [
+    "argo-project",
+    "argo-shared",
+    "rollback-new",
+    "cert",
+    "ecr-denied"
+   ],
+   "case": "argo-two-owners",
+   "reason": null,
+   "category": "argocd",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 0.5,
+    "ndcg_at_5": 0.631,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "argo-sync",
+    "argo-shared",
+    "argo-project",
+    "rollback-new",
+    "conflict-b"
+   ],
+   "off": [
+    "argo-sync",
+    "rollback-new",
+    "argo-shared",
+    "crashloop",
+    "prom-targets"
+   ],
+   "case": "argo-loop",
+   "reason": null,
+   "category": "argocd",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "argo-project"
+   ],
+   "off": [
+    "argo-project"
+   ],
+   "case": "argo-denied",
+   "reason": null,
+   "category": "argocd",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "pg-disk"
+   ],
+   "off": [
+    "pg-disk"
+   ],
+   "case": "similar-disk-pg",
+   "reason": null,
+   "category": "similar",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "opensearch-disk",
+    "s3-denied",
+    "selector",
+    "errcode",
+    "dns"
+   ],
+   "off": [
+    "opensearch-disk",
+    "dns",
+    "s3-denied",
+    "selector",
+    "errcode"
+   ],
+   "case": "similar-disk-os",
+   "reason": null,
+   "category": "similar",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "loki-limits",
+    "crashloop",
+    "dns",
+    "readiness",
+    "cert"
+   ],
+   "off": [
+    "loki-limits",
+    "crashloop",
+    "dns",
+    "readiness",
+    "argo-project"
+   ],
+   "case": "similar-429",
+   "reason": null,
+   "category": "similar",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "ecr-denied",
+    "imagepull",
+    "irsa",
+    "pod-identity"
+   ],
+   "off": [
+    "ecr-denied",
+    "irsa",
+    "imagepull",
+    "pod-identity"
+   ],
+   "case": "similar-ecr",
+   "reason": null,
+   "category": "similar",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "prom-targets",
+    "selector",
+    "readiness",
+    "conflict-a",
+    "argo-path"
+   ],
+   "off": [
+    "prom-targets",
+    "selector",
+    "pod-identity",
+    "conflict-a",
+    "argo-path"
+   ],
+   "case": "similar-up",
+   "reason": null,
+   "category": "similar",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "pg-conn",
+    "netpol",
+    "selector",
+    "errcode"
+   ],
+   "off": [
+    "pg-conn",
+    "netpol",
+    "errcode",
+    "selector"
+   ],
+   "case": "similar-pg",
+   "reason": null,
+   "category": "similar",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "cert"
+   ],
+   "off": [
+    "cert"
+   ],
+   "case": "similar-cert",
+   "reason": null,
+   "category": "similar",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "rollback-new",
+    "rollback-old"
+   ],
+   "off": [
+    "rollback-new",
+    "rollback-old"
+   ],
+   "case": "stale-rollback",
+   "reason": null,
+   "category": "stale",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "conflict-b",
+    "conflict-a",
+    "argo-shared",
+    "cert",
+    "readiness"
+   ],
+   "off": [
+    "conflict-a",
+    "conflict-b",
+    "argo-project",
+    "argo-shared",
+    "readiness"
+   ],
+   "case": "conflict-redis",
+   "reason": null,
+   "category": "conflict",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "long-tail"
+   ],
+   "off": [
+    "long-tail"
+   ],
+   "case": "long-passage",
+   "reason": null,
+   "category": "long_passage",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "errcode"
+   ],
+   "off": [
+    "errcode"
+   ],
+   "case": "exact-code",
+   "reason": null,
+   "category": "exact",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "argo-shared"
+   ],
+   "off": [
+    "argo-shared"
+   ],
+   "case": "exact-flag",
+   "reason": null,
+   "category": "exact",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "crashloop"
+   ],
+   "off": [
+    "crashloop"
+   ],
+   "case": "forbidden-match",
+   "reason": null,
+   "category": "authorization",
+   "reranking": "applied",
+   "on_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   },
+   "off_measures": {
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0
+   }
+  },
+  {
+   "on": [
+    "errcode"
+   ],
+   "off": [
+    "errcode"
+   ],
+   "case": "none-identifier",
+   "reason": null,
+   "category": "no_answer",
+   "reranking": "applied"
+  },
+  {
+   "on": [],
+   "off": [],
+   "case": "none-unrelated",
+   "reason": null,
+   "category": "no_answer",
+   "reranking": null
+  },
+  {
+   "on": [],
+   "off": [],
+   "case": "none-empty",
+   "reason": null,
+   "category": "no_answer",
+   "reranking": null
+  }
+ ]
+}

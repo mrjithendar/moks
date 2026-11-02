@@ -197,11 +197,18 @@ jobs:
         run: |
           IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:${{ github.sha }}"
           docker build --build-arg GIT_COMMIT=${{ github.sha }} -t smoke .
-          docker run -d --name smoke -e RERANKER_TOKEN=ci -e RERANKER_METRICS_PORT=0 -p 8090:8090 --network none --read-only --tmpfs /tmp smoke
-          docker rm -f smoke
-          docker run -d --name smoke -e RERANKER_TOKEN=ci -e RERANKER_METRICS_PORT=0 -p 8090:8090 --read-only --tmpfs /tmp smoke
-          for i in $(seq 1 60); do curl -fsS localhost:8090/readyz && break; sleep 2; done
-          curl -fsS localhost:8090/readyz
+          # No network, so a runtime download would fail here rather than in production.
+          docker run -d --name smoke -e RERANKER_TOKEN=ci -e RERANKER_METRICS_PORT=0 --network none --read-only --tmpfs /tmp --user 10001:10001 smoke
+          docker exec smoke python -c "
+          import time, urllib.request
+          for _ in range(60):
+              try:
+                  print(urllib.request.urlopen('http://127.0.0.1:8090/readyz').read()); break
+              except Exception:
+                  time.sleep(2)
+          else:
+              raise SystemExit('never ready')
+          "
           docker rm -f smoke
           docker images smoke --format 'image size {{ .Size }}' >> "$GITHUB_STEP_SUMMARY"
           docker buildx build --platform linux/arm64,linux/amd64 --provenance=false --build-arg GIT_COMMIT=${{ github.sha }} --metadata-file meta.json --push -t "$IMAGE" .

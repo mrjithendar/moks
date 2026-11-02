@@ -275,3 +275,51 @@ def test_configured_egress_is_exactly_what_was_listed():
     docs = render("values-minikube.yaml", *TERMINAL, "terminal.network.egress[0].cidr=0.0.0.0/0", "terminal.network.egress[0].except={10.0.0.0/8,169.254.0.0/16}", "terminal.network.egress[0].ports={443}")
     rule = of(docs, "NetworkPolicy", "terminals")["spec"]["egress"][-1]
     assert rule["to"][0]["ipBlock"]["except"] == ["10.0.0.0/8", "169.254.0.0/16"] and rule["ports"] == [{"port": 443, "protocol": "TCP"}]
+
+
+RERANKER = ("reranker.enabled=true", "reranker.image.digest=sha256:" + "b" * 64)
+
+
+@pytest.mark.parametrize("values", ["values-minikube.yaml", "values-eks.yaml"])
+def test_reranking_is_absent_by_default(values):
+    docs = render(values, *([] if "minikube" in values else ["image.tag=ci"]))
+    assert not [d for d in docs if "reranker" in d["metadata"]["name"]]
+    assert not [k for d in docs if d["kind"] == "ConfigMap" for k in (d.get("data") or {}) if "RERANK" in k]
+
+
+def test_deploying_the_service_does_not_turn_it_on_for_search():
+    config = next(d for d in render("values-minikube.yaml", *RERANKER) if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "moks-config")["data"]
+    assert config["MOKS_RAG_RERANK_ENABLED"] == "false" and config["MOKS_RAG_RERANK_REVISION"] and config["MOKS_RAG_RERANK_URL"].startswith("http://moks-reranker.moks.svc")
+
+
+def test_the_reranker_has_no_public_route_and_runs_restricted():
+    docs = render("values-minikube.yaml", *RERANKER)
+    assert not [d for d in docs if d["kind"] in ("Ingress", "VirtualService") and "reranker" in str(d)]
+    assert of(docs, "Service", "moks-reranker")["spec"]["type"] == "ClusterIP"
+    pod = of(docs, "Deployment", "moks-reranker")["spec"]["template"]["spec"]
+    c = pod["containers"][0]
+    assert pod["automountServiceAccountToken"] is False and pod["securityContext"]["runAsNonRoot"] is True and pod["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
+    assert c["securityContext"]["readOnlyRootFilesystem"] is True and c["securityContext"]["allowPrivilegeEscalation"] is False and c["securityContext"]["capabilities"]["drop"] == ["ALL"]
+    assert c["resources"]["limits"]["memory"] and "@sha256:" in c["image"]
+    assert {e["name"] for e in c["env"]} >= {"RERANKER_TOKEN", "RERANKER_THREADS"} and "envFrom" not in c  # never the database credentials
+
+
+def test_only_the_api_and_worker_reach_it_and_it_reaches_nothing():
+    docs = render("values-minikube.yaml", *RERANKER)
+    policy = of(docs, "NetworkPolicy", "moks-reranker")["spec"]
+    assert policy["egress"] == [] and set(policy["policyTypes"]) == {"Ingress", "Egress"}
+    callers = [p["podSelector"]["matchLabels"] for p in policy["ingress"][0]["from"]]
+    assert callers == [{"app": "moks", "component": "api"}, {"app": "moks", "component": "worker"}]
+    assert any(r.get("to") == [{"podSelector": {"matchLabels": {"app": "moks-reranker"}}}] for r in of(docs, "NetworkPolicy", "moks")["spec"]["egress"])
+
+
+def test_the_reranker_runs_a_pinned_image_or_not_at_all():
+    with pytest.raises(subprocess.CalledProcessError):
+        render("values-minikube.yaml", "reranker.enabled=true")
+
+
+def test_the_mesh_allows_only_the_callers():
+    docs = render("values-eks.yaml", *RERANKER)
+    rule = of(docs, "AuthorizationPolicy", "moks-reranker")["spec"]["rules"][0]
+    assert rule["to"][0]["operation"]["ports"] == ["8090"] and all(p.startswith("cluster.local/ns/moks/sa/") for p in rule["from"][0]["source"]["principals"])
+
