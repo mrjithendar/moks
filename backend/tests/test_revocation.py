@@ -149,7 +149,7 @@ async def test_nothing_is_sent_to_the_llm_after_revocation():
             raise AccessRevoked("gone")
     inv.guard = Guard()
     with pytest.raises(AccessRevoked):
-        await inv._llm(Boom(), None, "s", "u", 10)
+        await inv._llm(Boom(), None, "s", "u", 10, 1)
 
 
 async def test_open_stream_ends_when_access_is_lost(client, monkeypatch):

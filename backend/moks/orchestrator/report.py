@@ -7,12 +7,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from . import evidence as ev
+
 REF = re.compile(r"^E\d{1,3}$")
 
 
 class Fact(BaseModel):
     statement: str = Field(max_length=1000)
     evidence: list[str] = Field(default_factory=list)
+    kind: str = "observation"  # observation | collection | documentation | historical; set by validate_claims, never by the model
+    qualifiers: list[str] = Field(default_factory=list)
 
 
 class Cause(BaseModel):
@@ -22,6 +26,7 @@ class Cause(BaseModel):
     reasoning: str = Field(default="", max_length=1200)
     verified: bool = False  # set only by verify_causes; never by the model
     contradicting: list[str] = Field(default_factory=list)  # evidence refs against this cause
+    origin: str = "model"  # model | rules | demoted_fact, the last being a statement that could not stand as a fact
 
 
 class Remediation(BaseModel):
@@ -44,7 +49,9 @@ class Report(BaseModel):
     generated_by: Literal["llm", "rules"] = "rules"
     notes: list[str] = Field(default_factory=list)
     validation: dict[str, Any] = Field(default_factory=dict)
-    verified_causes: list[dict[str, Any]] = Field(default_factory=list)
+    verified_causes: list[dict[str, Any]] = Field(default_factory=list)  # verified configuration defects only
+    verified_findings: list[dict[str, Any]] = Field(default_factory=list)  # every check that passed, by category
+    conflicts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -65,48 +72,109 @@ def parse_json_object(text: str) -> dict[str, Any]:
     return obj
 
 
-_CONFIRMED = re.compile(r"(?i)\b(root cause (is|was) confirmed|confirmed root cause|has been (resolved|fixed)|is now (resolved|fixed|healthy))\b")
-
-
 def validate_llm_report(raw: dict[str, Any], valid_refs: set[str], notes: list[str]) -> Report:
-    """Validate structure and citations. Facts must cite real evidence; uncited facts are dropped.
-    Causes keep only real citations and drop to low confidence without any."""
+    """Structure and the fields a model may not set. Whether its claims stand is validate_claims' job."""
     try:
         rep = Report.model_validate({**raw, "generated_by": "llm", "notes": notes})
     except ValidationError as exc:
         raise ValueError(f"report schema invalid: {exc.errors()[0]['msg']}") from None
-    dropped = 0
-    facts = []
     for f in rep.observed_facts:
-        f.evidence = [r for r in f.evidence if REF.match(r) and r in valid_refs]
-        if f.evidence:
-            facts.append(f)
-        else:
-            dropped += 1
-    rep.observed_facts = facts
-    downgraded = 0
+        f.kind, f.qualifiers = "observation", []
     for c in rep.suspected_causes:
-        c.verified = False
-        c.evidence = [r for r in c.evidence if REF.match(r) and r in valid_refs]
-        c.contradicting = [r for r in c.contradicting if REF.match(r) and r in valid_refs]
-        if not c.evidence and c.confidence != "low":
-            c.confidence = "low"
-            downgraded += 1
-        if _CONFIRMED.search(c.cause) or _CONFIRMED.search(c.reasoning):
-            c.reasoning = (c.reasoning + " (Not verified: MOKS has not confirmed this cause.)").strip()
+        c.verified, c.origin = False, "model"
     for r in rep.proposed_remediation:
         r.requires_approval = True
         r.executable = False
-    if _CONFIRMED.search(rep.summary):
-        rep.summary += " (Unverified: no change has been made or validated.)"
-    rep.validation = {"uncited_facts_dropped": dropped, "causes_downgraded": downgraded, "valid_refs": sorted(valid_refs, key=lambda r: int(r[1:]))}
+    rep.verified_causes, rep.verified_findings, rep.conflicts = [], [], []
+    rep.validation = {"valid_refs": sorted(valid_refs, key=lambda r: int(r[1:]))}
     return rep
 
 
-# Findings where the detector reads the fault itself, not a symptom of it. A selector that matches
-# no pods IS the broken selector; a crashloop is a symptom whose cause is still open.
+def _keep_refs(refs: list[str], ledger: ev.Ledger, *kinds: str) -> tuple[list[str], list[str]]:
+    kept = [r for r in refs if r in ledger.entries and ledger.entries[r].kind in kinds and ledger.in_scope(ledger.entries[r])]
+    return kept, [r for r in refs if r not in kept]
+
+
+def validate_claims(rep: Report, ledger: ev.Ledger, findings: list[dict], *, check_support: bool = True) -> Report:
+    """Every claim keeps only the citations that can show it. What cannot stand as a fact is qualified,
+    returned as a hypothesis, recorded as missing evidence or removed, and each decision is recorded.
+    `check_support` is off for the rule-based report, whose sentences come from the evidence itself."""
+    facts: list[Fact] = []
+    decisions: dict[str, list[dict]] = {"qualified": [], "hypothesis": [], "missing": [], "dropped": []}
+    demoted: list[Cause] = []
+    for f in rep.observed_facts:
+        v = ev.judge(f.statement, f.evidence, ledger, findings, check_support=check_support)
+        if v.disposition in ("accepted", "qualified"):
+            f.evidence, f.kind, f.qualifiers = v.refs, v.kind, v.reasons
+            facts.append(f)
+            if v.disposition == "qualified":
+                decisions["qualified"].append({"statement": f.statement[:200], "reasons": v.reasons})
+            continue
+        decisions[v.disposition].append({"statement": f.statement[:200], "reasons": v.reasons})
+        if v.disposition == "hypothesis":
+            demoted.append(Cause(cause=f.statement, evidence=v.refs, contradicting=v.contradicting, reasoning=f"Not shown as a fact: {'; '.join(v.reasons)}.", origin="demoted_fact"))
+        elif v.disposition == "missing":
+            rep.missing_evidence.append(f"Not established: {f.statement} ({'; '.join(v.reasons)}).")
+    rep.observed_facts = facts
+
+    downgraded = 0
+    for c in rep.suspected_causes:
+        c.verified = False
+        c.evidence, rejected = _keep_refs(c.evidence, ledger, ev.OBSERVATION, ev.INCOMPLETE, ev.HISTORICAL, ev.DOCUMENTATION)
+        c.contradicting = _keep_refs(c.contradicting, ledger, ev.OBSERVATION, ev.INCOMPLETE)[0]
+        live = [r for r in c.evidence if ledger.entries[r].kind in ev.LIVE]
+        if rejected:
+            decisions.setdefault("citations_removed", []).append({"statement": c.cause[:200], "refs": rejected})
+        if not live and c.confidence != "low":
+            c.confidence = "low"
+            downgraded += 1
+        if ev.CONFIRMED.search(c.cause) or ev.CONFIRMED.search(c.reasoning):
+            c.reasoning = (c.reasoning + " (Not verified: MOKS has not confirmed this cause.)").strip()
+            c.confidence = "low" if not live else c.confidence
+    rep.suspected_causes = rep.suspected_causes + demoted
+
+    kept, removed = [], []
+    for sentence in ev.sentences(rep.summary):
+        ok, why = ev.judge_sentence(sentence, ledger, findings) if check_support else (True, None)
+        if ok:
+            kept.append(sentence)
+        else:
+            removed.append({"sentence": sentence[:300], "reason": why})
+    if removed:
+        kept.append(_honest_ending(rep, ledger))
+    rep.summary = " ".join(kept) if kept else _honest_ending(rep, ledger)
+
+    rep.conflicts = ev.conflicts(ledger, findings)
+    for c in rep.conflicts:
+        rep.missing_evidence.append(f"Sources disagree: {c['detail']} ({', '.join(c['evidence'])}).")
+    for f in rep.observed_facts:
+        against = [c["subject"] for c in rep.conflicts if set(c["evidence"]) & set(f.evidence)]
+        if against:
+            f.qualifiers.append(f"another source disagrees about {against[0]}")
+    rep.validation |= {
+        "method": "deterministic: evidence kind, scope, freshness, coverage, findings and whether named identifiers occur in the citation. This is not proof a passage supports a claim.",
+        "model_assisted": False, "facts_kept": len(facts), "uncited_facts_dropped": len(decisions["dropped"]), "causes_downgraded": downgraded,
+        "decisions": decisions, "summary_sentences_removed": removed, "evidence_kinds": {r: e.kind for r, e in ledger.entries.items()},
+    }
+    return rep
+
+
+def _honest_ending(rep: Report, ledger: ev.Ledger) -> str:
+    """What may be said when a drafted summary could not stand."""
+    failed = ledger.by_kind(*ev.FAILED)
+    if rep.observed_facts:
+        tail = f" {len(failed)} evidence requests failed." if failed else ""
+        return f"The drafted summary went beyond the evidence; see the {len(rep.observed_facts)} facts and the hypotheses below.{tail}"
+    if failed:
+        return f"MOKS could not establish the state of the system: {len(failed)} evidence requests failed and nothing else supports a conclusion."
+    return "MOKS could not establish an answer from the evidence collected."
+
+
+# Failures a detector reads directly. A crashloop is one of these and its cause is still open.
+OBSERVED_FAILURES = {"crash_log_reason", "crashloop", "oomkilled", "image_pull", "unschedulable", "argocd_sync_failed"}
+# A wrong setting read from the object itself: a selector that matches no pods IS the broken selector.
+CONFIGURATION_DEFECTS = {"service_selector_mismatch", "config_ref_missing", "argocd_source_missing", "argocd_comparison_error"}
 ARGO_QUESTION = re.compile(r"(?i)\b(argo|gitops|syncs?\b)")
-SELF_EVIDENT = {"crash_log_reason", "service_selector_mismatch", "oomkilled", "image_pull", "unschedulable", "config_ref_missing", "argocd_source_missing", "argocd_comparison_error", "argocd_sync_failed"}
 
 
 def focus(question: str, findings: list[dict]) -> list[dict]:
@@ -114,14 +182,27 @@ def focus(question: str, findings: list[dict]) -> list[dict]:
     return sorted(findings, key=lambda f: not f["kind"].startswith("argocd_")) if ARGO_QUESTION.search(question) else findings
 
 
-def verify_causes(report: Report, findings: list[dict]) -> None:
-    """Verified means a deterministic check observed the fault directly. Model confidence never
-    counts: however sure the LLM is, its causes stay suspected."""
+def verify_causes(report: Report, findings: list[dict], ledger: ev.Ledger | None = None) -> None:
+    """Verified means a named check read the condition from a successful, in-scope observation of a
+    specific target. Model confidence never counts: however sure the LLM is, its causes stay suspected.
+    Observing a failure does not establish why it happened, so only a configuration defect goes in
+    verified_causes. Recovery is validated by action plans after a change, never by a report."""
     for c in report.suspected_causes:
         c.verified = False
-    report.verified_causes = [{"cause": f["title"], "detail": f.get("detail", ""), "evidence": f.get("evidence", []),
-                               "check": f"deterministic detector: {f['kind']}", "resources": f.get("resources", [])}
-                              for f in findings if f.get("kind") in SELF_EVIDENT and f.get("evidence")]
+    verified = []
+    for f in findings:
+        kind = f.get("kind")
+        category = "configuration_defect" if kind in CONFIGURATION_DEFECTS else "observed_failure" if kind in OBSERVED_FAILURES else None
+        refs = f.get("evidence") or []
+        if ledger is not None:
+            refs = [r for r in refs if r in ledger.entries and ledger.entries[r].kind in ev.LIVE and ledger.in_scope(ledger.entries[r])]
+        if not category or not refs:
+            continue
+        verified.append({"category": category, "check": f"deterministic detector: {kind}", "result": "condition present", "target": (f.get("resources") or [None])[0],
+                         "resources": f.get("resources", []), "namespace": f.get("namespace"), "at": ledger.as_of(refs) if ledger else None, "evidence": refs,
+                         "cause": f["title"], "detail": f.get("detail", "")})
+    report.verified_findings = verified
+    report.verified_causes = [v for v in verified if v["category"] == "configuration_defect"]
 
 
 def _scope_text(args: dict[str, Any]) -> str:
@@ -141,7 +222,7 @@ def rules_report(question: str, findings: list[dict], evidence: list[dict], note
         if f.get("suspected_cause"):
             causes.append(Cause(cause=f"{f['title']}: {f['suspected_cause']}",
                                 confidence="medium" if f["severity"] == "high" else "low", evidence=refs,
-                                reasoning="Rule-based detector match; not verified."))
+                                reasoning="Rule-based detector match; not verified.", origin="rules"))
         steps.extend(s for s in f.get("next_checks", []) if s not in steps)
         if f.get("remediation_hint"):
             remediation.append(Remediation(action=f["remediation_hint"], target=", ".join(f.get("resources", [])),
@@ -150,15 +231,21 @@ def rules_report(question: str, findings: list[dict], evidence: list[dict], note
                                            rollback="Revert the change through the same reviewed process."))
     # Baseline facts straight from evidence summaries, so the report always states what was checked.
     for e in evidence:
-        if e["ok"] and len(facts) < 16:
+        if e["ok"] and e.get("kind", ev.OBSERVATION) != ev.DOCUMENTATION and len(facts) < 16:
             facts.append(Fact(statement=f"{e['tool']} ({_scope_text(e['args'])}): {e['summary']}", evidence=[e["ref"]]))
     failed = [e for e in evidence if not e["ok"]]
     missing = [f"{e['tool']} failed ({e.get('error')}); its evidence is missing." for e in failed]
+    if any(e.get("truncated") for e in evidence):
+        missing.append("Some results were cut short, so a resource that is not listed may still exist.")
     if not findings:
         missing.append("No rule-based detector matched. Application-level metrics or logs may be needed to explain the symptom.")
     ok = [e for e in evidence if e["ok"]]
-    summary = (f"{len(findings)} problem(s) detected from {len(ok)} successful evidence queries."
-               if findings else f"No Kubernetes-level problems detected in {len(ok)} successful evidence queries.")
+    if findings:
+        summary = f"{len(findings)} problem(s) detected from {len(ok)} successful evidence queries."
+    elif failed:  # silence from a check that did not run says nothing about what it would have found
+        summary = f"No detector matched in {len(ok)} successful evidence queries, but {len(failed)} failed, so this does not show the system is healthy."
+    else:
+        summary = f"No Kubernetes-level problems detected in {len(ok)} successful evidence queries."
     argo = [f["resources"][0].partition("/")[2] for f in findings if f["kind"].startswith("argocd_")]
     if argo and ARGO_QUESTION.search(question):
         gone = sum(f["kind"] == "argocd_source_missing" for f in findings)

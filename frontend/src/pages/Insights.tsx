@@ -67,6 +67,7 @@ function IndexHealth({ s }: { s: any }) {
         <Stat value={o.documents_behind} label="documents behind the index" />
         <Stat value={s.pipeline.documents_behind} label={`on an older pipeline than v${s.pipeline.version}`} />
       </div>
+      {s.index?.activation === "degraded" && <div className="alert warn small">The active index is degraded: {s.index.incomplete_documents} documents are incomplete. {s.index.incomplete_sample?.[0]?.reason}</div>}
       {e.missing > 0 && <div className="alert warn small">{e.missing} documents are searchable by keyword only because embedding failed. MOKS retries them on its own once embedding works.</div>}
       {s.reindex_progress && <div className="small muted">Reindex running: {s.reindex_progress.chunks} of {s.reindex_progress.of} passages copied.</div>}
     </div>
@@ -234,6 +235,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
 
 function SourceDetail({ s, onClose }: { s: any; onClose: () => void }) {
   const { toast } = useFeedback();
+  const change = (path: string, method: string, body: any) => api(path, { method, body }).then(() => api(`/knowledge/documents/${open.id}`)).then(setOpen, (e) => toast(e.message, "bad"));
   const failures = useLoad(() => api<any>(`/knowledge/sources/${s.id}/failures`), [s.id]);
   const docs = useLoad(() => api<any[]>(`/knowledge/sources/${s.id}/documents`), [s.id]);
   const [email, setEmail] = useState("");
@@ -275,11 +277,18 @@ function SourceDetail({ s, onClose }: { s: any; onClose: () => void }) {
         {docs.data && <DataTable label="Documents" rows={docs.data} rowKey={(d) => d.id} onRow={(d) => api(`/knowledge/documents/${d.id}`).then(setOpen, (e) => toast(e.message, "bad"))} cols={[
           { key: "p", head: "Path", primary: true, cell: (d) => <Truncate text={d.path} mono /> },
           { key: "s", head: "State", status: true, cell: (d) => <Badge kind={d.status === "active" ? "ok" : "neutral"}>{d.status}</Badge> },
+          { key: "l", head: "Lifecycle", cell: (d) => <Badge kind={d.lifecycle === "active" ? "neutral" : "warn"}>{d.lifecycle}</Badge> },
+          { key: "t", head: "Review", cell: (d) => <Badge kind={d.trust === "reviewed" ? "ok" : "neutral"}>{d.trust}</Badge> },
           { key: "v", head: "Vectors", cell: (d) => d.vector_state },
           { key: "r", head: "Note", cell: (d) => <span className="small muted">{d.excluded_reason ?? (d.doc_state !== "current" ? d.doc_state : d.behind ? "index catching up" : "")}</span> },
         ]} />}
         {open && <Drawer title={open.path} onClose={() => setOpen(null)}>
           <div className="stack"><div className="small muted">{open.source} · revision {open.revision?.slice(0, 12) ?? "—"}{open.changed_revision ? ` · last changed in ${open.changed_revision.slice(0, 12)}` : ""}</div>
+            <div className="row small"><Badge kind={open.trust === "reviewed" ? "ok" : "neutral"}>{open.trust}</Badge><Badge kind={open.lifecycle === "active" ? "neutral" : "warn"}>{open.lifecycle}</Badge>
+              {open.trust !== "reviewed" && <button type="button" className="ghost small" onClick={() => change(`/knowledge/documents/${open.id}/review`, "POST", {})}>Mark reviewed</button>}
+              {open.lifecycle === "active" && <button type="button" className="ghost small" onClick={() => change(`/knowledge/documents/${open.id}/lifecycle`, "PUT", { state: "quarantined" })}>Quarantine</button>}
+              {open.lifecycle === "quarantined" && <button type="button" className="ghost small" onClick={() => change(`/knowledge/documents/${open.id}/lifecycle`, "PUT", { state: "active" })}>Release</button>}
+              {open.lifecycle === "active" && <button type="button" className="ghost small" onClick={() => change(`/knowledge/documents/${open.id}/lifecycle`, "PUT", { state: "archived" })}>Archive</button>}</div>
             {open.chunks.map((c: any) => <div key={c.ord} className="stack tight"><div className="small muted">{c.heading} · lines {c.lines[0]}-{c.lines[1]} · about {c.tokens} tokens</div><pre className="passage">{c.text}</pre></div>)}
             {!open.chunks.length && <Empty title="No text is stored for this document.">{open.excluded_reason}</Empty>}</div>
         </Drawer>}
@@ -287,6 +296,8 @@ function SourceDetail({ s, onClose }: { s: any; onClose: () => void }) {
     </Drawer>
   );
 }
+
+const GATE_TONE: Record<string, "ok" | "bad" | "warn" | "neutral"> = { passed: "ok", failed: "bad", skipped: "warn", not_applicable: "neutral" };
 
 // ---- FinOps -----------------------------------------------------------------------------------
 
@@ -535,8 +546,8 @@ export function Evals() {
         <div key={r.id} className="card" style={{ marginBottom: 12 }}>
           <div className="row between"><h2>{r.dataset} · {r.mode}</h2><span>{r.score != null ? <Badge kind={r.score >= 0.9 ? "ok" : r.score >= 0.7 ? "warn" : "bad"}>score {r.score.toFixed(3)}</Badge> : <Badge>{r.status}</Badge>} <Time iso={r.created_at} /></span></div>
           {r.gates?.length > 0 && <div className="stack">
-            <div className="row small">{r.gates.map((g: any) => <Badge key={g.name} kind={g.passed ? "ok" : "bad"}>{g.name.replace(/_/g, " ")}: {g.passed ? "passed" : "failed"}</Badge>)}</div>
-            {r.gates.filter((g: any) => !g.passed).flatMap((g: any) => g.failures.slice(0, 5).map((f: string) => <div key={g.name + f} className="alert error small">{g.name}: {f}</div>))}
+            <div className="row small">{r.gates.map((g: any) => <Badge key={g.name} kind={GATE_TONE[g.state ?? (g.passed ? "passed" : "failed")]}>{g.name.replace(/_/g, " ")}: {(g.state ?? (g.passed ? "passed" : "failed")).replace("_", " ")} ({g.checked})</Badge>)}</div>
+            {r.gates.filter((g: any) => g.state === "failed" || (!g.state && !g.passed)).flatMap((g: any) => g.failures.slice(0, 5).map((f: string) => <div key={g.name + f} className="alert error small">{g.name}: {f}</div>))}
             {r.versions?.metrics && <div className="small muted mono">{Object.entries(r.versions.metrics).map(([k, v]) => `${k} ${v}`).join(" · ")}</div>}
             <div className="small muted">Gates are deterministic checks. The score summarizes quality; a failed gate fails the run whatever the score says.</div>
           </div>}

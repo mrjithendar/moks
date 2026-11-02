@@ -192,6 +192,9 @@ class Model:
     def __init__(self, cfg):
         self.cfg = cfg
 
+    def output_tokens(self, wanted):
+        return wanted
+
     async def complete(self, system, messages, json_mode, max_tokens):
         from moks.llm.providers import LLMResponse
 

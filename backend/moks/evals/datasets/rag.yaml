@@ -30,3 +30,5 @@ cases:
   - {id: superseded-ranks-below-current, query: "rollback procedure deployment", as: reader, first: new, flagged: {old: superseded}, gate: freshness}
   - {id: injection-stays-data, query: "certificate renewal cert-manager", as: reader, relevant: [inject], gate: injection}
   - {id: lookalike-is-not-a-skill, query: "pretends to be a skill", as: reader, relevant: [skill-lookalike], library_unchanged: true, gate: injection}
+  - {id: two-questions-both-answered, query: "how do I promote the redis replica; what does ERR_PAY_4071 mean", as: reader, relevant: [redis, errcode]}
+  - {id: three-questions-in-one, query: "how to roll back the deployment; how to renew the certificate; how to handle payments oomkilled", as: reader, relevant: [new, inject, oom]}

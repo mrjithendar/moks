@@ -129,3 +129,19 @@ backends does not move vectors: run a reindex afterwards, which pays to embed ev
   viewers. LISTEN/NOTIFY is a later optimisation.
 - Investigations, evidence and audit rows have no retention policy yet.
 - The image has not been built or deployed from this workstation (no Docker daemon). CI builds it.
+
+## What the 2026-11 reliability work did and did not prove
+
+Verified by automated tests with a real PostgreSQL and fake connectors: evidence typing and claim rules, ownership fencing, crash resume, index coverage, the evaluation boundary, and skill publication. Twelve deliberate breaks of these guards were each caught by a test.
+
+Not verified:
+
+- Nothing here has run against a real cluster, a real LLM or a real embedding provider. The deployed `mk4` runs an earlier build.
+- Claim support is identifier overlap, not meaning. A well-formed false sentence about the right resource can pass.
+- Conflict detection covers two patterns: firing alerts against clean Kubernetes checks, and one query returning different results.
+- Evidence time scope is the window the executor enforces. Staleness is measured from collection time.
+- The evaluation boundary is application-enforced, inside one database and role.
+- The `rag` and `skills` datasets are small and synthetic, and the evaluation realm has keyword ranking only, so vector retrieval is not evaluated.
+- Injection evaluation checks data framing, skill integrity and tool policy with no live model, so model behavior under injection is not measured.
+- Improvement proposals stop at review: approval does not create the runbook or skill version. An approved one is applied through the normal Git and publication path by hand.
+- Skills have no diff view or per-environment readiness history in the UI, and AI drafting of skill changes was not built.

@@ -28,7 +28,7 @@ spec:
         - name: migrate
           image: {{ $image }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["sh", "-c", "moks migrate && moks db-grants && moks seed /etc/moks/seed.yaml --if-present"]
+          command: ["sh", "-c", "moks migrate && moks db-grants && moks seed /etc/moks/seed.yaml --if-present && moks skills bootstrap"]
           {{- include "moks.env" (dict "root" . "component" "migrate") | nindent 10 }}
           {{- include "moks.containerSecurity" . | nindent 10 }}
           {{- include "moks.volumeMounts" (dict "root" . "component" "migrate") | nindent 10 }}

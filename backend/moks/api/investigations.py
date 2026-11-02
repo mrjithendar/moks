@@ -258,7 +258,7 @@ async def get(inv_id: uuid.UUID, request: Request, ctx: AuthContext = Depends(ge
     ev = (await db.execute(select(Evidence).where(Evidence.investigation_id == inv.id).order_by(Evidence.collected_at))).scalars().all()
     out = serialize(inv, env.name, user.email if user else None, full=True)
     out["evidence"] = [{
-        "ref": e.ref, "tool": e.tool, "connector_type": e.connector_type, "args": e.args, "scope": e.scope, "ok": e.ok,
+        "ref": e.ref, "tool": e.tool, "connector_type": e.connector_type, "args": e.args, "scope": e.scope, "ok": e.ok, "kind": e.kind,
         "summary": e.summary, "data": e.data, "source": e.source, "truncated": e.truncated, "error": e.error,
         "duration_ms": e.duration_ms, "collected_at": e.collected_at.isoformat(),
     } for e in sorted(ev, key=lambda e: int(e.ref[1:]))]

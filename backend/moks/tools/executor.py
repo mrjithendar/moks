@@ -23,6 +23,7 @@ from .. import audit
 from ..config import get_settings
 from ..connectors.base import ConnectorError
 from ..models import Evidence
+from ..orchestrator.evidence import ACCESS_DENIED, classify
 from ..observability import POLICY_DENIALS, TOOL_CALLS, tracer
 from ..rbac import P
 from ..redaction import redact_obj
@@ -46,6 +47,7 @@ class ToolOutcome:
     evidence_ref: str | None = None
     duration_ms: int = 0
     collected_at: str | None = None
+    kind: str | None = None  # orchestrator.evidence.classify
 
 
 log = logging.getLogger("moks.tools")
@@ -128,7 +130,13 @@ class ToolExecutor:
             decision="deny", outcome="denied",
             details={"reason": reason, "kind": kind, "args": args, "investigation_id": str(self.ctx.investigation_id) if self.ctx.investigation_id else None},
         )
-        return ToolOutcome(False, tool, args, f"denied: {reason}", error=reason, error_kind=kind, denied=True)
+        outcome = ToolOutcome(False, tool, args, f"denied: {reason}", error=reason, error_kind=kind, denied=True, kind=ACCESS_DENIED,
+                              collected_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        if self.db is not None and self._next_ref is not None:  # citable, so a report can say what it was refused
+            outcome.evidence_ref = self._next_ref()
+            self.db.add(Evidence(investigation_id=self.ctx.investigation_id, ref=outcome.evidence_ref, tool=tool[:60], connector_type="policy", args=args if isinstance(args, dict) else {},
+                                 scope={"environment": self.ctx.environment.name}, ok=False, kind=ACCESS_DENIED, summary=outcome.summary, source={}, error=reason))
+        return outcome
 
     def _authorize(self, spec: ToolSpec, parsed) -> None:
         env = self.ctx.environment.name
@@ -188,6 +196,7 @@ class ToolExecutor:
         outcome.collected_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at))
         if outcome.ok:
             outcome.data, outcome.truncated = truncate_json(redact_obj(outcome.data), self.settings.max_result_bytes)
+        outcome.kind = classify(ok=outcome.ok, tool=tool, truncated=outcome.truncated, partial=bool((outcome.source or {}).get("partial")))
         TOOL_CALLS.labels(tool, "ok" if outcome.ok else (outcome.error_kind or "error")).inc()
         log.info("tool call", extra={"event": "tool_call", "tool": tool, "operation": tool, "dependency": spec.connector_type, "outcome": "success" if outcome.ok else "failure",
                                      "durationMs": outcome.duration_ms, **({} if outcome.ok else {"errorCode": outcome.error_kind or "error"})})
@@ -202,7 +211,7 @@ class ToolExecutor:
                 args=clean_args,
                 scope={"environment": self.ctx.environment.name, "namespace": clean_args.get("namespace"),
                        "from": self.ctx.time_from.isoformat(), "to": self.ctx.time_to.isoformat()},
-                ok=outcome.ok, summary=outcome.summary, data=outcome.data, source=outcome.source or {},
+                ok=outcome.ok, kind=outcome.kind, summary=outcome.summary, data=outcome.data, source=outcome.source or {},
                 truncated=outcome.truncated, error=outcome.error, duration_ms=outcome.duration_ms,
             ))
         if outcome.ok and not self.audit_success:

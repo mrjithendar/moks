@@ -114,7 +114,7 @@ initContainers:
   - name: migrate
     image: {{ include "moks.image" .root }}
     imagePullPolicy: {{ .root.Values.image.pullPolicy }}
-    command: ["sh", "-c", "moks migrate && moks seed /etc/moks/seed.yaml --if-present"]
+    command: ["sh", "-c", "moks migrate && moks seed /etc/moks/seed.yaml --if-present && moks skills bootstrap"]
   {{- end }}
     {{- include "moks.env" . | nindent 4 }}
     {{- include "moks.containerSecurity" .root | nindent 4 }}

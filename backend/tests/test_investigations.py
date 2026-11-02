@@ -252,6 +252,6 @@ async def test_prompt_injection_cannot_widen_tools_or_scope(client, monkeypatch)
     rep = done.report
     assert [f["statement"] for f in rep["observed_facts"]] == ["payments is crashlooping"]
     assert rep["suspected_causes"][0]["confidence"] == "low" and rep["suspected_causes"][0]["verified"] is False
-    assert "Unverified" in rep["summary"]
+    assert "resolved" not in rep["summary"].lower() and rep["validation"]["summary_sentences_removed"]
     assert rep["proposed_remediation"][0]["executable"] is False
     assert done.tokens_in >= 2000 and float(done.cost_usd) > 0

@@ -56,6 +56,15 @@ class StepSpec(BaseModel):
     purpose: str | None = Field(default=None, max_length=120)
     when_question: str | None = Field(default=None, max_length=200, description="regex; run only if the question matches")
     required: bool = False  # skipping it is reported as a gap in the skill's result
+    id: str | None = Field(default=None, pattern=r"^[a-z0-9-]{1,40}$")
+    requires_finding: str | None = Field(default=None, pattern=r"^[a-z_]+$")  # precondition: run only if this finding exists
+    stop_if_finding: str | None = Field(default=None, pattern=r"^[a-z_]+$")   # checked after this step
+    escalate: str = Field(default="", max_length=200)  # what a person should do when stop_if_finding fires
+
+
+class SkillBudget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    max_tool_calls: int | None = Field(default=None, ge=1, le=30)
 
 
 class RemediationSpec(BaseModel):
@@ -180,6 +189,7 @@ class SkillMeta(BaseModel):
     overrides_builtin: bool = False  # a custom skill must say so to replace a built-in of the same name
     runbooks: list[str] = Field(default_factory=list, max_length=8)
     evaluation: list[EvalCase] = Field(default_factory=list, max_length=8)
+    budget: SkillBudget = Field(default_factory=SkillBudget)
 
     def needs(self) -> set[str]:
         from ..tools.builtin import REGISTRY
@@ -320,10 +330,14 @@ def replace_library(lib: SkillLibrary) -> None:
 RESOURCE_WORDS = {"Pod": "pod", "Deployment": "deployment", "Service": "service", "Ingress": "ingress", "Node": "node", "PersistentVolumeClaim": "pvc", "HPA": "hpa", "StatefulSet": "statefulset"}
 
 
-def select(question: str, finding_kinds: set[str], limit: int = 3, eligible=None, requested: str | None = None, resources: set[str] | None = None) -> list[tuple[Skill, int, list[str]]]:
-    """Rank skills by evidence: matching detector findings weigh more than question keywords. Only
-    eligible skills are ranked, so one that cannot run never takes a place from one that can. Keeps
-    `reasons` plain so a report can say why each was chosen."""
+SELECT_LIMIT = 3
+FINDING_WEIGHT = 3
+KEYWORD_WEIGHT = 2  # a finding is stronger evidence than one word, but what was asked must beat a generic finding
+
+
+def select(question: str, finding_kinds: set[str], limit: int = SELECT_LIMIT, eligible=None, requested: str | None = None, resources: set[str] | None = None) -> list[tuple[Skill, int, list[str]]]:
+    """Rank skills by intent and evidence. Only eligible skills are ranked, so one that cannot run never
+    takes a place from one that can. Keeps `reasons` plain so a report can say why each was chosen."""
     ranked = []
     q = question.lower()
     resources = resources or set()
@@ -337,11 +351,11 @@ def select(question: str, finding_kinds: set[str], limit: int = 3, eligible=None
             reasons.append("chosen by the operator")
         hit_kinds = sorted(finding_kinds & set(sk.meta.triggers.findings))
         if hit_kinds:
-            score += 3 * len(hit_kinds)
+            score += FINDING_WEIGHT * len(hit_kinds)
             reasons.append("findings: " + ", ".join(hit_kinds))
         words = sorted({m.group(0).lower() for r in sk.keyword_res for m in [r.search(question)] if m})
         if words:
-            score += len(words)
+            score += KEYWORD_WEIGHT * len(words)
             reasons.append("question: " + ", ".join(words))
         if score:
             hit = [t for t in sk.meta.resource_types if t in resources or RESOURCE_WORDS.get(t, t.lower()) in q]
@@ -405,7 +419,13 @@ def contexts_for(step: StepSpec, findings: list[dict], base: dict[str, str]) -> 
                 ctx["pod"] = rname
                 owner = f.get("owner") or ""
                 okind, _, oname = owner.partition("/")
-                if okind == "ReplicaSet" and oname:
+                top = f.get("controller")  # read from ownerReferences by the engine; "" means nothing owns the ReplicaSet
+                if top:
+                    tkind, _, tname = top.partition("/")
+                    ctx["workload"] = tname
+                    if tkind == "Deployment":
+                        ctx["deployment"] = tname
+                elif okind == "ReplicaSet" and oname and top is None:  # the reference could not be read: the naming convention is all there is
                     ctx["deployment"] = oname.rsplit("-", 1)[0]
                     ctx["workload"] = ctx["deployment"]
                 elif oname:

@@ -144,10 +144,10 @@ version number cannot be reused for different content. States: `draft` (failed v
 
 A **generation** is the exact set of versions everyone runs. Git stays the review step:
 
-- Built-ins ship in the image, so a new one publishes automatically when a process starts.
+- Built-ins ship in the image, but starting a process publishes nothing. `moks skills release --reason "..."` publishes them as one generation, and `moks skills bootstrap` makes the first generation on an empty database.
 - Custom skills in `MOKS_SKILLS_DIR` are registered and wait on the Skills page for an administrator. Replacing a
   built-in needs `overrides_builtin: true` in the file and "allow override" in policy.
-- Rollback creates a new generation pointing at an earlier published version. A later scan does not undo it.
+- Rollback creates a new generation pointing at an earlier published version. A later release publishes only what it is asked to, so check what a release includes before running it.
 
 API, worker and detection processes follow the active generation from PostgreSQL within about 30 seconds and report
 what they run (`GET /skills/generation`, shown on the Skills page). A process that cannot load a generation keeps its

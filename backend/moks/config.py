@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     default_query_window_minutes: int = 60
     max_result_bytes: int = 48_000
     max_tokens_per_investigation: int = 60_000
+    investigation_lease_seconds: int = 120
+    investigation_max_attempts: int = 2  # a crashed run resumes this many times in all
+    rag_decompose: bool = False  # off: the rag dataset measured no gain from it. Turn on only with a dataset that shows one.
+    rag_activation: str = "strict"  # strict: a reindex with any incomplete document fails. degraded: it activates and says so.
+    evidence_max_age_seconds: int = 900  # older evidence cannot back a claim about the current state without saying so
 
     # Rate limits (per process; see docs/SECURITY.md)
     rate_login_per_minute: int = 10

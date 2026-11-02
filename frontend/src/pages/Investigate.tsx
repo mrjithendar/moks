@@ -231,7 +231,7 @@ export function InvestigationView() {
                 <h2>Evidence ({evidence.length})</h2>
                 {evidence.map((e) => (
                   <button type="button" key={e.ref} className="ev-row" onClick={() => setOpen(e.ref)}>
-                    <div className="row tight"><span className="cite nocite">{e.ref}</span><Truncate text={e.tool} mono />{e.ok ? <Badge kind="ok">ok</Badge> : <Badge kind="bad">failed</Badge>}</div>
+                    <div className="row tight"><span className="cite nocite">{e.ref}</span><Truncate text={e.tool} mono /><EvidenceKind kind={e.kind} ok={e.ok} /></div>
                     <div className="small muted clamp-2">{e.summary}</div>
                   </button>
                 ))}
@@ -239,6 +239,7 @@ export function InvestigationView() {
             </div>
           </div>
           {opened && <EvidenceDrawer e={opened} grafana={inv.grafana_url} onClose={() => setOpen(null)} />}
+          {report && can("investigation.run") && <div className="mt"><ProposalForm investigation={inv.id} question={inv.question} evidence={evidence} /></div>}
           {propose && <Dialog title="Propose an action plan" wide onClose={() => setPropose(null)}>
             <p className="small muted">Proposal from the report: {propose.action}</p>
             <PlanForm env={inv.environment} ns={inv.namespace} initial={proposalPlan(inv, propose)} onDone={(id) => nav(`/actions/${id}`)} /></Dialog>}
@@ -247,6 +248,60 @@ export function InvestigationView() {
     </>
   );
 }
+
+/** A draft for someone else to review. Nothing here publishes a skill or a runbook. */
+function ProposalForm({ investigation, question, evidence }: { investigation: string; question: string; evidence: any[] }) {
+  const usable = evidence.filter((e) => e.kind === "observation" || e.kind === "incomplete");
+  const [form, setForm] = useState({ kind: "runbook", title: "", body: "", owner: "", refs: [] as string[] });
+  const [state, setState] = useState<{ saved?: string; error?: string }>({});
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    try {
+      const r = await api<any>("/proposals", { method: "POST", body: { investigation_id: investigation, kind: form.kind, title: form.title, body: form.body, owner: form.owner, evidence: form.refs, regression_fixture: { question } } });
+      setState({ saved: `Saved as draft v${r.version}. It needs a review by someone else.` });
+    } catch (err: any) {
+      setState({ error: err.message });
+    }
+  };
+  return (
+    <details className="card"><summary>Propose a runbook or skill update</summary>
+      <form className="stack" onSubmit={submit}>
+        <p className="small muted">Saved as a redacted draft with this question as its regression case. It changes nothing until it is reviewed and published.</p>
+        <label>Type<select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })}><option value="runbook">Runbook</option><option value="skill">Skill</option></select></label>
+        <label>Title<input required minLength={5} maxLength={200} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></label>
+        <label>Owner<input required minLength={2} maxLength={200} value={form.owner} onChange={(e) => setForm({ ...form, owner: e.target.value })} placeholder="team-payments" /></label>
+        <label>What should change<textarea required minLength={20} rows={5} value={form.body} onChange={(e) => setForm({ ...form, body: e.target.value })} /></label>
+        <fieldset><legend className="small">Evidence (successful live results only)</legend>
+          <div className="row small">{usable.map((e) => <label key={e.ref} className="inline"><input type="checkbox" checked={form.refs.includes(e.ref)}
+            onChange={(ev) => setForm({ ...form, refs: ev.target.checked ? [...form.refs, e.ref] : form.refs.filter((r) => r !== e.ref) })} /> {e.ref}</label>)}</div>
+        </fieldset>
+        {state.error && <div className="alert error small">{state.error}</div>}
+        {state.saved && <div className="alert ok small">{state.saved}</div>}
+        <div><button type="submit" disabled={!form.refs.length}>Save draft</button></div>
+      </form>
+    </details>
+  );
+}
+
+const EVIDENCE_KINDS: Record<string, { label: string; tone: "ok" | "warn" | "bad" | "neutral" | "info" }> = {
+  observation: { label: "observed", tone: "ok" },
+  incomplete: { label: "partial result", tone: "warn" },
+  tool_error: { label: "collection failed", tone: "bad" },
+  access_denied: { label: "access denied", tone: "bad" },
+  documentation: { label: "documentation", tone: "info" },
+  historical: { label: "historical", tone: "neutral" },
+};
+
+export function EvidenceKind({ kind, ok }: { kind?: string; ok: boolean }) {
+  const k = EVIDENCE_KINDS[kind ?? (ok ? "observation" : "tool_error")] ?? EVIDENCE_KINDS.observation;
+  return <Badge kind={k.tone}>{k.label}</Badge>;
+}
+
+const FACT_KINDS: Record<string, string> = { collection: "about collection", documentation: "from documentation", historical: "earlier observation" };
+const VERIFIED: [string, string, string][] = [
+  ["configuration_defect", "Verified configuration defects", "A check read the wrong setting from the object itself."],
+  ["observed_failure", "Observed failures", "These happened. Why they happened is still open, so see the suspected causes."],
+];
 
 function Cites({ refs, onCite }: { refs: string[]; onCite: (r: string) => void }) {
   return <>{refs.map((r) => <button type="button" key={r} className="cite" onClick={() => onCite(r)}>{r}</button>)}</>;
@@ -264,19 +319,25 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose }
       {!hideSummary && <div className="rs static"><h3>Summary</h3><Markdown text={report.summary ?? ""} /><div className="small muted">{report.generated_by === "llm" ? "Written by the LLM from cited evidence" : "Rule-based report"}</div></div>}
       {report.missing_evidence.length > 0 && <div className="rs missing"><strong>Missing evidence</strong><ul>{report.missing_evidence.map((m: string, i: number) => <li key={i}>{m}</li>)}</ul></div>}
       <Section title="Observed facts" count={report.observed_facts.length}>
-        {report.observed_facts.length ? <ul>{report.observed_facts.map((f: any, i: number) => <li key={i}>{f.statement}<Cites refs={f.evidence} onCite={onCite} /></li>)}</ul>
+        {report.observed_facts.length ? <ul>{report.observed_facts.map((f: any, i: number) => <li key={i}>{FACT_KINDS[f.kind] && <><Badge kind="neutral">{FACT_KINDS[f.kind]}</Badge> </>}{f.statement}<Cites refs={f.evidence} onCite={onCite} />
+          {f.qualifiers?.map((q: string) => <div key={q} className="small muted">{q}</div>)}</li>)}</ul>
           : <div className="muted small">No facts with supporting evidence.</div>}
       </Section>
-      {report.verified_causes?.length > 0 && <Section title="Verified causes" count={report.verified_causes.length}>
-        <ul>{report.verified_causes.map((c: any, i: number) => <li key={i}>{c.cause}<Cites refs={c.evidence} onCite={onCite} /><div className="small muted">Checked by a {c.check}.</div></li>)}</ul>
-      </Section>}
+      {(report.conflicts ?? []).length > 0 && <div className="rs missing"><strong>Sources disagree</strong><ul>{report.conflicts.map((c: any, i: number) => <li key={i}>{c.detail}<Cites refs={c.evidence} onCite={onCite} /></li>)}</ul></div>}
+      {VERIFIED.map(([category, title, note]) => {
+        const rows = (report.verified_findings ?? report.verified_causes?.map((c: any) => ({ ...c, category: "configuration_defect" })) ?? []).filter((v: any) => v.category === category);
+        return rows.length > 0 && <Section key={category} title={title} count={rows.length}>
+          <div className="small muted">{note}</div>
+          <ul>{rows.map((c: any, i: number) => <li key={i}>{c.cause}<Cites refs={c.evidence} onCite={onCite} /><div className="small muted">{[c.check, c.target && `target ${c.target}`, c.result, c.at].filter(Boolean).join(" · ")}</div></li>)}</ul>
+        </Section>;
+      })}
       <Section title="Suspected causes" count={report.suspected_causes.length}>
         {report.suspected_causes.length ? (
           <ul>{report.suspected_causes.map((c: any, i: number) => (
             <li key={i}><Badge kind={CONF[c.confidence]}>{c.confidence} confidence</Badge> {c.cause}<Cites refs={c.evidence} onCite={onCite} />
               {c.contradicting?.length > 0 && <div className="small muted">Evidence against this: <Cites refs={c.contradicting} onCite={onCite} /></div>}
               {c.reasoning && <div className="small muted">{c.reasoning}</div>}
-              <div className="small muted">Suspected, not verified.</div></li>
+              <div className="small muted">{c.origin === "demoted_fact" ? "Drafted as a fact, but the evidence could not show it. Treat it as a hypothesis." : "Suspected, not verified."}</div></li>
           ))}</ul>
         ) : <div className="muted small">No cause suggested.</div>}
       </Section>
@@ -304,7 +365,8 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose }
       {report.skill_runs?.length > 0 && <Section title="What each skill did" count={report.skill_runs.length} open={false}>
         {report.skill_runs.map((r: any) => <div key={r.skill} className="stack tight skill-run">
           <div className="small"><strong>{r.skill}</strong> <span className="muted">v{r.version} · <span className="mono">{r.digest?.slice(0, 12)}</span> · {r.reasons.join("; ")}</span></div>
-          {r.stopped && <div className="alert warn small">Stopped during this run: {r.stopped}</div>}
+          {r.outcome && <div><Badge kind={r.outcome === "complete" ? "ok" : "warn"}>{r.outcome}</Badge></div>}
+          {r.stopped && <div className="alert warn small">Stopped during this run: {r.stopped}{r.escalation ? `. ${r.escalation}` : ""}</div>}
           {r.gaps?.map((g: string) => <div key={g} className="alert warn small">{g}</div>)}
           <ul className="small">{r.steps.map((s: any, i: number) => <li key={i}><span className="mono">{s.tool}</span> <Badge kind={s.status === "executed" ? "ok" : s.status === "failed" ? "bad" : "neutral"}>{s.status}</Badge>{s.evidence.length > 0 && <Cites refs={[...new Set<string>(s.evidence)]} onCite={onCite} />} <span className="muted">{s.reason ?? s.errors[0] ?? ""}</span></li>)}</ul>
           {r.checks?.filter((c: any) => c.status !== "guidance_only").map((c: any, i: number) => <div key={i} className="small"><Badge kind={c.status === "passed" ? "ok" : c.status === "failed" ? "bad" : "neutral"}>{c.status.replace("_", " ")}</Badge> {c.text}</div>)}
@@ -314,7 +376,10 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose }
       {report.skills?.length > 0 && <div className="small" style={{ marginTop: 8 }}>Skills applied: {report.skills.map((s: any) => (
         <Link key={s.name} to="/skills" title={s.reasons.join("; ")}><Badge kind="info">{s.name}</Badge></Link>))}</div>}
       {report.notes?.length > 0 && <details><summary className="small">Investigation notes ({report.notes.length})</summary><ul className="small">{report.notes.map((n: string, i: number) => <li key={i}>{n}</li>)}</ul></details>}
-      {report.validation?.uncited_facts_dropped > 0 && <div className="small muted">{report.validation.uncited_facts_dropped} uncited statement(s) were removed by citation checks.</div>}
+      {report.validation?.uncited_facts_dropped > 0 && <div className="small muted">{report.validation.uncited_facts_dropped} statement(s) with no usable citation were removed.</div>}
+      {report.validation?.summary_sentences_removed?.length > 0 && <div className="small muted">{report.validation.summary_sentences_removed.length} sentence(s) of the drafted summary went beyond the evidence and were removed.</div>}
+      {report.validation?.method && <div className="small muted">Claims were checked by rules: evidence type, scope, freshness and coverage. That does not prove a passage supports a claim.</div>}
+      {report.execution?.resumed_after && <div className="small muted">This run resumed after {report.execution.resumed_after} (attempt {report.execution.attempt}); older evidence is labeled historical.</div>}
     </div>
   );
 }

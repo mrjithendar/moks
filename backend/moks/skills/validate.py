@@ -58,6 +58,9 @@ def validate(sk: "Skill", others: dict[str, "Skill"] | None = None) -> list[dict
         out.append({"level": level, "where": where, "message": message})
 
     known = _known_findings()
+    ids = [s.id for s in sk.meta.steps if s.id]
+    if len(ids) != len(set(ids)):
+        add("error", "steps", "step ids must be unique")
     for i, step in enumerate(sk.meta.steps):
         where = f"steps[{i}]"
         _check_args(step.tool, step.args, where, add)
@@ -71,6 +74,13 @@ def validate(sk: "Skill", others: dict[str, "Skill"] | None = None) -> list[dict
                 add("error", where, f"when_question is not a valid regular expression: {exc}")
         if step.for_each and not _is_finding(step.for_each.split(".", 1)[1], known):
             add("warning", where, f"no detector produces {step.for_each}")
+        for label, name in (("requires_finding", step.requires_finding), ("stop_if_finding", step.stop_if_finding)):
+            if name and not _is_finding(name, known):
+                add("error", where, f"{label}: no detector produces finding {name}")
+        if step.stop_if_finding and not step.escalate:
+            add("error", where, "a stop condition must say how to escalate")
+        if step.required and step.when_question:
+            add("warning", where, "a required step that depends on the question can be skipped and reported as a gap")
     for f in sk.meta.triggers.findings:
         if not _is_finding(f, known):
             add("warning", "triggers", f"no detector produces finding {f}")

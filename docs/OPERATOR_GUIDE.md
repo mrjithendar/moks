@@ -521,8 +521,8 @@ uses the same daily budget as investigations. Scoped users must choose a namespa
 ## Rolling out knowledge and skill governance (migration 0021)
 
 1. Take and verify a database backup. The migration is additive and forward-only.
-2. Deploy. No new settings are required. `MOKS_SKILLS_AUTOSCAN=0` stops processes publishing built-ins at start.
-3. The first start publishes generation 1. Check **SRE skills** shows every process current.
+2. Deploy. No new settings are required.
+3. The migrate step publishes generation 1 on an empty database. Check **SRE skills** shows every process current.
 4. The next sync re-reads every GitHub document, because older documents are on pipeline 0. With an embedding model this
    re-embeds them, against the embedding budget. Documents already indexed stay searchable meanwhile.
 5. Review sources marked shared globally, and set owners and review intervals.
@@ -556,3 +556,14 @@ A preset only fills in the form. Put the key in the Secret under the variable it
   model's rates. It is off when a custom endpoint is set. A declined request that no model will answer shows as refused.
 - Enter prices. With none, spend counts as $0 and the daily budget cannot limit the model.
 - The network policy allows outbound 443 to public addresses. A self-hosted server inside the cluster needs its own egress rule.
+
+## Upgrading to schema 0029
+
+The API's init container applies migrations 0025 to 0029 on the first rollout. They are additive and forward-only, so take a database dump first (`scripts/deploy-mk4.sh` does). What changes for operators:
+
+- **Skills no longer publish at startup.** A new image only makes its skills available to register. After a rollout, run `moks skills release --reason "<why>"` in a worker pod. Until then every process keeps the active generation. An empty database gets its first generation from `moks skills bootstrap`, which the migrate step runs. `--only` publishes named skills and `--remove` drops them; nothing is removed because an image lacks it. Set `MOKS_RELEASE_REVISION` to record the commit on the generation.
+- **A reindex is strict by default.** If any document is incomplete in the new index the build fails and the current index stays active. `MOKS_RAG_ACTIVATION=degraded` activates anyway, shows the gap under Index health, and marks those documents for backfill.
+- **Every existing document reads as unreviewed**, because nobody has reviewed it. It stays searchable, but its source's authority no longer affects ranking until it is marked reviewed. Sources with `review_required` quarantine new and changed documents.
+- **Old evidence is classified from `ok` and `truncated`.** Denials were not stored before, so none appear in older runs.
+
+Rollback: redeploy the previous image digest. The extra columns and tables are ignored by older code, but an older worker claims and runs investigations without tokens, so do not run two versions side by side.

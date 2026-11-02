@@ -24,7 +24,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import __version__, jobs, versions
-from .api import actions, admin, alerts, assist, backups, conversations, detections, diagnostics, environments, evals, explorer, finops, incidents, investigations, knowledge, logs, metrics, multi, skills
+from .api import actions, admin, alerts, assist, backups, proposals, conversations, detections, diagnostics, environments, evals, explorer, finops, incidents, investigations, knowledge, logs, metrics, multi, skills
 from .auth import routes as auth_routes
 from .auth.deps import get_auth
 from .auth.sessions import AuthContext
@@ -46,7 +46,7 @@ async def _follow_skills(stop: asyncio.Event) -> None:
 
     try:
         if skill_registry.scan_on_start():
-            await skill_registry.scan()
+            await skill_registry.register_all()
     except Exception as exc:
         log.warning("skill scan failed", extra={"event": "skill_scan_failed", "errorType": type(exc).__name__})
     while not stop.is_set():
@@ -124,7 +124,7 @@ def create_app() -> FastAPI:
     router.include_router(investigations.router)
     router.include_router(explorer.router)
     router.include_router(admin.router)
-    for extra in (incidents, knowledge, finops, actions, diagnostics, assist, alerts, evals, skills, multi, metrics, logs, detections, conversations, backups):
+    for extra in (incidents, knowledge, finops, actions, diagnostics, assist, alerts, evals, skills, multi, metrics, logs, detections, conversations, backups, proposals):
         router.include_router(extra.router)
 
     @app.exception_handler(jobs.QueueFull)

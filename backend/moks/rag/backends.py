@@ -43,7 +43,8 @@ def rrf(*rankings: list[str]) -> list[tuple[str, float]]:
 
 
 def _filters_sql(found: list[access.Grant], params: dict) -> str:
-    return f"d.status = 'active' AND s.lifecycle = 'active' AND {access.sql(found, params)}"
+    params["realm"] = access.realm()
+    return f"d.status = 'active' AND d.lifecycle = 'active' AND s.lifecycle = 'active' AND d.realm = :realm AND s.realm = :realm AND {access.sql(found, params)}"
 
 
 class PostgresBackend:

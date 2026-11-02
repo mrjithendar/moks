@@ -13,15 +13,16 @@ import json
 import math
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 
 from .. import detection, skills
 from ..db import session_scope
-from ..models import Document, KnowledgeSource
+from ..models import Document, IndexOutbox, KnowledgeSource, LLMConfig, LLMUsage
 from ..orchestrator import prompts
-from ..rag import ingest, service
+from ..rag import access, ingest, service
 from ..rag.chunking import PIPELINE_VERSION
 from ..rbac import Binding, Principal
 from ..skills import readiness as rd
@@ -29,14 +30,46 @@ from ..skills import registry
 from ..skills.validate import errors, validate
 
 
-def _gate(name: str, failures: list[str], total: int) -> dict:
-    return {"name": name, "passed": not failures, "checked": total, "failures": failures[:20]}
+class IsolationError(Exception):
+    """The boundary around evaluation content could not be shown to hold, so the run stops."""
+
+
+def _gate(name: str, failures: list[str], total: int, evidence: str = "deterministic") -> dict:
+    """Nothing checked is not a pass: `skipped` gates fail the run unless a dataset marks them not applicable.
+    `evidence` says what kind of proof this is: deterministic, simulated or live."""
+    state = "skipped" if not total else "failed" if failures else "passed"
+    return {"name": name, "state": state, "passed": state == "passed", "checked": total, "failures": failures[:20], "evidence": evidence}
+
+
+def gates_ok(gates: list[dict]) -> bool:
+    return bool(gates) and all(g["state"] in ("passed", "not_applicable") for g in gates)
+
+
+def _not_applicable(gates: list[dict], names: list[str]) -> list[dict]:
+    for g in gates:
+        if g["name"] in names and g["state"] == "skipped":
+            g["state"] = "not_applicable"
+    return gates
+
+
+async def _spent_since(start) -> dict:
+    """What really happened, from the same meter as everything else. No figure is assumed."""
+    async with session_scope() as db:
+        tokens_in, tokens_out, cost = (await db.execute(select(func.coalesce(func.sum(LLMUsage.tokens_in), 0), func.coalesce(func.sum(LLMUsage.tokens_out), 0), func.coalesce(func.sum(LLMUsage.cost_usd), 0))
+                                                        .where(LLMUsage.purpose.like("eval%"), LLMUsage.created_at >= start))).one()
+    return {"tokens_in": int(tokens_in), "tokens_out": int(tokens_out), "cost_usd": float(cost), "cost_basis": "measured from llm_usage"}
 
 
 def versions(dataset: dict) -> dict:
     lib = skills.library()
     return {"dataset": hashlib.sha256(json.dumps(dataset, sort_keys=True).encode()).hexdigest()[:16], "skills_generation": lib.generation, "skills_digest": lib.digest,
-            "pipeline": PIPELINE_VERSION, "prompt": hashlib.sha256((prompts.PLANNER_SYSTEM + prompts.REPORT_SYSTEM).encode()).hexdigest()[:16]}
+            "pipeline": PIPELINE_VERSION, "prompt": hashlib.sha256((prompts.PLANNER_SYSTEM + prompts.REPORT_SYSTEM).encode()).hexdigest()[:16], "index": "evaluation realm: keyword and identifier ranking, no vectors"}
+
+
+async def _active_model() -> str | None:
+    async with session_scope() as db:
+        cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalars().first()
+        return f"{cfg.provider}/{cfg.model}" if cfg else None
 
 
 def _ndcg(ranked: list[str], relevant: set[str]) -> float:
@@ -45,34 +78,76 @@ def _ndcg(ranked: list[str], relevant: set[str]) -> float:
     return dcg / ideal
 
 
+async def _outbox_size() -> int:
+    async with session_scope() as db:
+        return (await db.execute(select(func.count()).select_from(IndexOutbox).where(IndexOutbox.status == "pending"))).scalar_one()
+
+
+async def _prove_isolated(words: str, people: dict, by_doc: dict) -> list[str]:
+    """From outside the realm, with the widest grant there is, nothing of this run may be visible."""
+    token = access.enter_realm(access.OPERATIONAL)
+    try:
+        wide = Principal("00000000-0000-0000-0000-00000000ffff", "isolation@eval", [Binding("admin", "*", "*")])
+        async with session_scope() as db:
+            found = await service.search(db, wide, words, 20)
+            ids = {uuid.UUID(h["document_id"]) for h in found["results"]}
+        return [str(i) for i in ids & set(by_doc)]
+    finally:
+        access.leave_realm(token)
+
+
+async def _remove_run(tag: str) -> None:
+    async with session_scope() as db:
+        await db.execute(delete(KnowledgeSource).where(KnowledgeSource.name.like(f"eval-{tag}-%"), KnowledgeSource.realm == access.EVALUATION))
+
+
 async def run_rag(data: dict, run_id: uuid.UUID) -> dict[str, Any]:
     tag = str(run_id)[:8]
-    env = lambda e: f"eval-{tag}-{e}"  # names no real binding matches, so a run cannot leak into real searches
+    env = lambda e: f"eval-{tag}-{e}"  # noqa: E731
+    started = datetime.now(timezone.utc)
+    await service.cleanup_evaluations()
+    outbox_before = await _outbox_size()
+    token = access.enter_realm(access.EVALUATION)
+    try:
+        return await _run_rag(data, tag, env, started, outbox_before)
+    finally:
+        access.leave_realm(token)
+        await _remove_run(tag)  # also after a crash in the middle; cleanup_evaluations catches what this cannot
+
+
+async def _run_rag(data: dict, tag: str, env, started, outbox_before: int) -> dict[str, Any]:
     by_doc: dict[uuid.UUID, str] = {}
     async with session_scope() as db:
         sources: dict[tuple, KnowledgeSource] = {}
         for d in data["documents"]:
             key = (d["environment"], d["namespace"])
             if key not in sources:
-                sources[key] = KnowledgeSource(name=f"eval-{tag}-{len(sources)}", type="upload", config={}, scope_environment=env(key[0]), scope_namespace=key[1], classification="internal")
+                sources[key] = KnowledgeSource(name=f"eval-{tag}-{len(sources)}", type="upload", config={}, scope_environment=env(key[0]), scope_namespace=key[1], classification="internal", realm=access.EVALUATION)
                 db.add(sources[key])
                 await db.flush()
             doc = await service.index_document(db, sources[key], d["path"], d["text"], revision=tag, url=None, extra={"service": d.get("service")})
             by_doc[doc.id] = d["id"]
-    await service.drain_outbox(len(by_doc) * 2)
     people = {name: Principal(f"00000000-0000-0000-0000-{i:012d}", f"{name}@eval", [Binding(r, env(e) if e != "*" else "*", n) for r, e, n in rows])
               for i, (name, rows) in enumerate(data["bindings"].items())}
+    leaks = await _prove_isolated(" ".join(c["query"] for c in data["cases"][:5])[:400], people, by_doc)
+    if leaks:
+        raise IsolationError(f"evaluation documents were visible to an operational search: {leaks[:3]}")
     results, recall, mrr, ndcg, latency = [], [], [], [], []
-    failures: dict[str, list[str]] = {"isolation": [], "exact_identifier": [], "abstention": [], "freshness": [], "injection": []}
+    failures: dict[str, list[str]] = {"isolation": [], "exact_identifier": [], "abstention": [], "freshness": [], "injection": [], "realm_isolation": []}
     checked = dict.fromkeys(failures, 0)
     before = {n: s.digest for n, s in skills.library().skills.items()}
+    known = set(by_doc)
     for case in data["cases"]:
         start = time.monotonic()
         async with session_scope() as db:
             r = await service.search(db, people[case["as"]], case["query"], 5, environment=env(case["environment"]) if case.get("environment") else None)
         latency.append(time.monotonic() - start)
-        ranked = [by_doc.get(uuid.UUID(h["document_id"]), "?") for h in r["results"]]
-        ranked = [x for x in ranked if x != "?"]
+        ids = [uuid.UUID(h["document_id"]) for h in r["results"]]
+        checked["realm_isolation"] += 1
+        strangers = [str(i) for i in ids if i not in known]
+        if strangers:  # an evaluation must never read a production document
+            failures["realm_isolation"].append(f"{case['id']}: {strangers[:3]}")
+        ranked = [by_doc[i] for i in ids if i in by_doc]
         relevant = set(case.get("relevant") or [])
         row: dict[str, Any] = {"case": case["id"], "ranked": ranked, "mode": r["mode"], "answer": r["evidence"]["state"], "checks": {}}
         if relevant:
@@ -109,24 +184,28 @@ async def run_rag(data: dict, run_id: uuid.UUID) -> dict[str, Any]:
         if case.get("gate") == "injection":
             checked["injection"] += 1
             same = {n: s.digest for n, s in skills.library().skills.items()} == before
-            ok = same and bool(relevant & set(ranked))  # retrieved as ordinary data, and nothing changed because of it
+            framed = all(_is_framed(h["text"]) for h in r["results"])
+            ok = same and framed and bool(relevant & set(ranked))  # retrieved as ordinary data, and nothing changed because of it
             row["checks"]["injection"] = ok
             if not ok:
                 failures["injection"].append(case["id"])
-        row["score"] = round(sum(row["checks"].values()) / len(row["checks"]), 4) if row["checks"] else 1.0
+        row["score"] = round(sum(row["checks"].values()) / len(row["checks"]), 4) if row["checks"] else None
         results.append(row)
-    async with session_scope() as db:
-        for s in (await db.execute(select(KnowledgeSource).where(KnowledgeSource.name.like(f"eval-{tag}-%")))).scalars():
-            for d in (await db.execute(select(Document).where(Document.source_id == s.id))).scalars():
-                await service.remove_document(db, d)
-            s.lifecycle = "deleted"
-    await service.drain_outbox(len(by_doc) * 2)
+    if await _outbox_size() != outbox_before:
+        failures["realm_isolation"].append("the operational outbox changed during the run")
     latency.sort()
     metrics = {"recall_at_5": _mean(recall), "mrr": _mean(mrr), "ndcg_at_5": _mean(ndcg), "latency_p50_ms": round(latency[len(latency) // 2] * 1000, 1), "latency_max_ms": round(latency[-1] * 1000, 1),
-               "cost_usd": 0, "mode": results[0]["mode"] if results else None}
+               **await _spent_since(started), "mode": results[0]["mode"] if results else None, "model": await _active_model()}
     gates = [_gate(k, v, checked[k]) for k, v in failures.items()]
-    gates.append({"name": "recall_at_5", "passed": metrics["recall_at_5"] >= data.get("min_recall", 0.9), "checked": len(recall), "failures": [], "value": metrics["recall_at_5"]})
+    gates.append({"name": "recall_at_5", "state": "passed" if recall and metrics["recall_at_5"] >= data.get("min_recall", 0.9) else "failed" if recall else "skipped", "evidence": "deterministic",
+                  "passed": bool(recall) and metrics["recall_at_5"] >= data.get("min_recall", 0.9), "checked": len(recall), "failures": [], "value": metrics["recall_at_5"]})
     return {"results": results, "gates": gates, "metrics": metrics, "score": metrics["recall_at_5"]}
+
+
+def _is_framed(text: str) -> bool:
+    """A retrieved passage reaches the model inside a block it cannot close, whatever it says."""
+    wrapped = prompts.untrusted("kb", text, 4000)
+    return wrapped.count("</untrusted_data") == 1 and wrapped.startswith("<untrusted_data")
 
 
 def _mean(xs: list[float]) -> float:
@@ -150,7 +229,7 @@ def _pick(case: dict, view: registry.Policy) -> tuple[list[str], dict[str, str],
             ok[sk.name] = sk
         else:
             refused[sk.name] = why
-    chosen = skills.select(case["question"], set(case.get("findings") or []), eligible=lambda s: s.name in ok, requested=case.get("requested"), limit=4)
+    chosen = skills.select(case["question"], set(case.get("findings") or []), eligible=lambda s: s.name in ok, requested=case.get("requested"))  # the limit production uses
     return [s.name for s, _, _ in chosen], refused, [s for s, _, _ in chosen]
 
 
@@ -207,9 +286,8 @@ async def run_skills(data: dict) -> dict[str, Any]:
             if fx is None:
                 failures["declared_cases"].append(f"{sk.name}: no fixture {e.fixture}")
                 continue
-            picked, _, _ = _pick({**fx}, registry.Policy())
-            wide = [s.name for s, _, _ in skills.select(fx["question"], set(fx.get("findings") or []), limit=8)]
-            if e.expect.selected and sk.name not in picked + wide:
+            picked, _, _ = _pick({**fx}, registry.Policy())  # exactly what production selects, with its limit
+            if e.expect.selected and sk.name not in picked:
                 failures["declared_cases"].append(f"{sk.name}: not selected for {e.fixture}")
             planned = [p["tool"] for p in _plan(sk, fx.get("findings") or [], "payments")]
             for t in e.expect.tools:
@@ -241,5 +319,5 @@ async def run_skills(data: dict) -> dict[str, Any]:
     except ValueError:
         pass
     gates = [_gate(k, v, checked[k]) for k, v in failures.items()]
-    return {"results": results, "gates": gates, "metrics": {"cases": len(results), "skills": len(lib.skills), "declared_cases": checked["declared_cases"]},
+    return {"results": results, "gates": gates, "metrics": {"cases": len(results), "skills": len(lib.skills), "declared_cases": checked["declared_cases"], "cost_usd": 0.0, "cost_basis": "no model is called by this dataset"},
             "score": round(sum(g["passed"] for g in gates) / len(gates), 4)}

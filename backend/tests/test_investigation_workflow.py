@@ -148,7 +148,8 @@ async def test_failed_rollout_scenario(client, monkeypatch):
     inv = await _run(r["id"])
     kinds = {f["kind"] for f in inv.report["findings"]}
     assert "image_pull" in kinds and "rollout-failures" in [s["name"] for s in inv.report["skills"]] or "image-pull-failures" in [s["name"] for s in inv.report["skills"]]
-    assert any("cannot pull" in c["cause"] for c in inv.report["verified_causes"])
+    assert any("cannot pull" in c["cause"] and c["category"] == "observed_failure" for c in inv.report["verified_findings"])
+    assert not inv.report["verified_causes"]  # seeing a pull fail does not establish why it fails
 
 
 async def test_repeated_detection_of_a_real_fixture_produces_one_incident(client):

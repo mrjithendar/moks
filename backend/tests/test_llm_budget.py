@@ -29,6 +29,9 @@ class Provider:
             raise LLMError(self.fail, "failed")
         return LLMResponse(text="{}", tokens_in=self.tokens[0], tokens_out=self.tokens[1], model=self.cfg.model, provider=self.cfg.provider)
 
+    def output_tokens(self, wanted):
+        return wanted
+
     async def embed(self, texts):
         return [[0.0] for _ in texts]
 

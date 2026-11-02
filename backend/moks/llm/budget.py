@@ -133,7 +133,7 @@ async def complete(provider: Provider, system: str, messages: list[Message], *, 
     """The one way to call a chat model."""
     cfg = provider.cfg
     chars = len(system) + sum(len(str(m.get("content", ""))) for m in messages)
-    rid = await reserve(cfg, estimate(cfg, chars, max_tokens), user_id=user_id, investigation_id=investigation_id, purpose=purpose, wait_seconds=wait_seconds)
+    rid = await reserve(cfg, estimate(cfg, chars, provider.output_tokens(max_tokens)), user_id=user_id, investigation_id=investigation_id, purpose=purpose, wait_seconds=wait_seconds)
     try:
         resp = await complete_metered(provider, system, messages, json_mode=json_mode, max_tokens=max_tokens)
     except LLMError as exc:

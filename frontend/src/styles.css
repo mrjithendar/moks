@@ -476,3 +476,9 @@ select.manage { padding: 4px 6px; font-size: 12px; }
 .term-scope-line summary { min-height: 28px; cursor: pointer; overflow-wrap: anywhere; }
 .term-scope-line .term-scope { position: static; border: 0; padding: 6px 0 0; margin: 0; }
 .term-warn { color: var(--warn); font-weight: 600; }
+@media (max-width: 900px), (pointer: coarse) {
+  /* Links that stand alone get a full touch target. Links inside running text keep its line height. */
+  main a:not(.btn):not(.cite):not(.report a):not(.prose a):not(p a) { display: inline-flex; align-items: center; min-height: 44px; }
+  main label.inline { min-height: 44px; }
+  main input[type="checkbox"], main input[type="radio"] { width: 24px; height: 24px; }
+}

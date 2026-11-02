@@ -38,7 +38,7 @@ async def clean():
             await db.execute(text("DELETE FROM skill_policies"))
         skills.replace_library(skills.load(""))
     await reset()
-    await registry.scan(extra_dir="")
+    await registry.bootstrap(extra_dir="")
     yield
     await reset()
 
@@ -59,13 +59,13 @@ async def test_builtins_publish_as_one_generation_and_every_version_is_pinned_by
 
 async def test_a_second_scan_changes_nothing():
     before = await active()
-    r = await registry.scan(extra_dir="")
+    r = await registry.bootstrap(extra_dir="")
     assert not r["published"] and (await active()).generation == before.generation
 
 
 async def test_a_custom_skill_waits_until_it_is_published(tmp_path):
     write(tmp_path, "demo-skill", text_of())
-    r = await registry.scan(extra_dir=str(tmp_path))
+    r = await registry.register_all(extra_dir=str(tmp_path))
     assert "demo-skill" in r["waiting"] and "demo-skill" not in skills.library().skills
     sk = skills.load(str(tmp_path)).skills["demo-skill"]
     uid = await make_user(f"p-{uuid.uuid4().hex[:6]}@example.com", ["admin"])
@@ -81,21 +81,21 @@ async def test_a_custom_skill_waits_until_it_is_published(tmp_path):
 
 async def test_versions_are_immutable(tmp_path):
     write(tmp_path, "demo-skill", text_of())
-    await registry.scan(extra_dir=str(tmp_path))
+    await registry.register_all(extra_dir=str(tmp_path))
     write(tmp_path, "demo-skill", text_of() + "changed\n")
-    r = await registry.scan(extra_dir=str(tmp_path))
+    r = await registry.register_all(extra_dir=str(tmp_path))
     assert any("bump it" in e["error"] for e in r["rejected"])
 
 
 async def test_rollback_restores_a_published_version_in_a_new_generation(tmp_path):
     uid = await make_user(f"r-{uuid.uuid4().hex[:6]}@example.com", ["admin"])
     write(tmp_path, "demo-skill", text_of(version="1"))
-    await registry.scan(extra_dir=str(tmp_path))
+    await registry.register_all(extra_dir=str(tmp_path))
     one = skills.load(str(tmp_path)).skills["demo-skill"].digest
     async with session_scope() as db:
         await registry.publish(db, one, uid)
     write(tmp_path, "demo-skill", text_of(version="2"))
-    await registry.scan(extra_dir=str(tmp_path))
+    await registry.register_all(extra_dir=str(tmp_path))
     two = skills.load(str(tmp_path)).skills["demo-skill"].digest
     async with session_scope() as db:
         await registry.publish(db, two, uid)
@@ -115,7 +115,7 @@ async def test_an_invalid_version_cannot_be_published_and_the_last_generation_st
     uid = await make_user(f"i-{uuid.uuid4().hex[:6]}@example.com", ["admin"])
     bad = text_of(extra="steps:\n  - {tool: k8s_list_pods, args: {nonsense: 1}}\n")
     write(tmp_path, "demo-skill", bad)
-    r = await registry.scan(extra_dir=str(tmp_path))
+    r = await registry.register_all(extra_dir=str(tmp_path))
     assert any("no argument nonsense" in e["error"] for e in r["rejected"])
     before = await active()
     sk = skills.load(str(tmp_path)).skills["demo-skill"]
@@ -144,7 +144,7 @@ async def test_replacing_a_builtin_is_explicit_twice(tmp_path):
     write(tmp_path, "crashloop-triage", text_of(name="crashloop-triage"))
     assert "would replace a built-in" in skills.load(str(tmp_path)).errors[0]["error"]
     write(tmp_path, "crashloop-triage", text_of(name="crashloop-triage", version="9", overrides="overrides_builtin: true\n"))
-    await registry.scan(extra_dir=str(tmp_path))
+    await registry.register_all(extra_dir=str(tmp_path))
     sk = skills.load(str(tmp_path)).skills["crashloop-triage"]
     uid = await make_user(f"o-{uuid.uuid4().hex[:6]}@example.com", ["admin"])
     async with session_scope() as db:
@@ -416,3 +416,67 @@ async def test_the_real_app_starts_publishes_skills_and_reports_itself():
         async with session_scope() as db:
             row = (await db.execute(select(ComponentVersion).where(ComponentVersion.component == "api"))).scalars().first()
         assert row is not None and row.skill_generation == skills.library().generation
+
+
+async def test_starting_a_process_never_publishes(tmp_path):
+    before = await active()
+    new = text_of(version="1")
+    write(tmp_path, "demo-skill", new)
+    r = await registry.register_all(extra_dir=str(tmp_path))
+    assert "demo-skill" in r["registered"] and (await active()).generation == before.generation
+
+
+async def test_runtime_scanning_is_off_unless_asked_for(monkeypatch):
+    monkeypatch.delenv("MOKS_SKILLS_AUTOSCAN", raising=False)
+    assert registry.scan_on_start() is False
+
+
+async def test_an_older_pod_cannot_downgrade_or_remove_skills(tmp_path):
+    """The image behind a restarting pod lacks a published skill and holds an older copy of another."""
+    published = (await active()).manifest
+    older = str(tmp_path)  # holds nothing, so a built-in appears gone
+    await registry.register_all(extra_dir=older)
+    monkey = skills.BUILTIN
+    skills.BUILTIN = tmp_path
+    try:
+        await registry.register_all(extra_dir="")
+    finally:
+        skills.BUILTIN = monkey
+    assert (await active()).manifest == published
+    assert (await registry.refresh(force=True)).skills
+
+
+async def test_a_release_needs_a_reason_and_records_where_it_came_from(tmp_path, monkeypatch):
+    with pytest.raises(registry.PublishError):
+        await registry.release(None, "  ")
+    write(tmp_path, "demo-skill", text_of())
+    monkeypatch.setenv("MOKS_RELEASE_REVISION", "abc123")
+    r = await registry.release(None, "reviewed in PR 40", names=["demo-skill"], evaluation={"run": "e1", "passed": True}, extra_dir=str(tmp_path))
+    gen = await active()
+    assert r["published"] == ["demo-skill"] and gen.release_revision == "abc123" and gen.evaluation["run"] == "e1" and gen.reason == "reviewed in PR 40"
+
+
+async def test_removal_is_explicit(tmp_path):
+    name = next(iter((await active()).manifest))
+    r = await registry.release(None, "retiring it", remove=[name])
+    assert r["removed"] == [name] and name not in (await active()).manifest
+
+
+async def test_a_bad_version_stops_the_whole_release(tmp_path):
+    before = await active()
+    write(tmp_path, "demo-skill", text_of(extra="steps:\n  - {tool: k8s_list_pods, args: {nonsense: 1}}\n"))
+    with pytest.raises(registry.PublishError):
+        await registry.release(None, "try it", names=["demo-skill"], extra_dir=str(tmp_path))
+    assert (await active()).generation == before.generation
+
+
+async def test_a_set_that_cannot_run_together_is_refused(tmp_path):
+    write(tmp_path, "demo-skill", text_of(rule="same-rule"))
+    await registry.release(None, "first", names=["demo-skill"], extra_dir=str(tmp_path))
+    other = tmp_path / "other"
+    other.mkdir()
+    write(other, "demo-two", text_of(name="demo-two", rule="same-rule"))
+    before = await active()
+    with pytest.raises(registry.PublishError):
+        await registry.release(None, "clashes with what is live", names=["demo-two"], extra_dir=str(other))
+    assert (await active()).generation == before.generation

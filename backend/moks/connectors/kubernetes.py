@@ -281,6 +281,14 @@ class KubernetesConnector:
         return [summarize_workload("Deployment", d) for d in deps] + [summarize_workload("StatefulSet", s) for s in sts] + \
             [summarize_workload("DaemonSet", d) for d in dss]
 
+    async def controller_of(self, namespace: str, replica_set: str) -> str:
+        """What owns a ReplicaSet, from its ownerReferences: "Deployment/x", or "" if nothing does."""
+        apps = await self.apps()
+        api = await self._client()
+        rs = api.sanitize_for_serialization(await self._call(f"get replicaset {namespace}/{replica_set}", apps.read_namespaced_replica_set, replica_set, namespace))
+        owner = next((o for o in rs["metadata"].get("ownerReferences") or [] if o.get("controller")), None)
+        return f"{owner['kind']}/{owner['name']}" if owner else ""
+
     async def rollout_history(self, namespace: str, deployment: str) -> dict:
         apps = await self.apps()
         api = await self._client()

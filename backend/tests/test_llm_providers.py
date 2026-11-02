@@ -178,7 +178,7 @@ async def test_claude_request_sends_no_sampling_or_prefill_and_reads_only_text(c
     call = claude.calls[0]
     assert (r.text, r.tokens_in, r.tokens_out) == ("hello", 7, 9)
     assert "temperature" not in call and call["messages"][-1]["role"] == "user" and "JSON object" in call["system"]
-    assert call["max_tokens"] == 4000  # thinking shares this limit
+    assert call["max_tokens"] == 500  # the configured cap holds, even under the floor thinking would like
     assert claude.init["api_key"] == "secret-value"
 
 
@@ -253,7 +253,7 @@ async def test_claude_on_bedrock_uses_the_messages_api_with_the_aws_identity(cla
     sent = Claude.calls[-1]
     # Refused by these models, or not offered on Bedrock.
     assert not sent["beta"] and "temperature" not in sent and "fallbacks" not in sent and "betas" not in sent
-    assert sent["model"] == "anthropic.claude-opus-5-5" and sent["max_tokens"] == p.AnthropicProvider.MIN_TOKENS
+    assert sent["model"] == "anthropic.claude-opus-5-5" and sent["max_tokens"] == 500  # the configured cap beats the provider's floor
     assert "single JSON object" in sent["system"]
 
 

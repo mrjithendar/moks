@@ -13,6 +13,7 @@
   moks terminal                      run the terminal gateway (pods in the terminal namespace only)
   moks eval DATASET [--mode rules|llm]  run an evaluation dataset and print scores
   moks reindex                       rebuild the knowledge index for the active embedding model
+  moks skills register|bootstrap|release   record, first-install or publish skills; never automatic
 """
 from __future__ import annotations
 
@@ -319,6 +320,18 @@ async def _eval(dataset: str, mode: str) -> None:
     print(f"score {summary['score']:.3f} over {summary['cases']} cases (run {rid})")
 
 
+async def _skills(a) -> None:
+    from .skills import registry
+
+    if a.skills_cmd == "register":
+        r = await registry.register_all()
+        print({k: r[k] for k in ("registered", "waiting", "rejected")})
+    elif a.skills_cmd == "bootstrap":
+        print(await registry.bootstrap())
+    else:
+        print(await registry.release(None, a.reason, names=a.only, remove=a.remove))
+
+
 async def _reindex() -> None:
     from .db import session_scope
     from .rag import service
@@ -461,6 +474,13 @@ def main(argv: list[str] | None = None) -> None:
     ev.add_argument("dataset")
     ev.add_argument("--mode", choices=["rules", "llm"], default="rules")
     sub.add_parser("reindex")
+    sk = sub.add_parser("skills").add_subparsers(dest="skills_cmd", required=True)
+    sk.add_parser("register", help="record the skills in this image; publishes nothing")
+    sk.add_parser("bootstrap", help="first install: publish the image's built-ins if no generation exists")
+    rel = sk.add_parser("release", help="publish the image's built-ins, or the named skills, as one generation")
+    rel.add_argument("--reason", required=True)
+    rel.add_argument("--only", nargs="*", help="skill names; default: every built-in in this image")
+    rel.add_argument("--remove", nargs="*", default=[], help="skills to drop from the generation, by name")
     bk = sub.add_parser("backup").add_subparsers(dest="backup_cmd", required=True)
     br = bk.add_parser("run", help="encrypt a pg_dump file, upload it, verify the copy and apply retention")
     br.add_argument("--dump", required=True)
@@ -507,6 +527,8 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_eval(a.dataset, a.mode))
     elif a.cmd == "reindex":
         asyncio.run(_reindex())
+    elif a.cmd == "skills":
+        asyncio.run(_skills(a))
     elif a.cmd == "backup":
         if a.backup_cmd == "run":
             asyncio.run(_backup_run(a.dump, a.manifest))

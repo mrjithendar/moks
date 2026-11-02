@@ -95,6 +95,10 @@ class Provider:
         except ValueError:
             raise LLMError("bad_response", f"{self.name} returned non-JSON") from None
 
+    def output_tokens(self, wanted: int) -> int:
+        """What this provider will actually ask for. Reservations are made on this number."""
+        return wanted
+
     async def complete(self, system: str, messages: list[Message], *, json_mode: bool, max_tokens: int,
                        temperature: float = 0.1) -> LLMResponse:
         raise NotImplementedError
@@ -217,10 +221,13 @@ class AnthropicProvider(Provider):
 
         return AsyncAnthropic(api_key=self._key(), base_url=self.cfg.endpoint or None, timeout=float(self.cfg.timeout_seconds), max_retries=RETRIES)
 
+    def output_tokens(self, wanted: int) -> int:
+        return min(max(wanted, self.MIN_TOKENS), self.cfg.max_output_tokens)  # the configured cap always wins
+
     async def complete(self, system, messages, *, json_mode, max_tokens, temperature=0.1):
         import anthropic
 
-        args: dict[str, Any] = {"model": self.cfg.model, "max_tokens": max(max_tokens, self.MIN_TOKENS), "messages": messages,
+        args: dict[str, Any] = {"model": self.cfg.model, "max_tokens": self.output_tokens(max_tokens), "messages": messages,
                                 "system": system + ("\nRespond with a single JSON object and nothing else." if json_mode else "")}
         direct = not self.cfg.endpoint  # a gateway may not know the beta
         try:

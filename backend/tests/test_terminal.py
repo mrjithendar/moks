@@ -200,7 +200,7 @@ def cookie(client):
 
 async def events(action, sid=None):
     async with session_scope() as db:
-        q = select(AuditEvent).where(AuditEvent.action == action)
+        q = select(AuditEvent).where(AuditEvent.action == action).order_by(AuditEvent.id)
         rows = (await db.execute(q)).scalars().all()
     return [r for r in rows if sid is None or r.resource_id == str(sid)]
 

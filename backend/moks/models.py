@@ -200,9 +200,24 @@ class Investigation(Base):
     cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
     worker_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    execution_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # new for every claim; the reaper clears it
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class InvestigationCheckpoint(Base):
+    """Where a run got to and what it had decided. Evidence stays in `evidence`; nothing raw is copied here."""
+    __tablename__ = "investigation_checkpoints"
+    investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), primary_key=True)
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    node: Mapped[str] = mapped_column(String(30))
+    next_node: Mapped[str] = mapped_column(String(30))
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    state: Mapped[dict] = mapped_column(JSONB, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class InvestigationEvent(Base):
@@ -226,6 +241,7 @@ class Evidence(Base):
     args: Mapped[dict] = mapped_column(JSONB, default=dict)
     scope: Mapped[dict] = mapped_column(JSONB, default=dict)
     ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    kind: Mapped[str] = mapped_column(String(20), default="observation")  # observation | incomplete | tool_error | access_denied | documentation | historical
     summary: Mapped[str] = mapped_column(Text, default="")
     data: Mapped[dict | list | None] = mapped_column(JSONB, nullable=True)
     source: Mapped[dict] = mapped_column(JSONB, default=dict)
@@ -357,6 +373,8 @@ class KnowledgeSource(Base):
     stale_policy: Mapped[str] = mapped_column(String(20), default="flag")  # flag | exclude
     stale_after_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sync_cursor: Mapped[dict] = mapped_column(JSONB, default=dict)
+    realm: Mapped[str] = mapped_column(String(20), default="operational")  # operational | evaluation
+    review_required: Mapped[bool] = mapped_column(Boolean, default=False)  # new documents wait in quarantine for an owner
 
 
 class KnowledgeSyncItem(Base):
@@ -380,8 +398,14 @@ class DocumentIndexState(Base):
     document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     index_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("embedding_indexes.id", ondelete="CASCADE"), primary_key=True)
     revision: Mapped[int] = mapped_column(BigInteger, default=0)
-    chunks: Mapped[int] = mapped_column(Integer, default=0)
-    vectors: Mapped[int] = mapped_column(Integer, default=0)
+    chunks: Mapped[int] = mapped_column(Integer, default=0)   # written
+    vectors: Mapped[int] = mapped_column(Integer, default=0)  # written
+    expected_chunks: Mapped[int | None] = mapped_column(Integer, nullable=True)  # None: written before these were tracked, so unverified
+    expected_vectors: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    model_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    dimensions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retries: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -389,6 +413,7 @@ class Document(Base):
     __tablename__ = "documents"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
     source_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("knowledge_sources.id", ondelete="CASCADE"))
+    realm: Mapped[str] = mapped_column(String(20), default="operational")  # must equal its source's: a composite foreign key enforces it
     path: Mapped[str] = mapped_column(String(1000))
     title: Mapped[str] = mapped_column(String(500), default="")
     kind: Mapped[str] = mapped_column(String(30), default="text")
@@ -412,7 +437,34 @@ class Document(Base):
     superseded_by: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     doc_state: Mapped[str] = mapped_column(String(20), default="current")  # current | deprecated | superseded
     vector_state: Mapped[str] = mapped_column(String(20), default="unknown")  # unknown | complete | missing | not_applicable
+    lifecycle: Mapped[str] = mapped_column(String(20), default="active")  # draft | quarantined | active | archived | deleted
+    trust: Mapped[str] = mapped_column(String(20), default="unreviewed")  # unreviewed | reviewed: found by a sync is not the same as vouched for
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     vector_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ImprovementProposal(Base):
+    """A runbook or skill change an engineer proposes from an incident. It stays a draft until someone
+    else reviews it, and approval still only feeds the normal publication path."""
+    __tablename__ = "improvement_proposals"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(20))  # runbook | skill
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text)
+    evidence: Mapped[list] = mapped_column(JSONB, default=list)
+    regression_fixture: Mapped[dict] = mapped_column(JSONB, default=dict)
+    owner: Mapped[str] = mapped_column(String(200))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    state: Mapped[str] = mapped_column(String(20), default="draft")  # draft | approved | rejected
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class IndexOutbox(Base):
@@ -460,6 +512,7 @@ class EmbeddingIndex(Base):
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     build_watermark: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # outbox position when the build began
     build_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # who owns this build
+    activation: Mapped[str | None] = mapped_column(String(20), nullable=True)  # complete | degraded, decided from recorded coverage
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -614,6 +667,8 @@ class SkillGeneration(Base):
     manifest: Mapped[dict] = mapped_column(JSONB)  # skill id -> version digest
     status: Mapped[str] = mapped_column(String(20), default="active")  # active | retired
     reason: Mapped[str] = mapped_column(Text, default="")
+    release_revision: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    evaluation: Mapped[dict] = mapped_column(JSONB, default=dict)  # the run that backed this publication, if any
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

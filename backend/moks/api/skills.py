@@ -152,7 +152,7 @@ async def rollback(name: str, body: PublishIn, ctx: AuthContext = Depends(needs(
 
 @router.post("/reload")
 async def reload(ctx: AuthContext = Depends(needs(P.ADMIN_POLICIES))) -> dict:
-    """Registers the files on disk. New built-ins publish; custom versions wait here for an administrator."""
-    r = await registry.scan(ctx.user.id)
-    await audit.record(None, action="skills.reload", actor_id=ctx.user.id, actor_email=ctx.user.email, details={k: r[k] for k in ("registered", "published", "waiting", "generation")} | {"rejected": len(r["rejected"])})
-    return {"loaded": len(skills.library().skills), "errors": r["rejected"], **{k: r[k] for k in ("registered", "published", "waiting", "generation")}}
+    """Registers the files on disk. Everything waits here for an explicit publication."""
+    r = await registry.register_all()
+    await audit.record(None, action="skills.reload", actor_id=ctx.user.id, actor_email=ctx.user.email, details={k: r[k] for k in ("registered", "waiting")})
+    return {"loaded": len(skills.library().skills), "errors": r["rejected"], "registered": r["registered"], "published": [], "waiting": r["waiting"], "generation": registry.snapshot()["generation"]}

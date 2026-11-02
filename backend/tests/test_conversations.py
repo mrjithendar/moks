@@ -229,7 +229,7 @@ async def test_previous_logs_give_a_verified_quoted_cause_without_any_llm(client
     inv = await _run(r["id"])
     calls = [e.get("args") for e in (await client.get(f"/moks/api/investigations/{r['id']}")).json()["evidence"] if e["tool"] == "k8s_pod_logs"]
     assert any(c.get("previous") for c in calls) and any(not c.get("previous") for c in calls)
-    assert any("invalid PAYMENT_MODE=lve" in c["cause"] for c in inv.report["verified_causes"])
+    assert any("invalid PAYMENT_MODE=lve" in c["cause"] for c in inv.report["verified_findings"])
 
 
 async def test_each_container_of_a_multi_container_pod_is_read_by_name(client, monkeypatch):
@@ -265,7 +265,7 @@ async def test_gone_previous_logs_are_reported_not_ignored(client, monkeypatch):
     h = await login(client, f"g-{tag}@example.com")
     r = (await client.post("/moks/api/investigations", json={"question": "what is wrong", "environment": env, "namespace": "logs"}, headers=h)).json()
     inv = await _run(r["id"])
-    assert any("Previous logs" in n for n in inv.report["notes"]) and not inv.report["verified_causes"]
+    assert any("Previous logs" in n for n in inv.report["notes"]) and not inv.report["verified_causes"] and not any(c["check"].endswith("crash_log_reason") for c in inv.report["verified_findings"])
 
 
 async def test_the_model_gets_the_thread_as_untrusted_data_without_deleted_messages(client):

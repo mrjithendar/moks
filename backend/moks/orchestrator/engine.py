@@ -11,6 +11,7 @@ is cooperative and immediate: a watcher cancels the run when cancel_requested is
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -21,7 +22,8 @@ from decimal import Decimal
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.dialects.postgresql import insert
 
 from .. import audit
 from ..config import get_settings
@@ -30,9 +32,10 @@ from ..db import session_scope
 from ..auth.revocation import CHECK_SECONDS as WATCH_SECONDS, AccessGuard, AccessRevoked
 from ..llm.lc import MoksChatModel
 from ..llm.providers import LLMError, provider_for
-from ..models import SkillPolicy, Environment, Investigation, InvestigationEvent, LLMConfig, RoleBinding, User
+from ..models import Environment, Evidence, Investigation, InvestigationCheckpoint, InvestigationEvent, LLMConfig, LLMUsage, RoleBinding, SkillVersion, User
 from ..observability import INVESTIGATION_DURATION, INVESTIGATIONS, INVESTIGATIONS_RUNNING, continue_trace, tracer
 from ..rbac import Binding, P, Principal
+from ..redaction import redact_obj
 from ..scope import ScopeError, effective_scope
 from ..tools.contracts import ToolContext
 from ..tools.executor import ToolExecutor, ToolOutcome, tools_for_planner
@@ -40,7 +43,9 @@ from ..tools.lc import as_tools
 from . import graph, prompts
 from .. import conversations
 from ..diagnosis.logs import last_failure
-from .report import Report, focus, parse_json_object, rules_report, validate_llm_report, verify_causes
+from ..llm.budget import CHARS_PER_TOKEN
+from .evidence import HISTORICAL, LIVE, Ledger, classify
+from .report import Report, focus, parse_json_object, rules_report, validate_claims, validate_llm_report, verify_causes
 
 log = logging.getLogger("moks.orchestrator")
 
@@ -52,11 +57,25 @@ MAX_NAMESPACES_SWEEP = 10
 
 MAX_LOG_PODS = 3
 LOG_TAIL = 150
+PLAN_TOKENS = 1200
+REPORT_TOKENS = 1500   # asked for, within the configured cap; a smaller cap is honored
+MIN_PLAN_TOKENS = 150
+MIN_REPORT_TOKENS = 300  # below this a report would be cut off mid-JSON, so the rule-based one is used
 LOG_FINDINGS = {"crashloop", "oomkilled", "oomkilled_earlier", "not_ready", "config_error", "evicted"}
+
+
+CHECKPOINT_VERSION = 1
+MAX_OWNER_LOOKUPS = 10
+RECOLLECT = {"k8s_triage", "k8s_list_pods", "prom_alerts"}  # what a resumed run reads again when its evidence has aged
+MAX_RECOLLECT = 4
 
 
 class BudgetExceeded(Exception):
     pass
+
+
+class OwnershipLost(Exception):
+    """This worker's claim is gone. Whatever it holds must not be written anywhere."""
 
 
 async def load_principal(db, user_id: uuid.UUID) -> Principal:
@@ -73,8 +92,27 @@ async def emit(investigation_id: uuid.UUID, seq: int, type_: str, payload: dict[
         db.add(InvestigationEvent(investigation_id=investigation_id, seq=seq, type=type_, payload=payload))
 
 
+async def emit_next(investigation_id: uuid.UUID, type_: str, payload: dict[str, Any]) -> None:
+    """An event from outside the run, with the next free sequence number."""
+    async with session_scope() as db:
+        seq = (await db.execute(select(func.coalesce(func.max(InvestigationEvent.seq), 0)).where(InvestigationEvent.investigation_id == investigation_id))).scalar_one()
+        db.add(InvestigationEvent(investigation_id=investigation_id, seq=seq + 1, type=type_, payload=payload))
+
+
+def _call_key(tool: str, args: dict[str, Any]) -> str:
+    return tool + json.dumps(args, sort_keys=True)
+
+
 class Investigator:
-    def __init__(self, investigation_id: uuid.UUID, worker_id: str, connectors_override: dict | None = None, use_llm: bool = True):
+    def __init__(self, investigation_id: uuid.UUID, worker_id: str, connectors_override: dict | None = None, use_llm: bool = True,
+                 token: uuid.UUID | None = None, attempt: int = 1):
+        self.token = token
+        self.attempt = attempt
+        self.lost = False
+        self.completed_nodes: list[str] = []
+        self.resumed_from: str | None = None
+        self.connector_ids: dict[str, str | None] = {}
+        self.llm_key: str | None = None
         self.guard: AccessGuard | None = None
         self.owner: uuid.UUID | None = None
         self.revoked: str | None = None
@@ -102,12 +140,24 @@ class Investigator:
         self.skill_generation: int | None = None
         self.requested_skill: str | None = None
         self.focus_namespace: str | None = None
+        self.versions: dict[str, Any] = {}
+
+    async def _fence(self, db) -> None:
+        """Inside a transaction that is about to write: the row lock holds off the reaper until the
+        commit, so a write either lands while the claim is good or not at all."""
+        if self.token is None:
+            return
+        held = (await db.execute(text("SELECT 1 FROM investigations WHERE id = :i AND execution_token = :t FOR SHARE"), {"i": self.id, "t": self.token})).first()
+        if held is None:
+            self.lost = True
+            raise OwnershipLost(str(self.id))
 
     async def _emit(self, type_: str, payload: dict[str, Any]) -> None:
         self.seq += 1
-        await emit(self.id, self.seq, type_, payload)
-        if type_ == "phase":
-            async with session_scope() as db:
+        async with session_scope() as db:
+            await self._fence(db)
+            db.add(InvestigationEvent(investigation_id=self.id, seq=self.seq, type=type_, payload=payload))
+            if type_ == "phase":
                 await db.execute(update(Investigation).where(Investigation.id == self.id).values(stage=payload["phase"]))
 
     def _next_ref(self) -> str:
@@ -116,7 +166,19 @@ class Investigator:
 
     # ---- entry point ----------------------------------------------------------------------
 
+    async def _adopt(self) -> None:
+        """Runs started directly, not through the worker's claim, still run under a token."""
+        async with session_scope() as db:
+            row = (await db.execute(text("""UPDATE investigations SET execution_token = gen_random_uuid(), status = 'running', worker_id = :w, started_at = COALESCE(started_at, now()),
+                                            heartbeat_at = now(), lease_expires_at = now() + make_interval(secs => :l), attempts = attempts + 1
+                                            WHERE id = :i AND status IN ('queued', 'running') RETURNING execution_token, attempts"""),
+                                    {"i": self.id, "w": self.worker_id[:100], "l": self.settings.investigation_lease_seconds})).first()
+        if row:
+            self.token, self.attempt = row
+
     async def run(self) -> None:
+        if self.token is None:
+            await self._adopt()
         async with session_scope() as db:
             queued = (await db.execute(select(InvestigationEvent.payload).where(InvestigationEvent.investigation_id == self.id, InvestigationEvent.seq == 0))).scalar_one_or_none()
         with tracer().start_as_current_span("investigation", context=continue_trace((queued or {}).get("traceparent"))) as span:
@@ -137,8 +199,10 @@ class Investigator:
             async with asyncio.timeout(self.settings.max_duration_seconds):
                 mode = await self._investigate()
             status = "completed"
+        except OwnershipLost:
+            status = "abandoned"
         except asyncio.CancelledError:
-            status, error = "cancelled", self.revoked or "cancelled by user"
+            status, error = ("abandoned", None) if self.lost else ("cancelled", self.revoked or "cancelled by user")
             uncancel = getattr(task, "uncancel", None)
             if uncancel:
                 uncancel()
@@ -154,28 +218,54 @@ class Investigator:
         finally:
             watcher.cancel()
             INVESTIGATIONS_RUNNING.dec()
-        if status != "completed":
-            # Keep the partial evidence useful: write a rule-based report of what was collected.
-            partial = rules_report("", self.findings, self.evidence, self.notes + [f"Investigation {status}: {error}"])
-            await self._finish(status, partial.model_dump() if self.evidence and not self.revoked else None, error)
-            await self._emit("error" if status == "failed" else "cancelled", {"message": error})
-        await self._emit("done", {"status": status})
+        try:
+            if status != "completed" and status != "abandoned":
+                # Keep the partial evidence useful: write a rule-based report of what was collected.
+                partial = rules_report("", self.findings, self.evidence, self.notes + [f"Investigation {status}: {error}"])
+                if not await self._finish(status, partial.model_dump() if self.evidence and not self.revoked else None, error):
+                    status = "abandoned"
+                else:
+                    await self._emit("error" if status == "failed" else "cancelled", {"message": error})
+            if status != "abandoned":
+                await self._emit("done", {"status": status})
+        except OwnershipLost:
+            status = "abandoned"
+        except Exception:  # the database went away: the lease lapses and the reaper decides what happens next
+            log.exception("could not record the outcome", extra={"event": "investigation_outcome_lost", "investigation_id": str(self.id)})
+            status = "abandoned"
+        if status == "abandoned":
+            log.warning("stopped: this worker no longer owns the investigation", extra={"event": "investigation_abandoned", "investigation_id": str(self.id)})
         INVESTIGATIONS.labels(status, mode).inc()
         INVESTIGATION_DURATION.labels(mode).observe(time.monotonic() - start)
         log.info("investigation finished", extra={"event": "investigation_finished", "investigation_id": str(self.id), "operation": mode, "outcome": "success" if status == "completed" else "failure",
                                                   "durationMs": int((time.monotonic() - start) * 1000), **({} if status == "completed" else {"errorCode": status})})
 
+    async def _renew(self) -> bool:
+        """False when the work should stop for a reason recorded on the object. Raises if the database cannot say."""
+        async with session_scope() as db:
+            if self.token is None:
+                inv = await db.get(Investigation, self.id)
+                if inv is None or inv.cancel_requested:
+                    return False
+                inv.heartbeat_at = datetime.now(timezone.utc)
+                return True
+            row = (await db.execute(text("""UPDATE investigations SET heartbeat_at = now(), lease_expires_at = now() + make_interval(secs => :l)
+                                            WHERE id = :i AND execution_token = :t AND status = 'running' AND lease_expires_at > now() RETURNING cancel_requested"""),
+                                    {"i": self.id, "t": self.token, "l": self.settings.investigation_lease_seconds})).first()
+        if row is None:
+            self.lost = True
+            return False
+        return not row[0]
+
     async def _watch(self, task: asyncio.Task) -> None:
-        last_check = time.monotonic()
+        last_check = renewed = time.monotonic()
         while True:
             await asyncio.sleep(1.0 if WATCH_SECONDS >= 1 else WATCH_SECONDS)
             try:
-                async with session_scope() as db:
-                    inv = await db.get(Investigation, self.id)
-                    if inv is None or inv.cancel_requested:
-                        task.cancel()
-                        return
-                    inv.heartbeat_at = datetime.now(timezone.utc)
+                if not await self._renew():
+                    task.cancel()
+                    return
+                renewed = time.monotonic()
                 if self.guard is not None and time.monotonic() - last_check >= WATCH_SECONDS:
                     last_check = time.monotonic()
                     await self.guard.check()
@@ -184,22 +274,133 @@ class Investigator:
                 log.warning("investigation stopped: access revoked", extra={"event": "investigation_revoked", "investigation_id": str(self.id)})
                 task.cancel()
                 return
-            except Exception:  # transient DB errors must not kill the run
+            except Exception:  # a short outage must not kill the run, but past the lease it may no longer be ours
                 log.warning("heartbeat failed", extra={"event": "heartbeat_failed", "investigation_id": str(self.id)})
+                if self.token is not None and time.monotonic() - renewed > self.settings.investigation_lease_seconds:
+                    self.lost = True
+                    task.cancel()
+                    return
 
-    async def _finish(self, status: str, report: dict | None, error: str | None) -> None:
+    async def _finish(self, status: str, report: dict | None, error: str | None) -> bool:
+        """The one transition out of running. Exactly one caller wins it, so there is one reply and one
+        audit record however many workers thought they owned the run."""
         async with session_scope() as db:
-            await db.execute(update(Investigation).where(Investigation.id == self.id).values(
+            q = update(Investigation).where(Investigation.id == self.id)
+            if self.token is not None:
+                q = q.where(Investigation.execution_token == self.token, Investigation.status == "running")
+            won = (await db.execute(q.values(
                 status=status, report=report, error=error, finished_at=datetime.now(timezone.utc),
                 tool_calls=self.tool_calls, tokens_in=self.tokens_in, tokens_out=self.tokens_out, cost_usd=self.cost,
                 skill_generation=self.skill_generation, skill_pins=self.skill_runs,
-            ))
+            ).returning(Investigation.id))).first()
+            if won is None:
+                self.lost = True
+                return False
+            await db.execute(delete(InvestigationCheckpoint).where(InvestigationCheckpoint.investigation_id == self.id))
             inv = await db.get(Investigation, self.id)
             await conversations.record_reply(db, inv, (report or {}).get("summary") or error or "No report was produced.")
             await audit.record(db, action="investigation.finish", actor_id=inv.created_by if inv else None,
                                resource_type="investigation", resource_id=str(self.id), namespace=inv.namespace if inv else None,
-                               outcome=status, details={"tool_calls": self.tool_calls, "tokens_in": self.tokens_in,
+                               outcome=status, details={"tool_calls": self.tool_calls, "tokens_in": self.tokens_in, "attempt": self.attempt,
                                                         "tokens_out": self.tokens_out, "cost_usd": str(self.cost), "error": error})
+        return True
+
+    # ---- checkpoints ----------------------------------------------------------------------
+
+    def _versions(self, llm_cfg: LLMConfig | None) -> dict[str, Any]:
+        return {"llm": f"{llm_cfg.provider}/{llm_cfg.model}" if llm_cfg else None, "prompts": hashlib.sha256((prompts.PLANNER_SYSTEM + prompts.REPORT_SYSTEM).encode()).hexdigest()[:16]}
+
+    def _snapshot(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Decisions and progress, never evidence payloads or credentials: evidence is re-read from its table."""
+        report = state.get("report")
+        return {
+            "version": CHECKPOINT_VERSION, "completed": self.completed_nodes, "ref": self.ref, "tool_calls": self.tool_calls, "evidence_refs": [e["ref"] for e in self.evidence],
+            "graph": {k: (report.model_dump() if k == "report" and report is not None else state.get(k)) for k in ("namespace", "round", "calls", "use_rules", "finished", "mode", "report")},
+            "notes": self.notes, "findings": self.findings, "calls_seen": sorted(self.calls_seen), "rejected": self.rejected[-20:], "focus_namespace": self.focus_namespace,
+            "skills": [{"digest": sk.digest, "score": score, "reasons": why} for sk, score, why in self.skills], "skill_runs": self.skill_runs, "skill_rejected": self.skill_rejected,
+            "skill_generation": self.skill_generation, "connectors": self.connector_ids, "versions": self.versions,
+            "budget": {"tool_calls": self.tool_calls, "tokens_in": self.tokens_in, "tokens_out": self.tokens_out, "cost_usd": str(self.cost)},
+            "authorization": {"principal": str(self.owner), "checked_at": datetime.now(timezone.utc).isoformat()},
+            "scope": {"from": self._window[0].isoformat(), "to": self._window[1].isoformat()} if self._window else None,
+        }
+
+    async def _checkpoint(self, node: str, next_node: str, state: dict[str, Any]) -> None:
+        self.completed_nodes.append(node)
+        body = redact_obj(json.loads(json.dumps(self._snapshot(state), default=str)))
+        async with session_scope() as db:
+            await self._fence(db)
+            values = {"seq": self.seq, "node": node, "next_node": next_node, "attempt": self.attempt, "state": body, "updated_at": func.now()}
+            await db.execute(insert(InvestigationCheckpoint).values(investigation_id=self.id, **values).on_conflict_do_update(index_elements=["investigation_id"], set_=values))
+
+    async def _resume(self, llm_cfg: LLMConfig | None) -> dict[str, Any] | None:
+        """Restores a checkpoint, after permissions were checked again by the caller. Evidence from before the
+        crash stays citable, but anything past the freshness limit becomes historical. Returns graph state."""
+        async with session_scope() as db:
+            row = await db.get(InvestigationCheckpoint, self.id)
+            if row is None:
+                return None
+            cp, entry, node = row.state, row.next_node, row.node
+            if cp.get("version") != CHECKPOINT_VERSION:
+                self.notes.append("A checkpoint from another version was ignored; this run started again.")
+                return None
+            rows = (await db.execute(select(Evidence).where(Evidence.investigation_id == self.id))).scalars().all()
+            spent = (await db.execute(select(func.coalesce(func.sum(LLMUsage.tokens_in), 0), func.coalesce(func.sum(LLMUsage.tokens_out), 0), func.coalesce(func.sum(LLMUsage.cost_usd), 0))
+                                      .where(LLMUsage.investigation_id == self.id))).one()
+            pins = {r.digest: r for r in (await db.execute(select(SkillVersion).where(SkillVersion.digest.in_([p["digest"] for p in cp["skills"]])))).scalars()}
+            now = datetime.now(timezone.utc)
+            changed = {t for t, i in (cp.get("connectors") or {}).items() if self.connector_ids.get(t) != i}
+            aged = [e for e in rows if e.kind in LIVE and ((now - e.collected_at).total_seconds() > self.settings.evidence_max_age_seconds or e.connector_type in changed)]
+            await self._fence(db)
+            for e in aged:
+                e.kind = HISTORICAL
+            await db.flush()
+            self.evidence = [{"ref": e.ref, "tool": e.tool, "args": e.args, "ok": e.ok, "summary": e.summary, "data": e.data, "error": e.error, "error_kind": None, "denied": e.kind == "access_denied",
+                              "source": e.source, "collected_at": e.collected_at.isoformat(), "truncated": e.truncated, "kind": e.kind} for e in sorted(rows, key=lambda r: int(r.ref[1:]))]
+            texts = {d: (r.content, r.source, r.skill_id, r.version) for d, r in pins.items()}
+        from .. import skills as skill_lib
+
+        self.notes = cp["notes"]
+        self.findings = cp["findings"]
+        self.calls_seen = set(cp["calls_seen"]) - {_call_key(e["tool"], e["args"]) for e in self.evidence if e["kind"] == HISTORICAL}
+        self.rejected = cp["rejected"]
+        self.focus_namespace = cp["focus_namespace"]
+        self.completed_nodes = cp["completed"]
+        self.ref = max([int(e["ref"][1:]) for e in self.evidence] + [cp["ref"]])
+        self.tool_calls = max(cp["tool_calls"], len(self.evidence))  # calls the crash interrupted were still made
+        self.tokens_in, self.tokens_out, self.cost = int(spent[0]), int(spent[1]), Decimal(spent[2])
+        self.skill_runs, self.skill_rejected, self.skill_generation = cp["skill_runs"], cp["skill_rejected"], cp["skill_generation"]
+        self.skills = []
+        for pin in cp["skills"]:
+            if pin["digest"] in texts:
+                content, source, sid, version = texts[pin["digest"]]
+                self.skills.append((skill_lib.parse(content, f"registry:{sid}@{version}", source), pin["score"], pin["reasons"]))
+            else:
+                self.notes.append("A pinned skill version is no longer in the registry, so its guidance was dropped from this run.")
+        self.skill_runs = [r for r in self.skill_runs if r["digest"] in texts]
+        if changed:
+            self.notes.append(f"Resumed with different connectors for {', '.join(sorted(changed))}; evidence read through the old ones is historical.")
+        if (cp.get("versions") or {}).get("llm") != self.versions.get("llm") or (cp.get("versions") or {}).get("prompts") != self.versions.get("prompts"):
+            self.notes.append("The model or prompts changed between attempts of this investigation.")
+        self.resumed_from = node
+        await self._emit("note", {"message": f"Resumed after {node} (attempt {self.attempt}). Budgets carry over."})
+        graph_state = {k: v for k, v in cp["graph"].items() if v is not None}
+        if graph_state.get("report"):
+            graph_state["report"] = Report.model_validate(graph_state["report"])
+        return {**graph_state, "entry": entry}
+
+    async def _recollect(self, executor: ToolExecutor, namespace: str) -> None:
+        """Reads the basics again when a resumed run's evidence has aged. Same budget, same path as any call."""
+        stale = [e for e in self.evidence if e["kind"] == HISTORICAL and e["tool"] in RECOLLECT]
+        for e in stale[:MAX_RECOLLECT]:
+            out = await self._call(executor, e["tool"], e["args"], "read again: the earlier result is too old to rely on")
+            if out and out.ok and e["tool"] == "k8s_triage":
+                known = {(f["kind"], tuple(f.get("resources", []))): f for f in self.findings}
+                for f in out.data.get("findings", []):
+                    key = (f["kind"], tuple(f.get("resources", [])))
+                    if key in known:
+                        known[key]["evidence"] = [*known[key].get("evidence", []), out.evidence_ref]
+                    else:
+                        self.findings.append({**f, "namespace": e["args"].get("namespace"), "evidence": [out.evidence_ref]})
 
     # ---- the loop -------------------------------------------------------------------------
 
@@ -216,6 +417,7 @@ class Investigator:
                 connectors, conn_errors = self.connectors_override, {}
             else:
                 connectors, conn_errors = await registry.for_environment(db, env.id)
+            self.connector_ids = {t: str(c[0].id) if c[0] is not None else None for t, c in connectors.items()}
             llm_cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none() if self.use_llm else None
             question, namespace, t_from, t_to = inv.question, inv.namespace, inv.time_from, inv.time_to
             self.requested_skill = inv.requested_skill
@@ -244,14 +446,22 @@ class Investigator:
         await self.guard.check()
 
         provider = provider_for(llm_cfg) if llm_cfg else None
+        self.versions = self._versions(llm_cfg)
+        resumed = await self._resume(llm_cfg) if self.attempt > 1 else None
+        if resumed and resumed.get("namespace"):
+            scope_info["namespace"] = ctx.focus_namespace = resumed["namespace"]
         async with session_scope() as db:
             executor = ToolExecutor(db, ctx, next_ref=self._next_ref, timeout_seconds=min(45, self.settings.max_duration_seconds))
-            final = await graph.run(self, executor, ctx, question, namespace, scope_info, provider, llm_cfg, (LLMError, BudgetExceeded))
+            if resumed:
+                await self._recollect(executor, resumed.get("namespace") or namespace)
+            final = await graph.run(self, executor, ctx, question, namespace, scope_info, provider, llm_cfg, (LLMError, BudgetExceeded), resumed)
             await db.commit()
         namespace, report = final["namespace"], final["report"]
         mode = final.get("mode") or mode
         await self._emit("phase", {"phase": "verification", "label": "Verifying causes against direct evidence"})
-        verify_causes(report, self.findings)
+        ledger = self._ledger(namespace)
+        validate_claims(report, ledger, self.findings, check_support=report.generated_by == "llm")
+        verify_causes(report, self.findings, ledger)
         await self._emit("phase", {"phase": "report", "label": "Writing findings"})
         payload = report.model_dump()
         payload["scope"] = scope_info
@@ -266,9 +476,14 @@ class Investigator:
         payload["skill_generation"] = self.skill_generation
         payload["skill_actions"] = await self._skill_actions(namespace, env_name)
         payload["notes"] = list(dict.fromkeys([*(payload.get("notes") or []), *self.notes]))
-        await self._finish("completed", payload, None)
+        payload["execution"] = {"attempt": self.attempt, "resumed_after": self.resumed_from, "versions": self.versions}
+        if not await self._finish("completed", payload, None):
+            raise OwnershipLost(str(self.id))
         await self._emit("report", {"report": payload})
         return mode
+
+    def _ledger(self, namespace: str) -> Ledger:
+        return Ledger.build(self.evidence, namespace=namespace, max_age_seconds=self.settings.evidence_max_age_seconds)
 
     def _with_history(self, question: str) -> str:
         """Earlier turns give the model context. They are data: one person's text must not instruct it."""
@@ -320,7 +535,7 @@ class Investigator:
         return next((f["resources"][0] for f in ranked if f.get("resources")), None)
 
     async def _call(self, executor: ToolExecutor, tool: str, args: dict[str, Any], purpose: str | None = None) -> ToolOutcome | None:
-        key = tool + json.dumps(args, sort_keys=True)
+        key = _call_key(tool, args)
         if key in self.calls_seen:
             return None
         if self.tool_calls >= self.settings.max_tool_calls:
@@ -331,13 +546,20 @@ class Investigator:
         self.tool_calls += 1
         await self._emit("tool_call", {"tool": tool, "args": args, "purpose": purpose})
         out = await executor.run(tool, args)
+        try:
+            await self._fence(executor.db)  # a result that arrives after the claim was lost is discarded, not stored
+        except OwnershipLost:
+            await executor.db.rollback()
+            await audit.record(None, action="tool.call", resource_type="tool", resource_id=tool, outcome="discarded", details={"investigation_id": str(self.id), "reason": "claim lost before the result was stored"})
+            raise
         await executor.db.commit()
         record = {"ref": out.evidence_ref, "tool": tool, "args": out.args, "ok": out.ok, "summary": out.summary,
                   "data": out.data, "error": out.error, "error_kind": out.error_kind, "denied": out.denied,
-                  "source": out.source, "collected_at": out.collected_at, "truncated": out.truncated}
+                  "source": out.source, "collected_at": out.collected_at, "truncated": out.truncated,
+                  "kind": out.kind or classify(ok=out.ok, tool=tool, denied=out.denied, truncated=out.truncated)}
         if out.evidence_ref:
             self.evidence.append(record)
-        else:
+        if not out.evidence_ref or out.denied:
             self.rejected.append({"tool": tool, "args": args, "reason": out.error, "kind": out.error_kind})
         await self._emit("tool_result", {k: v for k, v in record.items() if k != "data"} | {"duration_ms": out.duration_ms})
         if tool == "k8s_argocd_status" and out.ok and isinstance(out.data, dict):
@@ -546,6 +768,26 @@ class Investigator:
             ok[sk.name] = state
         return ok, refused
 
+    async def _resolve_owners(self, ctx: ToolContext) -> None:
+        """Steps need the Deployment behind a pod. It comes from ownerReferences; a name is only a guess
+        (a ReplicaSet called a-b-c need not belong to a Deployment a-b)."""
+        k = (ctx.connectors.get("kubernetes") or (None, None))[1]
+        if k is None or not hasattr(k, "controller_of"):
+            return
+        seen: dict[tuple, str | None] = {}
+        for f in self.findings:
+            kind, _, name = str(f.get("owner") or "").partition("/")
+            if kind != "ReplicaSet" or not f.get("namespace") or "controller" in f:
+                continue
+            key = (f["namespace"], name)
+            if key not in seen and len(seen) < MAX_OWNER_LOOKUPS:
+                try:
+                    seen[key] = await k.controller_of(*key)
+                except Exception:
+                    seen[key] = None  # unknown, so step arguments fall back and the name stays a guess
+            if seen.get(key) is not None:
+                f["controller"] = seen[key]
+
     async def _still_allowed(self, sk, env_name: str) -> str | None:
         """Why a pinned skill must stop now, if it must. Replacing a version does not stop it: only a
         decision against the skill does."""
@@ -566,6 +808,7 @@ class Investigator:
         from ..skills.registry import snapshot
         from ..tools.builtin import REGISTRY
 
+        await self._resolve_owners(ctx)
         kinds = {f["kind"] for f in self.findings}
         ready, refused = await self._eligible(ctx)
         self.skill_generation = snapshot()["generation"]
@@ -594,13 +837,19 @@ class Investigator:
             await self._emit("phase", {"phase": "skill", "label": f"Running skill {sk.name}"})
             share = max(1, budget // (len(ordered) - position))
             budget -= share
+            if sk.meta.budget.max_tool_calls is not None and share > sk.meta.budget.max_tool_calls:
+                budget += share - sk.meta.budget.max_tool_calls
+                share = sk.meta.budget.max_tool_calls
             for step in sk.meta.steps:
-                record = {"tool": step.tool, "purpose": step.purpose, "required": step.required, "status": "skipped", "reason": None, "evidence": [], "errors": []}
+                record = {"id": step.id, "tool": step.tool, "purpose": step.purpose, "required": step.required, "status": "skipped", "reason": None, "evidence": [], "errors": []}
                 run["steps"].append(record)
-                stop = await self._still_allowed(sk, ctx.environment.name)
+                stop = run["stopped"] or await self._still_allowed(sk, ctx.environment.name)
                 if stop:
                     run["stopped"] = stop
                     record["reason"] = f"skill stopped: {stop}"
+                    continue
+                if step.requires_finding and step.requires_finding not in {f["kind"] for f in self.findings}:
+                    record["status"], record["reason"] = "not_applicable", f"needs finding {step.requires_finding}, which this run did not produce"
                     continue
                 spec = REGISTRY[step.tool]
                 if not all(ctx.available(c) for c in (spec.connector_type, *spec.also_requires)):
@@ -641,6 +890,9 @@ class Investigator:
                         record["errors"].append((out.error or out.summary or "failed")[:200])
                     else:
                         record["reason"] = None
+                if step.stop_if_finding and step.stop_if_finding in {f["kind"] for f in self.findings}:
+                    run["stopped"], run["escalation"] = f"stop condition met: {step.stop_if_finding}", step.escalate
+                    self.notes.append(f"Skill {sk.name} stopped at {step.id or step.tool}: {step.escalate}")
             budget += max(share, 0)  # what one skill did not need goes to the next
 
     def _contracts(self) -> None:
@@ -664,9 +916,10 @@ class Investigator:
                     checks.append({"field": "verification", "text": item.label or f"{item.finding} {item.expect}", "status": "passed" if present == (item.expect == "present") else "failed"})
             checks += [{"field": "recovery_validation", "text": x, "status": "guidance_only"} for x in sk.meta.recovery_validation]
             run["checks"] = checks
-            gaps = [f"step {s['tool']} {s['status']}: {s['reason'] or '; '.join(s['errors'])}" for s in run["steps"] if s["required"] and s["status"] != "executed"]
+            gaps = [f"step {s['tool']} {s['status']}: {s['reason'] or '; '.join(s['errors'])}" for s in run["steps"] if s["required"] and s["status"] not in ("executed", "not_applicable")]
             gaps += [f"check failed: {c['text']}" for c in checks if c["status"] == "failed"]
             run["gaps"] = gaps
+            run["outcome"] = "stopped" if run.get("stopped") else "incomplete" if gaps else "complete"  # a required check that did not run is never success
             for g in gaps[:4]:
                 self.notes.append(f"Skill {sk.name}: {g}.")
 
@@ -703,18 +956,24 @@ class Investigator:
                                 "finding": f["title"], "evidence": f.get("evidence", [])})
         return out
 
-    async def _check_budget(self, cfg: LLMConfig) -> None:
-        if self.tokens_in + self.tokens_out >= self.settings.max_tokens_per_investigation:
-            raise BudgetExceeded(f"token budget of {self.settings.max_tokens_per_investigation} for this investigation used")
+    def _capacity(self, cfg: LLMConfig, chars: int, wanted: int, least: int) -> int:
+        """Output tokens this call may use: the configured cap, what was asked for, and what the
+        investigation has left after the prompt. Raises rather than ask for an answer that cannot fit."""
+        left = self.settings.max_tokens_per_investigation - self.tokens_in - self.tokens_out - chars // CHARS_PER_TOKEN
+        room = min(cfg.max_output_tokens, wanted, left)
+        if room < least:
+            raise BudgetExceeded(f"not enough output capacity for this step: {max(room, 0)} tokens left, {least} needed "
+                                 f"(configured cap {cfg.max_output_tokens}, investigation budget {self.settings.max_tokens_per_investigation})")
+        return room
 
-    async def _llm(self, provider, cfg: LLMConfig, system: str, user: str, max_tokens: int) -> dict[str, Any]:
+    async def _llm(self, provider, cfg: LLMConfig, system: str, user: str, wanted: int, least: int) -> dict[str, Any]:
         if self.guard is not None:
             await self.guard.check()  # nothing more goes to the provider for someone who lost access
-        await self._check_budget(cfg)
-        model = MoksChatModel(provider=provider, max_tokens=max_tokens, user_id=self.owner, investigation_id=self.id)
         messages: list[BaseMessage] = [SystemMessage(content=system), HumanMessage(content=user)]
         last_error: Exception | None = None
         for attempt in range(2):
+            room = self._capacity(cfg, sum(len(str(m.content)) for m in messages), wanted, least)
+            model = MoksChatModel(provider=provider, max_tokens=room, user_id=self.owner, investigation_id=self.id)
             resp = await model.ainvoke(messages)
             self.tokens_in += resp.usage_metadata["input_tokens"]
             self.tokens_out += resp.usage_metadata["output_tokens"]
@@ -733,7 +992,7 @@ class Investigator:
         system = prompts.PLANNER_SYSTEM.replace("{max_calls}", str(MAX_CALLS_PER_ROUND)) + prompts.skills_section(self.skills)
         await self._emit("phase", {"phase": "planning", "label": f"Planning follow-up evidence (round {round_no})"})
         return await self._llm(provider, cfg, system, prompts.planner_user(question, scope_info, tools, self.evidence, self.findings, self.settings.max_tool_calls - self.tool_calls, self.rejected),
-                               max_tokens=min(cfg.max_output_tokens, 1200))
+                               PLAN_TOKENS, MIN_PLAN_TOKENS)
 
     async def _act(self, executor: ToolExecutor, ctx: ToolContext, calls: list) -> int:
         """Runs what the planner asked for. Returns how many calls were new."""
@@ -767,7 +1026,7 @@ class Investigator:
     async def _llm_report(self, provider, cfg: LLMConfig, question: str, scope_info: dict) -> Report:
         raw = await self._llm(provider, cfg, prompts.REPORT_SYSTEM + prompts.skills_section(self.skills),
                               prompts.report_user(question, scope_info, self.evidence, self.findings, self.notes),
-                              max_tokens=max(cfg.max_output_tokens, 1500))
+                              REPORT_TOKENS, MIN_REPORT_TOKENS)
         refs = {e["ref"] for e in self.evidence if e["ref"]}
         return validate_llm_report(raw, refs, self.notes)
 

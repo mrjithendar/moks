@@ -6,8 +6,14 @@
 
 Without a model, or when one fails, the run takes `rules`, so a report always comes out. The graph
 only decides what happens next: each node calls an Investigator method, which keeps policy, budget and
-evidence where they were. State is not checkpointed: a stopped worker's investigation is taken over by
-the existing reaper, and evidence is already in PostgreSQL.
+evidence where they were.
+
+After each node the Investigator writes a checkpoint, fenced by the claim's token in the same transaction.
+This is deliberately not LangGraph's PostgresSaver: that writes through its own connection, so a worker
+that lost its claim could still overwrite a checkpoint, and almost everything worth keeping lives on the
+Investigator rather than in graph state. A resumed run enters at the node after the checkpoint, and that
+node runs again from the start. All of them are safe to repeat: every tool here is read-only and
+counts against the same budget, and findings are restored from before the node began.
 """
 from __future__ import annotations
 
@@ -20,6 +26,7 @@ from ..observability import tracer
 
 
 class State(TypedDict, total=False):
+    entry: str
     namespace: str
     round: int
     calls: list[dict]
@@ -29,10 +36,13 @@ class State(TypedDict, total=False):
     mode: str
 
 
-def _traced(name: str, fn: Callable[[State], Awaitable[dict]]) -> Callable[[State], Awaitable[dict]]:
+def _traced(inv: Any, name: str, fn: Callable[[State], Awaitable[dict]], route: Callable[[State], str]) -> Callable[[State], Awaitable[dict]]:
     async def node(state: State) -> dict:
         with tracer().start_as_current_span(f"node {name}"):
-            return await fn(state)
+            out = await fn(state)
+        merged = {**state, **out}
+        await inv._checkpoint(name, route(merged), merged)
+        return out
     return node
 
 
@@ -93,22 +103,30 @@ def build(inv: Any, executor: Any, ctx: Any, question: str, scope_info: dict, pr
         written, mode = await inv._write_report(provider, cfg, question, scope_info)
         return {"report": written, "mode": mode}
 
+    routes: dict[str, Callable[[State], str]] = {
+        "triage": lambda s: "logs",
+        "logs": lambda s: "skills",
+        "skills": lambda s: "plan" if provider else "rules",
+        "plan": lambda s: "rules" if s.get("use_rules") else "act" if s.get("calls") else "correlate",
+        "act": lambda s: "correlate" if s.get("finished") else "plan",
+        "rules": lambda s: "correlate",
+        "correlate": lambda s: "report",
+        "report": lambda s: END,
+    }
+    nodes = {"triage": triage, "logs": logs, "skills": skills, "plan": plan, "act": act, "rules": rules, "correlate": correlate, "report": report}
     graph = StateGraph(State)
-    for name, fn in (("triage", triage), ("logs", logs), ("skills", skills), ("plan", plan), ("act", act), ("rules", rules), ("correlate", correlate), ("report", report)):
-        graph.add_node(name, _traced(name, fn))
-    graph.add_edge(START, "triage")
-    graph.add_edge("triage", "logs")
-    graph.add_edge("logs", "skills")
-    graph.add_conditional_edges("skills", lambda s: "plan" if provider else "rules", ["plan", "rules"])
-    graph.add_conditional_edges("plan", lambda s: "rules" if s.get("use_rules") else "act" if s.get("calls") else "correlate", ["rules", "act", "correlate"])
-    graph.add_conditional_edges("act", lambda s: "correlate" if s.get("finished") else "plan", ["plan", "correlate"])
-    graph.add_edge("rules", "correlate")
-    graph.add_edge("correlate", "report")
-    graph.add_edge("report", END)
+    for name, fn in nodes.items():
+        graph.add_node(name, _traced(inv, name, fn, routes[name]))
+    graph.add_conditional_edges(START, lambda s: s.get("entry") or "triage", list(nodes))
+    for name, route in routes.items():
+        graph.add_conditional_edges(name, route, [*nodes, END])
     return graph.compile()
 
 
-async def run(inv: Any, executor: Any, ctx: Any, question: str, namespace: str, scope_info: dict, provider: Any, cfg: Any, failures: tuple) -> State:
+async def run(inv: Any, executor: Any, ctx: Any, question: str, namespace: str, scope_info: dict, provider: Any, cfg: Any, failures: tuple, resumed: dict | None = None) -> State:
+    """`resumed` is the graph state of a checkpoint, with `entry` naming the node to continue at."""
+    if resumed and resumed.get("entry") == END:
+        return resumed  # the report was written and only publishing it was lost
     compiled = build(inv, executor, ctx, question, scope_info, provider, cfg, failures)
     limit = 2 * inv.settings.max_llm_rounds + 12  # every path is bounded; this only catches a mistake in the graph
-    return await compiled.ainvoke({"namespace": namespace}, {"recursion_limit": limit})
+    return await compiled.ainvoke(resumed or {"namespace": namespace}, {"recursion_limit": limit})

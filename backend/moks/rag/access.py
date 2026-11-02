@@ -15,6 +15,7 @@ search widens its candidate pool within a bound rather than returning too few.
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 
@@ -22,6 +23,23 @@ from ..rbac import ROLES, P, Principal
 
 PERM = P.INVESTIGATION_READ
 GLOB = "*?["
+OPERATIONAL = "operational"
+EVALUATION = "evaluation"
+_realm: ContextVar[str] = ContextVar("moks_rag_realm", default=OPERATIONAL)
+
+
+def realm() -> str:
+    """The storage boundary. It is not a permission: no binding, wildcard or admin role reaches the
+    other realm, because every query is pinned to this one value. Only an evaluation run changes it."""
+    return _realm.get()
+
+
+def enter_realm(name: str):
+    return _realm.set(name)
+
+
+def leave_realm(token) -> None:
+    _realm.reset(token)
 
 
 @dataclass(frozen=True)

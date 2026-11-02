@@ -86,3 +86,19 @@ a scope. An RRF score only orders one result list. It is not a probability, and 
 `mode` and `fallback_reason` say what actually ran. `evidence.state` is `supported`, `weak` or `none`, decided from what
 the passages literally contain. `supported` means the terms are present, not that the answer is right.
 Conflicts are flagged when two documents share a title and scope. MOKS does not decide which is right.
+
+## Index coverage
+
+`document_index_state` records, per document and index generation, the revision, expected and written chunks and vectors, the model and dimensions, the last error and retries. An index is `complete` or `degraded` from that record, and a degraded one becomes complete only when the record shows every document whole. With Pinecone, written counts are what MOKS recorded, because Pinecone cannot count by metadata; OpenSearch is also sampled by `verify_index`.
+
+## Document lifecycle and trust
+
+A document is `draft`, `quarantined`, `active`, `archived` or `deleted`, and only `active` is searched. Search reads this from PostgreSQL, so a quarantine works at commit. `trust` is separate: a sync finding a file makes it `unreviewed`, and changed content loses a review. Only a reviewed document's source authority affects ranking.
+
+## Evaluation isolation
+
+Evaluation content lives in `realm = 'evaluation'`, enforced in every candidate query, in the authoritative check and by a composite foreign key that ties a document to its source's realm. No grant reaches across it, including a wildcard admin. A run uses its own backend name, so it never touches an external index or the outbox; it proves isolation before its first case and stops if it cannot. It removes its content in a `finally` block, and `cleanup_evaluations` collects what a dead run left. This is application-enforced in one database, not a separate database or role.
+
+## Query understanding
+
+Search reads identifiers, error names, resource types and time references without a model, and returns them as `understanding`. `MOKS_RAG_DECOMPOSE` splits multi-part questions into separate rankings. It is off: on the `rag` dataset it changed neither recall, MRR nor nDCG and added latency. That dataset is small and synthetic, so re-measure on real questions before turning it on.

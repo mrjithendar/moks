@@ -117,6 +117,12 @@ WEB_ONLY = {"urls", "crawl", "max_pages"}
 ONLY_FOR = {"github": WEB_ONLY, "web": GITHUB_ONLY}
 
 
+async def _source(db: AsyncSession, sid: uuid.UUID) -> KnowledgeSource | None:
+    """No endpoint reaches evaluation content, whoever asks."""
+    src = await db.get(KnowledgeSource, sid)
+    return src if src is not None and src.realm == "operational" else None
+
+
 def source_out(s: KnowledgeSource, counts: dict | None = None, job: str | None = None) -> dict[str, Any]:
     stale_after = timedelta(minutes=s.sync_interval_minutes * 2) if s.sync_interval_minutes else None
     return {"sync_interval_minutes": s.sync_interval_minutes, "next_sync_at": s.next_sync_at.isoformat() if s.next_sync_at else None,
@@ -153,9 +159,9 @@ async def status(ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depend
 
 @router.get("/sources")
 async def list_sources(ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> list[dict]:
-    rows = (await db.execute(select(KnowledgeSource).where(KnowledgeSource.lifecycle != "deleted").order_by(KnowledgeSource.name))).scalars().all()
+    rows = (await db.execute(select(KnowledgeSource).where(KnowledgeSource.lifecycle != "deleted", KnowledgeSource.realm == "operational").order_by(KnowledgeSource.name))).scalars().all()
     counts: dict[uuid.UUID, dict] = {}
-    for sid, st, n in (await db.execute(select(Document.source_id, Document.status, func.count()).group_by(Document.source_id, Document.status))).all():
+    for sid, st, n in (await db.execute(select(Document.source_id, Document.status, func.count()).where(Document.realm == "operational").group_by(Document.source_id, Document.status))).all():
         counts.setdefault(sid, {})[st] = n
     running = dict((await db.execute(select(Job.dedupe_key, Job.status).where(Job.type == "knowledge_sync", Job.status.in_(["queued", "running"])))).all())
     return [source_out(s, counts.get(s.id), running.get(f"knowledge_sync:{s.id}")) for s in rows]
@@ -188,7 +194,7 @@ async def create_source(body: SourceIn, ctx: AuthContext = Depends(needs(P.ADMIN
 async def update_source(sid: uuid.UUID, body: SourceUpdate, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Changes settings and keeps indexed documents. A sync then applies any new include or exclude
     rules; changing a credential alone re-reads nothing."""
-    src = await db.get(KnowledgeSource, sid)
+    src = await _source(db, sid)
     if src is None:
         raise HTTPException(404, "Source not found")
     changes = body.model_dump(exclude_unset=True)
@@ -231,7 +237,7 @@ async def update_source(sid: uuid.UUID, body: SourceUpdate, ctx: AuthContext = D
 
 @router.post("/sources/{sid}/sync")
 async def sync(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
-    src = await db.get(KnowledgeSource, sid)
+    src = await _source(db, sid)
     if src is None or src.type not in SYNCED:
         raise HTTPException(404, "Syncable source not found")
     jid = await jobs.enqueue("knowledge_sync", {"source_id": str(sid)}, dedupe_key=f"knowledge_sync:{sid}", created_by=ctx.user.id)
@@ -246,7 +252,7 @@ class ScheduleIn(BaseModel):
 
 @router.put("/sources/{sid}/schedule")
 async def schedule(sid: uuid.UUID, body: ScheduleIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
-    src = await db.get(KnowledgeSource, sid)
+    src = await _source(db, sid)
     if src is None or src.type not in SYNCED:
         raise HTTPException(404, "Syncable source not found")
     src.sync_interval_minutes = body.sync_interval_minutes
@@ -264,7 +270,7 @@ class LifecycleIn(BaseModel):
 @router.put("/sources/{sid}/lifecycle")
 async def set_lifecycle(sid: uuid.UUID, body: LifecycleIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Quarantined and archived sources stop being retrieved at once, because every result is checked against PostgreSQL. Their documents are kept."""
-    src = await db.get(KnowledgeSource, sid)
+    src = await _source(db, sid)
     if src is None or src.lifecycle == "deleted":
         raise HTTPException(404, "Source not found")
     old, src.lifecycle = src.lifecycle, body.lifecycle
@@ -275,7 +281,7 @@ async def set_lifecycle(sid: uuid.UUID, body: LifecycleIn, ctx: AuthContext = De
 
 @router.post("/sources/{sid}/review")
 async def reviewed(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
-    src = await db.get(KnowledgeSource, sid)
+    src = await _source(db, sid)
     if src is None or src.lifecycle == "deleted":
         raise HTTPException(404, "Source not found")
     src.last_reviewed_at = datetime.now(timezone.utc)
@@ -286,7 +292,7 @@ async def reviewed(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONN
 @router.delete("/sources/{sid}")
 async def delete_source(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Soft: the source and its document rows stay as tombstones until the index has dropped them, and for history."""
-    src = await db.get(KnowledgeSource, sid)
+    src = await _source(db, sid)
     if src is None or src.lifecycle == "deleted":
         raise HTTPException(404, "Source not found")
     for doc in (await db.execute(select(Document).where(Document.source_id == sid))).scalars():
@@ -302,7 +308,7 @@ async def delete_source(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN
 @router.post("/sources/{sid}/upload", status_code=201)
 async def upload(sid: uuid.UUID, file: UploadFile = File(...), namespace: str | None = Form(None), environment: str | None = Form(None),
                  ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
-    src = await db.get(KnowledgeSource, sid)
+    src = await _source(db, sid)
     if src is None or src.type != "upload":
         raise HTTPException(404, "Upload source not found")
     # A document can be narrower than its source, never wider: leaving these out means the source's scope.
@@ -324,12 +330,12 @@ async def upload(sid: uuid.UUID, file: UploadFile = File(...), namespace: str | 
 
 @router.get("/sources/{sid}/documents")
 async def documents(sid: uuid.UUID, status: str | None = None, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> list[dict]:
-    q = select(Document).where(Document.source_id == sid).order_by(Document.path).limit(2000)
+    q = select(Document).where(Document.source_id == sid, Document.realm == "operational").order_by(Document.path).limit(2000)
     if status:
         q = q.where(Document.status == status)
     rows = (await db.execute(q)).scalars().all()
     return [{"id": str(d.id), "path": d.path, "title": d.title, "status": d.status, "excluded_reason": d.excluded_reason, "revision": d.revision, "changed_revision": d.changed_revision,
-             "service": d.service, "environment": d.environment, "namespace": d.namespace, "url": d.url, "doc_state": d.doc_state, "vector_state": d.vector_state, "vector_error": d.vector_error,
+             "service": d.service, "environment": d.environment, "namespace": d.namespace, "url": d.url, "doc_state": d.doc_state, "lifecycle": d.lifecycle, "trust": d.trust, "vector_state": d.vector_state, "vector_error": d.vector_error,
              "behind": d.content_revision != d.indexed_revision, "checked_at": d.checked_at.isoformat() if d.checked_at else None, "updated_at": d.updated_at.isoformat() if d.updated_at else None} for d in rows]
 
 
@@ -347,7 +353,7 @@ async def failures(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONN
 async def retry_source(sid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
     """Failed files go back in the queue for the current listing, and a pass is queued."""
     n = (await db.execute(update(KnowledgeSyncItem).where(KnowledgeSyncItem.source_id == sid, KnowledgeSyncItem.state == "failed").values(state="pending", last_error=None).returning(KnowledgeSyncItem.path))).all()
-    src = await db.get(KnowledgeSource, sid)
+    src = await _source(db, sid)
     if src is None:
         raise HTTPException(404, "Source not found")
     if n:
@@ -364,13 +370,47 @@ async def document(did: uuid.UUID, ctx: AuthContext = Depends(get_auth), db: Asy
     from ..rag import access
 
     d = await db.get(Document, did)
-    if d is None or d.status == "deleted" or not access.can_read(ctx.principal, d.environment, d.namespace):
+    if d is None or d.status == "deleted" or d.realm != access.OPERATIONAL or not access.can_read(ctx.principal, d.environment, d.namespace):
         raise HTTPException(404, "Document not found")
     s = await db.get(KnowledgeSource, d.source_id)
     chunks = (await db.execute(select(Chunk).where(Chunk.document_id == did).order_by(Chunk.ord).limit(200))).scalars().all()
     return {"id": str(d.id), "title": d.title, "path": d.path, "status": d.status, "excluded_reason": d.excluded_reason, "source": s.name, "revision": d.revision, "changed_revision": d.changed_revision,
-            "url": d.url, "doc_state": d.doc_state, "superseded_by": d.superseded_by, "checked_at": d.checked_at.isoformat() if d.checked_at else None, "vector_state": d.vector_state,
+            "url": d.url, "doc_state": d.doc_state, "superseded_by": d.superseded_by, "lifecycle": d.lifecycle, "trust": d.trust, "reviewed_at": d.reviewed_at.isoformat() if d.reviewed_at else None, "review_due_at": d.review_due_at.isoformat() if d.review_due_at else None, "checked_at": d.checked_at.isoformat() if d.checked_at else None, "vector_state": d.vector_state,
             "chunks": [{"ord": c.ord, "heading": c.heading, "text": c.text, "lines": [c.start_line, c.end_line], "offsets": [c.start_offset, c.end_offset], "tokens": c.token_estimate} for c in chunks]}
+
+
+class DocumentLifecycleIn(BaseModel):
+    state: str = Field(pattern="^(draft|quarantined|active|archived|deleted)$")
+    superseded_by: uuid.UUID | None = None
+    reason: str = Field(default="", max_length=500)
+
+
+class DocumentReviewIn(BaseModel):
+    review_due_at: datetime | None = None
+
+
+@router.put("/documents/{did}/lifecycle")
+async def document_lifecycle(did: uuid.UUID, body: DocumentLifecycleIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    d = await db.get(Document, did)
+    if d is None or d.realm != "operational":
+        raise HTTPException(404, "Document not found")
+    before = d.lifecycle
+    try:
+        await service.set_document_lifecycle(db, d, body.state, body.superseded_by)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    await audit.record(db, action="knowledge.document_lifecycle", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="document", resource_id=str(did), details={"from": before, "to": body.state, "reason": body.reason})
+    return {"id": str(d.id), "lifecycle": d.lifecycle}
+
+
+@router.post("/documents/{did}/review")
+async def document_review(did: uuid.UUID, body: DocumentReviewIn, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    d = await db.get(Document, did)
+    if d is None or d.realm != "operational":
+        raise HTTPException(404, "Document not found")
+    service.review_document(d, ctx.user.id, body.review_due_at)
+    await audit.record(db, action="knowledge.document_review", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="document", resource_id=str(did), details={"revision": d.revision, "content_hash": d.content_hash})
+    return {"id": str(d.id), "trust": d.trust, "reviewed_at": d.reviewed_at.isoformat()}
 
 
 @router.get("/sources/{sid}/access")
@@ -379,7 +419,7 @@ async def access_preview(sid: uuid.UUID, email: str, ctx: AuthContext = Depends(
     from ..actions.service import principal_of
     from ..rag import access
 
-    src, user = await db.get(KnowledgeSource, sid), (await db.execute(select(User).where(User.email == email.strip().lower()))).scalar_one_or_none()
+    src, user = await _source(db, sid), (await db.execute(select(User).where(User.email == email.strip().lower()))).scalar_one_or_none()
     if src is None or src.lifecycle == "deleted":
         raise HTTPException(404, "Source not found")
     if user is None or not user.is_active:

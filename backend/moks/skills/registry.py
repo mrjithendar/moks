@@ -2,9 +2,14 @@
 
 A SkillVersion is one exact SKILL.md, named by the SHA-256 of its text. A SkillGeneration is the exact
 set of versions everyone should run. Git stays the place skills are reviewed: built-ins ship in the
-image and custom skills in a reviewed ConfigMap. scan() registers what it finds; a built-in version not
-seen before is published automatically, because reaching the image took a reviewed merge, and a
-custom one waits for an administrator. Nothing is ever loaded from retrieved documents or tool output.
+image and custom skills in a reviewed ConfigMap. Nothing is ever loaded from retrieved documents or tool
+output.
+
+Publication is an explicit act, and starting a process is not one. register() records what an image
+holds and changes nothing anyone runs. bootstrap() is the one exception for an empty database. release()
+publishes a chosen set with its reason, revision and evaluation; publish() does one version and rollback()
+restores one. Nothing removes a skill because an image lacks it, so an older pod that restarts cannot
+downgrade or delete anything: removal is named explicitly.
 
 Every process follows the active generation from PostgreSQL, so API, workers and detection cannot
 drift after a reload. A process that cannot use a new generation keeps its last valid one and reports
@@ -35,7 +40,7 @@ from .. import audit
 from ..db import session_scope
 from ..models import SkillGeneration, SkillPolicy, SkillVersion
 from . import Skill, SkillLibrary, load, parse, replace_library
-from .validate import validate
+from .validate import errors, validate
 
 log = logging.getLogger("moks.skills")
 LOCK = 7_203_115
@@ -81,8 +86,8 @@ async def _active(db: AsyncSession) -> SkillGeneration | None:
     return (await db.execute(select(SkillGeneration).where(SkillGeneration.status == "active").order_by(SkillGeneration.generation.desc()).limit(1))).scalars().first()
 
 
-async def _activate(db: AsyncSession, manifest: dict[str, str], reason: str, actor: uuid.UUID | None) -> SkillGeneration:
-    """Refuses a set that could not run. The current generation stays active if this raises."""
+async def _activate(db: AsyncSession, manifest: dict[str, str], reason: str, actor: uuid.UUID | None, evaluation: dict | None = None) -> SkillGeneration:
+    """Refuses a set that could not run together. The current generation stays active if this raises."""
     rows = (await db.execute(select(SkillVersion).where(SkillVersion.digest.in_(list(manifest.values()))))).scalars().all()
     if len(rows) != len(set(manifest.values())):
         raise PublishError("a version in this set is not registered")
@@ -92,12 +97,17 @@ async def _activate(db: AsyncSession, manifest: dict[str, str], reason: str, act
         for rule in sk.meta.detection:
             if rule_owner.setdefault(rule.id, sk.name) != sk.name:
                 raise PublishError(f"detection rule {rule.id} is declared by both {rule_owner[rule.id]} and {sk.name}")
+    for sk in parsed.values():
+        bad = errors(validate(sk, parsed))
+        if bad:
+            raise PublishError(f"{sk.name} {sk.meta.version} cannot run in this set: {bad[0]}")
     await db.execute(update(SkillGeneration).where(SkillGeneration.status == "active").values(status="retired"))
-    gen = SkillGeneration(digest=manifest_digest(manifest), manifest=manifest, status="active", reason=reason[:500], created_by=actor)
+    gen = SkillGeneration(digest=manifest_digest(manifest), manifest=manifest, status="active", reason=reason[:500], created_by=actor,
+                          release_revision=os.environ.get("MOKS_RELEASE_REVISION") or None, evaluation=evaluation or {})
     db.add(gen)
     await db.flush()
     await audit.record(db, action="skills.generation", actor_id=actor, resource_type="skill_generation", resource_id=str(gen.generation), decision="allow",
-                       details={"digest": gen.digest, "skills": len(manifest), "reason": reason[:300]})
+                       details={"digest": gen.digest, "skills": len(manifest), "reason": reason[:300], "release": gen.release_revision, "evaluated": bool(evaluation)})
     return gen
 
 
@@ -121,17 +131,15 @@ async def register(db: AsyncSession, sk: Skill, content: str, others: dict[str, 
     return row
 
 
-async def scan(actor: uuid.UUID | None = None, extra_dir: str | None = None) -> dict:
-    """Registers what is on disk and publishes new built-ins. Safe to run in every process at once."""
+async def register_all(extra_dir: str | None = None) -> dict:
+    """Records what is on disk. Publishes nothing and changes no generation, so any process may run it."""
     lib = load(extra_dir)
-    result = {"registered": [], "published": [], "waiting": [], "rejected": list(lib.errors), "generation": None}
+    result = {"registered": [], "waiting": [], "rejected": list(lib.errors), "library": lib}
     async with session_scope() as db:
         await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": LOCK})
-        active = await _active(db)
-        manifest = dict(active.manifest) if active else {}
         known = set((await db.execute(select(SkillVersion.digest))).scalars())
-        changed = []
-        now = datetime.now(timezone.utc)
+        active = await _active(db)
+        running = set((active.manifest or {}).values()) if active else set()
         for sk in lib.skills.values():
             new = sk.digest not in known
             try:
@@ -144,26 +152,63 @@ async def scan(actor: uuid.UUID | None = None, extra_dir: str | None = None) -> 
             if row.state == "draft":
                 if new:
                     result["rejected"].append({"path": sk.path, "error": "; ".join(i["message"] for i in row.validation if i["level"] == "error")})
-                continue
-            if row.source == "builtin" and new:
-                row.state, row.published_at = "published", now
-                changed.append(sk.name)
-                manifest[sk.name] = sk.digest
-            elif row.source == "builtin" and sk.name not in manifest:
-                row.state = "published"
-                manifest[sk.name] = sk.digest
-                changed.append(sk.name)
-            elif row.source != "builtin" and row.state == "validated":
+            elif sk.digest not in running:
                 result["waiting"].append(sk.name)
-        gone = [n for n, d in manifest.items() if n not in lib.skills and (await db.get(SkillVersion, d)).source == "builtin"]
-        for name in gone:
+    return result
+
+
+async def bootstrap(actor: uuid.UUID | None = None, extra_dir: str | None = None) -> dict:
+    """First install only: with no generation at all, the image's valid built-ins become the first one.
+    Does nothing once one exists, so it is safe in a migration step that runs on every rollout."""
+    found = await register_all(extra_dir)
+    result = {k: found[k] for k in ("registered", "rejected")} | {"generation": None, "published": []}
+    async with session_scope() as db:
+        await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": LOCK})
+        if await _active(db) is not None:
+            return result
+        manifest = {sk.name: sk.digest for sk in found["library"].skills.values() if sk.source == "builtin" and sk.digest in {r.digest for r in (await db.execute(select(SkillVersion).where(SkillVersion.state != "draft"))).scalars()}}
+        gen = await _activate(db, manifest, "first install", actor)
+        await db.execute(update(SkillVersion).where(SkillVersion.digest.in_(list(manifest.values()))).values(state="published", published_at=datetime.now(timezone.utc)))
+        result["generation"], result["published"] = gen.generation, sorted(manifest)
+    await refresh(force=True)
+    return result
+
+
+async def release(actor: uuid.UUID | None, reason: str, *, names: list[str] | None = None, remove: list[str] | None = None, evaluation: dict | None = None, extra_dir: str | None = None) -> dict:
+    """Publishes the built-ins this image holds, or the named ones, as one generation. A reason is
+    required, and a version registered as invalid stops the whole release: the last good generation stays."""
+    if not reason.strip():
+        raise PublishError("a release needs a reason")
+    found = await register_all(extra_dir)
+    lib = found["library"]
+    async with session_scope() as db:
+        await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": LOCK})
+        active = await _active(db)
+        if active is None:
+            raise PublishError("no generation exists yet; run `moks skills bootstrap` first")
+        manifest, changed = dict(active.manifest), []
+        for sk in lib.skills.values():
+            if (names is None and sk.source != "builtin") or (names is not None and sk.name not in names) or manifest.get(sk.name) == sk.digest:
+                continue
+            row = await db.get(SkillVersion, sk.digest)
+            if row is None or row.state == "draft":
+                raise PublishError(f"{sk.name} {sk.meta.version} failed validation")
+            previous = manifest.get(sk.name)
+            manifest[sk.name] = sk.digest
+            changed.append((row, previous))
+        for name in remove or []:
+            if name not in manifest:
+                raise PublishError(f"{name} is not in the active generation")
             del manifest[name]
-        if changed or gone or active is None:
-            try:
-                gen = await _activate(db, manifest, f"image update: {', '.join(sorted(changed + gone))[:300]}", actor)
-                result["generation"], result["published"] = gen.generation, changed
-            except PublishError as exc:
-                result["rejected"].append({"path": "generation", "error": str(exc)})
+        if not changed and not remove:
+            return {"generation": active.generation, "published": [], "removed": [], "rejected": found["rejected"]}
+        gen = await _activate(db, manifest, reason, actor, evaluation)
+        now = datetime.now(timezone.utc)
+        for row, previous in changed:
+            row.state, row.published_by, row.published_at = "published", actor, now
+            if previous:
+                await db.execute(update(SkillVersion).where(SkillVersion.digest == previous).values(state="deprecated"))
+        result = {"generation": gen.generation, "published": [r.skill_id for r, _ in changed], "removed": remove or [], "rejected": found["rejected"]}
     await refresh(force=True)
     return result
 
@@ -252,4 +297,5 @@ def snapshot() -> dict:
 
 
 def scan_on_start() -> bool:
-    return os.environ.get("MOKS_SKILLS_AUTOSCAN", "1") != "0"
+    """Off: runtime processes follow generations. On, a process only registers versions; it never publishes."""
+    return os.environ.get("MOKS_SKILLS_AUTOSCAN", "0") == "1"

@@ -21,6 +21,7 @@ from sqlalchemy import select
 from ..db import session_scope
 from ..models import AUTOMATION_USER_ID, Environment, EvalRun, Evidence, Investigation, RoleBinding
 from ..orchestrator.engine import Investigator
+from ..rag import access
 from . import gates
 from .fixture import FixtureKubernetes
 
@@ -97,9 +98,10 @@ async def execute(run_id: uuid.UUID) -> dict[str, Any]:
             run = await db.get(EvalRun, run_id)
             run.results, run.score, run.status, run.finished_at = out["results"], Decimal(str(out["score"])), "completed", datetime.now(timezone.utc)
             run.gates, run.versions = out["gates"], {**gates.versions(data), "metrics": out["metrics"]}
-        return {"score": out["score"], "gates_passed": all(g["passed"] for g in out["gates"])}
+        return {"score": out["score"], "gates_passed": gates.gates_ok(out["gates"])}
     env_id = await _eval_env(f"eval-{dataset}")
     results = []
+    token = access.enter_realm(access.EVALUATION)  # anything these runs retrieve comes from the evaluation realm, never production
     for case in data["cases"]:
         now = datetime.now(timezone.utc)
         async with session_scope() as db:
@@ -114,6 +116,7 @@ async def execute(run_id: uuid.UUID) -> dict[str, Any]:
             inv = await db.get(Investigation, inv_id)
             refs = set((await db.execute(select(Evidence.ref).where(Evidence.investigation_id == inv_id))).scalars())
             results.append(score_case(case, inv, refs))
+    access.leave_realm(token)
     total = round(sum(r["score"] for r in results) / len(results), 4) if results else 0
     async with session_scope() as db:
         run = await db.get(EvalRun, run_id)

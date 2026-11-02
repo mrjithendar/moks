@@ -55,6 +55,7 @@ docs/             Architecture, security/RBAC, connectors, operator guide, testi
 - [Demo incident lab](lab/README.md)
 - [SRE skills (SKILL.md)](docs/SKILLS.md)
 - [FinOps](docs/FINOPS.md)
+- [Trustworthy reports and durable investigations](docs/INVESTIGATION_DURABILITY.md)
 - [Testing and results](docs/TESTING.md)
 - [Status and limitations](docs/LIMITATIONS.md)
 

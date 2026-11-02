@@ -1,7 +1,9 @@
 """Investigation worker: claims queued investigations from PostgreSQL and runs them.
 
 Jobs are claimed with SELECT ... FOR UPDATE SKIP LOCKED, so any number of worker replicas can
-run without Redis. Runs whose heartbeat stopped (worker crashed) are marked failed.
+run without Redis. Every claim gets its own token and lease. When a lease lapses the reaper takes the
+token away, which fences the old worker off, and either requeues the run to resume from its checkpoint
+or records why it ended.
 """
 from __future__ import annotations
 
@@ -10,37 +12,43 @@ import logging
 import os
 import socket
 import uuid
-from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 
 from sqlalchemy import text
 
-from .. import versions
+from .. import conversations, versions
 from ..config import get_settings
 from ..db import session_scope
-from .engine import Investigator, emit
+from ..models import Investigation
+from .engine import Investigator, emit, emit_next
 
 log = logging.getLogger("moks.worker")
 
-STALE_AFTER = timedelta(minutes=2)
+
+class Claim(NamedTuple):
+    id: uuid.UUID
+    token: uuid.UUID
+    attempt: int
 
 
 def worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}"
 
 
-async def claim(wid: str) -> uuid.UUID | None:
+async def claim(wid: str) -> Claim | None:
     async with session_scope() as db:
         row = (await db.execute(text(
             """
-            UPDATE investigations SET status = 'running', worker_id = :wid, started_at = now(), heartbeat_at = now()
+            UPDATE investigations SET status = 'running', worker_id = :wid, started_at = COALESCE(started_at, now()), heartbeat_at = now(),
+                   execution_token = gen_random_uuid(), lease_expires_at = now() + make_interval(secs => :lease), attempts = attempts + 1
             WHERE id = (
               SELECT id FROM investigations
               WHERE status = 'queued' AND NOT cancel_requested
               ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
-            ) RETURNING id
+            ) RETURNING id, execution_token, attempts
             """
-        ), {"wid": wid})).first()
-        return row[0] if row else None
+        ), {"wid": wid, "lease": get_settings().investigation_lease_seconds})).first()
+        return Claim(row[0], row[1], row[2]) if row else None
 
 
 async def cancel_queued() -> None:
@@ -55,15 +63,35 @@ async def cancel_queued() -> None:
 
 
 async def reap_stale() -> None:
-    cutoff = datetime.now(timezone.utc) - STALE_AFTER
+    """A lapsed lease means the worker's decision is over: its token goes in the same statement, so
+    nothing it does later can land. A run with a checkpoint and attempts left goes back in the queue."""
+    s = get_settings()
     async with session_scope() as db:
         rows = (await db.execute(text(
-            "UPDATE investigations SET status = 'failed', finished_at = now(), error = 'worker stopped responding' "
-            "WHERE status = 'running' AND heartbeat_at < :cutoff RETURNING id"
-        ), {"cutoff": cutoff})).all()
-    for (iid,) in rows:
-        log.warning("reaped stale investigation", extra={"event": "investigation_reaped", "investigation_id": str(iid)})
-        await emit(iid, 10_001, "done", {"status": "failed"})
+            """
+            UPDATE investigations i SET
+              status = CASE WHEN cancel_requested THEN 'cancelled'
+                            WHEN attempts < :attempts AND EXISTS (SELECT 1 FROM investigation_checkpoints c WHERE c.investigation_id = i.id) THEN 'queued'
+                            ELSE 'failed' END,
+              finished_at = CASE WHEN NOT cancel_requested AND attempts < :attempts AND EXISTS (SELECT 1 FROM investigation_checkpoints c WHERE c.investigation_id = i.id) THEN NULL ELSE now() END,
+              error = CASE WHEN cancel_requested THEN 'cancelled while its worker was not responding'
+                           WHEN attempts < :attempts AND EXISTS (SELECT 1 FROM investigation_checkpoints c WHERE c.investigation_id = i.id) THEN NULL
+                           ELSE 'worker stopped responding' END,
+              execution_token = NULL, lease_expires_at = NULL, worker_id = NULL
+            WHERE status = 'running' AND COALESCE(lease_expires_at, heartbeat_at + make_interval(secs => :lease)) < now()
+            RETURNING id, status, error
+            """
+        ), {"attempts": s.investigation_max_attempts, "lease": s.investigation_lease_seconds})).all()
+        for iid, status, error in rows:
+            if status != "queued":
+                inv = await db.get(Investigation, iid)
+                await conversations.record_reply(db, inv, error)
+    for iid, status, _ in rows:
+        log.warning("reaped stale investigation", extra={"event": "investigation_reaped", "investigation_id": str(iid), "outcome": status})
+        if status == "queued":
+            await emit_next(iid, "note", {"message": "The worker stopped responding. This investigation will resume from its last checkpoint."})
+        else:
+            await emit(iid, 10_001, "done", {"status": status})
 
 
 async def run_worker(stop: asyncio.Event | None = None) -> None:
@@ -86,7 +114,7 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
 
     if skill_registry.scan_on_start():
         try:
-            await skill_registry.scan()
+            await skill_registry.register_all()
         except Exception as exc:  # the worker still runs on the last published generation
             log.warning("skill scan failed", extra={"event": "skill_scan_failed", "errorType": type(exc).__name__})
 
@@ -107,6 +135,7 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
         if tick % 600 == 0:
             await service.reconcile_index()
             await service.verify_index()
+            await service.cleanup_evaluations()
 
     outbox: asyncio.Task | None = None
     while not stop.is_set():
@@ -127,11 +156,11 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
             if interactive:
                 await cancel_queued()
                 while len(running) < s.worker_concurrency:
-                    iid = await claim(wid)
-                    if iid is None:
+                    won = await claim(wid)
+                    if won is None:
                         break
-                    log.info("claimed investigation", extra={"event": "investigation_claimed", "investigation_id": str(iid)})
-                    t = asyncio.create_task(Investigator(iid, wid).run())
+                    log.info("claimed investigation", extra={"event": "investigation_claimed", "investigation_id": str(won.id)})
+                    t = asyncio.create_task(Investigator(won.id, wid, token=won.token, attempt=won.attempt).run())
                     running.add(t)
                     t.add_done_callback(running.discard)
         except Exception:
