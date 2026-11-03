@@ -67,6 +67,10 @@ async def test_git_never_guesses_the_deployed_revision():
         await git.read_file("acme/other", "README.md", None)  # outside the allowlist
     with pytest.raises(ConnectorError):
         await git.provider.read("acme/shop", "deploy/.env", None)  # secret paths are never read
+    with pytest.raises(ConnectorError) as missing:
+        await git.read_file("acme/shop", "www/docs/OPERATIONS.md", None)
+    assert missing.value.kind == "not_found" and "www/docs/OPERATIONS.md does not exist in acme/shop" in str(missing.value)
+    assert "base URL" not in str(missing.value)  # the connector is fine; the path was guessed
 
 
 def test_eks_token_is_a_presigned_sts_call():

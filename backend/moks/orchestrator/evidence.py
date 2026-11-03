@@ -82,6 +82,7 @@ class Entry:
     at: datetime | None
     text: str
     summary: str
+    data: Any = None
 
 
 @dataclass
@@ -100,7 +101,7 @@ class Ledger:
                 continue
             kind = e.get("kind") or classify(ok=e["ok"], tool=e["tool"], denied=bool(e.get("denied")), truncated=bool(e.get("truncated")))
             body = json.dumps({"s": e.get("summary"), "a": e.get("args"), "d": e.get("data")}, default=str).lower()
-            entries[e["ref"]] = Entry(e["ref"], kind, e["tool"], (e.get("args") or {}).get("namespace"), _when(e.get("collected_at")), body, str(e.get("summary") or ""))
+            entries[e["ref"]] = Entry(e["ref"], kind, e["tool"], (e.get("args") or {}).get("namespace"), _when(e.get("collected_at")), body, str(e.get("summary") or ""), e.get("data"))
         return cls(entries, namespace, now or datetime.now(timezone.utc), max_age_seconds)
 
     def by_kind(self, *kinds: str) -> list[Entry]:
@@ -120,14 +121,45 @@ class Ledger:
         return min(times).strftime("%Y-%m-%d %H:%M UTC") if times else None
 
 
+SVC_NAMESPACE = re.compile(r"\.([a-z0-9-]+)\.svc\b")
+
+
+def _alert_namespace(labels: dict) -> str | None:
+    """The namespace an alert instance is about: its namespace label, else one named in a service DNS
+    address (instance="cart.roboshop-ai.svc:4107"). None when the alert does not say."""
+    if labels.get("namespace"):
+        return str(labels["namespace"])
+    for key in ("instance", "service", "job"):
+        m = SVC_NAMESPACE.search(str(labels.get(key) or ""))
+        if m:
+            return m.group(1)
+    return None
+
+
+def _firing_in_scope(ledger: Ledger, data: Any) -> int:
+    """Firing alert instances that could concern the namespace under investigation. Alerts that name
+    another namespace say nothing about this one, so they cannot disagree with its Kubernetes checks."""
+    count = 0
+    for rule in data if isinstance(data, list) else []:
+        if not isinstance(rule, dict):
+            continue
+        for inst in rule["active"] if "active" in rule else [rule]:
+            if inst.get("state", "firing") != "firing":
+                continue
+            ns = _alert_namespace(inst.get("labels") or {})
+            if ledger.namespace == "*" or ns is None or ns == ledger.namespace:
+                count += 1
+    return count
+
+
 def conflicts(ledger: Ledger, findings: list[dict]) -> list[dict]:
     """Sources that disagree. Marked for the engineer: MOKS does not decide which one is right."""
     out = []
     faults = [f for f in findings if f.get("severity") in ("high", "medium") and f.get("kind") != "recent_rollout"]
     for e in ledger.by_kind(OBSERVATION, INCOMPLETE):
-        if e.tool != "prom_alerts" or '"d": []' in e.text or '"d": null' in e.text:
+        if e.tool != "prom_alerts" or not _firing_in_scope(ledger, e.data):
             continue
-        triage = [t for t in ledger.by_kind(OBSERVATION) if t.tool == "k8s_triage"]
+        triage = [t for t in ledger.by_kind(OBSERVATION) if t.tool == "k8s_triage" and ledger.in_scope(t)]
         if triage and not faults:
             out.append({"subject": "firing alerts", "evidence": [e.ref, *[t.ref for t in triage[:2]]],
                         "detail": "Prometheus has firing alerts, but the Kubernetes checks found nothing wrong."})

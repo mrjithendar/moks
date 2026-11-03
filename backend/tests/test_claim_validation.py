@@ -81,6 +81,19 @@ def test_conflicting_sources_are_surfaced_not_resolved():
     assert any("disagrees" in q for q in rep.observed_facts[0].qualifiers)
 
 
+def test_alerts_about_another_namespace_do_not_disagree_with_its_checks():
+    def alerts(*labels):
+        return [{"name": "ServiceDown", "active": [{"labels": l, "state": "firing"} for l in labels]}]
+    other = alerts({"instance": "cart.roboshop-ai.svc.cluster.local:4107", "job": "roboshop"}, {"namespace": "roboshop-ai"})
+    assert ev.conflicts(ledger(item("E1"), item("E2", "prom_alerts", summary="2 firing", data=other)), []) == []
+    here = alerts({"instance": "api.payments.svc:8080"})
+    assert ev.conflicts(ledger(item("E1"), item("E2", "prom_alerts", summary="1 firing", data=here)), [])
+    unknown = alerts({"alertname": "NodeDown", "instance": "10.0.0.4:9100"})  # says nothing about a namespace: still counted
+    assert ev.conflicts(ledger(item("E1"), item("E2", "prom_alerts", summary="1 firing", data=unknown)), [])
+    pending = [{"name": "ServiceDown", "active": [{"labels": {"namespace": "payments"}, "state": "pending"}]}]
+    assert ev.conflicts(ledger(item("E1"), item("E2", "prom_alerts", summary="0 firing", data=pending)), []) == []
+
+
 def test_documentation_never_states_the_current_state():
     led = ledger(item("E1", "kb_search", summary="runbook: payments runs 3 replicas", kind=ev.DOCUMENTATION))
     rep = check([("Payments runs 3 replicas.", ["E1"])], led=led)

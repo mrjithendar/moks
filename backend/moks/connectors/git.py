@@ -96,7 +96,14 @@ class GitHubProvider:
         if SECRET_PATHS.search(path):
             raise ConnectorError("forbidden", f"{path} looks like a secret file and is never read")
         params = {"ref": ref} if ref else None
-        body = await self.http.get_json("contents", f"/repos/{repo}/contents/{quote(path)}", params=params)
+        try:
+            body = await self.http.get_json("contents", f"/repos/{repo}/contents/{quote(path)}", params=params)
+        except ConnectorError as exc:
+            if exc.kind != "not_found":
+                raise
+            # GitHub answers 404 for a missing path, ref or repository (and for a private one the token cannot see).
+            raise ConnectorError("not_found", f"{path} does not exist in {repo} at {ref or 'the default branch'}; "
+                                              "use git_list_files to find the right path instead of guessing") from None
         if isinstance(body, list) or body.get("type") != "file":
             raise ConnectorError("bad_request", f"{path} is not a file")
         if body.get("size", 0) > MAX_FILE_BYTES:
