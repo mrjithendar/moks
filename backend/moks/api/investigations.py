@@ -151,8 +151,8 @@ async def follow_up(inv_id: uuid.UUID, body: FollowUpIn, request: Request, ctx: 
     if parent.conversation_id is None:  # started by an alert or a detection rule
         await conversations.start(db, parent)
     await conversations.join(db, parent.conversation_id, ctx.user.id)
-    r = await start_investigation(CreateIn(question=body.question, environment=env.name, namespace=parent.namespace, minutes=minutes, incident_id=parent.incident_id),
-                                  request, ctx, db, parent.conversation_id)
+    r = await start_investigation(CreateIn(question=body.question, environment=env.name, minutes=minutes, incident_id=parent.incident_id),
+                                  request, ctx, db, parent.conversation_id, inherited_namespace=parent.namespace)
     (await db.get(Investigation, uuid.UUID(r["id"]))).parent_id = parent.id
     return r
 
@@ -162,14 +162,32 @@ async def create(body: CreateIn, request: Request, ctx: AuthContext = Depends(ge
     return await start_investigation(body, request, ctx, db)
 
 
-async def start_investigation(body: CreateIn, request: Request, ctx: AuthContext, db: AsyncSession, conversation_id: uuid.UUID | None = None) -> dict[str, Any]:
-    """conversation_id is never taken from a request body: callers have checked the person may post there."""
+async def start_investigation(body: CreateIn, request: Request, ctx: AuthContext, db: AsyncSession, conversation_id: uuid.UUID | None = None,
+                              inherited_namespace: str | None = None) -> dict[str, Any]:
+    """conversation_id is never taken from a request body: callers have checked the person may post there.
+    inherited_namespace is the conversation's: a default for a follow-up that names no target of its own, never an
+    override, so a question about something new is not pinned to the namespace of the last one."""
     s = get_settings()
     limiter.check(f"inv:{ctx.user.id}", s.rate_investigations_per_minute)
     queued = (await db.execute(select(func.count()).select_from(Investigation).where(Investigation.status == "queued"))).scalar_one()
     if queued >= s.investigation_queue_limit:
         raise HTTPException(429, "Too many investigations are waiting; try again shortly", headers={"Retry-After": "30"})
-    env, ns, why_env = await resolve_scope(db, ctx, body.question, body.environment, body.namespace)
+    why_ns = "chosen" if body.namespace else None
+    if body.namespace is None and inherited_namespace:
+        from ..orchestrator.intent import explicit_targets
+
+        if not explicit_targets(body.question):
+            body, why_ns = body.model_copy(update={"namespace": inherited_namespace}), "the conversation's namespace"
+    try:
+        env, ns, why_env = await resolve_scope(db, ctx, body.question, body.environment, body.namespace)
+    except HTTPException as exc:
+        if exc.status_code != 422 or not inherited_namespace:
+            raise
+        # A namespace-scoped person named a target MOKS cannot place: stay where the conversation was, and say so.
+        env, ns, why_env = await resolve_scope(db, ctx, body.question, body.environment, inherited_namespace)
+        why_ns = "the conversation's namespace (the question's target is in none of your namespaces by name)"
+    why_ns = why_ns or ("named in the question" if ns in set(re.findall(r"[a-z0-9][a-z0-9-]{1,62}", body.question.lower())) else
+                        "all namespaces you may investigate; MOKS resolves the target" if ns == "*" else "your only namespace")
     body = body.model_copy(update={"environment": env.name, "namespace": ns})
     # "*" (all namespaces) is matched literally: only bindings whose namespace pattern is "*" allow it.
     await require(request, ctx, P.INVESTIGATION_RUN, env.name, body.namespace)
@@ -203,7 +221,7 @@ async def start_investigation(body: CreateIn, request: Request, ctx: AuthContext
         await add_event(db, inv.incident_id, "investigation", {"text": f"Investigation started: {body.question[:200]}", "investigation_id": str(inv.id)}, ctx.user.id)
     db.add(InvestigationEvent(investigation_id=inv.id, seq=0, type="queued",
                               payload={"window_minutes": int(window.total_seconds() // 60), "requested_minutes": minutes,
-                                       "environment": env.name, "environment_reason": why_env, "namespace": ns, "traceparent": traceparent()}))
+                                       "environment": env.name, "environment_reason": why_env, "namespace": ns, "namespace_reason": why_ns, "traceparent": traceparent()}))
     await audit.record(db, action="investigation.create", actor_id=ctx.user.id, actor_email=ctx.user.email,
                        resource_type="investigation", resource_id=str(inv.id), environment=env.name, namespace=body.namespace,
                        decision="allow", details={"question_chars": len(body.question), "window_minutes": int(window.total_seconds() // 60)},

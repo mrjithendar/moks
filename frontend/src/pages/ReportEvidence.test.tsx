@@ -71,3 +71,45 @@ describe("how a report says what it knows", () => {
     expect(screen.getByText(/Existing order kept \(circuit open\)/)).toBeTruthy();
   });
 });
+
+describe("an answer shaped by what was asked", () => {
+  afterEach(cleanup);
+  const guidance = {
+    response_type: "deployment_guidance", summary: "Deployment guidance for site.example from 1 source(s): k8s/README.md.",
+    request: { targets: [{ mention: "site.example", kind: "domain" }], repository: "acme/site.example", namespaces: ["site"], environment: "prod" },
+    answer: {
+      steps: [{ text: "the most recently pushed image", command: "./deploy.sh", note: "the most recently pushed image", sources: ["E2"], path: "k8s/README.md", placeholders: [] }],
+      rollback: [{ text: "a specific commit (also how you roll back)", command: "./deploy.sh <sha>", sources: ["E2"], path: "k8s/README.md", placeholders: ["<sha>"] }],
+      gaps: [{ kind: "insufficient_evidence", detail: "The sources do not say how to verify a deployment.", evidence: [] }],
+      sources: [{ ref: "E2", path: "k8s/README.md", repository: "acme/site.example", used: true, why: "in the target's repository" }],
+    },
+    relevance: { status: "passed" },
+  };
+
+  it("shows deployment steps, rollback and gaps instead of an incident report", () => {
+    show(guidance);
+    expect(screen.getByText("Deployment guidance")).toBeTruthy();
+    expect(screen.getByText("./deploy.sh")).toBeTruthy();
+    expect(screen.getByText("./deploy.sh <sha>")).toBeTruthy();
+    expect(screen.getByText(/Placeholder: <sha>/)).toBeTruthy();
+    expect(screen.getByText(/do not say how to verify/)).toBeTruthy();
+    expect(screen.queryByText("Suspected causes")).toBeNull();
+    expect(screen.queryByText("Observed facts")).toBeNull();
+  });
+
+  it("says plainly that a change request changed nothing", () => {
+    show({ ...guidance, response_type: "execution_plan", answer: { ...guidance.answer, execution: { executed: false, note: "MOKS has no allowlisted deploy action.", authorization: ["Request an action plan."], actions: [] } } });
+    expect(screen.getByText("Nothing was changed.")).toBeTruthy();
+    expect(screen.getByText("Request an action plan.")).toBeTruthy();
+  });
+
+  it("keeps observed conditions apart from verified defects, and shared infrastructure apart from the target", () => {
+    show({ verified_findings: [{ category: "observed_condition", cause: "Argo CD app a reports ComparisonError", evidence: ["E1"], check: "deterministic detector: argocd_comparison_error" }],
+           shared_findings: [{ title: "3 Argo CD applications cannot reach eks.example", detail: "d", evidence: ["E1"] }],
+           excluded: [{ count: 4, reason: "Argo CD applications outside this request's target" }] });
+    expect(screen.getByText("Observed conditions")).toBeTruthy();
+    expect(screen.queryByText("Verified configuration defects")).toBeNull();
+    expect(screen.getByText("Shared infrastructure")).toBeTruthy();
+    expect(screen.getByText(/Left out as unrelated to this request: 4/)).toBeTruthy();
+  });
+});

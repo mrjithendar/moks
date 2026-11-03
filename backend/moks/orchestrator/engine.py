@@ -33,6 +33,8 @@ from ..auth.revocation import CHECK_SECONDS as WATCH_SECONDS, AccessGuard, Acces
 from ..llm.lc import MoksChatModel
 from ..llm.providers import LLMError, provider_for
 from ..models import Environment, Evidence, Investigation, InvestigationCheckpoint, InvestigationEvent, LLMConfig, LLMUsage, RoleBinding, SkillVersion, User
+from opentelemetry import trace as trace_api
+
 from ..observability import INVESTIGATION_DURATION, INVESTIGATIONS, INVESTIGATIONS_RUNNING, continue_trace, tracer
 from ..rbac import Binding, P, Principal
 from ..redaction import redact_obj
@@ -40,16 +42,18 @@ from ..scope import ScopeError, effective_scope
 from ..tools.contracts import ToolContext
 from ..tools.executor import ToolExecutor, ToolOutcome, tools_for_planner
 from ..tools.lc import as_tools
-from . import graph, prompts
+from . import graph, prompts, relevance
 from .. import conversations
 from ..diagnosis.logs import last_failure
 from ..llm.budget import CHARS_PER_TOKEN
 from .evidence import HISTORICAL, LIVE, Ledger, classify
+from .intent import CONCEPT_TOOLS, FILTERED_CLUSTER_TOOLS, GUIDANCE_TOOLS, LLM_SYSTEM, RequestContext, build as build_request, classify as classify_request, names_in as intent_names, refine
 from .report import Report, focus, parse_json_object, rules_report, validate_claims, validate_llm_report, verify_causes
 
 log = logging.getLogger("moks.orchestrator")
 
 TRACE_ID = re.compile(r"\b[0-9a-f]{32}\b", re.I)
+DNS_FAILURE = re.compile(r"(?i)no such host|nxdomain|could not resolve|temporary failure in name resolution|name or service not known|lookup [\w.-]+ on [\d.]+:53|server misbehaving")
 CHANGE_WORDS = re.compile(r"(?i)\b(latenc\w*|slow\w*|deploy\w*|rollout|rolled|release\w*|change\w*|regress\w*|timeout\w*|degrad\w*)\b")
 MAX_CALLS_PER_ROUND = 4
 MAX_NAMESPACES_SWEEP = 10
@@ -141,6 +145,26 @@ class Investigator:
         self.requested_skill: str | None = None
         self.focus_namespace: str | None = None
         self.versions: dict[str, Any] = {}
+        # The validated request (orchestrator/intent.py) and what was decided about it, for the report and traces.
+        self.request: RequestContext | None = None
+        self.sources: list[dict[str, Any]] = []     # documents and files read for guidance, with relevance decisions
+        self.gaps: list[dict[str, Any]] = []
+        self.retrieval_notes: list[str] = []
+        self.shared_findings: list[dict[str, Any]] = []  # shared infrastructure, kept apart from the target's findings
+        self.excluded: list[dict[str, Any]] = []         # evidence about other targets, left out of the answer with its provenance
+        self.trace: dict[str, Any] = {"tools": [], "sources": [], "scope_rejections": []}
+        self.environment_info: dict[str, Any] = {}
+        self.conversation_namespace: str | None = None
+        self.llm_failures: tuple = (Exception,)
+
+    @property
+    def tool_budget(self) -> int:
+        """Tool calls this request may use: the intent's budget, never above the global ceiling."""
+        cap = self.settings.max_tool_calls
+        if self.request is None:
+            return cap
+        own = (self.settings.intent_tool_budgets or {}).get(self.request.primary) or cap
+        return max(1, min(cap, own))
 
     async def _fence(self, db) -> None:
         """Inside a transaction that is about to write: the row lock holds off the reaper until the
@@ -315,7 +339,9 @@ class Investigator:
         report = state.get("report")
         return {
             "version": CHECKPOINT_VERSION, "completed": self.completed_nodes, "ref": self.ref, "tool_calls": self.tool_calls, "evidence_refs": [e["ref"] for e in self.evidence],
-            "graph": {k: (report.model_dump() if k == "report" and report is not None else state.get(k)) for k in ("namespace", "round", "calls", "use_rules", "finished", "mode", "report")},
+            "graph": {k: (report.model_dump() if k == "report" and report is not None else state.get(k)) for k in ("namespace", "round", "calls", "use_rules", "finished", "mode", "report", "workflow")},
+            "request": self.request.model_dump() if self.request else None, "trace": self.trace, "gaps": self.gaps, "retrieval_notes": self.retrieval_notes,
+            "sources": [{k: v for k, v in x.items() if k != "text"} for x in self.sources], "shared_findings": self.shared_findings, "excluded": self.excluded,
             "notes": self.notes, "findings": self.findings, "calls_seen": sorted(self.calls_seen), "rejected": self.rejected[-20:], "focus_namespace": self.focus_namespace,
             "skills": [{"digest": sk.digest, "score": score, "reasons": why} for sk, score, why in self.skills], "skill_runs": self.skill_runs, "skill_rejected": self.skill_rejected,
             "skill_generation": self.skill_generation, "connectors": self.connector_ids, "versions": self.versions,
@@ -361,6 +387,21 @@ class Investigator:
 
         self.notes = cp["notes"]
         self.findings = cp["findings"]
+        if cp.get("request"):
+            self.request = RequestContext.model_validate(cp["request"])
+        self.trace = cp.get("trace") or self.trace
+        self.gaps, self.retrieval_notes = cp.get("gaps") or [], cp.get("retrieval_notes") or []
+        self.shared_findings, self.excluded = cp.get("shared_findings") or [], cp.get("excluded") or []
+        by_ref = {e["ref"]: e.get("data") for e in self.evidence}
+
+        def text_of(ref: str, path: str) -> str:  # file text comes back from evidence, not the checkpoint
+            d = by_ref.get(ref)
+            if isinstance(d, dict):
+                return str(d.get("text") or "")
+            if isinstance(d, list):
+                return "\n".join(f"{h.get('title') or ''}\n{h.get('heading') or ''}\n{h.get('text') or ''}" for h in d if isinstance(h, dict) and (h.get("citation") or {}).get("path") == path)
+            return ""
+        self.sources = [{**x, "text": text_of(x["ref"], x["path"])} for x in cp.get("sources") or []]
         self.calls_seen = set(cp["calls_seen"]) - {_call_key(e["tool"], e["args"]) for e in self.evidence if e["kind"] == HISTORICAL}
         self.rejected = cp["rejected"]
         self.focus_namespace = cp["focus_namespace"]
@@ -425,6 +466,12 @@ class Investigator:
             self.owner = principal_id
             if inv.conversation_id:
                 self.history = await conversations.history(db, inv.conversation_id, inv.id, principal, env.name)
+                from ..models import Conversation
+
+                conv = await db.get(Conversation, inv.conversation_id)
+                self.conversation_namespace = conv.namespace if conv and conv.id != inv.id else None
+            queued = (await db.execute(select(InvestigationEvent.payload).where(InvestigationEvent.investigation_id == inv.id, InvestigationEvent.seq == 0))).scalar_one_or_none() or {}
+            self.environment_info = {"name": env.name, "is_production": bool(env.is_production), "reason": queued.get("environment_reason"), "namespace_reason": queued.get("namespace_reason")}
             self._window = (t_from, t_to)
             env_name = env.name
             max_window = timedelta(minutes=min(env.max_query_window_minutes, self.settings.max_query_window_minutes))
@@ -458,6 +505,7 @@ class Investigator:
             await db.commit()
         namespace, report = final["namespace"], final["report"]
         mode = final.get("mode") or mode
+        req = self.request or build_request(question)
         await self._emit("phase", {"phase": "verification", "label": "Verifying causes against direct evidence"})
         ledger = self._ledger(namespace)
         validate_claims(report, ledger, self.findings, check_support=report.generated_by == "llm")
@@ -469,7 +517,7 @@ class Investigator:
         payload["coverage"] = self._coverage(conn_errors)
         payload["relationships"] = self._relationships()
         payload["primary_resource"] = self._primary_resource()
-        payload["findings"] = self.findings
+        payload["findings"] = [f for f in self.findings if (self.request is None or self.request.in_scope(f.get("namespace")) or f.get("namespace") is None)]
         payload["skills"] = [{"name": sk.name, "version": sk.meta.version, "digest": sk.digest, "description": sk.meta.description, "reasons": why} for sk, _, why in self.skills]
         payload["skill_runs"] = self.skill_runs
         payload["skill_rejected"] = self.skill_rejected
@@ -477,6 +525,17 @@ class Investigator:
         payload["skill_actions"] = await self._skill_actions(namespace, env_name)
         payload["notes"] = list(dict.fromkeys([*(payload.get("notes") or []), *self.notes]))
         payload["execution"] = {"attempt": self.attempt, "resumed_after": self.resumed_from, "versions": self.versions}
+        payload["shared_findings"] = self.shared_findings
+        payload["excluded"] = self.excluded
+        payload["request"] = req.trace()
+        verdict = relevance.check(payload, req, ledger, self.findings)
+        payload["relevance"] = verdict
+        self.trace["relevance"] = {"status": verdict["status"], "failed": [c["name"] for c in verdict.get("first_pass", verdict["checks"]) if not c["passed"]], "corrections": verdict["corrections"]}
+        self.trace["response_type"] = payload["response_type"]
+        payload["trace"] = redact_obj(json.loads(json.dumps({**self.trace, "routing": req.trace()}, default=str)))
+        await self._emit("relevance", {"status": verdict["status"], "checks": [{"name": c["name"], "passed": c["passed"]} for c in verdict["checks"]], "corrections": verdict["corrections"]})
+        log.info("request answered", extra={"event": "request_answered", "investigation_id": str(self.id), "operation": req.primary, "outcome": verdict["status"],
+                                             "response_type": payload["response_type"], "tool_calls": self.tool_calls, "scope": req.scope})
         if not await self._finish("completed", payload, None):
             raise OwnershipLost(str(self.id))
         await self._emit("report", {"report": payload})
@@ -496,7 +555,7 @@ class Investigator:
             row = by_source.setdefault(e["tool"].split("_")[0], {"ok": 0, "failed": 0})
             row["ok" if e["ok"] else "failed"] += 1
         return {"sources": by_source, "unavailable": conn_errors, "failed_tools": sorted({e["tool"] for e in self.evidence if not e["ok"]}),
-                "tool_calls": self.tool_calls, "tool_budget": self.settings.max_tool_calls, "budget_reached": self.tool_calls >= self.settings.max_tool_calls}
+                "tool_calls": self.tool_calls, "tool_budget": self.tool_budget, "budget_reached": self.tool_calls >= self.tool_budget}
 
     def _relationships(self) -> dict[str, list]:
         """Observed ownership only: Service -> pods by selector, workload -> pods by ownerReference."""
@@ -534,13 +593,49 @@ class Investigator:
         ranked = sorted(self.findings, key=lambda f: {"high": 0, "medium": 1, "low": 2}.get(f.get("severity"), 3))
         return next((f["resources"][0] for f in ranked if f.get("resources")), None)
 
+    def _outside_request(self, tool: str, args: dict[str, Any]) -> str | None:
+        """Why a call falls outside what this request needs, if it does. Authorization is the executor's job and
+        is unchanged; this narrows further, to the request's workflow and target."""
+        from ..tools.builtin import REGISTRY
+
+        req = self.request
+        if req is None:
+            return None
+        allowed = GUIDANCE_TOOLS if req.workflow == "guidance" else CONCEPT_TOOLS if req.workflow == "concept" else None
+        if allowed is not None and tool not in allowed and tool not in req.tools_expanded():
+            return f"answering a {req.primary.replace('_', ' ')} request does not need {tool}"
+        spec = REGISTRY.get(tool)
+        if spec is None:
+            return None  # the executor refuses unknown tools and audits the attempt
+        ns = args.get(spec.namespace_arg) if spec.namespace_arg else None
+        if req.workflow == "guidance":
+            if tool == "k8s_argocd_status" and not args.get("application"):
+                return "guidance reads the target's own Argo CD application, not every application"
+            if ns and ns not in req.namespaces and not (tool == "k8s_ingresses" and ns in (req.candidates.get("namespace") or [])):
+                return f"namespace {ns} is not established as the target's"
+        if req.scope != "target":
+            return None
+        if ns and ns not in req.namespaces:
+            return f"namespace {ns} is outside this request's target ({', '.join(req.namespaces)}); widening needs evidence of a dependency"
+        if spec.cluster_scoped and spec.connector_type in ("kubernetes", "prometheus", "loki") and tool not in FILTERED_CLUSTER_TOOLS | req.tools_expanded():
+            return f"{tool} reads the whole cluster, and nothing so far shows {req.target_name or req.namespaces[0]} depends on it"
+        return None
+
     async def _call(self, executor: ToolExecutor, tool: str, args: dict[str, Any], purpose: str | None = None) -> ToolOutcome | None:
         key = _call_key(tool, args)
         if key in self.calls_seen:
             return None
-        if self.tool_calls >= self.settings.max_tool_calls:
+        blocked = self._outside_request(tool, args)
+        if blocked and not executor.would_deny(tool, args):  # what policy refuses, the executor refuses and audits as before
+            self.calls_seen.add(key)
+            self.rejected.append({"tool": tool, "args": args, "reason": blocked, "kind": "request_scope"})
+            self.trace["scope_rejections"].append({"tool": tool, "namespace": args.get("namespace"), "reason": blocked})
+            await executor.refuse(tool, args, blocked)
+            await self._emit("note", {"message": f"Not run: {tool} ({blocked})"})
+            return None
+        if self.tool_calls >= self.tool_budget:
             if "tool budget" not in " ".join(self.notes):
-                self.notes.append(f"Tool-call budget of {self.settings.max_tool_calls} reached.")
+                self.notes.append(f"Tool-call budget of {self.tool_budget} for this request reached.")
             return None
         self.calls_seen.add(key)
         self.tool_calls += 1
@@ -562,11 +657,146 @@ class Investigator:
         if not out.evidence_ref or out.denied:
             self.rejected.append({"tool": tool, "args": args, "reason": out.error, "kind": out.error_kind})
         await self._emit("tool_result", {k: v for k, v in record.items() if k != "data"} | {"duration_ms": out.duration_ms})
+        self.trace["tools"].append({"tool": tool, "purpose": purpose, "namespace": args.get("namespace"), "ref": out.evidence_ref, "ok": out.ok})
         if tool == "k8s_argocd_status" and out.ok and isinstance(out.data, dict):
-            # Pods are fine when Argo CD fails, so these never come from triage. Filtering one app can repeat a finding.
-            known = {(f["kind"], tuple(f.get("resources", []))) for f in self.findings}
-            self.findings.extend({**f, "evidence": [out.evidence_ref]} for f in out.data.get("findings", []) if (f["kind"], tuple(f["resources"])) not in known)
+            self._argo_findings(out)
         return out
+
+    def _argo_findings(self, out: ToolOutcome) -> None:
+        """Argo CD reports on every application it manages. Those of the target are findings; others that fail
+        for the same concrete cause are a shared failure, kept apart; the rest are left out, with a record of
+        what was left out and where it came from. Without a target, apps with one shared cause are grouped."""
+        from .. import argocd as argo
+
+        known = {(f["kind"], tuple(f.get("resources", []))) for f in [*self.findings, *self.shared_findings]}
+        new = [{**f, "evidence": [out.evidence_ref]} for f in out.data.get("findings", []) if (f["kind"], tuple(f["resources"])) not in known]
+        req = self.request
+        if req is None or req.scope != "target":
+            self.findings.extend(argo.group(new))
+            return
+        mine = [f for f in new if req.in_scope(f.get("namespace"))]
+        others = [f for f in new if not req.in_scope(f.get("namespace"))]
+        keys = {((f.get("cause") or {}).get("category"), (f.get("cause") or {}).get("key")) for f in mine if (f.get("cause") or {}).get("key")}
+        same = [f for f in others if ((f.get("cause") or {}).get("category"), (f.get("cause") or {}).get("key")) in keys]
+        self.findings.extend(mine)
+        if same:
+            for g in argo.group([*[{**f} for f in mine if ((f.get("cause") or {}).get("category"), (f.get("cause") or {}).get("key")) in keys], *same]):
+                if g["kind"] == "argocd_shared_cause":
+                    self.shared_findings.append(g)
+                    req.expand(None, [], f"{g['title']}: the target's application fails for the same reason, so this is a shared failure", [out.evidence_ref])
+        rest = [f for f in others if f not in same]
+        if rest:
+            self.excluded.append({"tool": "k8s_argocd_status", "evidence": [out.evidence_ref], "count": len(rest), "reason": "Argo CD applications outside this request's target",
+                                  "namespaces": sorted({f.get("namespace") or "?" for f in rest})[:20]})
+
+    async def _intake(self, executor: ToolExecutor, ctx: ToolContext, question: str, namespace: str, provider, cfg, failures: tuple) -> None:
+        """The request, validated, before any live evidence: intent, target, environment, scope, what is unresolved."""
+        from . import guidance
+
+        self.llm_failures = failures
+        scores, signals, _ = classify_request(question)
+        req = build_request(question, scores=scores, signals=signals)
+        if req.confidence == "low" and provider and self.settings.intent_llm_classifier:
+            try:
+                raw = await self._llm(provider, cfg, LLM_SYSTEM, prompts.untrusted("request", question, 2000), 200, 60)
+                req = refine(req, raw, scores)
+            except failures as exc:
+                self.notes.append(f"The model could not classify the request ({getattr(exc, 'message', str(exc))}); the rules decided.")
+        req.environment = ctx.environment.name
+        req.environment_reason = self.environment_info.get("reason")
+        k8s = ctx.connectors.get("kubernetes")
+        req.cluster = (getattr(k8s[0], "name", None) if k8s and k8s[0] is not None else None) or (ctx.environment.name if k8s else None)
+        if req.requested_environment and req.requested_environment.startswith("prod") and not self.environment_info.get("is_production"):
+            req.ambiguities.append(f"the request names production, but environment {ctx.environment.name} is not marked as production")
+        if namespace != "*":
+            # The investigation's namespace bounds what may be read. It is the request's target only when the
+            # question is about something in particular; "why are Argo CD apps failing" in shop is not about shop alone.
+            req.resolve("namespace", namespace, self.environment_info.get("namespace_reason") or "the investigation's namespace")
+            pinned = bool(req.targets) or namespace in intent_names(question)
+        git = ctx.connectors.get("git")
+        repositories = list(getattr(git[1], "repositories", None) or []) if git else []
+        names: list[str] | None = None
+        if k8s and req.targets:
+            try:
+                names = ctx.scope.filter(await ctx.connector("kubernetes").list_namespaces())
+            except Exception:
+                names = None
+        guidance.resolve_static(req, repositories, names)
+        self.request = req
+        if req.workflow == "investigate" and req.targets and not req.resolved("namespace"):
+            await guidance.verify_namespace_by_ingress(self, executor, req)
+        if req.namespaces and (namespace == "*" or pinned):
+            req.scope = "target"
+        explicit = [t for t in req.targets if t.kind != "object"]
+        if self.history and explicit:
+            spoken = " ".join(h["text"] for h in self.history).lower()
+            mine = [t.mention.lower() for t in explicit] + ([req.repository.lower()] if req.repository else [])
+            if not any(m in spoken for m in mine) or (self.conversation_namespace and req.namespaces and self.conversation_namespace not in ("*", *req.namespaces)):
+                self.history, req.history_used = [], False
+                self.notes.append(f"Earlier turns of this conversation were about something other than {req.target_name}, so they were left out of this answer.")
+        span = trace_api.get_current_span()
+        for k, v in (("moks.intent", req.primary), ("moks.workflow", req.workflow), ("moks.response_type", req.response_type), ("moks.scope", req.scope)):
+            span.set_attribute(k, v)
+        await self._emit("routing", req.trace())
+        log.info("request routed", extra={"event": "request_routed", "investigation_id": str(self.id), "operation": req.primary, "workflow": req.workflow,
+                                           "scope": req.scope, "unresolved": ",".join(req.unresolved), "classifier": req.classifier})
+
+    async def _shared_dependencies(self, executor: ToolExecutor, ctx: ToolContext) -> None:
+        """Widen past the target only when its own evidence points at something shared, and say why."""
+        req = self.request
+        if req is None or req.scope != "target" or "kubernetes" not in ctx.connectors or not ctx.scope.cluster_wide:
+            return
+        mine = [e for e in self.evidence if e["ok"] and req.in_scope(e["args"].get("namespace"))]
+        dns = [e["ref"] for e in mine if DNS_FAILURE.search(json.dumps(e.get("data"), default=str)[:200_000])]
+        if dns and "k8s_dns_health" not in req.tools_expanded():
+            req.expand(None, ["k8s_dns_health"], f"{', '.join(dns[:3])} show name-resolution failures in {', '.join(req.namespaces)}, so cluster DNS is a candidate shared dependency", dns[:3])
+            await self._emit("note", {"message": f"Scope widened to cluster DNS: {req.expansions[-1]['reason']}"})
+            await self._call(executor, "k8s_dns_health", {}, "shared dependency: cluster DNS")
+        nodes = [ref for f in self.findings if f["kind"] in ("unschedulable", "evicted") and req.in_scope(f.get("namespace")) for ref in f.get("evidence", [])]
+        if nodes and "k8s_nodes" not in req.tools_expanded():
+            req.expand(None, ["k8s_nodes"], f"{', '.join(nodes[:3])} show pods that cannot be scheduled or were evicted, so node capacity is shared", nodes[:3])
+            await self._call(executor, "k8s_nodes", {}, "shared dependency: node capacity")
+
+    def consider_expansion(self, raw: Any) -> None:
+        """A planner's request for more scope stands only on evidence that exists and names what it asks for."""
+        req = self.request
+        if req is None or req.scope != "target" or not isinstance(raw, dict):
+            return
+        wanted = [str(n) for n in raw.get("namespaces") or [] if isinstance(n, str)][:3]
+        refs = [r for r in raw.get("evidence") or [] if any(e["ref"] == r for e in self.evidence)]
+        text = " ".join(json.dumps(e.get("data"), default=str)[:50_000] for e in self.evidence if e["ref"] in refs).lower()
+        shown = [n for n in wanted if n in text and n not in req.namespaces]
+        if shown:
+            req.expand(shown, [], str(raw.get("reason") or "the planner cited a dependency")[:300], refs)
+        elif wanted:
+            self.trace["scope_rejections"].append({"namespaces": wanted, "reason": "expansion refused: the cited evidence does not name these namespaces"})
+
+    def _view(self, e: dict[str, Any]) -> dict[str, Any]:
+        """Evidence as the model sees it for this request: output a tool could not filter is filtered here,
+        and the stored evidence keeps everything, so provenance is intact."""
+        req = self.request
+        if req is None or req.scope != "target" or not e["ok"]:
+            return e
+        data = e.get("data")
+        if e["tool"] == "k8s_argocd_status" and isinstance(data, dict):
+            problems = [r for r in data.get("problems") or [] if req.in_scope(r.get("namespace"))]
+            removed = len(data.get("problems") or []) - len(problems)
+            kept = {**data, "problems": problems, "findings": [f for f in data.get("findings") or [] if req.in_scope(f.get("namespace"))], "healthy": [], "out_of_scope_problems": removed}
+            return {**e, "data": kept, "summary": f"{len(problems)} Argo CD application(s) of this target with problems" + (f"; {removed} outside the target left out" if removed else "")}
+        if e["tool"] == "prom_alerts" and isinstance(data, list):
+            rows, removed = [], 0
+            for r in data:
+                active = r.get("active") or []
+                mine = [x for x in active if req.in_scope((x.get("labels") or {}).get("namespace"))]
+                shared = [{**x, "shared": True} for x in active if not (x.get("labels") or {}).get("namespace")]
+                removed += len(active) - len(mine) - len(shared)
+                if mine or shared:
+                    rows.append({**r, "active": mine + shared})
+            return {**e, "data": rows, "summary": f"{len(rows)} alert rule(s) for this target or the shared cluster" + (f"; {removed} alert(s) about other namespaces left out" if removed else "")}
+        return e
+
+    def _views(self) -> list[dict[str, Any]]:
+        return [self._view(e) for e in self.evidence]
 
     async def _focus(self, ctx: ToolContext, question: str) -> tuple[str | None, str]:
         """For all-namespace investigations: find the namespace the question is about by matching
@@ -601,7 +831,18 @@ class Investigator:
 
     async def _baseline(self, executor: ToolExecutor, ctx: ToolContext, namespace: str, question: str) -> None:
         namespaces: list[str]
-        if namespace == "*":
+        req = self.request
+        if namespace == "*" and req is not None and req.namespaces:
+            res = req.resolved("namespace")
+            focus, why = req.namespaces[0], (res.source if res else "resolved from the request")
+            self.notes.append(f"Scope: {why}.")
+            await self._emit("note", {"message": f"Scope: {why}"})
+            async with session_scope() as db:
+                await db.execute(update(Investigation).where(Investigation.id == self.id).values(namespace=focus))
+            self.focus_namespace = namespace = focus
+        elif namespace == "*" and req is not None and req.scope == "cluster":
+            self.notes.append("Scope: the request asks about the whole environment.")
+        if namespace == "*" and (req is None or req.scope != "cluster"):
             focus, why = await self._focus(ctx, question)
             self.notes.append(f"Scope: {why}.")
             await self._emit("note", {"message": f"Scope: {why}"})
@@ -610,6 +851,9 @@ class Investigator:
                     await db.execute(update(Investigation).where(Investigation.id == self.id).values(namespace=focus))
                 self.focus_namespace = focus
                 namespace = focus
+                if req is not None:
+                    req.resolve("namespace", focus, why)
+                    req.scope = "target"
         if namespace == "*":
             if "kubernetes" not in ctx.connectors:
                 namespaces = []
@@ -818,7 +1062,7 @@ class Investigator:
         trace = TRACE_ID.search(question)
         base = {"namespace": "" if namespace == "*" else namespace, "question": question[:200],
                 "trace_id": trace.group(0).lower() if trace else "", "repository": self._repository(ctx)}
-        budget = max(0, self.settings.max_tool_calls - self.tool_calls - 4)  # leave room for follow-ups
+        budget = max(0, self.tool_budget - self.tool_calls - 4)  # leave room for follow-ups
         # What was asked for runs first, and each skill gets a share, so findings about something else cannot use it all.
         asked = lambda pair: not any(w.startswith(("chosen", "question:")) for w in pair[0][2])
         ordered = sorted(zip(self.skills, self.skill_runs), key=asked)
@@ -1048,7 +1292,7 @@ class Investigator:
         tools = [t.schema_for_llm() for t in tools_for_planner(ctx)]
         system = prompts.PLANNER_SYSTEM.replace("{max_calls}", str(MAX_CALLS_PER_ROUND)) + prompts.skills_section(self.skills)
         await self._emit("phase", {"phase": "planning", "label": f"Planning follow-up evidence (round {round_no})"})
-        return await self._llm(provider, cfg, system, prompts.planner_user(question, scope_info, tools, self.evidence, self.findings, self.settings.max_tool_calls - self.tool_calls, self.rejected),
+        return await self._llm(provider, cfg, system, prompts.planner_user(question, scope_info, tools, self._views(), self.findings, self.tool_budget - self.tool_calls, self.rejected, self.request),
                                PLAN_TOKENS, MIN_PLAN_TOKENS)
 
     async def _act(self, executor: ToolExecutor, ctx: ToolContext, calls: list) -> int:
@@ -1073,16 +1317,21 @@ class Investigator:
     async def _write_report(self, provider, cfg: LLMConfig | None, question: str, scope_info: dict) -> tuple[Report, str | None]:
         await self._emit("phase", {"phase": "hypotheses", "label": "Forming and checking hypotheses"})
         self.findings = focus(question, self.findings)
+        rtype = self.request.response_type if self.request else "troubleshooting"
         if provider:
             try:
-                return await self._llm_report(provider, cfg, self._with_history(question), scope_info), None
+                rep = await self._llm_report(provider, cfg, self._with_history(question), scope_info)
+                rep.response_type = rtype
+                return rep, None
             except (LLMError, BudgetExceeded, ValueError) as exc:
                 self.notes.append(f"LLM report unavailable ({getattr(exc, 'message', str(exc))}); showing the rule-based report.")
-        return rules_report(question, self.findings, self.evidence, self.notes), "deterministic" if not provider else "llm_fallback"
+        rep = rules_report(question, self.findings, self._views(), self.notes)
+        rep.response_type = rtype
+        return rep, "deterministic" if not provider else "llm_fallback"
 
     async def _llm_report(self, provider, cfg: LLMConfig, question: str, scope_info: dict) -> Report:
         raw = await self._llm(provider, cfg, prompts.REPORT_SYSTEM + prompts.skills_section(self.skills),
-                              prompts.report_user(question, scope_info, self.evidence, self.findings, self.notes),
+                              prompts.report_user(question, scope_info, self._views(), self.findings, self.notes, self.request, self.shared_findings),
                               REPORT_TOKENS, MIN_REPORT_TOKENS)
         refs = {e["ref"] for e in self.evidence if e["ref"]}
         return validate_llm_report(raw, refs, self.notes)

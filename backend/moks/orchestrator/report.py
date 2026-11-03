@@ -49,10 +49,14 @@ class Report(BaseModel):
     generated_by: Literal["llm", "rules"] = "rules"
     notes: list[str] = Field(default_factory=list)
     validation: dict[str, Any] = Field(default_factory=dict)
-    verified_causes: list[dict[str, Any]] = Field(default_factory=list)  # verified configuration defects only
+    verified_causes: list[dict[str, Any]] = Field(default_factory=list)  # verified configuration defects only (observed conditions never)
     verified_findings: list[dict[str, Any]] = Field(default_factory=list)  # every check that passed, by category
     withheld_findings: list[dict[str, Any]] = Field(default_factory=list)  # observed, but a skill's required evidence is missing
     conflicts: list[dict[str, Any]] = Field(default_factory=list)
+    # What kind of answer this is (orchestrator/intent.py RESPONSE_TYPE) and, for guidance, explanation and
+    # execution requests, its structure. Set by MOKS, never by the model.
+    response_type: str = "troubleshooting"
+    answer: dict[str, Any] = Field(default_factory=dict)
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -87,6 +91,7 @@ def validate_llm_report(raw: dict[str, Any], valid_refs: set[str], notes: list[s
         r.requires_approval = True
         r.executable = False
     rep.verified_causes, rep.verified_findings, rep.conflicts = [], [], []
+    rep.response_type, rep.answer = "troubleshooting", {}
     rep.validation = {"valid_refs": sorted(valid_refs, key=lambda r: int(r[1:]))}
     return rep
 
@@ -174,7 +179,10 @@ def _honest_ending(rep: Report, ledger: ev.Ledger) -> str:
 # Failures a detector reads directly. A crashloop is one of these and its cause is still open.
 OBSERVED_FAILURES = {"crash_log_reason", "crashloop", "oomkilled", "image_pull", "unschedulable", "argocd_sync_failed"}
 # A wrong setting read from the object itself: a selector that matches no pods IS the broken selector.
-CONFIGURATION_DEFECTS = {"service_selector_mismatch", "config_ref_missing", "argocd_source_missing", "argocd_comparison_error"}
+CONFIGURATION_DEFECTS = {"service_selector_mismatch", "config_ref_missing", "argocd_source_missing"}
+# A condition a system reports about itself. It shows that a check failed: not why, not that a setting is wrong,
+# and nothing about the workloads it manages. An Argo CD ComparisonError is one.
+OBSERVED_CONDITIONS = {"argocd_comparison_error", "argocd_shared_cause", "argocd_unhealthy", "argocd_out_of_sync"}
 ARGO_QUESTION = re.compile(r"(?i)\b(argo|gitops|syncs?\b)")
 
 
@@ -193,7 +201,8 @@ def verify_causes(report: Report, findings: list[dict], ledger: ev.Ledger | None
     verified, held = [], []
     for f in findings:
         kind = f.get("kind")
-        category = "configuration_defect" if kind in CONFIGURATION_DEFECTS else "observed_failure" if kind in OBSERVED_FAILURES else None
+        category = ("configuration_defect" if kind in CONFIGURATION_DEFECTS else "observed_failure" if kind in OBSERVED_FAILURES
+                    else "observed_condition" if kind in OBSERVED_CONDITIONS else None)
         refs = f.get("evidence") or []
         if ledger is not None:
             refs = [r for r in refs if r in ledger.entries and ledger.entries[r].kind in ev.LIVE and ledger.in_scope(ledger.entries[r])]

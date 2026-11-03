@@ -1,5 +1,27 @@
 # Testing
 
+## Request routing and scope
+
+Results from 2026-11-03, local only (PostgreSQL 17, Node 26). Nothing ran against mk4 or a real model.
+
+| Check | Result | How |
+|---|---|---|
+| `tests/test_request_routing.py` | 31 passed | real API, orchestrator, executor and knowledge index; fake Kubernetes, Git and Prometheus; one test scripts an LLM |
+| `routing` evaluation dataset, rules mode | score 1.000 on 4 cases | `moks eval routing` path, fixture connectors |
+| Backend suite | 1162 passed, 3 failed, 43 skipped | the 3 are `test_helm_render.py` terminal defaults, failing on the committed chart too |
+| Frontend suite, typecheck | 132 passed, clean | Node 26 (Node 20 cannot load jsdom's dependencies) |
+
+Covered: "How do I deploy jithendar.com?" (grounded guidance, no RoboShop findings, no mutations), a 502 that starts at
+the target's Ingress and namespace, health of all Argo CD apps with only genuinely shared failures grouped, "Explain
+Argo CD." with no live reads, "Deploy jithendar.com to production." through the action-plan route, ambiguous targets,
+missing runbooks, failed retrieval and Git reads, a RoboShop conversation followed by a jithendar.com question, DNS
+failures that widen scope to cluster DNS, a shared Argo CD failure kept apart from the target, an unrelated critical
+alert, workload reassurance without workload evidence, stale and conflicting runbooks, and a planner asking for
+another namespace.
+
+Not run: a real model's guidance or classification; the live mk4 knowledge index, which holds no jithendar.com
+documents (see [ARCHITECTURE.md](ARCHITECTURE.md#request-routing)).
+
 ## Web terminal
 
 Results from 2026-10-31. Nothing here ran on mk4, on AWS, or in a container.

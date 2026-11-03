@@ -1,0 +1,63 @@
+# Routing: each question gets the workflow and the answer shape it asks for, and no more evidence than it needs.
+# Same fixture connectors and scoring as `lab`, plus expect.response_type, expect.require_tools,
+# expect.forbid_tools, expect.max_tool_calls and expect.relevance (allowed relevance-check outcomes).
+name: routing
+cases:
+  - id: conceptual-no-live-queries
+    question: Explain Argo CD.
+    namespace: moks-lab
+    fixture:
+      pods:
+        - {name: payments-5c4-z9, labels: {app: payments}, waiting: CrashLoopBackOff, last: Error, restarts: 9}
+      deployments:
+        - {name: payments, replicas: 1, ready: 0}
+    expect:
+      response_type: conceptual
+      forbid_tools: [k8s_triage, k8s_list_pods, k8s_pod_logs, prom_alerts, k8s_argocd_status]
+      max_tool_calls: 2
+      forbid: ["crashloop", "payments-5c4"]
+      relevance: [passed, corrected]
+
+  - id: deployment-guidance-not-an-incident
+    question: How do I deploy checkout?
+    namespace: moks-lab
+    fixture:
+      pods:
+        - {name: checkout-6d9f-a1, labels: {app: checkout}}
+        - {name: payments-5c4-z9, labels: {app: payments}, waiting: CrashLoopBackOff, last: Error, restarts: 9}
+      deployments:
+        - {name: checkout, replicas: 1, ready: 1}
+        - {name: payments, replicas: 1, ready: 0}
+    expect:
+      response_type: deployment_guidance
+      forbid_tools: [k8s_triage, k8s_pod_logs, prom_alerts, k8s_list_pods]
+      forbid: ["CrashLoopBackOff", "verified configuration defect"]
+      relevance: [passed, corrected]
+
+  - id: troubleshooting-starts-at-the-target
+    question: Why is checkout returning 502 errors?
+    namespace: moks-lab
+    fixture:
+      pods:
+        - {name: checkout-6d9f-a1, labels: {app: checkout}}
+      services:
+        - {name: checkout, selector: {app: checkout-v2}}
+      deployments:
+        - {name: checkout, replicas: 1, ready: 1}
+    expect:
+      response_type: troubleshooting
+      require_tools: [k8s_triage]
+      finding_kinds: [service_selector_mismatch]
+
+  - id: execution-request-changes-nothing
+    question: Restart checkout now.
+    namespace: moks-lab
+    fixture:
+      pods:
+        - {name: checkout-6d9f-a1, labels: {app: checkout}}
+      deployments:
+        - {name: checkout, replicas: 1, ready: 1}
+    expect:
+      response_type: execution_plan
+      forbid_tools: [k8s_triage, k8s_pod_logs, prom_alerts]
+      forbid: ["has been restarted", "restarted successfully"]

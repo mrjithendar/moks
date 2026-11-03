@@ -130,7 +130,8 @@ async def k8s_argocd_status(ctx: ToolContext, a: ArgoArgs) -> ToolResult:
     if not s["installed"]:
         return ToolResult(s["error"], s, {"api": f"GET argoproj.io applications in {argocd.namespace()}"})
     worst = next((f["title"] for f in s["findings"] if f["severity"] != "low"), None)
-    return ToolResult(f"{s['total']} Argo CD applications, {len(s['problems'])} with problems" + (f": {worst}" if worst else ""), s,
+    shared = "; ".join(f"{len(g['applications'])} share {g['cause']['category'].replace('_', ' ')} for {g['cause']['key']}" for g in s.get("shared_causes") or [])
+    return ToolResult(f"{s['total']} Argo CD applications, {len(s['problems'])} with problems" + (f" ({shared})" if shared else "") + (f": {worst}" if worst else ""), s,
                       {"api": f"GET argoproj.io applications in {argocd.namespace()}"})
 
 

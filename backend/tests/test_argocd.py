@@ -85,7 +85,9 @@ async def test_it_names_each_failing_app_and_where_git_has_it_now():
     assert "mrjithendar/roboshop-ai:services/web/frontend" in by_app["application/frontend"]["detail"]
     assert "mrjithendar/tools:minikube/cert-manager/values.yaml" in by_app["application/cert-manager"]["detail"]
     assert all("without prune" in f["remediation_hint"] for f in s["findings"])
-    assert "not affected" in by_app["application/frontend"]["detail"] and by_app["application/frontend"]["severity"] == "medium"
+    # Argo CD's own report says nothing about running workloads, so the finding does not claim they are fine
+    assert "not affected" not in by_app["application/frontend"]["detail"] and "state is unknown" in by_app["application/frontend"]["detail"]
+    assert by_app["application/frontend"]["severity"] == "medium"
 
 
 async def test_exact_paths_in_another_repository_rank_first():

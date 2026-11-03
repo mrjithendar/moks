@@ -144,7 +144,7 @@ async def post_message(cid: uuid.UUID, body: MessageIn, request: Request, ctx: A
         raise HTTPException(403, "Ask someone in this conversation to add you first")
     await conversations.join(db, conv.id, ctx.user.id)
     if body.ask:
-        created = await start_investigation(CreateIn(question=body.content, environment=env.name, namespace=conv.namespace, minutes=body.minutes), request, ctx, db, conv.id)
+        created = await start_investigation(CreateIn(question=body.content, environment=env.name, minutes=body.minutes), request, ctx, db, conv.id, inherited_namespace=conv.namespace)
         await audit.record(db, action="conversation.turn", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="conversation", resource_id=str(conv.id),
                            environment=env.name, namespace=conv.namespace, decision="allow", details={"investigation_id": created["id"]})
     else:

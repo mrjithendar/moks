@@ -301,7 +301,55 @@ const FACT_KINDS: Record<string, string> = { collection: "about collection", doc
 const VERIFIED: [string, string, string][] = [
   ["configuration_defect", "Verified configuration defects", "A check read the wrong setting from the object itself."],
   ["observed_failure", "Observed failures", "These happened. Why they happened is still open, so see the suspected causes."],
+  ["observed_condition", "Observed conditions", "Reported by the system itself. This shows the condition, not its cause, and nothing about the running workloads."],
 ];
+
+const RESPONSE_LABEL: Record<string, string> = {
+  deployment_guidance: "Deployment guidance", repository_answer: "Repository answer", execution_plan: "Change request",
+  conceptual: "Explanation", troubleshooting: "Troubleshooting", health_check: "Health check",
+};
+const GUIDED = new Set(["deployment_guidance", "repository_answer", "execution_plan"]);
+const SECTION_TITLES: [string, string][] = [["prerequisites", "Prerequisites"], ["steps", "Steps"], ["verification", "Verification"], ["rollback", "Rollback"]];
+const GAP_LABEL: Record<string, string> = { missing_source: "no source", retrieval_failure: "retrieval failed", insufficient_evidence: "not in the sources", unresolved: "unresolved" };
+
+function Routing({ report }: { report: any }) {
+  const r = report.request;
+  if (!r) return null;
+  const target = r.targets?.[0]?.mention;
+  const where = [r.repository && `repository ${r.repository}`, r.namespaces?.length && `namespace ${r.namespaces.join(", ")}`, r.environment && `environment ${r.environment}`].filter(Boolean).join(" · ");
+  return <div className="small muted routing">Answered as <Badge kind="info">{RESPONSE_LABEL[report.response_type] ?? report.response_type}</Badge>
+    {target && <> about <strong>{target}</strong></>}{where && <> ({where})</>}
+    {report.relevance && report.relevance.status !== "passed" && <> · <Badge kind={report.relevance.status === "failed" ? "bad" : "warn"}>relevance check {report.relevance.status}</Badge></>}</div>;
+}
+
+function GuidanceItems({ items, onCite }: { items: any[]; onCite: (r: string) => void }) {
+  return <ol>{items.map((x: any, i: number) => <li key={i}>
+    {x.command ? <><code className="mono">{x.command}</code>{x.note || x.text !== `Run \`${x.command}\`` ? <span className="small"> — {x.note ?? x.text}</span> : null}</> : <Markdown text={x.text} />}
+    <Cites refs={x.sources ?? []} onCite={onCite} />{x.path && <span className="small muted"> {x.path}</span>}
+    {x.placeholders?.length > 0 && <div className="small muted">Placeholder: {x.placeholders.join(", ")}</div>}</li>)}</ol>;
+}
+
+export function Answer({ report, onCite }: { report: any; onCite: (r: string) => void }) {
+  const a = report.answer ?? {};
+  const ex = a.execution;
+  return <div className="answer stack tight">
+    {ex && <div className="alert warn small"><strong>Nothing was changed.</strong> {ex.note}
+      <ul>{ex.authorization?.map((s: string, i: number) => <li key={i}>{s}</li>)}</ul>
+      {ex.actions?.length > 0 && <div>Allowlisted actions that may apply: {ex.actions.map((x: any) => <Badge key={x.action} kind="neutral">{x.title}</Badge>)}</div>}</div>}
+    {a.overview?.length > 0 && <div className="rs static"><Markdown text={a.overview[0].text} /><Cites refs={a.overview[0].sources} onCite={onCite} /> <span className="small muted">{a.overview[0].path}</span></div>}
+    {a.explanation && <div className="rs static"><Markdown text={a.explanation} />{a.cited?.length > 0 && <Cites refs={a.cited} onCite={onCite} />}
+      {a.examples?.length > 0 && <ul className="small">{a.examples.map((x: string, i: number) => <li key={i}><Markdown text={x} /></li>)}</ul>}</div>}
+    {SECTION_TITLES.map(([key, title]) => a[key]?.length > 0 && <Section key={key} title={title} count={a[key].length}><GuidanceItems items={a[key]} onCite={onCite} /></Section>)}
+    {a.configuration?.length > 0 && <Section title="Configuration found" count={a.configuration.length} open={false}>
+      <ul className="small">{a.configuration.map((c: any, i: number) => <li key={i}><span className="mono">{c.path}</span> — {c.detail}<Cites refs={c.sources ?? []} onCite={onCite} /></li>)}</ul></Section>}
+    {a.question_for_user && <div className="alert info small"><strong>To go further:</strong> {a.question_for_user}</div>}
+    {a.gaps?.length > 0 && <div className="rs missing"><strong>What the sources do not establish</strong><ul>{a.gaps.map((g: any, i: number) => <li key={i}><Badge kind="neutral">{GAP_LABEL[g.kind] ?? g.kind}</Badge> {g.detail}{g.evidence?.length > 0 && <Cites refs={g.evidence} onCite={onCite} />}</li>)}</ul></div>}
+    {a.conflicts?.length > 0 && <div className="rs missing"><strong>Sources disagree or may be stale</strong><ul>{a.conflicts.map((c: any, i: number) => <li key={i}>{c.detail}<Cites refs={c.sources ?? []} onCite={onCite} /></li>)}</ul></div>}
+    {a.assumptions?.length > 0 && <div className="small muted"><strong>Assumptions:</strong> {a.assumptions.join(" ")}</div>}
+    {a.sources?.length > 0 && <Section title="Sources considered" count={a.sources.length} open={false}>
+      <ul className="small">{a.sources.map((x: any, i: number) => <li key={i}>{x.ref && <Cites refs={[x.ref]} onCite={onCite} />} <span className="mono">{x.repository ? `${x.repository}:` : ""}{x.path}</span> <Badge kind={x.used ? "ok" : "neutral"}>{x.used ? "used" : "not used"}</Badge> <span className="muted">{x.why}</span></li>)}</ul></Section>}
+  </div>;
+}
 
 function Cites({ refs, onCite }: { refs: string[]; onCite: (r: string) => void }) {
   return <>{refs.map((r) => <button type="button" key={r} className="cite" onClick={() => onCite(r)}>{r}</button>)}</>;
@@ -314,8 +362,21 @@ function Section({ title, count, open = true, children }: { title: string; count
 }
 
 export function Report({ report, evidence = [], hideSummary, onCite, onPropose }: { report: any; evidence?: any[]; hideSummary?: boolean; onCite: (r: string) => void; onPropose?: (r: any) => void }) {
+  if (GUIDED.has(report.response_type) || report.response_type === "conceptual") {
+    return <div className="report">
+      <Routing report={report} />
+      {!hideSummary && <div className="rs static"><h3>Answer</h3><Markdown text={report.summary ?? ""} /><div className="small muted">{report.generated_by === "llm" ? "Organized by the LLM; every command is checked against the cited sources" : "Extracted from the sources by rules"}</div></div>}
+      <Answer report={report} onCite={onCite} />
+      {report.observed_facts?.length > 0 && <Section title="Current state" count={report.observed_facts.length}><ul>{report.observed_facts.map((f: any, i: number) => <li key={i}>{f.statement}<Cites refs={f.evidence} onCite={onCite} /></li>)}</ul></Section>}
+      {evidence.length > 0 && <Section title="Supporting evidence" count={evidence.length} open={false}>
+        <ul>{evidence.slice(0, 40).map((e) => <li key={e.ref}><button type="button" className="cite" style={{ marginLeft: 0 }} onClick={() => onCite(e.ref)}>{e.ref}</button> <span className="small">{e.summary}</span></li>)}</ul>
+      </Section>}
+      {report.notes?.length > 0 && <details><summary className="small">Notes ({report.notes.length})</summary><ul className="small">{report.notes.map((n: string, i: number) => <li key={i}>{n}</li>)}</ul></details>}
+    </div>;
+  }
   return (
     <div className="report">
+      <Routing report={report} />
       {!hideSummary && <div className="rs static"><h3>Summary</h3><Markdown text={report.summary ?? ""} /><div className="small muted">{report.generated_by === "llm" ? "Written by the LLM from cited evidence" : "Rule-based report"}</div></div>}
       {report.missing_evidence.length > 0 && <div className="rs missing"><strong>Missing evidence</strong><ul>{report.missing_evidence.map((m: string, i: number) => <li key={i}>{m}</li>)}</ul></div>}
       <Section title="Observed facts" count={report.observed_facts.length}>
@@ -331,6 +392,10 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose }
           <ul>{rows.map((c: any, i: number) => <li key={i}>{c.cause}<Cites refs={c.evidence} onCite={onCite} /><div className="small muted">{[c.check, c.target && `target ${c.target}`, c.result, c.at].filter(Boolean).join(" · ")}</div></li>)}</ul>
         </Section>;
       })}
+      {report.shared_findings?.length > 0 && <Section title="Shared infrastructure" count={report.shared_findings.length}>
+        <div className="small muted">Outside the target, included because the target fails for the same reason.</div>
+        <ul>{report.shared_findings.map((f: any, i: number) => <li key={i}>{f.title}<Cites refs={f.evidence ?? []} onCite={onCite} /><div className="small muted">{f.detail}</div></li>)}</ul></Section>}
+      {report.excluded?.length > 0 && <div className="small muted">Left out as unrelated to this request: {report.excluded.map((x: any) => `${x.count} ${x.reason}`).join("; ")} (still in the evidence).</div>}
       <Section title="Suspected causes" count={report.suspected_causes.length}>
         {report.suspected_causes.length ? (
           <ul>{report.suspected_causes.map((c: any, i: number) => (

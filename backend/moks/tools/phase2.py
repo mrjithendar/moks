@@ -149,6 +149,26 @@ async def git_recent_commits(ctx: ToolContext, a: CommitsArgs) -> ToolResult:
                       {"api": f"GET /repos/{a.repository}/commits"})
 
 
+class ListFilesArgs(ToolArgs):
+    repository: str = Field(pattern=REPO)
+    pattern: str | None = Field(default=None, max_length=200, description="regular expression a path must match (case-insensitive)")
+    ref: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_./-]{1,200}$")
+    limit: int = Field(default=200, ge=1, le=500)
+
+
+async def git_list_files(ctx: ToolContext, a: ListFilesArgs) -> ToolResult:
+    """Paths only, never contents, so a repository's layout can be found without reading it."""
+    try:
+        rx = re.compile(a.pattern, re.I) if a.pattern else None
+    except re.error as exc:
+        raise ConnectorError("invalid", f"pattern is not a valid regular expression ({exc})") from None
+    paths = await ctx.connector("git").list_paths(a.repository, a.ref)
+    hits = [p for p in paths if rx is None or rx.search(p)]
+    return ToolResult(f"{len(hits)} of {len(paths)} paths in {a.repository}" + (f" match {a.pattern!r}" if a.pattern else ""),
+                      {"repository": a.repository, "paths": hits[: a.limit], "total": len(paths), "matched": len(hits), "truncated": len(hits) > a.limit},
+                      {"api": f"GET /repos/{a.repository}/git/trees"})
+
+
 async def git_read_file(ctx: ToolContext, a: ReadFileArgs) -> ToolResult:
     r = await ctx.connector("git").read_file(a.repository, a.path, a.ref)
     return ToolResult(f"{a.repository}:{a.path}@{r['ref']} ({len(r['text'])} chars)", r, {"link": r["url"]})
@@ -430,6 +450,7 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("cw_metrics_list", "Discover CloudWatch metrics and their dimensions.", "cloudwatch", CwListArgs, cw_metrics_list, cluster_scoped=True, namespace_arg=None),
     ToolSpec("cw_alarms", "CloudWatch alarms by state.", "cloudwatch", AlarmArgs, cw_alarms, cluster_scoped=True, namespace_arg=None),
     ToolSpec("git_recent_commits", "Recent commits in an allowed repository, optionally for one path.", "git", CommitsArgs, git_recent_commits, cluster_scoped=True, namespace_arg=None),
+    ToolSpec("git_list_files", "List file paths (no contents) in an allowed repository, optionally matching a pattern.", "git", ListFilesArgs, git_list_files, cluster_scoped=True, namespace_arg=None),
     ToolSpec("git_read_file", "Read one file (manifest, config, runbook) from an allowed repository; secrets are never read.", "git", ReadFileArgs, git_read_file, cluster_scoped=True, namespace_arg=None),
     ToolSpec("git_compare_deployment", "Tie a running Deployment to its Git commit when image tags/annotations carry a SHA; never guesses.", "git", CompareDeployArgs, git_compare_deployment),
     ToolSpec("kb_search", "Search runbooks, docs, manifests and approved postmortems you may read (cited passages).", "knowledge", KbArgs, kb_search, namespace_arg=None),

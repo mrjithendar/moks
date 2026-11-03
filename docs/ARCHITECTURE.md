@@ -123,6 +123,11 @@ LLM fails or exceeds budget, MOKS falls back to rule-based follow-ups and report
 `missing_evidence[]`, `next_steps[]`,
 `proposed_remediation[{action, target, expected_impact, risk, rollback, requires_approval=true, executable=false}]`.
 The report also stores the scope, the window, the rule-based findings and the validation counts.
+`response_type` says which answer this is (`deployment_guidance`, `repository_answer`, `execution_plan`,
+`conceptual`, `troubleshooting`, `health_check`); for the first four, `answer` holds the structure
+(prerequisites, steps, verification, rollback, configuration, gaps, conflicts, sources, and for execution
+requests the authorization route). `shared_findings` and `excluded` keep shared infrastructure and evidence
+about other targets apart from the answer.
 
 ## Security boundaries
 
@@ -328,10 +333,55 @@ as well as one that fails. There is no point-in-time recovery; see [LIMITATIONS.
 An investigation runs as a LangGraph state machine (`orchestrator/graph.py`):
 
 ```
-triage -> logs -> skills -+-> plan <-> act -+-> correlate -> report
-                          |      |          |
-                          +----> rules -----+
+         +-> triage -> logs -> skills -+-> plan <-> act -+-> correlate -> report
+         |                             |      |          |
+intake --+                             +----> rules -----+
+         +-> gather -> compose     (deployment guidance, repository questions, execution requests)
+         +-> concept               (conceptual questions: documentation only, nothing live)
 ```
+
+### Request routing
+
+`intake` builds a `RequestContext` (`orchestrator/intent.py`) before anything live is read: the intents
+(deployment guidance, troubleshooting, health check, conceptual, repository, execution; several may apply),
+guidance versus execution, the targets as written, the environment and cluster, and what is unresolved. The
+classification reads the form of the question and the verb it turns on; when the rules are unsure and a model
+is configured, the model classifies too, and it can never turn a question into an execution. "How do I deploy X?"
+asks for guidance and authorizes nothing.
+
+Targets resolve only from evidence, each with its source: an allowlisted repository with the target's name, a
+namespace with its name, an Ingress that serves the domain (`k8s_ingresses`), the namespace the target's own
+manifests declare, or a file that names it. A namespace that only shares a word with a domain stays a candidate.
+In a conversation, the conversation's namespace is a default for a follow-up that names no target, never an
+override, and earlier turns about something else are not given to the model.
+
+Scope is enforced on every call, not only in prompts. `Investigator._outside_request` refuses calls the request
+does not need (other namespaces, cluster-wide scans, tools outside the workflow). What RBAC would refuse is still
+refused and audited by the ToolExecutor; what RBAC allows but the request does not need is refused and audited as
+`request_scope`. Output a tool cannot filter (Argo CD status, alert lists) is filtered before synthesis
+(`Investigator._view`) while the stored evidence keeps everything. Scope widens only on evidence: name-resolution
+failures in the target's evidence allow `k8s_dns_health`; Argo CD apps that fail for the same concrete cause as the
+target's own (the same unreachable host, the same repository) become a separate shared-infrastructure finding; a
+planner's `expand` stands only if the evidence it cites names the namespace. Every expansion records its reason
+and evidence. Tool budgets are per intent (`MOKS_INTENT_TOOL_BUDGETS`, under `MOKS_MAX_TOOL_CALLS`).
+
+Guidance (`orchestrator/guidance.py`) reads the knowledge index and the target's repository (README, runbooks,
+CI workflows, Dockerfiles, kustomizations, Argo CD definitions; `git_list_files` finds them), then extracts
+prerequisites, steps, verification and rollback, each item citing its source. A model may organize the answer,
+but a command it gives stands only if it occurs in a source it cites. Missing sources, failed retrieval and
+sources without steps are different gaps and are reported as such; stale or conflicting documents are listed.
+An execution request gets the same grounded steps, a scoped plan and the action-plan route; nothing runs.
+
+Before the report is stored, `orchestrator/relevance.py` checks it with rules: the answer type matches the
+intent, it answers the question or says what is missing, it is about the target, its instructions cite sources,
+its steps are concrete, reassurance about workloads rests on workload evidence, and unresolved values are stated.
+A failure gets one bounded correction and a second check, never a loop. The decisions (intent, resolutions,
+sources and why each was used, tools and their purpose, expansions, response type, relevance results) go into the
+report's `request`, `trace` and `relevance` fields and the `routing` and `relevance` events, without the
+question text or tool payloads.
+
+An Argo CD ComparisonError is an *observed condition*: it shows Argo CD could not compare, not that a setting is
+wrong (only `argocd_source_missing` is a verified configuration defect) and not that workloads are healthy.
 
 With no model, or when one fails, the run takes `rules`, so a report always comes out. Rounds and tool calls stay bounded
 by `max_llm_rounds` and `max_tool_calls`. The graph only decides what happens next: nodes call Investigator methods.

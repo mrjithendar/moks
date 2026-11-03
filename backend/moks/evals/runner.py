@@ -4,7 +4,8 @@ connectors, then scores each report.
 
 Score per case = mean of the checks that apply: expected finding kinds present, required fact
 phrases present, forbidden phrases absent, every fact cites existing evidence, no causes marked
-verified, high-severity false positives within the limit, investigation completed.
+verified, high-severity false positives within the limit, investigation completed; and for routing,
+the response type, tools that must or must not run, a tool-call ceiling and the relevance check.
 """
 from __future__ import annotations
 
@@ -57,7 +58,7 @@ async def _eval_env(name: str) -> uuid.UUID:
         return env.id
 
 
-def score_case(case: dict, inv: Investigation, evidence_refs: set[str]) -> dict:
+def score_case(case: dict, inv: Investigation, evidence_refs: set[str], tools: list[str] | None = None) -> dict:
     exp = case.get("expect", {})
     rep = inv.report or {}
     text = json.dumps(rep).lower()
@@ -75,6 +76,17 @@ def score_case(case: dict, inv: Investigation, evidence_refs: set[str]) -> dict:
     checks["nothing_marked_verified"] = not any(c.get("verified") for c in rep.get("suspected_causes", []))
     if "max_high_findings" in exp:
         checks["no_false_positives"] = sum(1 for f in rep.get("findings", []) if f["severity"] == "high") <= exp["max_high_findings"]
+    tools = tools or []
+    if exp.get("response_type"):
+        checks["response_type"] = rep.get("response_type") == exp["response_type"]
+    if exp.get("forbid_tools"):
+        checks["no_forbidden_tools"] = not set(tools) & set(exp["forbid_tools"])
+    if exp.get("require_tools"):
+        checks["required_tools"] = set(exp["require_tools"]) <= set(tools)
+    if "max_tool_calls" in exp:
+        checks["tool_calls_bounded"] = inv.tool_calls <= exp["max_tool_calls"]
+    if exp.get("relevance"):
+        checks["relevance"] = (rep.get("relevance") or {}).get("status") in exp["relevance"]
     return {"case": case["id"], "score": round(sum(checks.values()) / len(checks), 4), "checks": checks,
             "findings": sorted(kinds), "mode": rep.get("generated_by"), "investigation_id": str(inv.id),
             "tool_calls": inv.tool_calls, "tokens": inv.tokens_in + inv.tokens_out}
@@ -147,8 +159,8 @@ async def execute(run_id: uuid.UUID) -> dict[str, Any]:
                            use_llm=(mode == "llm")).run()
         async with session_scope() as db:
             inv = await db.get(Investigation, inv_id)
-            refs = set((await db.execute(select(Evidence.ref).where(Evidence.investigation_id == inv_id))).scalars())
-            results.append(score_case(case, inv, refs))
+            rows = (await db.execute(select(Evidence.ref, Evidence.tool).where(Evidence.investigation_id == inv_id))).all()
+            results.append(score_case(case, inv, {r for r, _ in rows}, [t for _, t in rows]))
     access.leave_realm(token)
     total = round(sum(r["score"] for r in results) / len(results), 4) if results else 0
     async with session_scope() as db:

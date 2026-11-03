@@ -33,6 +33,11 @@ COLLECTION = re.compile(r"(?i)\b(quer(y|ies)|requests?|calls?|tools?|connectors?
                         r"|\b(could not|unable to|failed to|cannot) (read|reach|query|collect|retrieve|fetch|access|list)\b")
 HEALTH = re.compile(r"(?i)\b(healthy|health is good|no (\w+ )?(errors?|issues?|problems?|failures?|alerts?|restarts?|incidents?|anomal\w+)|all (\w+ )?(pods?|workloads?|services?|replicas?|deployments?|containers?|nodes?|checks?)\b|"
                     r"(running|operating|working|performing) (normally|fine|correctly|as expected|well)|nothing (is )?(wrong|failing)|not (failing|crashing|degraded)|resolved|recovered|back to normal|stable)\b")
+# Reassurance about running workloads. Only a successful read of those workloads can back it, never a
+# report about something else (an Argo CD condition, an alert list) that happens to be live.
+REASSURE = re.compile(r"(?i)\b(unaffected|not (been |be )?(affected|impacted)|(keep|keeps|continue|continues) (to )?(run|running|serving|serve)|still (running|serving|up|available)|no (user|customer)[- ]facing impact)\b")
+WORKLOAD_CLAIM = re.compile(r"(?i)\b(workloads?|pods?|deployments?|replicas?|containers?|services?|application|app|site|website|traffic|users?)\b")
+WORKLOAD_TOOLS = {"k8s_triage", "k8s_list_pods", "k8s_workloads", "k8s_describe_pod", "k8s_services"}
 DOCUMENTED = re.compile(r"(?i)\b(runbooks?|documentation|documented|docs?|postmortems?|according to|playbooks?|wiki)\b")
 CONFIRMED = re.compile(r"(?i)\b(root cause (is|was|has been) (confirmed|identified|established)|confirmed root cause|has been (resolved|fixed|remediated)|is now (resolved|fixed|healthy))\b")
 IDENTIFIER = re.compile(r"(?<![\w./-])[A-Za-z0-9_]+(?:[-/.:][A-Za-z0-9_]+)+(?![\w-])")
@@ -166,7 +171,7 @@ def judge(statement: str, refs: list[str], ledger: Ledger, findings: list[dict],
     fabricated = [r for r in refs if r not in ledger.entries]
     reasons = [f"cited {r}, which does not exist" for r in fabricated]
     is_collection = bool(COLLECTION.search(statement))
-    is_health = bool(HEALTH.search(statement)) and not is_collection
+    is_health = (bool(HEALTH.search(statement)) or bool(REASSURE.search(statement))) and not is_collection
     if not known:
         return Verdict("dropped", reasons=reasons or ["cites no evidence"])
 
@@ -213,6 +218,8 @@ def judge(statement: str, refs: list[str], ledger: Ledger, findings: list[dict],
         reasons.append(f"collected {ledger.as_of(used)}, older than the {ledger.max_age_seconds // 60}-minute freshness limit")
         verdict = "qualified"
     if is_health:
+        if REASSURE.search(statement) and WORKLOAD_CLAIM.search(statement) and not any(e.tool in WORKLOAD_TOOLS for e in live):
+            return Verdict("hypothesis", refs=used, reasons=reasons + ["claims workloads are unaffected, but no cited evidence reads those workloads"])
         against = _contradiction(statement, findings)
         if against:
             return Verdict("hypothesis", refs=used, reasons=reasons + [f"contradicted by {', '.join(against)}"], contradicting=against)
@@ -237,11 +244,13 @@ def judge_sentence(sentence: str, ledger: Ledger, findings: list[dict]) -> tuple
     absent = [n for n in _identifiers(sentence) if not _in_text(n, ledger.live_text())]
     if absent:
         return False, f"{', '.join(absent[:3])} does not appear in any evidence"
-    if not HEALTH.search(sentence):
+    if not HEALTH.search(sentence) and not REASSURE.search(sentence):
         return True, None
     live = [e for e in ledger.by_kind(OBSERVATION) if not ledger.stale(e)]
     if not live:
         return False, "claims health with no complete, current observation"
+    if REASSURE.search(sentence) and WORKLOAD_CLAIM.search(sentence) and not any(e.tool in WORKLOAD_TOOLS and ledger.in_scope(e) for e in live):
+        return False, "claims workloads are unaffected, but no evidence read those workloads"
     against = _contradiction(sentence, findings)
     if against:
         return False, f"contradicted by {', '.join(against)}"

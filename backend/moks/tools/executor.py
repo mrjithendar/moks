@@ -153,6 +153,27 @@ class ToolExecutor:
                 where = f"namespace {ns!r}" if spec.namespace_arg else "all namespaces"
                 raise ScopeError(f"{spec.name} requires {spec.extra_permission} for {where} in {env!r}")
 
+    def would_deny(self, tool: str, args: dict[str, Any] | None) -> bool:
+        """Whether run() would refuse this call on policy, without running or recording anything. A caller that
+        narrows further still lets run() refuse what policy refuses, so that refusal is audited as one."""
+        spec = REGISTRY.get(tool)
+        if spec is None or not spec.read_only or spec.privileged:
+            return True
+        try:
+            self._authorize(spec, spec.args.model_validate(args if isinstance(args, dict) else {}))
+        except ValidationError:
+            return False  # run() reports invalid arguments itself
+        except ScopeError:
+            return True
+        return False
+
+    async def refuse(self, tool: str, args: dict[str, Any], reason: str) -> None:
+        """An allowed call that the request does not need: audited, not run, not evidence."""
+        POLICY_DENIALS.labels("request_scope").inc()
+        await audit.record(None, action="tool.call", actor_id=self.ctx.principal.user_id, actor_email=self.ctx.principal.email, resource_type="tool", resource_id=tool[:200],
+                           environment=self.ctx.environment.name, namespace=str(args.get("namespace"))[:253] if args.get("namespace") else None, decision="deny", outcome="not_needed",
+                           details={"reason": reason, "kind": "request_scope", "args": args, "investigation_id": str(self.ctx.investigation_id) if self.ctx.investigation_id else None})
+
     async def run(self, tool: str, args: dict[str, Any] | None) -> ToolOutcome:
         args = args if isinstance(args, dict) else {}
         if self.ctx.guard is not None:

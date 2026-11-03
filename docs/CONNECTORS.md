@@ -187,6 +187,7 @@ and `phase2.py`.
 | `cw_metric` | cloudwatch | `namespace`*, `metric`*, `dimensions`, `stat` (default Average), `minutes` | environment-wide | — |
 | `cw_alarms` | cloudwatch | `state` (default ALARM) | environment-wide | — |
 | `git_recent_commits` | git | `repository`*, `path`, `hours` (≤720, default 72), `limit` (≤100, default 20) | environment-wide | — |
+| `git_list_files` | git | `repository`*, `pattern` (regex, ≤200), `ref`, `limit` (≤500, default 200) | environment-wide | — |
 | `git_read_file` | git | `repository`*, `path`*, `ref` | environment-wide | — |
 | `git_compare_deployment` | git, kubernetes | `namespace`* (≤63), `deployment`* (≤253), `repository`* | `namespace` in scope | — |
 | `kb_search` | knowledge | `query`* (≤500), `k` (≤12, default 6) | result filtering / query pinning | — |

@@ -86,9 +86,11 @@ REPORT = json.dumps({"summary": "done", "observed_facts": [], "suspected_causes"
 def test_the_graph_has_the_documented_shape():
     drawn = graph.build(None, None, None, "q", {}, object(), None, ()).get_graph()
     nodes = set(drawn.nodes) - {"__start__", "__end__"}
-    assert nodes == {"triage", "logs", "skills", "plan", "act", "rules", "correlate", "report"}
+    assert nodes == {"intake", "gather", "compose", "concept", "triage", "logs", "skills", "plan", "act", "rules", "correlate", "report"}
     edges = {(e.source, e.target) for e in drawn.edges}
     assert {("plan", "act"), ("act", "plan"), ("plan", "rules"), ("act", "correlate"), ("report", "__end__")} <= edges
+    # Every request is understood before anything live is read, and only investigations triage
+    assert {("__start__", "intake"), ("intake", "triage"), ("intake", "gather"), ("intake", "concept"), ("gather", "compose"), ("compose", "__end__"), ("concept", "__end__")} <= edges
 
 
 async def test_without_a_model_the_run_takes_the_rules_path(cluster, client):
