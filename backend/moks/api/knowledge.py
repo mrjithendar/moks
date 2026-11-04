@@ -26,6 +26,7 @@ from .admin import CredentialRef
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 
 SYNCED = ("github", "web")
+Profile = Literal["documentation", "infrastructure", "application"]
 
 
 def clean_urls(urls: list[str]) -> list[str]:
@@ -45,6 +46,8 @@ class SourceIn(BaseModel):
     ref: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_./-]{1,100}$")
     include: list[str] = Field(default_factory=list, max_length=50)
     exclude: list[str] = Field(default_factory=list, max_length=50)
+    # What a GitHub source reads (rag/ingest.py PROFILES). Empty with no include rules: documentation and configuration, as before profiles.
+    profiles: list[Profile] = Field(default_factory=list, max_length=3)
     services: dict[str, str] = Field(default_factory=dict, max_length=100)
     sync_interval_minutes: int = Field(default=1440, ge=0, le=43200)  # daily; 0 turns automatic sync off
     scope_environment: str = Field(default="*", pattern=r"^[a-z0-9*?\-]{1,100}$")
@@ -92,6 +95,7 @@ class SourceUpdate(BaseModel):
     ref: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_./-]{1,100}$")
     include: list[str] | None = Field(default=None, max_length=50)
     exclude: list[str] | None = Field(default=None, max_length=50)
+    profiles: list[Profile] | None = Field(default=None, max_length=3)
     services: dict[str, str] | None = Field(default=None, max_length=100)
     sync_interval_minutes: int | None = Field(default=None, ge=0, le=43200)
     scope_environment: str | None = Field(default=None, pattern=r"^[a-z0-9*?\-]{1,100}$")
@@ -116,8 +120,8 @@ class SourceUpdate(BaseModel):
         return clean_urls(v) if v is not None else v
 
 
-SYNC_FIELDS = ("revision", "listing", "content", "state", "started_at", "discovered", "processed", "excluded", "failed", "remaining", "deletions_applied")
-GITHUB_ONLY = {"ref", "include", "exclude", "services", "credential_ref"}
+SYNC_FIELDS = ("revision", "listing", "content", "state", "started_at", "discovered", "processed", "excluded", "failed", "remaining", "deletions_applied", "listed", "policy_excluded")
+GITHUB_ONLY = {"ref", "include", "exclude", "profiles", "services", "credential_ref"}
 WEB_ONLY = {"urls", "crawl", "max_pages"}
 ONLY_FOR = {"github": WEB_ONLY, "web": GITHUB_ONLY}
 
@@ -128,7 +132,8 @@ async def _source(db: AsyncSession, sid: uuid.UUID) -> KnowledgeSource | None:
     return src if src is not None and src.realm == "operational" else None
 
 
-def source_out(s: KnowledgeSource, counts: dict | None = None, job: str | None = None) -> dict[str, Any]:
+def source_out(s: KnowledgeSource, counts: dict | None = None, job: str | None = None, indexing: dict | None = None) -> dict[str, Any]:
+    """`last_sync_status` is the upstream half (files read). `indexing` is the other half: what the search backend has applied."""
     stale_after = timedelta(minutes=s.sync_interval_minutes * 2) if s.sync_interval_minutes else None
     return {"sync_interval_minutes": s.sync_interval_minutes, "next_sync_at": s.next_sync_at.isoformat() if s.next_sync_at else None,
             "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None, "last_attempt_at": s.last_attempt_at.isoformat() if s.last_attempt_at else None,
@@ -141,7 +146,8 @@ def source_out(s: KnowledgeSource, counts: dict | None = None, job: str | None =
             "credential_ref": s.credential_ref, "lifecycle": s.lifecycle, "team": s.team, "classification": s.classification, "shared_globally": s.shared_globally,
             "applies_to": s.applies_to or {}, "authority": s.authority, "review_interval_days": s.review_interval_days, "last_reviewed_at": s.last_reviewed_at.isoformat() if s.last_reviewed_at else None,
             "review_overdue": bool(s.review_interval_days and (s.last_reviewed_at is None or datetime.now(timezone.utc) - s.last_reviewed_at > timedelta(days=s.review_interval_days))),
-            "stale_policy": s.stale_policy, "stale_after_days": s.stale_after_days, "review_required": s.review_required, "sync": {k: v for k, v in (s.sync_cursor or {}).items() if k in SYNC_FIELDS}}
+            "stale_policy": s.stale_policy, "stale_after_days": s.stale_after_days, "review_required": s.review_required, "sync": {k: v for k, v in (s.sync_cursor or {}).items() if k in SYNC_FIELDS},
+            "profiles": (s.config or {}).get("profiles") or [], "indexing": indexing}
 
 
 @router.get("/search")
@@ -204,7 +210,68 @@ async def list_sources(ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN
     for sid, st, n in (await db.execute(select(Document.source_id, Document.status, func.count()).where(Document.realm == "operational").group_by(Document.source_id, Document.status))).all():
         counts.setdefault(sid, {})[st] = n
     running = dict((await db.execute(select(Job.dedupe_key, Job.status).where(Job.type == "knowledge_sync", Job.status.in_(["queued", "running"])))).all())
-    return [source_out(s, counts.get(s.id), running.get(f"knowledge_sync:{s.id}")) for s in rows]
+    outbox: dict[uuid.UUID, dict] = {}
+    for sid, st, n in (await db.execute(select(Document.source_id, IndexOutbox.status, func.count()).join(Document, Document.id == IndexOutbox.document_id)
+                                        .where(IndexOutbox.status != "done", Document.realm == "operational").group_by(Document.source_id, IndexOutbox.status))).all():
+        outbox.setdefault(sid, {})[st] = n
+    behind = dict((await db.execute(select(Document.source_id, func.count()).where(Document.realm == "operational", Document.content_revision != Document.indexed_revision).group_by(Document.source_id))).all())
+
+    def indexing(sid: uuid.UUID) -> dict:
+        o = outbox.get(sid, {})
+        state = "failed" if o.get("dead") else "pending" if o.get("pending") or behind.get(sid) else "complete"
+        return {"state": state, "pending": o.get("pending", 0), "dead": o.get("dead", 0), "documents_behind": behind.get(sid, 0)}
+    return [source_out(s, counts.get(s.id), running.get(f"knowledge_sync:{s.id}"), indexing(s.id)) for s in rows]
+
+
+@router.get("/profiles")
+async def profiles(ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN))) -> dict:
+    """What each GitHub ingestion profile reads, and what is never read."""
+    return {"profiles": ingest.PROFILES, "default_include": ingest.DEFAULT_INCLUDE, "always_excluded": ingest.DEFAULT_EXCLUDE, "max_file_bytes": ingest.MAX_FILE_BYTES,
+            "note": "Files that look like credentials (keys, .env, Secret manifests with data) are refused when read and recorded as excluded with the reason."}
+
+
+@router.get("/sources/{sid}/health")
+async def source_health(sid: uuid.UUID, path: str | None = None, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_SOURCE_ADMIN)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    """Upstream sync, indexing and retrieval readiness, with reasons. With `path`, why that one file is or is not searchable."""
+    from ..rag import readiness
+
+    src = await _source(db, sid)
+    if src is None or src.lifecycle == "deleted":
+        raise HTTPException(404, "Source not found")
+    out = await readiness.source_health(db, src)
+    if path:
+        out["path"] = {"path": path[:1000], "reasons": await readiness.explain_path(db, src, path[:1000])}
+    return out
+
+
+class SourceTestIn(BaseModel):
+    query: str = Field(min_length=2, max_length=500)
+    environment: str | None = Field(default=None, max_length=100)
+    namespace: str | None = Field(default=None, max_length=253)
+    path: str | None = Field(default=None, max_length=1000)
+    k: int = Field(default=6, ge=1, le=12)
+
+
+@router.post("/sources/{sid}/test-retrieval")
+async def source_test(sid: uuid.UUID, body: SourceTestIn, ctx: AuthContext = Depends(needs(P.KNOWLEDGE_TEST)), db: AsyncSession = Depends(get_db, scope="function")) -> dict:
+    """The investigation's search, narrowed to one source, under the caller's own grants. A source the caller can
+    neither read nor administer does not exist here."""
+    from ..rag import access, readiness
+
+    src = await _source(db, sid)
+    admin = ctx.principal.can(P.KNOWLEDGE_SOURCE_ADMIN)
+    if src is None or src.lifecycle == "deleted" or not (admin or access.can_read(ctx.principal, src.scope_environment, src.scope_namespace)):
+        raise HTTPException(404, "Source not found")
+    try:
+        out = await readiness.test_source(db, ctx.principal, src, body.query, body.environment, body.namespace, body.path, body.k)
+    except ConnectorError as exc:
+        raise HTTPException(502, exc.message) from None
+    if not admin:  # counts and index state are for those who run sources
+        out["reasons"] = [r for r in out["reasons"] if r["code"] in ("no_results", "outside_scope", "no_access")] or out["reasons"][:0]
+    out["results"] = [{**r, "text": r["text"][:1500], "citation": {**r["citation"], "url": service.safe_url(r["citation"].get("url"))}} for r in out["results"]]
+    await audit.record(db, action="knowledge.source_test", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="knowledge_source", resource_id=str(sid), decision="allow",
+                       details={"chars": len(body.query), "environment": body.environment, "namespace": body.namespace, "results": len(out["results"])})
+    return out
 
 
 @router.post("/sources", status_code=201)
@@ -213,7 +280,7 @@ async def create_source(body: SourceIn, ctx: AuthContext = Depends(needs(P.KNOWL
         raise HTTPException(422, "github sources need a repository")
     if body.type == "web" and not body.urls:
         raise HTTPException(422, "web sources need at least one URL")
-    cfg = ({"repository": body.repository, "ref": body.ref, "include": body.include, "exclude": body.exclude, "services": body.services} if body.type == "github"
+    cfg = ({"repository": body.repository, "ref": body.ref, "include": body.include, "exclude": body.exclude, "profiles": list(dict.fromkeys(body.profiles)), "services": body.services} if body.type == "github"
            else {"urls": body.urls, "crawl": body.crawl, "max_pages": body.max_pages} if body.type == "web" else {})
     src = KnowledgeSource(name=body.name, type=body.type, config=cfg, credential_ref=body.credential_ref.model_dump(exclude_none=True),
                           scope_environment=body.scope_environment, scope_namespace=body.scope_namespace, service=body.service,
@@ -243,7 +310,7 @@ async def update_source(sid: uuid.UUID, body: SourceUpdate, ctx: AuthContext = D
         raise HTTPException(422, f"{src.type} sources have no {', '.join(sorted(invalid))}")
     old_scope = (src.scope_environment, src.scope_namespace)
     cfg = dict(src.config or {})
-    for key in ("ref", "include", "exclude", "services", "urls", "crawl", "max_pages"):
+    for key in ("ref", "include", "exclude", "profiles", "services", "urls", "crawl", "max_pages"):
         if key in changes:
             cfg[key] = changes[key]
     src.config = cfg

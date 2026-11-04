@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from ..config import get_settings
 
 PIPELINE_VERSION = 3  # 3: line numbers count only newlines and skip leading blanks; redaction keeps line breaks
+# Code has its own version, so changing how code is split re-reads code only, not every runbook and manifest.
+CODE_PIPELINE_VERSION = 4  # 4: code splits at top-level definitions, and each chunk is headed by the definitions in it
 CHARS_PER_TOKEN = 4  # an estimate: no tokenizer is shipped, and models differ
 MAX_CHUNKS = 3000
 
@@ -27,6 +29,14 @@ CODE_EXT = {".py", ".go", ".ts", ".tsx", ".js", ".jsx", ".java", ".kt", ".rb", "
 MARKDOWN_EXT = {".md", ".markdown", ".mdx", ".rst", ".adoc", ".txt"}
 YAML_EXT = {".yaml", ".yml"}
 DATA_EXT = {".json", ".toml", ".ini", ".cfg", ".conf", ".properties", ".env.example"}
+_JS = re.compile(r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:function\*?\s+[A-Za-z_$]|class\s+[A-Za-z_$]|(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=|(?:interface|type|enum)\s+[A-Za-z_$])")
+DEFINITION = {  # a top-level definition, at column 0: where a reader of the file would say a new part starts
+    ".py": re.compile(r"^(?:async\s+def|def|class)\s+[A-Za-z_]"), ".go": re.compile(r"^(?:func|type)\s"),
+    ".js": _JS, ".jsx": _JS, ".mjs": _JS, ".cjs": _JS, ".ts": _JS, ".tsx": _JS,
+    ".sh": re.compile(r"^(?:function\s+[A-Za-z_][\w-]*|[A-Za-z_][\w-]*\s*\(\))"), ".bash": re.compile(r"^(?:function\s+[A-Za-z_][\w-]*|[A-Za-z_][\w-]*\s*\(\))"),
+    ".tf": re.compile(r"^(?:resource|data|module|variable|output|provider|locals|terraform)\b"), ".hcl": re.compile(r"^[A-Za-z_][\w-]*(?:\s+\"[^\"]*\")*\s*\{"),
+    "dockerfile": re.compile(r"(?i)^FROM\s"),
+}
 FENCE = re.compile(r"^\s*(```|~~~)")
 HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$")
 SAFE_BREAK = re.compile(r"[\s,;:)\]}>]")
@@ -89,6 +99,17 @@ def kind_of(path: str) -> str:
     return "text"
 
 
+def version_for(path: str) -> int:
+    return CODE_PIPELINE_VERSION if kind_of(path) == "code" else PIPELINE_VERSION
+
+
+def _definitions(path: str) -> re.Pattern | None:
+    name = path.lower().rsplit("/", 1)[-1]
+    if name == "dockerfile" or name.startswith("dockerfile.") or name.endswith(".dockerfile"):
+        return DEFINITION["dockerfile"]
+    return DEFINITION.get("." + name.rsplit(".", 1)[-1]) if "." in name else None
+
+
 def title_of(path: str, text: str) -> str:
     m = re.search(r"^#\s+(.+)$", text, re.M)
     return (m.group(1).strip() if m else path.rsplit("/", 1)[-1])[:300]
@@ -111,19 +132,21 @@ def chunk(path: str, text: str) -> list[ChunkPiece]:
         return []
     k = kind_of(path)
     size, overlap = limits()
-    spans, sections = _spans(text, k, size)
+    spans, sections = _spans(text, k, size, _definitions(path) if k == "code" else None)
     out: list[ChunkPiece] = []
     for heading, a, b in sections:
         out.extend(_windows(text, spans[a:b], heading, size, overlap))
     return out
 
 
-def _spans(text: str, kind: str, size: int) -> tuple[list[_Span], list[tuple[str, int, int]]]:
-    """Lines split to fit, and the sections they fall in."""
+def _spans(text: str, kind: str, size: int, definitions: re.Pattern | None = None) -> tuple[list[_Span], list[tuple[str, int, int]]]:
+    """Lines split to fit, and the sections they fall in. In code, a top-level definition opens a section once the
+    current one holds a third of a chunk; smaller ones share a section, and its heading names each of them."""
     spans: list[_Span] = []
     sections: list[tuple[str, int, int]] = []
     stack: list[tuple[int, str]] = []
     heading, section_start, offset, fenced = "", 0, 0, False
+    section_chars = 0
     # Only newlines end a line. str.splitlines also breaks on form feeds and Unicode separators, which no editor or Git host counts.
     lines = re.findall(r"[^\n]*\n|[^\n]+$", text)
     for number, raw in enumerate(lines, 1):
@@ -147,8 +170,16 @@ def _spans(text: str, kind: str, size: int) -> tuple[list[_Span], list[tuple[str
             heading = bare.split(":", 1)[1].strip()
         elif kind == "yaml" and re.match(r"^\s{2}name:", bare) and heading and " " not in heading:
             heading = f"{heading} {bare.split(':', 1)[1].strip()}"[:480]
+        if definitions is not None and definitions.match(bare):
+            label = bare.strip().rstrip("{:").strip()[:120]
+            if section_chars >= size // 3 and len(spans) > section_start:
+                sections.append((heading, section_start, len(spans)))
+                heading, section_start, section_chars = label, len(spans), 0
+            else:
+                heading = f"{heading}; {label}"[:480] if heading else label
+        section_chars += len(raw)
         if kind == "code":
-            boundary = not bare.strip()
+            boundary = not bare.strip() or bool(definitions is not None and definitions.match(bare))
         elif kind in ("yaml", "data"):
             boundary = not bare.strip() or (not bare[:1].isspace() and bare[:1] not in "}]")
         else:

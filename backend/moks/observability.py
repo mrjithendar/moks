@@ -54,6 +54,7 @@ RERANK_TRUNCATED = Counter("moks_rerank_truncated_passages_total", "Passages onl
 OPENSEARCH_BULK_ITEMS = Counter("moks_opensearch_bulk_items_total", "Bulk items by what OpenSearch said about each", ["outcome"])
 OPENSEARCH_SEARCH_SECONDS = Histogram("moks_opensearch_search_seconds", "OpenSearch query time", ["kind"], buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5))
 OPENSEARCH_SEARCH_FAILURES = Counter("moks_opensearch_search_failures_total", "OpenSearch queries that gave no answer", ["kind", "reason"])
+KNOWLEDGE_RETRIEVALS = Counter("moks_knowledge_retrievals_total", "Knowledge stages of investigations, by stage and outcome", ["stage", "outcome"])
 RETRIEVAL_FALLBACKS = Counter("moks_retrieval_fallbacks_total", "Searches answered with less than was asked for", ["reason"])
 RETRIEVAL_MODES = Counter("moks_retrieval_searches_total", "Searches by the mode that actually ran", ["mode"])
 SEARCH_BACKEND = Gauge("moks_search_backend", "Search backend state, from the worker's probe", ["cluster", "metric"])

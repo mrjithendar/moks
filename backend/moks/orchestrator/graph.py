@@ -1,11 +1,13 @@
 """The investigation as a LangGraph state machine.
 
-             +-> triage -> logs -> skills -+-> plan <-> act -+-> correlate -> report
-             |                             |      |          |
-    intake --+                             +----> rules -----+
+             +-> knowledge -> triage -> logs -> skills -> refresh -+-> plan <-> act -+-> correlate -> report
+             |                                                     |      |          |
+    intake --+                                                     +----> rules -----+
              +-> gather -> compose          (deployment guidance, repository questions, execution requests)
              +-> concept                    (conceptual questions: documentation only, nothing live)
 
+`knowledge` searches the index before any live read, and `refresh` once more after triage when the findings
+name symptoms the first search did not (orchestrator/knowledge.py); both run whether or not a model plans.
 `intake` classifies the request and resolves its target before anything live is read, so a question about
 how to deploy something is answered from its sources, not by an incident sweep. Without a model, or when
 one fails, the investigation takes `rules`, so a report always comes out. The graph
@@ -86,6 +88,16 @@ def build(inv: Any, executor: Any, ctx: Any, question: str, scope_info: dict, pr
         await committed()
         return {"report": written, "mode": mode}
 
+    async def knowledge(state: State) -> dict:
+        await inv._retrieve(executor, question, "initial", state["namespace"])
+        await committed()
+        return {}
+
+    async def refresh(state: State) -> dict:
+        await inv._retrieve(executor, question, "refresh", state["namespace"])
+        await committed()
+        return {}
+
     async def triage(state: State) -> dict:
         await inv._emit("phase", {"phase": "triage", "label": "Triage: finding what is affected"})
         await inv._emit("phase", {"phase": "evidence", "label": "Collecting baseline evidence"})
@@ -140,20 +152,22 @@ def build(inv: Any, executor: Any, ctx: Any, question: str, scope_info: dict, pr
         return {"report": written, "mode": mode}
 
     routes: dict[str, Callable[[State], str]] = {
-        "intake": lambda s: {"guidance": "gather", "concept": "concept"}.get(s.get("workflow") or "investigate", "triage"),
+        "intake": lambda s: {"guidance": "gather", "concept": "concept"}.get(s.get("workflow") or "investigate", "knowledge"),
+        "knowledge": lambda s: "triage",
         "gather": lambda s: "compose",
         "compose": lambda s: END,
         "concept": lambda s: END,
         "triage": lambda s: "logs",
         "logs": lambda s: "skills",
-        "skills": lambda s: "plan" if provider else "rules",
+        "skills": lambda s: "refresh",
+        "refresh": lambda s: "plan" if provider else "rules",
         "plan": lambda s: "rules" if s.get("use_rules") else "act" if s.get("calls") else "correlate",
         "act": lambda s: "correlate" if s.get("finished") else "plan",
         "rules": lambda s: "correlate",
         "correlate": lambda s: "report",
         "report": lambda s: END,
     }
-    nodes = {"intake": intake, "gather": gather, "compose": compose, "concept": concept, "triage": triage, "logs": logs, "skills": skills, "plan": plan, "act": act, "rules": rules, "correlate": correlate, "report": report}
+    nodes = {"intake": intake, "knowledge": knowledge, "refresh": refresh, "gather": gather, "compose": compose, "concept": concept, "triage": triage, "logs": logs, "skills": skills, "plan": plan, "act": act, "rules": rules, "correlate": correlate, "report": report}
     graph = StateGraph(State)
     for name, fn in nodes.items():
         graph.add_node(name, _traced(inv, name, fn, routes[name]))
@@ -168,5 +182,5 @@ async def run(inv: Any, executor: Any, ctx: Any, question: str, namespace: str, 
     if resumed and resumed.get("entry") == END:
         return resumed  # the report was written and only publishing it was lost
     compiled = build(inv, executor, ctx, question, scope_info, provider, cfg, failures)
-    limit = 2 * inv.settings.max_llm_rounds + 14  # every path is bounded; this only catches a mistake in the graph
+    limit = 2 * inv.settings.max_llm_rounds + 16  # every path is bounded; this only catches a mistake in the graph
     return await compiled.ainvoke(resumed or {"namespace": namespace}, {"recursion_limit": limit})

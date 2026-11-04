@@ -23,7 +23,7 @@ from ..models import Chunk, Document, DocumentIndexState, EmbeddingIndex, IndexO
 from ..rbac import P, Principal
 from ..redaction import redact
 from . import access, service
-from .chunking import PIPELINE_VERSION
+from .chunking import version_for
 
 MAX_DOCUMENTS = 20_000  # beyond this the page says its counts are partial
 PREVIEW_CHARS = 40_000
@@ -196,7 +196,7 @@ async def detail(db: AsyncSession, principal: Principal, document_id: uuid.UUID)
     earlier = (await db.execute(select(Document).join(KnowledgeSource, KnowledgeSource.id == Document.source_id).where(Document.superseded_by_id == d.id, replaces.bindparams(**params)).limit(20))).scalars().all()
     operator = principal.can(P.KNOWLEDGE_INDEX)
     out |= {"preview": preview, "preview_cut": cut, "url": service.safe_url(d.url), "citation": {"source": s.name, "source_type": s.type, "repository": (s.config or {}).get("repository"), "path": d.path, "revision": d.revision,
-                                                                                               "content_changed_in": d.changed_revision, "url": service.safe_url(d.url), "pipeline_version": d.pipeline_version, "current_pipeline": PIPELINE_VERSION, "content_hash": d.content_hash,
+                                                                                               "content_changed_in": d.changed_revision, "url": service.safe_url(d.url), "pipeline_version": d.pipeline_version, "current_pipeline": version_for(d.path), "content_hash": d.content_hash,
                                                                                                "content_revision": d.content_revision, "indexed_revision": d.indexed_revision, "size_bytes": d.size_bytes},
             "review": {"trust": d.trust, "reviewed_at": _when(d.reviewed_at), "review_due_at": _when(d.review_due_at), "source_review_interval_days": s.review_interval_days, "source_last_reviewed_at": _when(s.last_reviewed_at),
                        "stale_policy": s.stale_policy, "stale_after_days": s.stale_after_days, "authority": s.authority, "shared_globally": s.shared_globally, "doc_state": d.doc_state},

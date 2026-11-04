@@ -131,9 +131,11 @@ def _mentions(text: str, req: RequestContext) -> bool:
     return any(n and n in low for n in names)
 
 
-def _source(inv: Any, *, ref: str, tool: str, path: str, repository: str | None, kind: str, text: str, freshness: dict | None, target_specific: bool, why: str) -> dict:
+def _source(inv: Any, *, ref: str, tool: str, path: str, repository: str | None, kind: str, text: str, freshness: dict | None, target_specific: bool, why: str,
+            general: bool = False, authority: str | None = None, lines: list | None = None, revision: str | None = None) -> dict:
     row = {"ref": ref, "tool": tool, "path": path, "repository": repository, "kind": kind, "text": text, "freshness": freshness or {"state": "current"},
-           "target_specific": target_specific, "used": target_specific, "why": why}
+           "target_specific": target_specific, "general": general, "used": target_specific or general, "why": why, "authority": authority or ("target" if target_specific else None),
+           "lines": lines, "revision": revision}
     inv.sources.append(row)
     inv.trace["sources"].append({k: v for k, v in row.items() if k != "text"})
     return row
@@ -141,32 +143,38 @@ def _source(inv: Any, *, ref: str, tool: str, path: str, repository: str | None,
 
 async def _knowledge(inv: Any, executor: Any, req: RequestContext) -> list[dict]:
     """The index first: it may hold runbooks no repository connector reaches. A weak or empty result is not
-    proof that nothing is written down, and a failed search is a different gap from an empty one."""
+    proof that nothing is written down, and a failed search is a different gap from an empty one. Relevance is
+    the knowledge stage's: a mapping, the repository, the namespace, an identifier or the target's name make a
+    passage the target's; a matching runbook with no service binding is general guidance, labeled as such."""
+    from . import knowledge
+
     target = req.target_name or ""
     verb = "deploy" if req.primary in ("deployment_guidance", "execution") else ""
     queries = [q for q in dict.fromkeys([f"{verb} {target}".strip(), f"{target} deployment runbook rollback" if verb and target else ""]) if q]
     if not queries:
         queries = [req.question[:200]]
+        extra = knowledge.context_query(inv, req.question)  # a follow-up such as "how do I fix it?" needs the turn before
+        if extra:
+            queries.append(extra)
+    before = len(inv.knowledge["queries"])
+    added = await knowledge.run(inv, executor, "initial", req.question, queries=queries[:2], purpose=f"documented {'deployment ' if verb else ''}steps for {target or 'this request'}")
+    for q in inv.knowledge["queries"][before:]:
+        if q["status"] == "failed":
+            inv.gaps.append({"kind": "retrieval_failure", "detail": f"Knowledge search failed ({q.get('reason') or 'error'}); documented steps may exist but could not be read.", "evidence": [q["ref"]] if q.get("ref") else []})
+        elif q["status"] == "ok" and q.get("evidence") in ("none", "weak"):
+            inv.retrieval_notes.append(f"Knowledge search for {q['query']!r} returned {'nothing' if q.get('evidence') == 'none' else 'only loose matches'}; that does not show no documentation exists.")
+    hits = {h.get("chunk_id"): h for e in inv.evidence if e["tool"] == "kb_search" and e["ok"] and isinstance(e.get("data"), list) for h in e["data"] if isinstance(h, dict)}
     found: list[dict] = []
-    for q in queries[:2]:
-        out = await inv._call(executor, "kb_search", {"query": q[:500], "k": 6}, f"documented {'deployment ' if verb else ''}steps for {target or 'this request'}")
-        if out is None:
+    for p in added:
+        hit = hits.get(p["chunk_id"]) or {}
+        text = f"{hit.get('title') or ''}\n{hit.get('heading') or ''}\n{hit.get('text') or ''}"
+        if any(s["path"] == p.get("path") and s["text"] == text for s in inv.sources):
             continue
-        if not out.ok:
-            inv.gaps.append({"kind": "retrieval_failure", "detail": f"Knowledge search failed ({out.error_kind or 'error'}: {(out.error or '')[:160]}); documented steps may exist but could not be read.", "evidence": [out.evidence_ref] if out.evidence_ref else []})
-            continue
-        state = ((out.source or {}).get("evidence") or {}).get("state")
-        if state in ("none", "weak"):
-            inv.retrieval_notes.append(f"Knowledge search for {q!r} returned {'nothing' if state == 'none' else 'only loose matches'}; that does not show no documentation exists.")
-        for hit in out.data or []:
-            cit = hit.get("citation") or {}
-            text = f"{hit.get('title') or ''}\n{hit.get('heading') or ''}\n{hit.get('text') or ''}"
-            specific = _mentions(f"{text} {cit.get('path')} {cit.get('repository')}", req) or bool(req.repository and cit.get("repository") == req.repository)
-            if any(s["path"] == cit.get("path") and s["text"] == text for s in inv.sources):
-                continue
-            found.append(_source(inv, ref=out.evidence_ref, tool="kb_search", path=str(cit.get("path") or ""), repository=cit.get("repository"), kind="indexed",
-                                 text=text, freshness=hit.get("freshness"), target_specific=specific,
-                                 why="mentions the target" if specific else "does not mention the target, so it is not used for steps"))
+        why = "; ".join(p["basis"]) if p["authority"] in ("target", "shared") else (p["excluded"] or "; ".join(p["basis"]))
+        if p["authority"] == "unverified":
+            why = f"not used for steps: {why}"
+        found.append(_source(inv, ref=p["ref"], tool="kb_search", path=str(p.get("path") or ""), repository=p.get("repository"), kind="indexed", text=text, freshness=hit.get("freshness"),
+                             target_specific=p["authority"] == "target", general=p["authority"] == "shared", authority=p["authority"], why=why, lines=p.get("lines"), revision=p.get("revision")))
     return found
 
 
@@ -301,7 +309,7 @@ def _category(heading: str) -> str | None:
 def _item(text: str, src: dict, command: str | None = None, note: str | None = None) -> dict:
     body = f"{command or ''} {text}"
     return {"text": text.strip()[:400], "command": command, "note": note, "sources": [src["ref"]], "path": src["path"], "repository": src.get("repository"),
-            "support": "quoted", "placeholders": sorted(set(_PLACEHOLDER.findall(body)))[:6]}
+            "support": "quoted", "placeholders": sorted(set(_PLACEHOLDER.findall(body)))[:6], "general": bool(src.get("general"))}
 
 
 def _paragraphs(lines: list[str]) -> list[str]:
@@ -329,7 +337,7 @@ def _markdown(src: dict, out: dict) -> None:
     secs = _sections(src["text"])
     for heading, level, lines in secs:
         cat = _category(heading)
-        if level <= 1 and not out["overview"]:
+        if level <= 1 and not out["overview"] and src.get("target_specific"):  # a shared runbook does not describe the target
             para = next((p for p in _paragraphs(lines) if len(p) > 40), None)
             if para:
                 out["overview"].append({"text": para[:600], "sources": [src["ref"]], "path": src["path"]})
@@ -402,7 +410,7 @@ def extract(sources: list[dict]) -> dict[str, Any]:
     """Guidance by rules: only what the sources say, each item citing where it says it."""
     out: dict[str, Any] = {"overview": [], "configuration": [], **{s: [] for s in SECTIONS}}
     for src in sources:
-        if not src.get("target_specific"):
+        if not src.get("target_specific") and not src.get("general"):
             continue
         if src["tool"] == "kb_search" or src["path"].lower().endswith((".md", ".markdown", ".txt", ".rst")) or src["kind"] in ("readme", "runbook"):
             _markdown(src, out)
@@ -429,9 +437,10 @@ def conflicts(sources: list[dict], extracted: dict) -> list[dict]:
     out = []
     for s in sources:
         fr = s.get("freshness") or {}
-        if s["target_specific"] and fr.get("state") not in (None, "current"):
+        mine = s["target_specific"] or s.get("general")
+        if mine and fr.get("state") not in (None, "current"):
             out.append({"kind": "stale", "detail": f"{s['path']} is {fr['state']}" + (f" ({fr.get('reason')})" if fr.get("reason") else "") + "; check what replaced it before following it.", "sources": [s["ref"]]})
-        if s["target_specific"] and fr.get("possible_conflict"):
+        if mine and fr.get("possible_conflict"):
             out.append({"kind": "conflict", "detail": f"{s['path']} may disagree with {', '.join(fr.get('conflict_with') or ['another document'])}.", "sources": [s["ref"]]})
     by_path: dict[str, set[str]] = {}
     for item in extracted["steps"]:
@@ -447,6 +456,10 @@ def conflicts(sources: list[dict], extracted: dict) -> list[dict]:
 def _gaps(inv: Any, req: RequestContext, extracted: dict) -> list[dict]:
     gaps = list(inv.gaps)
     specific = [s for s in inv.sources if s["target_specific"]]
+    general = [s for s in inv.sources if s.get("general")]
+    if req.targets and not specific and general:
+        gaps.append({"kind": "insufficient_evidence", "detail": f"Only general runbook guidance was found ({', '.join(sorted({s['path'] for s in general})[:3])}); nothing written for {req.target_name} itself.",
+                     "evidence": sorted({s["ref"] for s in general})[:4]})
     if req.targets and not specific and not any(g["kind"] == "retrieval_failure" for g in gaps):
         where = []
         if any(s["tool"] == "kb_search" for s in inv.sources) or any(t["tool"] == "kb_search" for t in inv.trace["tools"]):
@@ -456,7 +469,7 @@ def _gaps(inv: Any, req: RequestContext, extracted: dict) -> list[dict]:
         elif req.candidates.get("repository"):
             where.append(" and ".join(req.candidates["repository"][:MAX_DISCOVERY_REPOS]) + " (candidates)")
         gaps.append({"kind": "missing_source", "detail": f"No source about {req.target_name} was found in {', '.join(where) or 'any searched location'}.", "evidence": []})
-    elif specific and not extracted["steps"] and req.primary in ("deployment_guidance", "execution"):
+    elif specific and not [i for i in extracted["steps"] if not i.get("general")] and req.primary in ("deployment_guidance", "execution"):
         gaps.append({"kind": "insufficient_evidence", "detail": f"{len(specific)} source(s) about {req.target_name or 'the target'} were read, but none describes deployment steps.", "evidence": [s["ref"] for s in specific][:4]})
     if specific and req.primary in ("deployment_guidance", "execution"):
         for section, label in (("verification", "how to verify a deployment"), ("rollback", "how to roll back")):
@@ -577,7 +590,7 @@ def _validate_llm(raw: dict, rules: dict, texts: dict[str, str], doc_refs: set[s
 
 async def compose(inv: Any, provider: Any, cfg: Any, req: RequestContext) -> tuple[Report, str]:
     """The guidance answer, as a Report whose `answer` carries the structure the request calls for."""
-    used = [s for s in inv.sources if s["target_specific"]]
+    used = [s for s in inv.sources if s["target_specific"] or s.get("general")]
     rules = extract(used)
     gaps = _gaps(inv, req, rules)
     execution = _execution(inv, req) if req.primary == "execution" else None
@@ -595,10 +608,12 @@ async def compose(inv: Any, provider: Any, cfg: Any, req: RequestContext) -> tup
                 summary = (execution["note"].split(". ")[0] + ". " if execution else "") + str(raw["summary"])[:1200]
         except inv.llm_failures as exc:
             notes.append(f"LLM guidance unavailable ({getattr(exc, 'message', str(exc))}); showing guidance extracted from the sources.")
-    answer = {**g, "conflicts": conflicts(used, g), "gaps": gaps, "assumptions": [], "question_for_user": _question_for_user(req, gaps, used),
+    answer = {**g, "conflicts": conflicts(used, g), "gaps": gaps, "assumptions": [], "question_for_user": _question_for_user(req, gaps, [s for s in used if s["target_specific"]]),
               "sources": [{k: v for k, v in s.items() if k != "text"} for s in inv.sources], "retrieval": inv.retrieval_notes,
               "target": {"mention": req.target_name, "repository": req.repository, "namespaces": req.namespaces, "environment": req.environment, "cluster": req.cluster,
                          "resolutions": [r.model_dump() for r in req.resolutions], "unresolved": req.unresolved, "candidates": req.candidates}}
+    if any(s.get("general") for s in used):
+        answer["assumptions"].append("Items marked general come from shared runbooks that are not written for this target: check they apply before following them.")
     if req.requested_environment and req.environment and req.requested_environment.startswith("prod") and not inv.environment_info.get("is_production"):
         answer["assumptions"].append(f"You asked about production; this answer is for environment {req.environment}, which is not marked as production.")
     for item in (x for s in SECTIONS for x in g[s]):
@@ -620,9 +635,9 @@ async def compose(inv: Any, provider: Any, cfg: Any, req: RequestContext) -> tup
 async def explain(inv: Any, executor: Any, provider: Any, cfg: Any, req: RequestContext) -> tuple[Report, str]:
     """A direct answer. Documentation may be cited; nothing live is read."""
     await _knowledge(inv, executor, req)
-    docs = [s for s in inv.sources]
+    docs = [s for s in inv.sources if s.get("authority") in ("target", "shared", "unverified")]
     for s in docs:
-        s["used"] = True  # a concept is not tied to a target, so any readable passage may help
+        s["used"] = True  # a concept is not tied to a target, so any relevant readable passage may help
     refs = {s["ref"] for s in docs}
     answer: dict[str, Any] = {"sources": [{k: v for k, v in s.items() if k != "text"} for s in docs], "gaps": list(inv.gaps), "retrieval": inv.retrieval_notes}
     if provider:
@@ -651,7 +666,8 @@ async def explain(inv: Any, executor: Any, provider: Any, cfg: Any, req: Request
 def sources_digest(sources: list[dict], per_item: int, total: int) -> str:
     parts, used = [], 0
     for s in sources:
-        head = f"[{s['ref']}] {s['repository'] or ''}:{s['path']} kind={s['kind']} freshness={(s.get('freshness') or {}).get('state')}"
+        head = (f"[{s['ref']}] {s['repository'] or ''}:{s['path']} kind={s['kind']} freshness={(s.get('freshness') or {}).get('state')}"
+                + (" GENERAL GUIDANCE: a shared runbook, not written for this target" if s.get("general") else ""))
         chunk = head + "\n" + prompts.untrusted(s["path"] or s["tool"], s["text"], per_item)
         if used + len(chunk) > total:
             parts.append(head + " (omitted for length)")

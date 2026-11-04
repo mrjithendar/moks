@@ -23,18 +23,35 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..connectors.base import ConnectorError
 from ..connectors.git import GitConnector
-from ..models import Document, Incident, KnowledgeSource, KnowledgeSyncItem
+from ..models import Document, Incident, IndexOutbox, KnowledgeSource, KnowledgeSyncItem
 from ..observability import INDEXING_DOCUMENTS
 from ..redaction import redact
 from . import service, web
-from .chunking import PIPELINE_VERSION
+from .chunking import version_for
 
 log = logging.getLogger("moks.rag.ingest")
 
+# What a source reads when it names no profile and no include rules: what every source read before profiles
+# existed, so an older source is never silently broadened.
 DEFAULT_INCLUDE = ["**/*.md", "docs/**", "runbooks/**", "**/*.yaml", "**/*.yml", "**/Dockerfile", ".github/workflows/*",
                    "**/Chart.yaml", "**/values*.yaml", "**/*.tf"]
-DEFAULT_EXCLUDE = ["**/node_modules/**", "**/vendor/**", "**/dist/**", "**/.git/**", "**/package-lock.json", "**/*.lock",
-                   "**/*.min.js", "**/*.svg", "**/*.png", "**/*.jpg"]
+# Profiles a source opts into (config.profiles). Their patterns are added to any explicit include rules.
+PROFILES: dict[str, list[str]] = {
+    "documentation": ["**/*.md", "**/*.mdx", "**/*.markdown", "**/*.rst", "**/*.adoc", "**/*.txt", "docs/**", "runbooks/**"],
+    "infrastructure": ["**/*.yaml", "**/*.yml", "**/Dockerfile", "**/Dockerfile.*", "**/*.dockerfile", "**/Chart.yaml", "**/values*.yaml", "**/kustomization.y*ml",
+                       "**/*.tf", "**/*.hcl", ".github/workflows/*", "**/.gitlab-ci.yml", "**/Jenkinsfile", "**/Makefile", "**/*.sh"],
+    "application": ["**/*.py", "**/*.go", "**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.ts", "**/*.tsx", "**/*.sh", "**/*.bash",
+                    "**/Dockerfile", "**/Dockerfile.*", "**/package.json", "**/go.mod", "**/pyproject.toml", "**/requirements*.txt", "**/tsconfig.json"],
+}
+# Always excluded, whatever a source includes: dependencies, generated output and binaries. Files that look like
+# credentials are refused by rag/secrets.py when read, so they are recorded with that reason.
+DEPENDENCIES = ["**/node_modules/**", "**/vendor/**", "**/.venv/**", "**/venv/**", "**/site-packages/**", "**/bower_components/**", "**/.git/**"]
+GENERATED = ["**/dist/**", "**/.next/**", "**/__pycache__/**", "**/coverage/**", "**/*.min.js", "**/*.min.css", "**/*.map", "**/*.pb.go", "**/*_pb2.py", "**/*.generated.*",
+             "**/package-lock.json", "**/yarn.lock", "**/pnpm-lock.yaml", "**/go.sum", "**/*.lock", "**/*.tfstate", "**/*.tfstate.*"]
+BINARIES = ["**/*.svg", "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.gif", "**/*.ico", "**/*.webp", "**/*.pdf", "**/*.zip", "**/*.gz", "**/*.tgz", "**/*.jar",
+            "**/*.so", "**/*.dylib", "**/*.exe", "**/*.wasm", "**/*.woff", "**/*.woff2", "**/*.ttf", "**/*.pyc"]
+DEFAULT_EXCLUDE = DEPENDENCIES + GENERATED + BINARIES
+POLICY_SAMPLE = 200  # excluded paths kept with their rule, so an operator can see why a file is missing
 BATCH_FILES = 500  # files read per pass: the job runs again until the listing is finished
 PIN_HOURS = 24  # a pinned revision older than this is listed afresh, keeping progress on unchanged files
 MAX_FILE_BYTES = 300_000
@@ -46,10 +63,40 @@ WEB_PASS_SECONDS = 300
 
 
 def _match(path: str, patterns: list[str]) -> bool:
+    return _rule(path, patterns) is not None
+
+
+def _rule(path: str, patterns: list[str]) -> str | None:
     for p in patterns:
         if fnmatchcase(path, p) or (p.startswith("**/") and fnmatchcase(path, p[3:])):
-            return True
-    return False
+            return p
+    return None
+
+
+def policy(cfg: dict) -> tuple[list[str], list[str]]:
+    """(include, exclude) for a source. Explicit rules always count; profiles add patterns; with neither, the
+    pre-profile default applies. Exclusions only ever narrow."""
+    profiles = [p for p in cfg.get("profiles") or [] if p in PROFILES]
+    include = list(cfg.get("include") or [])
+    if profiles:
+        include += [x for p in profiles for x in PROFILES[p]]
+    elif not include:
+        include = list(DEFAULT_INCLUDE)
+    return list(dict.fromkeys(include)), list(dict.fromkeys([*(cfg.get("exclude") or []), *DEFAULT_EXCLUDE]))
+
+
+def explain(path: str, cfg: dict) -> dict[str, Any]:
+    """Whether the policy reads a path, and the rule that decided."""
+    include, exclude = policy(cfg)
+    hit = _rule(path, exclude)
+    if hit:
+        kind = "the source's exclude rules" if hit in (cfg.get("exclude") or []) else "dependencies, generated files and binaries are never indexed"
+        return {"included": False, "rule": hit, "reason": f"matches exclude rule {hit} ({kind})"}
+    inc = _rule(path, include)
+    if inc is None:
+        named = ", ".join(cfg.get("profiles") or []) or ("its include rules" if cfg.get("include") else "the default documentation and configuration rules")
+        return {"included": False, "rule": None, "reason": f"no include rule matches it (the source reads {named}; add a profile or an include rule)"}
+    return {"included": True, "rule": inc, "reason": f"matches include rule {inc}"}
 
 
 def service_for(path: str, mapping: dict[str, str]) -> str | None:
@@ -77,8 +124,16 @@ async def _take_inventory(db: AsyncSession, src: KnowledgeSource, git: GitConnec
     """Records every wanted file at one pinned revision, what still needs reading, and, only from a
     complete listing, what has gone."""
     sha, files, listing = await git.provider.inventory(repo, cfg.get("ref"))
-    include, exclude = cfg.get("include") or DEFAULT_INCLUDE, (cfg.get("exclude") or []) + DEFAULT_EXCLUDE
-    wanted = {f["path"]: f for f in files if _match(f["path"], include) and not _match(f["path"], exclude)}
+    include, exclude = policy(cfg)
+    wanted: dict[str, dict] = {}
+    left_out: list[dict] = []
+    for f in files:
+        rule = _rule(f["path"], exclude)
+        if rule is None and _match(f["path"], include):
+            wanted[f["path"]] = f
+        elif len(left_out) < POLICY_SAMPLE:
+            left_out.append({"path": f["path"], "rule": rule or "no include rule"})
+    policy_excluded = len(files) - len(wanted)
     existing = {d.path: d for d in (await db.execute(select(Document).where(Document.source_id == src.id))).scalars()}
     items = {i.path: i for i in (await db.execute(select(KnowledgeSyncItem).where(KnowledgeSyncItem.source_id == src.id))).scalars()}
     now = datetime.now(timezone.utc)
@@ -92,7 +147,7 @@ async def _take_inventory(db: AsyncSession, src: KnowledgeSource, git: GitConnec
         same_blob = item.blob_sha == f["sha"]
         item.blob_sha, item.size_bytes, item.revision = f["sha"], f.get("size", 0), sha
         doc = existing.get(path)
-        current = doc is not None and doc.content_hash == f"git:{f['sha']}" and doc.pipeline_version == PIPELINE_VERSION and doc.status in ("active", "excluded")
+        current = doc is not None and doc.content_hash == f"git:{f['sha']}" and doc.pipeline_version == version_for(path) and doc.status in ("active", "excluded")
         if f.get("size", 0) > MAX_FILE_BYTES:
             too_large.append(path)
             excluded += 1
@@ -118,7 +173,7 @@ async def _take_inventory(db: AsyncSession, src: KnowledgeSource, git: GitConnec
                 deleted += 1
         await db.execute(sa_delete(KnowledgeSyncItem).where(KnowledgeSyncItem.source_id == src.id, KnowledgeSyncItem.path.not_in(list(wanted) or [""])))
     src.sync_cursor = {"revision": sha, "listing": listing, "state": "ingesting", "started_at": now.isoformat(), "deletions_applied": trusted, "deleted": deleted,
-                       "too_large": too_large[:20], "added": 0, "updated": 0}
+                       "too_large": too_large[:20], "added": 0, "updated": 0, "listed": len(files), "policy_excluded": policy_excluded, "policy_sample": left_out}
     await db.commit()
     return src.sync_cursor
 
@@ -196,7 +251,12 @@ async def sync_github(db: AsyncSession, src: KnowledgeSource, transport=None) ->
         await db.commit()
         INDEXING_DOCUMENTS.labels(src.name, "active").set(done)
         INDEXING_DOCUMENTS.labels(src.name, "excluded").set(excluded)
+        # Reading every file is the upstream half. An external index applies the changes afterwards, from the outbox.
+        ids = select(Document.id).where(Document.source_id == src.id).scalar_subquery()
+        waiting = (await db.execute(select(func.count()).select_from(IndexOutbox).where(IndexOutbox.document_id.in_(ids), IndexOutbox.status != "done"))).scalar_one()
+        indexing = {"state": "pending" if waiting else "complete", "outbox": waiting, "note": "search results include these changes once the index has applied them" if waiting else None}
         return {"revision": cursor["revision"], "listing": cursor.get("listing"), "content": content, "complete": content == "complete" and trusted, "files_considered": discovered, "discovered": discovered, "processed": done + excluded,
+                "listed": cursor.get("listed"), "policy_excluded": cursor.get("policy_excluded"), "indexing": indexing,
                 "remaining": pending, "added": cursor.get("added", 0), "updated": cursor.get("updated", 0), "unchanged": max(done - cursor.get("added", 0) - cursor.get("updated", 0), 0),
                 "deleted": cursor.get("deleted", 0), "excluded": excluded, "failed": failed, "deletions_skipped": not trusted, "skipped_too_large": cursor.get("too_large", [])}
     finally:

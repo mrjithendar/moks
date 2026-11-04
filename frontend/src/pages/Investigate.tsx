@@ -99,7 +99,7 @@ const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 const STAGES: [string, string][] = [["triage", "Triage"], ["evidence", "Evidence"], ["correlation", "Correlation"], ["hypotheses", "Hypotheses"], ["verification", "Verification"], ["report", "Report"]];
 
 function Stages({ current, done }: { current?: string; done: boolean }) {
-  const reached = STAGES.findIndex(([k]) => k === (current === "skill" || current === "followup" ? "evidence" : current));
+  const reached = STAGES.findIndex(([k]) => k === (current === "skill" || current === "followup" ? "evidence" : current === "knowledge" ? "triage" : current));
   return (
     <ol className="stages" aria-label="Investigation stages">
       {STAGES.map(([k, label], i) => <li key={k} className={done || i < reached ? "done" : i === reached ? "now" : ""} aria-current={i === reached && !done ? "step" : undefined}>{label}</li>)}
@@ -325,7 +325,7 @@ function Routing({ report }: { report: any }) {
 function GuidanceItems({ items, onCite }: { items: any[]; onCite: (r: string) => void }) {
   return <ol>{items.map((x: any, i: number) => <li key={i}>
     {x.command ? <><code className="mono">{x.command}</code>{x.note || x.text !== `Run \`${x.command}\`` ? <span className="small"> — {x.note ?? x.text}</span> : null}</> : <Markdown text={x.text} />}
-    <Cites refs={x.sources ?? []} onCite={onCite} />{x.path && <span className="small muted"> {x.path}</span>}
+    <Cites refs={x.sources ?? []} onCite={onCite} />{x.path && <span className="small muted"> {x.path}</span>}{x.general && <> <Badge kind="info">general guidance</Badge></>}
     {x.placeholders?.length > 0 && <div className="small muted">Placeholder: {x.placeholders.join(", ")}</div>}</li>)}</ol>;
 }
 
@@ -351,6 +351,60 @@ export function Answer({ report, onCite }: { report: any; onCite: (r: string) =>
   </div>;
 }
 
+const KNOWLEDGE_STATUS: Record<string, [("ok" | "warn" | "bad" | "neutral"), string]> = {
+  retrieved: ["ok", "retrieved"], partial: ["warn", "partly failed"], empty: ["neutral", "nothing relevant"], failed: ["bad", "search failed"], not_attempted: ["neutral", "not searched"],
+};
+const AUTHORITY: Record<string, [("ok" | "info" | "warn" | "neutral"), string]> = {
+  target: ["ok", "about the target"], shared: ["info", "general guidance"], unverified: ["warn", "relationship not established"], unrelated: ["neutral", "other service"], low_relevance: ["neutral", "low relevance"],
+};
+const EMPTY_KNOWLEDGE: Record<string, string> = {
+  empty: "MOKS searched the knowledge index and found no passage you may read that matches this request. The answer rests on live evidence only.",
+  failed: "The knowledge search failed, so documented procedures could not be checked. The answer rests on live evidence only.",
+  not_attempted: "The knowledge index was not searched for this request.",
+};
+const safeLink = (url?: string | null) => (url && /^https?:\/\//i.test(url) ? url : undefined);
+
+function Passage({ p, onCite }: { p: any; onCite: (r: string) => void }) {
+  const [tone, label] = AUTHORITY[p.authority] ?? ["neutral", p.authority];
+  const lines = p.lines?.[0] ? `L${p.lines[0]}${p.lines[1] && p.lines[1] !== p.lines[0] ? `-${p.lines[1]}` : ""}` : "";
+  const where = `${p.repository ? `${p.repository}:` : ""}${p.path}`;
+  const href = safeLink(p.url);
+  return <li className="passage">
+    <div className="row tight wrap"><Cites refs={[p.ref]} onCite={onCite} /><Badge kind={tone}>{label}</Badge>
+      {p.freshness?.state && p.freshness.state !== "current" && <Badge kind="warn">{p.freshness.state}</Badge>}
+      {href ? <a className="mono small" href={href} target="_blank" rel="noreferrer noopener">{where} {lines}</a> : <span className="mono small">{where} {lines}</span>}
+      {p.revision && <span className="mono small muted">@ {String(p.revision).slice(0, 10)}</span>}</div>
+    {p.heading && <div className="small">{p.heading}</div>}
+    {p.excerpt && <div className="small muted excerpt">{p.excerpt}</div>}
+    <div className="small muted">{p.excluded ? `Not used: ${p.excluded}` : p.basis?.join("; ")}{p.freshness?.last_checked ? ` · checked ${new Date(p.freshness.last_checked).toLocaleDateString()}` : ""}</div>
+  </li>;
+}
+
+/** What was searched, what came back and why each passage was or was not used. Documentation, never current state. */
+export function KnowledgeUsed({ k, onCite }: { k?: any; onCite: (r: string) => void }) {
+  if (!k) return null;
+  const [tone, label] = KNOWLEDGE_STATUS[k.status] ?? ["neutral", k.status];
+  const used = (k.passages ?? []).filter((p: any) => p.used);
+  const rest = (k.passages ?? []).filter((p: any) => !p.used);
+  const scope = k.scope ?? {};
+  return <details className="rs knowledge" open={k.status === "failed"}>
+    <summary>Knowledge used<span className="count">{k.counts?.used ?? 0} of {k.counts?.retrieved ?? 0}</span> <Badge kind={tone}>{label}</Badge></summary>
+    <div className="small muted">{k.note}</div>
+    <div className="small">Searched {scope.environment ? <>environment <span className="mono">{scope.environment}</span></> : "all environments you can read"}
+      {scope.namespace ? <>, namespace <span className="mono">{scope.namespace}</span></> : ", every namespace you can read"}
+      {scope.target && <>, about <strong>{scope.target}</strong></>}{scope.repository && <> (repository <span className="mono">{scope.repository}</span>)</>}
+      {scope.history_used && ", with this conversation's earlier turns"}.</div>
+    {!used.length && EMPTY_KNOWLEDGE[k.status] && <div className="alert info small">{EMPTY_KNOWLEDGE[k.status]}</div>}
+    {k.reasons?.length > 0 && <ul className="small">{k.reasons.map((r: string, i: number) => <li key={i}>{r}</li>)}</ul>}
+    {k.hints?.length > 0 && <div className="small"><strong>Why the index may hold less than expected:</strong><ul>{k.hints.map((h: string, i: number) => <li key={i}>{h}</li>)}</ul></div>}
+    {k.queries?.length > 0 && <details className="small"><summary>Queries ({k.queries.length})</summary>
+      <ul>{k.queries.map((q: any, i: number) => <li key={i}><span className="mono">{q.query}</span> <Badge kind={q.status === "ok" ? "neutral" : q.status === "failed" ? "bad" : "warn"}>{q.stage} · {q.status === "ok" ? `${q.results} result(s)` : q.status.replace("_", " ")}</Badge>
+        {q.mode && <span className="muted"> {q.mode}{q.fallback ? ` (${q.fallback})` : ""}</span>}{q.reused && <span className="muted"> · reused after a restart</span>}{q.reason && <div className="muted">{q.reason}</div>}</li>)}</ul></details>}
+    {used.length > 0 && <><div className="small"><strong>Used in this answer</strong></div><ul className="passages">{used.map((p: any) => <Passage key={p.chunk_id} p={p} onCite={onCite} />)}</ul></>}
+    {rest.length > 0 && <details className="small"><summary>Retrieved, not used ({rest.length})</summary><ul className="passages">{rest.map((p: any) => <Passage key={p.chunk_id} p={p} onCite={onCite} />)}</ul></details>}
+  </details>;
+}
+
 function Cites({ refs, onCite }: { refs: string[]; onCite: (r: string) => void }) {
   return <>{refs.map((r) => <button type="button" key={r} className="cite" onClick={() => onCite(r)}>{r}</button>)}</>;
 }
@@ -367,6 +421,7 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose }
       <Routing report={report} />
       {!hideSummary && <div className="rs static"><h3>Answer</h3><Markdown text={report.summary ?? ""} /><div className="small muted">{report.generated_by === "llm" ? "Organized by the LLM; every command is checked against the cited sources" : "Extracted from the sources by rules"}</div></div>}
       <Answer report={report} onCite={onCite} />
+      <KnowledgeUsed k={report.knowledge} onCite={onCite} />
       {report.observed_facts?.length > 0 && <Section title="Current state" count={report.observed_facts.length}><ul>{report.observed_facts.map((f: any, i: number) => <li key={i}>{f.statement}<Cites refs={f.evidence} onCite={onCite} /></li>)}</ul></Section>}
       {evidence.length > 0 && <Section title="Supporting evidence" count={evidence.length} open={false}>
         <ul>{evidence.slice(0, 40).map((e) => <li key={e.ref}><button type="button" className="cite" style={{ marginLeft: 0 }} onClick={() => onCite(e.ref)}>{e.ref}</button> <span className="small">{e.summary}</span></li>)}</ul>
@@ -411,6 +466,7 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose }
       </Section>}
       {report.next_steps.length > 0 && <Section title="Recommended next steps" count={report.next_steps.length}>
         <ul>{report.next_steps.map((m: string, i: number) => <li key={i}><Markdown text={m} /></li>)}</ul></Section>}
+      <KnowledgeUsed k={report.knowledge} onCite={onCite} />
       {report.skill_actions?.length > 0 && <Section title="Suggested actions from skills" count={report.skill_actions.length} open={false}>
         <ul>{report.skill_actions.map((a: any, i: number) => (
           <li key={i}><span className="mono">{a.action}</span>{a.target_name && <span className="mono small"> · {a.target_kind}/{a.target_name}</span>}

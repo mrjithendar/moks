@@ -201,7 +201,9 @@ async def kb_search(ctx: ToolContext, a: KbArgs) -> ToolResult:
     summary = f"{len(hits)} knowledge passages ({r.get('mode')}) for {a.query!r}. Documented knowledge only: current state needs live evidence."
     if r["evidence"]["state"] != "supported":
         summary += f" {r['evidence']['reason']}"
-    return ToolResult(summary, hits, {"index": r.get("index"), "citations": [h["citation"] for h in hits], "evidence": r["evidence"], "fallback_reason": r.get("fallback_reason"), "reranking": r.get("reranking"), "ranking": ranking})
+    return ToolResult(summary, hits, {"index": r.get("index"), "citations": [h["citation"] for h in hits], "evidence": r["evidence"], "fallback_reason": r.get("fallback_reason"), "reranking": r.get("reranking"), "ranking": ranking,
+                                      "mode": r.get("mode"), "latency_ms": r.get("latency_ms"), "note": r.get("note"),
+                                      "scope": {"environment": ctx.environment.name, "namespace": ctx.focus_namespace or None}})
 
 
 # ---- FinOps -----------------------------------------------------------------------------------

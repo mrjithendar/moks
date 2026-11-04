@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import case, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,7 +34,7 @@ from ..rbac import Principal
 from . import access, rerank as reranking
 from .backends import MAPPING_VERSION, OpenSearchBackend, PineconeBackend, PostgresBackend, rrf
 from .query import parts, understand
-from .chunking import MAX_CHUNKS, PIPELINE_VERSION, chunk, kind_of, lifecycle_of, title_of
+from .chunking import CODE_PIPELINE_VERSION, MAX_CHUNKS, PIPELINE_VERSION, chunk, kind_of, lifecycle_of, title_of, version_for
 from .secrets import clean, exclusion_reason
 
 log = logging.getLogger("moks.rag")
@@ -205,10 +205,10 @@ def _row(c: Chunk, d: Document, src: KnowledgeSource, idx: EmbeddingIndex | None
 CHUNK_NS = uuid.UUID("9c1a7b52-6d7e-4b0a-9f55-2f6f6c3f2a11")
 
 
-def chunk_id(document_id: uuid.UUID, content_hash: str, ordinal: int) -> uuid.UUID:
+def chunk_id(document_id: uuid.UUID, content_hash: str, ordinal: int, version: int = PIPELINE_VERSION) -> uuid.UUID:
     """The same document, content, pipeline and position always give one id, so a replay cannot duplicate
     a chunk, and a new version never reuses an old one's id."""
-    return uuid.uuid5(CHUNK_NS, f"{document_id}:{content_hash}:{PIPELINE_VERSION}:{ordinal}")
+    return uuid.uuid5(CHUNK_NS, f"{document_id}:{content_hash}:{version}:{ordinal}")
 
 
 async def exclude_document(db: AsyncSession, src: KnowledgeSource, path: str, reason: str, content_hash: str, revision: str | None) -> Document:
@@ -222,7 +222,7 @@ async def exclude_document(db: AsyncSession, src: KnowledgeSource, path: str, re
         return doc
     await _drop_chunks(db, doc)
     doc.content_hash, doc.revision, doc.status, doc.excluded_reason, doc.title = content_hash, revision, "excluded", reason, path.rsplit("/", 1)[-1]
-    doc.pipeline_version, doc.updated_at, doc.checked_at, doc.vector_state = PIPELINE_VERSION, datetime.now(timezone.utc), datetime.now(timezone.utc), "not_applicable"
+    doc.pipeline_version, doc.updated_at, doc.checked_at, doc.vector_state = version_for(path), datetime.now(timezone.utc), datetime.now(timezone.utc), "not_applicable"
     await db.flush()
     await _record_change(db, doc, "delete")
     return doc
@@ -235,7 +235,7 @@ async def index_document(db: AsyncSession, src: KnowledgeSource, path: str, raw:
     content_hash = content_hash or hashlib.sha256(raw.encode()).hexdigest()
     now = datetime.now(timezone.utc)
     doc = (await db.execute(select(Document).where(Document.source_id == src.id, Document.path == path))).scalar_one_or_none()
-    if doc and doc.content_hash == content_hash and doc.status == "active" and doc.pipeline_version == PIPELINE_VERSION:
+    if doc and doc.content_hash == content_hash and doc.status == "active" and doc.pipeline_version == version_for(path):
         doc.checked_at, doc.revision, doc.url = now, revision or doc.revision, url or doc.url  # the link follows the revision it is cited at
         return doc  # unchanged: incremental sync skips it
     content_changed = doc is None or doc.content_hash != content_hash
@@ -252,7 +252,7 @@ async def index_document(db: AsyncSession, src: KnowledgeSource, path: str, raw:
     doc.service, doc.owner = extra.get("service", src.service), extra.get("owner", src.owner)
     doc.size_bytes = len(raw.encode())
     doc.updated_at, doc.checked_at = now, now
-    doc.pipeline_version = PIPELINE_VERSION
+    doc.pipeline_version = version_for(path)
     reason = exclusion_reason(path, raw)
     text_clean = clean(raw) if not reason else ""
     pieces = chunk(path, text_clean) if not reason else []
@@ -271,7 +271,7 @@ async def index_document(db: AsyncSession, src: KnowledgeSource, path: str, raw:
     doc.doc_state, doc.superseded_by = lifecycle_of(text_clean)
     doc.vector_state, doc.vector_error = "unknown", None
     await db.flush()
-    chunks = [Chunk(id=chunk_id(doc.id, content_hash, i), document_id=doc.id, ord=i, heading=p.heading[:480], text=p.text, start_line=p.start_line, end_line=p.end_line,
+    chunks = [Chunk(id=chunk_id(doc.id, content_hash, i, doc.pipeline_version), document_id=doc.id, ord=i, heading=p.heading[:480], text=p.text, start_line=p.start_line, end_line=p.end_line,
                     start_offset=p.start_offset, end_offset=p.end_offset, token_estimate=p.tokens, text_hash=p.text_hash) for i, p in enumerate(pieces)]
     db.add_all(chunks)
     await db.flush()
@@ -1185,7 +1185,8 @@ def _select(scored: list, k: int) -> list[dict]:
             "chunk_id": cid, "document_id": str(d.id), "ord": c.ord, "score": round(rank, 5), "signals": signals, "title": d.title, "heading": c.heading, "text": c.text,
             "citation": {"source": s.name, "source_type": s.type, "repository": (s.config or {}).get("repository"), "path": d.path, "revision": d.revision,
                          "lines": [c.start_line, c.end_line], "offsets": [c.start_offset, c.end_offset], "url": _line_url(d.url, c.start_line, c.end_line, s.type, d.kind)},
-            "scope": {"environment": d.environment, "namespace": d.namespace, "service": d.service, "owner": d.owner, "team": s.team, "classification": s.classification},
+            "scope": {"environment": d.environment, "namespace": d.namespace, "service": d.service, "owner": d.owner, "team": s.team, "classification": s.classification,
+                      "applies_to": s.applies_to or {}},
             "freshness": {"state": state, "reason": why, "trust": d.trust, "reviewed_at": d.reviewed_at.isoformat() if d.reviewed_at else None, "last_checked": d.checked_at.isoformat() if d.checked_at else None, "content_changed_in": d.changed_revision,
                           "document_updated": d.updated_at.isoformat() if d.updated_at else None, "source_synced": s.last_sync_at.isoformat() if s.last_sync_at else None},
         })
@@ -1290,7 +1291,8 @@ async def stats(db: AsyncSession) -> dict:
     outbox = dict((await db.execute(text("SELECT CASE WHEN status = 'pending' AND attempts > 0 THEN 'retrying' ELSE status END, count(*) FROM index_outbox WHERE status <> 'done' GROUP BY 1"))).all())
     stale = (await db.execute(select(func.count()).select_from(Document).where(Document.content_revision != Document.indexed_revision, Document.realm == realm))).scalar_one()
     vectors = dict((await db.execute(select(Document.vector_state, func.count()).where(Document.status == "active", Document.realm == realm).group_by(Document.vector_state))).all())
-    old_pipeline = (await db.execute(select(func.count()).select_from(Document).where(Document.status == "active", Document.realm == realm, Document.pipeline_version != PIPELINE_VERSION))).scalar_one()
+    old_pipeline = (await db.execute(select(func.count()).select_from(Document).where(Document.status == "active", Document.realm == realm,
+                                         Document.pipeline_version != case((Document.kind == "code", CODE_PIPELINE_VERSION), else_=PIPELINE_VERSION)))).scalar_one()
     gaps = await _coverage(db, idx) if idx else {}
     need = sum(vectors.get(k, 0) for k in ("complete", "missing", "unknown"))
     return {"backend": backend_name(), "documents": counts, "chunks": chunks, "pipeline": {"version": PIPELINE_VERSION, "documents_behind": old_pipeline},

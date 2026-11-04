@@ -152,12 +152,37 @@ function WebFields({ urls, crawl, maxPages, onChange }: { urls: string; crawl: b
   );
 }
 
+const PROFILES: [string, string][] = [["documentation", "Documentation (Markdown, docs/, runbooks/)"], ["infrastructure", "Infrastructure (manifests, Helm, Terraform, Dockerfiles, CI workflows, shell)"],
+  ["application", "Application code (Python, Go, JavaScript, TypeScript, TSX, shell)"]];
+
+function Profiles({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+  return <fieldset className="stack tight"><legend className="small">What to index</legend>
+    {PROFILES.map(([k, label]) => <label key={k} className="inline small"><input type="checkbox" checked={value.includes(k)} onChange={(e) => onChange(e.target.checked ? [...value, k] : value.filter((x) => x !== k))} /> {label}</label>)}
+    <div className="small muted">None ticked and no include globs: documentation and configuration, as sources read before profiles. Dependencies, generated files, binaries and files over 300 KB are never indexed; files that look like credentials are refused and listed with the reason.</div>
+  </fieldset>;
+}
+
+export function KnowledgeVsGit() {
+  return <details className="small"><summary>Knowledge source or Git connector?</summary>
+    <p>A <strong>GitHub knowledge source</strong> copies the files you choose into the knowledge index on a schedule (daily by default) or when you press Sync. Investigations search that copy under each person's knowledge access, and cite repository, path, commit and lines. It never reads live state.</p>
+    <p>A <strong>Git connector</strong> (Admin, Connectors) reads the repository live during an investigation, for deployed revisions, recent commits and individual files, within its own allowlist. Adding one does not create the other, and a token configured for one is not used by the other.</p>
+  </details>;
+}
+
+function IndexState({ s }: { s: any }) {
+  const ix = s.indexing;
+  if (!ix) return <span className="muted">—</span>;
+  const kind = ix.state === "complete" ? "ok" : ix.state === "failed" ? "bad" : "info";
+  return <span className="small"><Badge kind={kind}>{ix.state === "complete" ? "searchable" : ix.state === "failed" ? "index failed" : "indexing"}</Badge>
+    {ix.state !== "complete" && <span className="muted"> {ix.dead ? `${ix.dead} failed` : `${Math.max(ix.pending, ix.documents_behind)} waiting`}</span>}</span>;
+}
+
 function KnowledgeSources({ onChange }: { onChange: () => void }) {
   const { confirm: ask, toast } = useFeedback();
   const { can } = useAuth();
   const list = useLoad(() => api<any[]>("/knowledge/sources"), []);
   useInterval(() => { if (!list.loading && list.data?.some((s) => s.sync_state !== "idle")) list.reload(); }, 3000);
-  const [f, setF] = useState({ name: "", type: "github", repository: "", urls: "", crawl: false, maxPages: "50", include: "", scope_environment: "", scope_namespace: "*", credType: "none", credName: "", shared: false, team: "", classification: "internal", review: "" });
+  const [f, setF] = useState({ name: "", type: "github", repository: "", urls: "", crawl: false, maxPages: "50", include: "", scope_environment: "", scope_namespace: "*", credType: "none", credName: "", shared: false, team: "", classification: "internal", review: "", profiles: ["documentation", "infrastructure"] as string[], service: "" });
   const [detail, setDetail] = useState<any>(null);
   const [error, setError] = useState<unknown>();
   const [editing, setEditing] = useState<any>(null);
@@ -167,14 +192,14 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
     try {
       await api("/knowledge/sources", { method: "POST", body: { name: f.name, type: f.type, repository: f.type === "github" ? f.repository : null,
         ...(f.type === "web" ? { urls: parseUrls(f.urls), crawl: f.crawl, max_pages: Number(f.maxPages) } : {}),
-        include: f.include ? f.include.split(/[\s,]+/).filter(Boolean) : [], scope_environment: f.shared ? "*" : f.scope_environment || "*", scope_namespace: f.shared ? "*" : f.scope_namespace,
+        include: f.include ? f.include.split(/[\s,]+/).filter(Boolean) : [], ...(f.type === "github" ? { profiles: f.profiles } : {}), service: f.service || null, scope_environment: f.shared ? "*" : f.scope_environment || "*", scope_namespace: f.shared ? "*" : f.scope_namespace,
         shared_globally: f.shared, team: f.team || null, classification: f.classification, review_interval_days: f.review ? Number(f.review) : null,
         credential_ref: f.credType === "env" ? { type: "env", name: f.credName } : { type: "none" } } });
       list.reload(); onChange();
     } catch (err) { setError(err); }
   }
   function startEdit(s: any) {
-    setEditing({ id: s.id, name: s.name, github: s.type === "github", web: s.type === "web", urls: (s.config?.urls ?? []).join("\n"), crawl: !!s.config?.crawl, maxPages: String(s.config?.max_pages ?? 50), repository: s.config?.repository, include: (s.config?.include ?? []).join(", "), exclude: (s.config?.exclude ?? []).join(", "),
+    setEditing({ id: s.id, name: s.name, github: s.type === "github", web: s.type === "web", urls: (s.config?.urls ?? []).join("\n"), crawl: !!s.config?.crawl, maxPages: String(s.config?.max_pages ?? 50), repository: s.config?.repository, include: (s.config?.include ?? []).join(", "), profiles: s.config?.profiles ?? [], exclude: (s.config?.exclude ?? []).join(", "),
       scope_environment: s.scope_environment, scope_namespace: s.scope_namespace, owner: s.owner ?? "", service: s.service ?? "", enabled: s.enabled,
       credType: s.credential_ref?.type === "env" ? "env" : "none", credName: s.credential_ref?.name ?? "" });
   }
@@ -186,7 +211,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
       await api(`/knowledge/sources/${editing.id}`, { method: "PUT", body: { scope_environment: editing.scope_environment, scope_namespace: editing.scope_namespace,
         owner: editing.owner || null, service: editing.service || null, enabled: editing.enabled,
         ...(editing.web ? { urls: parseUrls(editing.urls), crawl: editing.crawl, max_pages: Number(editing.maxPages) } : {}),
-        ...(editing.github ? { include: globs(editing.include), exclude: globs(editing.exclude), credential_ref: editing.credType === "env" ? { type: "env", name: editing.credName } : { type: "none" } } : {}) } });
+        ...(editing.github ? { include: globs(editing.include), exclude: globs(editing.exclude), profiles: editing.profiles, credential_ref: editing.credType === "env" ? { type: "env", name: editing.credName } : { type: "none" } } : {}) } });
       setEditing(null); list.reload(); onChange();
     } catch (err) { setError(err); }
   }
@@ -220,6 +245,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
           { key: "own", head: "Owner", cell: (s) => <span className="small">{s.team || s.owner || <span className="muted">no owner</span>} · {s.classification}</span> },
           { key: "d", head: "Documents", cell: (s) => <span className="small">{Object.entries(s.documents).map(([k, v]) => `${v} ${k}`).join(", ") || "none"}</span> },
           { key: "sy", head: "Sync", cell: (s) => <span className="small">{s.syncable ? <SyncState s={s} /> : <span className="muted">Managed by uploads</span>}</span> },
+          { key: "ix", head: "Index", cell: (s) => <IndexState s={s} /> },
           { key: "sch", head: "Schedule", cell: (s) => (s.syncable ? <span className="small">
             <select aria-label={`Schedule for ${s.name}`} value={s.sync_interval_minutes} onChange={(e) => api(`/knowledge/sources/${s.id}/schedule`, { method: "PUT", body: { sync_interval_minutes: Number(e.target.value) } }).then(list.reload)}>
               {!SCHEDULES.some(([m]) => m === s.sync_interval_minutes) && <option value={s.sync_interval_minutes}>every {s.sync_interval_minutes} min</option>}
@@ -245,6 +271,7 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
           <label>Token<select value={editing.credType} onChange={(e) => ed("credType", e.target.value)}><option value="none">shared token, or none</option><option value="env">env variable</option></select></label>
           {editing.credType === "env" && <label>Variable<input required pattern="MOKS_CRED_[A-Z0-9_]+" value={editing.credName} onChange={(e) => ed("credName", e.target.value)} placeholder="MOKS_CRED_GITHUB_TOKEN" /></label>}
         </div>}
+        {editing.github && <Profiles value={editing.profiles} onChange={(v) => ed("profiles", v)} />}
         <div className="small muted">Indexed documents are kept. A new scope applies straight away; new include or exclude rules apply at the next sync, which removes files that no longer qualify. The value of a token is never entered here: this names the variable that holds it.</div>
         <div className="row"><button>Save</button><button type="button" className="ghost" onClick={() => setEditing(null)}>Cancel</button></div>
       </form>}
@@ -267,12 +294,73 @@ function KnowledgeSources({ onChange }: { onChange: () => void }) {
           <label style={{ flex: 1 }}>Include globs (default: docs, runbooks, Markdown, YAML, Helm, Terraform, workflows)<input value={f.include} onChange={(e) => setF({ ...f, include: e.target.value })} placeholder="docs/** **/*.md k8s/**" /></label>
           <label>Token<select value={f.credType} onChange={(e) => setF({ ...f, credType: e.target.value })}><option value="none">public repo</option><option value="env">env variable</option></select></label>
           {f.credType === "env" && <label>Variable<input value={f.credName} onChange={(e) => setF({ ...f, credName: e.target.value })} placeholder="MOKS_CRED_GITHUB_TOKEN" /></label>}
+          <label>Service<input value={f.service} onChange={(e) => setF({ ...f, service: e.target.value })} placeholder="payments" title="Ties this repository to a service, so investigations of that service treat it as authoritative" /></label>
         </div>}
+        {f.type === "github" && <Profiles value={f.profiles} onChange={(v) => setF({ ...f, profiles: v })} />}
+        {f.type === "github" && <KnowledgeVsGit />}
         <ErrorBox error={error} />
         <div><button>Add source</button></div>
       </form>
     </div>
   );
+}
+
+const READY_LABEL: Record<string, string> = { complete: "complete", in_progress: "in progress", partial: "partial", failed: "failed", never: "never synced", not_applicable: "uploads" };
+
+/** Upstream sync and indexing finish at different times; readiness says what that means for search. */
+export function Readiness({ id }: { id: string }) {
+  const [path, setPath] = useState("");
+  const [asked, setAsked] = useState("");
+  const h = useLoad(() => api<any>(`/knowledge/sources/${id}/health${qs(asked ? { path: asked } : {})}`), [id, asked]);
+  const d = h.data;
+  return <section className="stack tight" aria-label="Retrieval readiness">
+    <h3>Retrieval readiness</h3>
+    <Loading load={h} />
+    {d && <>
+      <div className="row tight"><Badge kind={d.ready ? "ok" : "warn"}>{d.ready ? "searchable" : "not ready"}</Badge>
+        <span className="small">Sync: {READY_LABEL[d.upstream.state] ?? d.upstream.state} · Index: {d.indexing.state} ({d.indexing.backend}{d.indexing.mode ? `, ${d.indexing.mode}` : ""}) · {d.searchable.documents} documents, {d.searchable.chunks} chunks searchable</span></div>
+      <dl className="kv small">
+        <dt>Last successful sync</dt><dd><Time iso={d.upstream.last_success_at} />{d.upstream.revision ? <span className="mono"> @ {d.upstream.revision.slice(0, 12)}</span> : ""}</dd>
+        <dt>Files</dt><dd>{d.upstream.files.listed ?? "—"} listed · {d.upstream.files.included} included · {d.upstream.files.excluded_by_policy ?? "—"} left out by policy · {d.upstream.files.excluded_by_content} excluded on read · {d.upstream.files.failed} failed · {d.upstream.files.pending} pending</dd>
+        <dt>Documents</dt><dd>{d.documents.active} active · {d.documents.draft} draft · {d.documents.quarantined} quarantined · {d.documents.archived} archived</dd>
+        <dt>Index backlog</dt><dd>{d.indexing.outbox_pending} pending · {d.indexing.outbox_dead} failed · {d.indexing.documents_behind} documents behind</dd>
+        <dt>Scope</dt><dd className="mono">{d.source.scope.environment}/{d.source.scope.namespace}{d.source.scope.shared_globally ? " (shared globally)" : ""}{d.source.profiles.length ? ` · ${d.source.profiles.join(", ")}` : ""}</dd>
+      </dl>
+      {d.reasons.length > 0 && <ul className="small">{d.reasons.map((r: any) => <li key={r.code}>{r.message}{r.detail && <span className="muted"> ({r.detail})</span>}</li>)}</ul>}
+      {d.upstream.policy_sample?.length > 0 && <details className="small"><summary>Left out by the ingestion policy ({d.upstream.files.excluded_by_policy})</summary>
+        <ul>{d.upstream.policy_sample.map((x: any) => <li key={x.path}><span className="mono">{x.path}</span> <span className="muted">{x.rule}</span></li>)}</ul></details>}
+    </>}
+    <form className="row nowrap" onSubmit={(e) => { e.preventDefault(); setAsked(path); }}><input className="grow" aria-label="File path to explain" value={path} onChange={(e) => setPath(e.target.value)} placeholder="Why is this file not found? e.g. docs/runbook.md" /><button className="ghost">Explain</button></form>
+    {d?.path && <div className="small">{d.path.reasons.length ? d.path.reasons.map((r: any) => <div key={r.code}>{r.message}{r.detail && <span className="muted"> ({r.detail})</span>}</div>) : <span>Searchable.</span>}</div>}
+  </section>;
+}
+
+export function TestRetrieval({ id, env, ns }: { id: string; env: string; ns: string }) {
+  const [f, setF] = useState({ query: "", environment: env, namespace: ns });
+  const [res, setRes] = useState<any>(null);
+  const [error, setError] = useState<unknown>();
+  async function go(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    try { setRes(await api(`/knowledge/sources/${id}/test-retrieval`, { method: "POST", body: { query: f.query, environment: f.environment || null, namespace: f.namespace || null } })); } catch (err) { setError(err); }
+  }
+  return <section className="stack tight" aria-label="Test retrieval">
+    <h3>Test retrieval</h3>
+    <div className="small muted">Runs the search investigations use, with your access and the scope you give, on this source only.</div>
+    <form className="row" onSubmit={go}>
+      <input className="grow" required minLength={2} aria-label="Question" value={f.query} onChange={(e) => setF({ ...f, query: e.target.value })} placeholder="why is payments crash-looping" />
+      <input aria-label="Environment" value={f.environment} onChange={(e) => setF({ ...f, environment: e.target.value })} placeholder="environment" />
+      <input aria-label="Namespace" value={f.namespace} onChange={(e) => setF({ ...f, namespace: e.target.value })} placeholder="namespace" />
+      <button className="ghost">Test</button>
+    </form>
+    <ErrorBox error={error} />
+    {res && <div className="stack tight small">
+      <div>{res.results.length} passage(s) · {res.mode}{res.fallback_reason ? ` (${res.fallback_reason})` : ""}{res.latency_ms != null ? ` · ${res.latency_ms} ms` : ""}</div>
+      {res.reasons.length > 0 && <ul>{res.reasons.map((r: any, i: number) => <li key={i}>{r.message}{r.detail && <span className="muted"> ({r.detail})</span>}</li>)}</ul>}
+      {res.results.map((r: any) => <div key={r.chunk_id} className="rs static"><div className="mono">{r.citation.path} L{r.citation.lines?.[0]}-{r.citation.lines?.[1]}{r.citation.revision ? ` @ ${r.citation.revision.slice(0, 10)}` : ""}</div>
+        <div className="muted">{r.heading}</div><Truncate text={r.text.slice(0, 400)} /></div>)}
+    </div>}
+  </section>;
 }
 
 function SourceDetail({ s, onClose }: { s: any; onClose: () => void }) {
@@ -300,6 +388,8 @@ function SourceDetail({ s, onClose }: { s: any; onClose: () => void }) {
           <dt>Listing</dt><dd>{s.sync?.listing ?? "—"}</dd><dt>Content</dt><dd>{s.sync?.content ?? "—"}</dd>
           <dt>Stale content</dt><dd>{s.stale_policy === "exclude" ? "Left out of search" : "Marked in results"}</dd>
         </dl>
+        <Readiness id={s.id} />
+        <TestRetrieval id={s.id} env={s.scope_environment !== "*" ? s.scope_environment : ""} ns={s.scope_namespace !== "*" ? s.scope_namespace : ""} />
         <h3>Who can read this</h3>
         <form className="row nowrap" onSubmit={checkAccess}><input className="grow" type="email" required aria-label="Person to check" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="person@example.com" /><button className="ghost">Check</button></form>
         <ErrorBox error={error} />

@@ -18,6 +18,7 @@ data:
   MOKS_API_DOCS: {{ .Values.config.apiDocs | quote }}
   MOKS_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
   MOKS_MAX_TOOL_CALLS: {{ .Values.config.maxToolCalls | quote }}
+  MOKS_KNOWLEDGE_MAX_SEARCHES: {{ .Values.config.knowledgeMaxSearches | default 3 | quote }}
   MOKS_MAX_DURATION_SECONDS: {{ .Values.config.maxDurationSeconds | quote }}
   MOKS_MAX_QUERY_WINDOW_MINUTES: {{ .Values.config.maxQueryWindowMinutes | quote }}
   MOKS_WORKER_CONCURRENCY: {{ .Values.config.workerConcurrency | quote }}

@@ -84,7 +84,7 @@ async def setup(client):
     iid = await start(client, "why is checkout crashing")
     await Investigator(iid, "t").run()
     async with session_scope() as db:
-        ref = (await db.execute(select(Evidence.ref).where(Evidence.investigation_id == iid, Evidence.ok.is_(True)))).scalars().first()
+        ref = (await db.execute(select(Evidence.ref).where(Evidence.investigation_id == iid, Evidence.ok.is_(True), Evidence.tool != "kb_search"))).scalars().first()  # live evidence: documentation cannot back a proposal
     author = f"a-{uuid.uuid4().hex[:6]}@example.com"
     await make_user(author, ["admin"])
     return iid, ref, author, await login(client, author)

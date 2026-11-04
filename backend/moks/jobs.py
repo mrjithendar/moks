@@ -208,7 +208,7 @@ def handlers() -> dict[str, Handler]:
             raise
         src = await db.get(KnowledgeSource, src.id)
         src.last_counts = {k: result.get(k, 0) for k in ("added", "updated", "deleted", "unchanged", "excluded", "failed", "discovered", "processed", "remaining")}
-        src.last_counts.update(listing=result.get("listing"), content=result.get("content"))
+        src.last_counts.update(listing=result.get("listing"), content=result.get("content"), listed=result.get("listed"), policy_excluded=result.get("policy_excluded"), indexing=result.get("indexing"))
         if result.get("complete"):
             src.last_success_at = datetime.now(timezone.utc)
         await _plan_next(db, src)

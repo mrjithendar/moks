@@ -30,6 +30,7 @@ config:
   apiDocs: false
   logLevel: INFO
   maxToolCalls: 24
+  knowledgeMaxSearches: 3  # knowledge-stage searches per investigation, on top of maxToolCalls (docs/KNOWLEDGE.md)
   maxDurationSeconds: 180
   maxQueryWindowMinutes: 360
   workerConcurrency: 2

@@ -52,6 +52,32 @@ A document has its own `draft`, `quarantined`, `active`, `archived` or `deleted`
 document has not been confirmed against its source. `stale_policy: flag` marks results, and `exclude` drops them.
 Example: [examples/knowledge-source.json](examples/knowledge-source.json).
 
+## What a GitHub source reads
+
+A source chooses **profiles** (`config.profiles`, in the source form as "What to index"):
+
+| Profile | Reads |
+|---|---|
+| `documentation` | Markdown, MDX, reStructuredText, AsciiDoc, text, `docs/**`, `runbooks/**` |
+| `infrastructure` | YAML, Helm charts and values, kustomizations, Terraform and HCL, Dockerfiles, CI workflows (GitHub, GitLab, Jenkins), Makefiles, shell |
+| `application` | Python, Go, JavaScript, TypeScript, TSX, shell, Dockerfiles, `package.json`, `go.mod`, `pyproject.toml`, `requirements*.txt` |
+
+Explicit `include` globs always count, and profiles add to them. A source with neither reads what every source
+read before profiles existed (Markdown, `docs/`, `runbooks/`, YAML, Dockerfile, workflows, Helm, Terraform), so
+an existing source is never broadened by an upgrade; application code is read only when someone ticks it.
+`exclude` globs always narrow. Whatever a source includes, MOKS never indexes dependencies (`node_modules`,
+`vendor`, virtualenvs), generated output (`dist`, `.next`, `__pycache__`, coverage, minified files, source maps,
+lock files, Terraform state, generated protobuf), binaries, or files over 300 KB, and refuses files that look
+like credentials (key files, `.env`, Secret manifests with data, text with many credential-like values),
+recording them as excluded with the reason. `GET /knowledge/profiles` lists the exact patterns.
+
+Every listing records how many files it saw, how many the policy left out and up to 200 of those paths with the
+rule that decided, so "why is this file not searchable?" has an answer (see [Source readiness](#source-readiness)).
+
+These always-excluded patterns are a little wider than before this release (virtualenvs, `.next`, coverage,
+source maps, more lock files and binary types). A complete listing removes documents that no longer qualify, so
+the first sync may delete a few documents of those kinds.
+
 ## Synchronization
 
 Sync is daily by default, with Sync Now on the Sources table. Both go through one job, deduplicated per source, and `next_sync_at` is in PostgreSQL, so a restart loses nothing.
@@ -67,17 +93,29 @@ The state is reported separately: listing `complete | partial | failed`, content
 and counts of discovered, processed, excluded, failed and remaining files. **Deletions come only from a
 complete listing.** On a web source that means a pass that visited everything: a 404 during an interrupted crawl deletes nothing, because a failing site looks the same. `last_success_at` moves only when both the listing and the content are complete, so stopping at a page limit is not a success.
 
+**Sync is not indexing.** A pass that reads every file finishes the upstream half: `last_sync_status` and
+`last_success_at` say so. With PostgreSQL search the chunks are searchable in the same transaction. With
+OpenSearch or Pinecone the changes wait in the outbox, so the sync result and the Sources table carry a separate
+`indexing` state (`complete | pending | failed`, with pending and dead counts). A source is searchable when both
+halves are done and its documents are active; see [Source readiness](#source-readiness).
+
 A file PostgreSQL refuses is recorded as failed, and the pass goes on. A page over 300 KB keeps its first 300 KB and says so wherever the document is shown.
 
 `PIPELINE_VERSION` in `rag/chunking.py` is part of change detection. Raise it when chunking, redaction,
 extraction or stored metadata change, and GitHub documents are read again even though their content did not change.
+Code has its own `CODE_PIPELINE_VERSION` (4), so a change to how code is split re-reads code files only. The
+first sync after this release re-reads and re-embeds the code files a source already holds (Dockerfiles, `.tf`,
+shell), not its Markdown or YAML.
 Uploads and postmortems keep no original text, so they stay on their old pipeline until uploaded or approved again. Status shows how many.
 
 ## Chunks and citations
 
 Chunks are limited by estimated tokens (`MOKS_RAG_CHUNK_TOKENS`, default 350, and `MOKS_RAG_CHUNK_OVERLAP_TOKENS`,
 default 30, at 4 characters a token, an estimate because no tokenizer ships with MOKS). Markdown splits on headings
-and keeps fences together when they fit, YAML on documents and top-level keys, code on blank lines. These are
+and keeps fences together when they fit, YAML on documents and top-level keys. Code splits at top-level
+definitions (Python `def`/`class`, Go `func`/`type`, JavaScript and TypeScript functions, classes, exported
+constants, interfaces and types, shell functions, Terraform blocks, Dockerfile stages) once a section holds a
+third of a chunk, and each chunk's heading names the definitions in it; otherwise at blank lines. These are
 line heuristics, not parsers. A line too long for one chunk is split across several, so nothing is dropped.
 
 Offsets refer to the stored, redacted text. A citation gives source, path, revision and line range.
@@ -143,3 +181,104 @@ Evaluation content lives in `realm = 'evaluation'`, enforced in every candidate 
 ## Query understanding
 
 Search reads identifiers, error names, resource types and time references without a model, and returns them as `understanding`. `MOKS_RAG_DECOMPOSE` splits multi-part questions into separate rankings. It is off: on the `rag` dataset it changed neither recall, MRR nor nDCG and added latency. That dataset is small and synthetic, so re-measure on real questions before turning it on.
+
+## Knowledge in investigations
+
+Retrieval is a stage of every investigation, not a planner's choice (`orchestrator/knowledge.py`):
+
+    intake -> knowledge -> triage -> logs -> skills -> refresh -> plan/act or rules -> correlate -> report
+
+- **knowledge** runs before anything live is read, with or without a model. It searches the original question and,
+  when it adds anything, a second query built from what MOKS resolved: target, repository, namespace and, for a
+  short follow-up such as "how do I fix it?", the words of the turn before.
+- **refresh** runs once after triage, only when the findings name symptoms the first queries did not
+  (CrashLoopBackOff, OOMKilled, a crash log line) and add at least two new terms.
+- Guidance and concept questions use the same stage through `guidance.py`.
+
+Every search is a `kb_search` tool call, so the executor applies RBAC, stores the result as evidence and audits
+it. The scope is the investigation's environment and namespace, or the target's namespace once resolved, set
+before the first search. The stage has its own allowance, `MOKS_KNOWLEDGE_MAX_SEARCHES` (default 3), counted in
+`tool_calls` but not taken from the live-evidence budget. It stops near the time limit. A finished stage is in the
+checkpoint and is not run again on resume; a search stored as evidence before a crash is reused, not repeated.
+A failed search never stops the investigation: the report says the knowledge gap in `missing_evidence`.
+
+**Relevance never widens access.** It is decided after search, on passages the person may already read. Each
+passage gets one authority, with its reasons:
+
+| Authority | When | Used |
+|---|---|---|
+| `target` | the source's `service` or `applies_to.services` matches the target or a service the question names, the repository is the target's, the document is scoped to the target's namespace, it names a resource from the findings, or it names the target | yes |
+| `shared` | documentation with no service binding that shares enough of the request's terms (or ranks top 3 in hybrid search with some overlap) | yes, labeled general guidance |
+| `unverified` | relevant, but from a repository or service binding not established as the target's | given to the model with that label; never used for guidance steps |
+| `unrelated` | bound to another service | no, with the reason |
+| `low_relevance` | shares too little with the request | no, with the reason |
+
+Passages are judged again as context grows (triage names the workloads), so a billing runbook found before
+triage is marked unrelated once the run knows it is about payments. To make a repository authoritative for a
+service, set the source's **Service** (or `applies_to.services`) or the `services` path map.
+
+Passages reach the planner and the report once, in a bounded block (9,000 characters, 1,200 per passage) inside
+untrusted-data fences, labeled with authority, path, commit, lines and freshness. The prompts say documentation
+describes intent and never proves current state; claim validation still turns a fact that cites only
+documentation into a hypothesis. Without a model, or when the model cites none of the target's passages, MOKS
+adds the documented procedures to next steps, labeled "Documented, not observed". Retrieved text grants no tools
+and no scope: every call still goes through the executor's allowlist, and remediation is a proposal that needs an
+action plan and its approvals.
+
+The report's `knowledge` section (shown as **Knowledge used**) records status (`retrieved | partial | empty |
+failed | not_attempted`), the scope searched, every query with its result count, mode and fallback, each passage
+with repository, path, commit, lines, link, freshness, authority and why it was or was not used, and, when nothing
+was found, hints about the sources the person can read (unfinished syncs, index backlog, documents awaiting
+review). Hints count only sources the person can read and never name them. Logs carry stage, outcome, mode,
+fallback, timing and counts, never passage text; `moks_knowledge_retrievals_total{stage,outcome}` counts stages.
+
+## Source readiness
+
+`GET /knowledge/sources/{id}/health` (source administrators) separates:
+
+- **upstream**: last successful sync and revision, the pinned revision, and files listed, included, left out by
+  policy (with a sample and the rule), excluded on read, failed and pending;
+- **documents**: active, draft, quarantined and archived, and vector state;
+- **indexing**: backend, mode, outbox pending and dead, documents behind;
+- **searchable**: documents and chunks the active backend can return now;
+- **reasons**, each with a code: `source_inactive`, `never_synced`, `sync_failed`, `sync_incomplete`, `sync_partial`,
+  `no_active_index`, `indexing_pending`, `indexing_failed`, `awaiting_review`, `stale_excluded`, `no_searchable_documents`.
+
+With `?path=docs/runbook.md` it says why one file is or is not searchable: `file_excluded` (and the rule),
+`file_pending`, `file_failed`, `file_content_excluded`, `file_not_found`, `awaiting_review`, `indexing_pending`.
+
+`POST /knowledge/sources/{id}/test-retrieval` (`knowledge.test`) runs the investigation's search, narrowed to the
+source, under the caller's grants and the environment and namespace given. When nothing comes back it adds the
+reasons above plus `outside_scope`, `no_access` or `no_results`. Someone who can neither read the source's scope nor
+administer sources gets 404; a reader who is not an administrator sees only the scope reasons, not counts. The audit
+record keeps the query length, not the query. Both are in the source's details drawer (Retrieval readiness, Test retrieval).
+
+A GitHub knowledge source and a Git connector are different things. The source copies files into the index on a
+schedule, and investigations search that copy under each person's knowledge access. The connector reads a
+repository live during an investigation (deployed revision, commits, files) within its own allowlist. Neither
+creates the other, and neither uses the other's credential.
+
+## Verify end to end
+
+With one GitHub repository and one investigation, on a test environment:
+
+1. **Source.** Knowledge Base, Sources: add a GitHub source for `owner/repo` scoped to the environment and the
+   namespace the service runs in, Service set to the service name, profiles Documentation and Infrastructure
+   (add Application to index code). The first sync is queued.
+2. **Sync.** When the row's Sync shows complete, open Details. Retrieval readiness should read *searchable*, with
+   Sync complete, Index complete, and nonzero searchable documents and chunks. If not, the reasons say which half
+   is unfinished. With OpenSearch, Index may read *indexing* for a minute while the outbox drains.
+3. **One file.** Type the runbook's path into "Why is this file not found?" and press Explain: it should say
+   Searchable, or name the rule, the review state or the index backlog.
+4. **Test retrieval.** In the same drawer, ask what an engineer would ("why is <service> crash-looping") with the
+   source's environment and namespace. The runbook's passage should come back with path, lines and commit. Sign in
+   as someone without a binding on that namespace and the same test returns 404 or no results with `no_access`.
+5. **Investigation.** Run "why is <service> crash-looping?" in that environment and namespace. In the report,
+   **Knowledge used** shows status *retrieved*, the scope searched, the queries, and the runbook passage as
+   *about the target* with a link to the commit and lines. Recommended next steps cite it (E-ref) as a documented
+   procedure, separate from observed facts. The Evidence list shows the `kb_search` call before the first
+   Kubernetes call.
+6. **Follow-up.** Ask "how do I fix it?" in the same conversation: Queries shows a second query with the service
+   name, and the new turn has its own `kb_search` evidence.
+7. **Negative check.** Quarantine the runbook document in the Knowledge Explorer and ask again: the passage is
+   gone, and Knowledge used gives the reason (nothing relevant, plus a hint that documents await review).

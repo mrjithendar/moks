@@ -42,7 +42,7 @@ from ..scope import ScopeError, effective_scope
 from ..tools.contracts import ToolContext
 from ..tools.executor import ToolExecutor, ToolOutcome, tools_for_planner
 from ..tools.lc import as_tools
-from . import graph, prompts, relevance
+from . import graph, knowledge, prompts, relevance
 from .. import conversations
 from ..diagnosis.logs import last_failure
 from ..llm.budget import CHARS_PER_TOKEN
@@ -156,15 +156,20 @@ class Investigator:
         self.environment_info: dict[str, Any] = {}
         self.conversation_namespace: str | None = None
         self.llm_failures: tuple = (Exception,)
+        self.knowledge: dict[str, Any] = knowledge.new_state()  # the retrieval stage: queries, passages, why each was or was not used
+        self.started = time.monotonic()
+
+    def time_left(self) -> float:
+        return self.settings.max_duration_seconds - (time.monotonic() - self.started)
 
     @property
     def tool_budget(self) -> int:
         """Tool calls this request may use: the intent's budget, never above the global ceiling."""
         cap = self.settings.max_tool_calls
         if self.request is None:
-            return cap
+            return cap + self.knowledge.get("calls", 0)
         own = (self.settings.intent_tool_budgets or {}).get(self.request.primary) or cap
-        return max(1, min(cap, own))
+        return max(1, min(cap, own)) + self.knowledge.get("calls", 0)  # the knowledge stage has its own allowance
 
     async def _fence(self, db) -> None:
         """Inside a transaction that is about to write: the row lock holds off the reaper until the
@@ -211,7 +216,7 @@ class Investigator:
 
     async def _run(self) -> None:
         INVESTIGATIONS_RUNNING.inc()
-        start = time.monotonic()
+        start = self.started = time.monotonic()
         mode = "unknown"
         async with session_scope() as db:
             self.seq = int((await db.execute(select(func.coalesce(func.max(InvestigationEvent.seq), 0))
@@ -340,7 +345,7 @@ class Investigator:
         return {
             "version": CHECKPOINT_VERSION, "completed": self.completed_nodes, "ref": self.ref, "tool_calls": self.tool_calls, "evidence_refs": [e["ref"] for e in self.evidence],
             "graph": {k: (report.model_dump() if k == "report" and report is not None else state.get(k)) for k in ("namespace", "round", "calls", "use_rules", "finished", "mode", "report", "workflow")},
-            "request": self.request.model_dump() if self.request else None, "trace": self.trace, "gaps": self.gaps, "retrieval_notes": self.retrieval_notes,
+            "request": self.request.model_dump() if self.request else None, "trace": self.trace, "gaps": self.gaps, "retrieval_notes": self.retrieval_notes, "knowledge": knowledge.for_checkpoint(self.knowledge),
             "sources": [{k: v for k, v in x.items() if k != "text"} for x in self.sources], "shared_findings": self.shared_findings, "excluded": self.excluded,
             "notes": self.notes, "findings": self.findings, "calls_seen": sorted(self.calls_seen), "rejected": self.rejected[-20:], "focus_namespace": self.focus_namespace,
             "skills": [{"digest": sk.digest, "score": score, "reasons": why} for sk, score, why in self.skills], "skill_runs": self.skill_runs, "skill_rejected": self.skill_rejected,
@@ -391,6 +396,7 @@ class Investigator:
             self.request = RequestContext.model_validate(cp["request"])
         self.trace = cp.get("trace") or self.trace
         self.gaps, self.retrieval_notes = cp.get("gaps") or [], cp.get("retrieval_notes") or []
+        self.knowledge = knowledge.restore(self, cp.get("knowledge"))  # completed stages are not searched again
         self.shared_findings, self.excluded = cp.get("shared_findings") or [], cp.get("excluded") or []
         by_ref = {e["ref"]: e.get("data") for e in self.evidence}
 
@@ -528,6 +534,7 @@ class Investigator:
         payload["shared_findings"] = self.shared_findings
         payload["excluded"] = self.excluded
         payload["request"] = req.trace()
+        await self._knowledge_outcome(report, payload, ledger, env_name, namespace)
         verdict = relevance.check(payload, req, ledger, self.findings)
         payload["relevance"] = verdict
         self.trace["relevance"] = {"status": verdict["status"], "failed": [c["name"] for c in verdict.get("first_pass", verdict["checks"]) if not c["passed"]], "corrections": verdict["corrections"]}
@@ -741,6 +748,42 @@ class Investigator:
         log.info("request routed", extra={"event": "request_routed", "investigation_id": str(self.id), "operation": req.primary, "workflow": req.workflow,
                                            "scope": req.scope, "unresolved": ",".join(req.unresolved), "classifier": req.classifier})
 
+    async def _retrieve(self, executor: ToolExecutor, question: str, stage: str, namespace: str) -> None:
+        """The knowledge stage. Runs in every mode, so documented procedures never depend on a planner asking.
+        Searches are scoped like every other read: the investigation's namespace, or the target's once resolved."""
+        req = self.request
+        if not executor.ctx.focus_namespace:
+            if namespace != "*":
+                executor.ctx.focus_namespace = namespace
+            elif req is not None and req.scope == "target" and len(req.namespaces) == 1:
+                executor.ctx.focus_namespace = req.namespaces[0]
+        if stage == "initial":
+            await self._emit("phase", {"phase": "knowledge", "label": "Searching runbooks and repository knowledge"})
+        else:
+            await self._emit("phase", {"phase": "knowledge", "label": "Searching the runbooks for these symptoms"})
+        await knowledge.run(self, executor, stage, question)
+
+    async def _knowledge_outcome(self, report: Report, payload: dict, ledger: Ledger, env_name: str, namespace: str) -> None:
+        """Which passages the answer used, what remains unverified, and why the index may have had less than hoped."""
+        st = self.knowledge
+        if report.generated_by == "llm" and payload.get("response_type") == "troubleshooting":
+            cited = {r for f in report.observed_facts for r in f.evidence} | {r for c in report.suspected_causes for r in c.evidence} | {r for x in report.next_steps for r in knowledge.REF.findall(x)}
+            if not cited & {p["ref"] for p in knowledge.usable(st) if p["authority"] == "target"}:
+                report.next_steps = [*report.next_steps, *knowledge.documented_steps(self, 2)]
+                payload["next_steps"] = report.next_steps
+        knowledge.reclassify(self, self.request.question if self.request else "")
+        knowledge.mark_used(self, report)
+        if st["status"] in ("empty", "failed", "not_attempted") and self.owner is not None:
+            async with session_scope() as db:
+                principal = await load_principal(db, self.owner)
+            st["hints"] = await knowledge.hints(self, principal, env_name, None if namespace in (None, "*") else namespace)
+        if st["status"] == "failed":
+            payload["missing_evidence"] = [*payload.get("missing_evidence", []), "Knowledge search failed, so documented procedures could not be checked; the answer rests on live evidence only."]
+        elif st["status"] == "empty" and payload.get("response_type") == "troubleshooting":
+            payload["missing_evidence"] = [*payload.get("missing_evidence", []), "No authorized runbook or repository passage matched this request; no documented procedure was checked."]
+        payload["knowledge"] = knowledge.summary(self)
+        self.trace["knowledge"] = {"status": st["status"], "queries": len(st["queries"]), "passages": len(st["passages"]), "used": payload["knowledge"]["counts"]["used"]}
+
     async def _shared_dependencies(self, executor: ToolExecutor, ctx: ToolContext) -> None:
         """Widen past the target only when its own evidence points at something shared, and say why."""
         req = self.request
@@ -774,6 +817,12 @@ class Investigator:
     def _view(self, e: dict[str, Any]) -> dict[str, Any]:
         """Evidence as the model sees it for this request: output a tool could not filter is filtered here,
         and the stored evidence keeps everything, so provenance is intact."""
+        if e["tool"] == "kb_search" and e["ok"] and isinstance(e.get("data"), list):
+            # Passage text goes to the model once, in the knowledge block, labeled by how it relates to the request.
+            by_chunk = {p["chunk_id"]: p for p in self.knowledge["passages"]}
+            rows = [{"path": (h.get("citation") or {}).get("path"), "lines": (h.get("citation") or {}).get("lines"),
+                     "authority": by_chunk.get(h.get("chunk_id"), {}).get("authority", "not classified")} for h in e["data"] if isinstance(h, dict)]
+            return {**e, "data": {"passages": rows, "text": "in the documented knowledge block"}}
         req = self.request
         if req is None or req.scope != "target" or not e["ok"]:
             return e
@@ -1292,7 +1341,8 @@ class Investigator:
         tools = [t.schema_for_llm() for t in tools_for_planner(ctx)]
         system = prompts.PLANNER_SYSTEM.replace("{max_calls}", str(MAX_CALLS_PER_ROUND)) + prompts.skills_section(self.skills)
         await self._emit("phase", {"phase": "planning", "label": f"Planning follow-up evidence (round {round_no})"})
-        return await self._llm(provider, cfg, system, prompts.planner_user(question, scope_info, tools, self._views(), self.findings, self.tool_budget - self.tool_calls, self.rejected, self.request),
+        return await self._llm(provider, cfg, system, prompts.planner_user(question, scope_info, tools, self._views(), self.findings, self.tool_budget - self.tool_calls, self.rejected, self.request,
+                                                                          knowledge.prompt_block(self)),
                                PLAN_TOKENS, MIN_PLAN_TOKENS)
 
     async def _act(self, executor: ToolExecutor, ctx: ToolContext, calls: list) -> int:
@@ -1327,11 +1377,12 @@ class Investigator:
                 self.notes.append(f"LLM report unavailable ({getattr(exc, 'message', str(exc))}); showing the rule-based report.")
         rep = rules_report(question, self.findings, self._views(), self.notes)
         rep.response_type = rtype
+        rep.next_steps = [*rep.next_steps, *knowledge.documented_steps(self)]
         return rep, "deterministic" if not provider else "llm_fallback"
 
     async def _llm_report(self, provider, cfg: LLMConfig, question: str, scope_info: dict) -> Report:
         raw = await self._llm(provider, cfg, prompts.REPORT_SYSTEM + prompts.skills_section(self.skills),
-                              prompts.report_user(question, scope_info, self._views(), self.findings, self.notes, self.request, self.shared_findings),
+                              prompts.report_user(question, scope_info, self._views(), self.findings, self.notes, self.request, self.shared_findings, knowledge.prompt_block(self)),
                               REPORT_TOKENS, MIN_REPORT_TOKENS)
         refs = {e["ref"] for e in self.evidence if e["ref"]}
         return validate_llm_report(raw, refs, self.notes)

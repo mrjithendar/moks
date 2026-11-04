@@ -190,6 +190,10 @@ tr.selected { background: var(--accent-soft); }
 .rs ul { margin: 6px 0 0; padding-left: 18px; }
 .rs li { margin-bottom: 5px; }
 .rs.static { padding-top: 10px; }
+.knowledge .passages { list-style: none; padding-left: 0; }
+.knowledge .passage { border-left: 2px solid var(--border-soft); padding-left: 8px; }
+.knowledge .mono, .knowledge .excerpt { overflow-wrap: anywhere; word-break: break-word; }
+.row.wrap { flex-wrap: wrap; }
 .rs.missing { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: var(--radius-s); padding: 8px 10px; margin: 8px 0; }
 .proposal-note { margin-top: 6px; }
 .cite { position: relative; display: inline-block; font-family: var(--mono); font-size: 11px; line-height: 16px; padding: 0 5px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); margin-left: 4px; cursor: pointer; border: 1px solid var(--info-line); font-weight: 400; min-height: 0; }

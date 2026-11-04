@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     investigation_max_attempts: int = 2  # a crashed run resumes this many times in all
     # Tool calls per intent, under max_tool_calls (0 or absent: max_tool_calls). JSON in MOKS_INTENT_TOOL_BUDGETS.
     intent_tool_budgets: dict[str, int] = {"conceptual": 2, "deployment_guidance": 12, "repository": 10, "execution": 12}
+    # Searches the knowledge stage may run per investigation (initial plus one refresh after triage). They are
+    # counted in tool_calls but come from this allowance, so documented procedures never cost live evidence.
+    knowledge_max_searches: int = 3
     guidance_max_files: int = 6        # repository files read for one guidance answer
     intent_llm_classifier: bool = True  # ask the chat model only when the rules are unsure
     rag_rerank_enabled: bool = False  # stays off until docs/RERANKING.md's gates pass on real questions

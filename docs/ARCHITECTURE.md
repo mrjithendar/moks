@@ -365,6 +365,11 @@ target's own (the same unreachable host, the same repository) become a separate 
 planner's `expand` stands only if the evidence it cites names the namespace. Every expansion records its reason
 and evidence. Tool budgets are per intent (`MOKS_INTENT_TOOL_BUDGETS`, under `MOKS_MAX_TOOL_CALLS`).
 
+Knowledge retrieval is a graph stage (`knowledge` before triage, one `refresh` after skills), so documented
+procedures reach every investigation whether or not a planner asks. Searches go through `kb_search` and the
+executor, come from their own allowance (`MOKS_KNOWLEDGE_MAX_SEARCHES`), are ranked for relevance only after
+authorization, and are recorded in the report's `knowledge` section. [KNOWLEDGE.md](KNOWLEDGE.md#knowledge-in-investigations) has the rules.
+
 Guidance (`orchestrator/guidance.py`) reads the knowledge index and the target's repository (README, runbooks,
 CI workflows, Dockerfiles, kustomizations, Argo CD definitions; `git_list_files` finds them), then extracts
 prerequisites, steps, verification and rollback, each item citing its source. A model may organize the answer,

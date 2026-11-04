@@ -452,8 +452,9 @@ async def test_a_pipeline_change_reprocesses_unchanged_content(github, monkeypat
     reads = gh.blob_reads
     await run_sync(sid)
     assert gh.blob_reads == reads
-    monkeypatch.setattr(ingest, "PIPELINE_VERSION", 99)
-    monkeypatch.setattr(service, "PIPELINE_VERSION", 99)
+    from moks.rag import chunking
+
+    monkeypatch.setattr(chunking, "PIPELINE_VERSION", 99)  # version_for reads it at call time
     r = await run_sync(sid)
     assert gh.blob_reads == reads + 1 and r["complete"]
     async with session_scope() as db:

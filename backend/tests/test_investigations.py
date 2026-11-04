@@ -190,9 +190,12 @@ class ScriptedLLM:
             ], "done": len(self.requests) > 1}
             content = json.dumps(plan)
         else:
+            import re
+
+            triage = (re.search(r"\[(E\d+)\] k8s_triage", body["messages"][1]["content"]) or re.search(r"(E1)", "E1")).group(1)  # knowledge searches come first
             content = json.dumps({
                 "summary": "The root cause is confirmed: payments crashes.",
-                "observed_facts": [{"statement": "payments is crashlooping", "evidence": ["E1"]},
+                "observed_facts": [{"statement": "payments is crashlooping", "evidence": [triage]},
                                    {"statement": "made-up fact", "evidence": ["E99"]},
                                    {"statement": "uncited claim", "evidence": []}],
                 "suspected_causes": [{"cause": "bad config", "confidence": "high", "evidence": ["E42"], "reasoning": "guess"}],

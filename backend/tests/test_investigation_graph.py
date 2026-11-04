@@ -86,10 +86,11 @@ REPORT = json.dumps({"summary": "done", "observed_facts": [], "suspected_causes"
 def test_the_graph_has_the_documented_shape():
     drawn = graph.build(None, None, None, "q", {}, object(), None, ()).get_graph()
     nodes = set(drawn.nodes) - {"__start__", "__end__"}
-    assert nodes == {"intake", "gather", "compose", "concept", "triage", "logs", "skills", "plan", "act", "rules", "correlate", "report"}
+    assert nodes == {"intake", "knowledge", "refresh", "gather", "compose", "concept", "triage", "logs", "skills", "plan", "act", "rules", "correlate", "report"}
     edges = {(e.source, e.target) for e in drawn.edges}
     assert {("plan", "act"), ("act", "plan"), ("plan", "rules"), ("act", "correlate"), ("report", "__end__")} <= edges
     # Every request is understood before anything live is read, and only investigations triage
+    assert {("intake", "knowledge"), ("knowledge", "triage"), ("skills", "refresh"), ("refresh", "plan"), ("refresh", "rules")} <= edges  # retrieval is a stage, not a planner choice
     assert {("__start__", "intake"), ("intake", "triage"), ("intake", "gather"), ("intake", "concept"), ("gather", "compose"), ("compose", "__end__"), ("concept", "__end__")} <= edges
 
 
