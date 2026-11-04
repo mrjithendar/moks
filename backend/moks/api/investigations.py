@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -23,10 +24,12 @@ from ..auth.sessions import AuthContext, client_ip
 from ..config import get_settings
 from ..db import get_db, session_scope
 from ..models import Conversation, ConversationMessage, Environment, Evidence, Investigation, InvestigationEvent, User
-from ..observability import traceparent
+from ..observability import SSE_STREAMS, SSE_STREAMS_OPEN, traceparent, unrecorded
 from ..rbac import P
 from ..scope import ScopeError, effective_scope
 from .common import env_or_404, max_window
+
+log = logging.getLogger("moks.api.investigations")
 
 router = APIRouter(tags=["investigations"])
 
@@ -289,7 +292,15 @@ async def get(inv_id: uuid.UUID, request: Request, ctx: AuthContext = Depends(ge
     follow = (await db.execute(select(Investigation).where(Investigation.parent_id == inv.id).order_by(Investigation.created_at))).scalars().all()
     out["follow_ups"] = [{"id": str(i.id), "question": i.question, "status": i.status} for i in follow if ctx.principal.can(P.INVESTIGATION_READ, env.name, i.namespace)]
     out["parent_id"] = str(inv.parent_id) if inv.parent_id else None
+    queued = (await db.execute(select(InvestigationEvent.payload).where(InvestigationEvent.investigation_id == inv.id, InvestigationEvent.seq == 0))).scalar_one_or_none() or {}
+    out["trace_id"] = trace_id_of(queued.get("traceparent"))  # the key that finds this run in Jaeger and its lines in Loki
     return out
+
+
+def trace_id_of(value: str | None) -> str | None:
+    """The trace id from a W3C traceparent (00-<32 hex>-<16 hex>-<flags>), or None."""
+    parts = (value or "").split("-")
+    return parts[1] if len(parts) == 4 and re.fullmatch(r"[0-9a-f]{32}", parts[1]) and parts[1] != "0" * 32 else None
 
 
 @router.post("/investigations/{inv_id}/cancel")
@@ -305,6 +316,9 @@ async def cancel(inv_id: uuid.UUID, request: Request, ctx: AuthContext = Depends
     return {"status": "cancelling"}
 
 
+STREAM_SECONDS = 600  # one connection; the browser reconnects with Last-Event-ID
+
+
 @router.get("/investigations/{inv_id}/events")
 async def events(inv_id: uuid.UUID, request: Request, after: int = -1, ctx: AuthContext = Depends(get_auth),
                  db: AsyncSession = Depends(get_db, scope="function")) -> StreamingResponse:
@@ -316,14 +330,15 @@ async def events(inv_id: uuid.UUID, request: Request, after: int = -1, ctx: Auth
     last = request.headers.get("last-event-id")
     cursor = int(last) if last and last.lstrip("-").isdigit() else after
 
-    async def stream():
+    async def poll():
         nonlocal cursor
-        deadline = asyncio.get_running_loop().time() + 600
+        deadline = asyncio.get_running_loop().time() + STREAM_SECONDS
         idle = 0
         checked = asyncio.get_running_loop().time()
         yield "retry: 2000\n\n"
         while asyncio.get_running_loop().time() < deadline:
             if await request.is_disconnected():
+                ended["outcome"] = "disconnected"
                 return
             if asyncio.get_running_loop().time() - checked >= STREAM_RECHECK_SECONDS:
                 checked = asyncio.get_running_loop().time()
@@ -331,6 +346,7 @@ async def events(inv_id: uuid.UUID, request: Request, after: int = -1, ctx: Auth
                     current = await load(s, cookie)  # the session and today's roles, not the ones at connect
                     allowed = current is not None and current.principal.can(P.INVESTIGATION_READ, env_name, namespace)
                 if not allowed:
+                    ended["outcome"] = "revoked"
                     yield "event: revoked\ndata: {}\n\n"
                     return
             async with session_scope() as s:
@@ -340,10 +356,12 @@ async def events(inv_id: uuid.UUID, request: Request, after: int = -1, ctx: Auth
                 status = (await s.get(Investigation, inv_id)).status
             for r in rows:
                 cursor = r.seq
+                ended["events"] += 1
                 data = json.dumps({"type": r.type, "seq": r.seq, "at": r.created_at.isoformat(), **r.payload}, default=str)
                 yield f"id: {r.seq}\nevent: {r.type}\ndata: {data}\n\n"
             if not rows:
                 if status in TERMINAL:
+                    ended["outcome"] = "end"
                     yield "event: end\ndata: {}\n\n"
                     return
                 idle += 1
@@ -352,7 +370,28 @@ async def events(inv_id: uuid.UUID, request: Request, after: int = -1, ctx: Auth
                 await asyncio.sleep(min(0.5, STREAM_RECHECK_SECONDS))
             else:
                 idle = 0
+        ended["outcome"] = "timeout"
         yield "event: timeout\ndata: {}\n\n"
+
+    ended = {"outcome": "cancelled", "events": 0}  # cancelled: the server stopped the stream (client gone, shutdown)
+
+    async def stream():
+        """The polling records nothing in the trace: the request's span ends with the stream and says how."""
+        from opentelemetry import trace
+
+        server, start = trace.get_current_span(), asyncio.get_running_loop().time()
+        SSE_STREAMS_OPEN.inc()
+        try:
+            with unrecorded():
+                async for chunk in poll():
+                    yield chunk
+        finally:
+            SSE_STREAMS_OPEN.dec()
+            SSE_STREAMS.labels(ended["outcome"]).inc()
+            server.set_attribute("moks.stream.outcome", ended["outcome"])
+            server.set_attribute("moks.stream.events", ended["events"])
+            log.info("event stream closed", extra={"event": "sse_stream_closed", "operation": ended["outcome"], "durationMs": int((asyncio.get_running_loop().time() - start) * 1000),
+                                                    "investigation_id": str(inv_id)})
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"})

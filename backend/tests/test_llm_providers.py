@@ -20,6 +20,7 @@ def cfg(provider, model="m", endpoint=None, name="MOKS_CRED_TEST_KEY"):
 def key(monkeypatch):
     monkeypatch.setenv("MOKS_CRED_TEST_KEY", "secret-value\n")
     monkeypatch.setattr(p, "_wait", lambda r, a: 0)
+    monkeypatch.setattr(p, "_ADJUSTED", {})  # what servers refused is remembered per process
 
 
 def transport(*responses):
@@ -68,6 +69,15 @@ async def test_a_server_refusing_a_parameter_gets_the_request_without_it(error, 
     t, seen = transport(httpx.Response(400, json={"error": {"message": error}}), CHAT)
     r = await ask(cfg("openai", endpoint="https://x.example/v1"), t)
     assert r.text and removed not in json.loads(seen[1].content)
+
+
+async def test_a_refused_parameter_is_not_sent_again_to_the_same_model():
+    t, seen = transport(httpx.Response(400, json={"error": {"message": "Unsupported value: 'temperature' does not support 0.1"}}), CHAT)
+    c = cfg("openai", endpoint="https://x.example/v1")
+    await ask(c, t)
+    t2, seen2 = transport(CHAT)
+    await ask(c, t2)
+    assert len(seen) == 2 and len(seen2) == 1 and "temperature" not in json.loads(seen2[0].content)
 
 
 async def test_max_tokens_field_is_swapped_when_refused():
@@ -180,6 +190,19 @@ async def test_claude_request_sends_no_sampling_or_prefill_and_reads_only_text(c
     assert "temperature" not in call and call["messages"][-1]["role"] == "user" and "JSON object" in call["system"]
     assert call["max_tokens"] == 500  # the configured cap holds, even under the floor thinking would like
     assert claude.init["api_key"] == "secret-value"
+
+
+async def test_claude_reports_which_model_served_and_whether_a_fallback_ran(claude):
+    """The served-by signal is a fallback_message entry in usage.iterations; response.model names the server."""
+    m = message()
+    m.model = "claude-sonnet-5-5"
+    m.usage.iterations = [SimpleNamespace(type="message", model="claude-opus-5-5"), SimpleNamespace(type="fallback_message", model="claude-sonnet-5-5")]
+    claude.answer = m
+    r = await provider_for(cfg("anthropic", "claude-opus-5-5")).complete("s", [{"role": "user", "content": "h"}], json_mode=False, max_tokens=100)
+    assert r.response_model == "claude-sonnet-5-5" and r.fallback
+    claude.answer = message()
+    r = await provider_for(cfg("anthropic", "claude-opus-5-5")).complete("s", [{"role": "user", "content": "h"}], json_mode=False, max_tokens=100)
+    assert r.response_model is None and not r.fallback  # a plain answer, or a stub without the field
 
 
 async def test_claude_fallback_is_used_on_models_that_support_it_and_not_through_a_gateway(claude):

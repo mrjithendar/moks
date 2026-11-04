@@ -209,6 +209,9 @@ export function InvestigationView() {
             <div className="stack">
               <Stages current={inv.stage} done={TERMINAL.has(inv.status)} />
               {inv.parent_id && <div className="small">Follow-up of <Link to={`/investigations/${inv.parent_id}`}>an earlier investigation</Link>.</div>}
+              {inv.trace_id && TERMINAL.has(inv.status) && (
+                <div className="small muted">Trace <code>{inv.trace_id}</code> <CopyButton text={inv.trace_id} label="Copy trace id" /> finds this run in Jaeger and its log lines in Loki.</div>
+              )}
               {report ? <Report report={report} evidence={evidence} onCite={setOpen} onPropose={can("action.request") && inv.namespace !== "*" ? setPropose : undefined} /> : (
                 <div className="card empty">{TERMINAL.has(inv.status) ? "No report was produced." : "Collecting evidence…"}</div>
               )}

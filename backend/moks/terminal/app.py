@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     s = get_settings()
-    setup_logging(s.log_level)
+    setup_logging(s.log_level, f"{s.otel_service_name}-terminal")
     app = FastAPI(title="MOKS terminal gateway", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     setup_tracing(f"{s.otel_service_name}-terminal", app)
 

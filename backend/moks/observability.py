@@ -53,6 +53,15 @@ LLM_LATENCY = Histogram(
 )
 LLM_TOKENS = Counter("moks_llm_tokens_total", "LLM tokens", ["provider", "model", "direction"])
 LLM_COST = Counter("moks_llm_cost_usd_total", "Estimated LLM cost in USD", ["provider", "model"])
+LLM_RETRIES = Counter("moks_llm_retries_total", "Provider calls repeated after a rate limit or overload", ["provider"])
+LLM_FALLBACKS = Counter("moks_llm_fallbacks_total", "Answers served by a different model than the one asked", ["provider", "model"])
+LLM_ANSWERS_UNUSED = Counter("moks_llm_answers_unused_total", "Model answers MOKS could not use, so it wrote a rule-based one",
+                             ["stage", "reason"])
+EMBED_REQUESTS = Counter("moks_embedding_requests_total", "Embedding calls", ["provider", "outcome"])
+EMBED_LATENCY = Histogram("moks_embedding_latency_seconds", "Embedding call latency", ["provider"],
+                          buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30))
+SSE_STREAMS_OPEN = Gauge("moks_sse_streams_open", "Investigation event streams open in this process")
+SSE_STREAMS = Counter("moks_sse_streams_total", "Investigation event streams by how they ended", ["outcome"])
 RERANK_CALLS = Counter("moks_rerank_calls_total", "Reranking attempts by outcome", ["outcome"])
 RERANK_SECONDS = Histogram("moks_rerank_seconds", "Round trip to the reranking service", buckets=(0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2))
 RERANK_CANDIDATES = Histogram("moks_rerank_candidates", "Authorized candidates sent for reranking", buckets=(1, 5, 10, 20, 30, 40, 50))
@@ -89,6 +98,29 @@ def start_metrics_server(port: int) -> None:
         start_http_server(port)
     except OSError as exc:  # port already in use (e.g. embedded worker in the same process)
         logging.getLogger("moks").warning("metrics server not started", extra={"event": "metrics_port_busy", "errorType": type(exc).__name__})
+
+
+_UNUSABLE = (("no JSON object", "no_json"), ("not a JSON object", "not_object"), ("schema invalid", "schema_invalid"))
+
+
+def llm_answer_unused(stage: str, exc: BaseException) -> str:
+    """Records why a model's answer was not used (stage: report, guidance, concept). The model call itself may
+    have succeeded: an answer that is not JSON or fails the schema ends here too, and before this only the
+    report's notes said so. The reason is a fixed code, never the model's text."""
+    kind = getattr(exc, "kind", None)
+    reason = kind if isinstance(kind, str) and kind else next((code for words, code in _UNUSABLE if words in str(exc)), type(exc).__name__)
+    reason = reason[:40]
+    LLM_ANSWERS_UNUSED.labels(stage, reason).inc()
+    try:
+        from opentelemetry import trace
+
+        here = trace.get_current_span()
+        here.set_attribute("moks.llm.answer_unused", reason)
+    except Exception:  # pragma: no cover - tracing optional
+        pass
+    logging.getLogger("moks.llm").warning("model answer not used", extra={"event": "llm_answer_unused", "operation": stage,
+                                                                          "errorType": type(exc).__name__, "errorCode": reason})
+    return reason
 
 
 # ---- Log context -------------------------------------------------------------------------
@@ -147,6 +179,9 @@ def error_fields(exc: BaseException) -> dict[str, str]:
 
 # ---- Logging -----------------------------------------------------------------------------
 
+# Which process and release wrote a line; set by setup_logging. Pod and namespace come from the collector.
+_identity: dict[str, str] = {}
+
 _EXTRA_FIELDS = (
     "event", "route", "method", "status", "durationMs", "outcome", "errorType", "operation",
     "dependency", "investigation_id", "tool", "action", "decision", "connector_type", "request_id", "errorCode",
@@ -163,6 +198,7 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "logger_name": record.name,
             "message": record.getMessage(),
+            **_identity,
         }
         out.update(getattr(record, "_moks_context", None) or _log_context.get())  # what the line is part of; the record's own fields win
         for key in _EXTRA_FIELDS:
@@ -193,7 +229,12 @@ def _with_context(factory):
     return make
 
 
-def setup_logging(level: str = "INFO") -> None:
+def setup_logging(level: str = "INFO", service: str | None = None) -> None:
+    from . import __version__
+    from .config import get_settings
+
+    commit = (get_settings().build_commit or "")[:12]
+    _identity.update({"service": service or "moks", "version": f"{__version__}+{commit}" if commit else __version__})
     if not getattr(logging.getLogRecordFactory(), "_moks", False):
         logging.setLogRecordFactory(_with_context(logging.getLogRecordFactory()))
     handler = logging.StreamHandler(sys.stdout)
@@ -230,10 +271,11 @@ def setup_tracing(service_name: str, app=None) -> None:
     from . import __version__
     from .config import get_settings
 
-    provider = TracerProvider(resource=Resource.create({
+    provider = TracerProvider(sampler=sampler(get_settings().trace_sample_ratio), resource=Resource.create({
         "service.name": service_name, "service.namespace": "moks", "service.version": __version__,
         "service.instance.id": os.environ.get("HOSTNAME", ""), "vcs.ref.head.revision": get_settings().build_commit}))
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    # Bounded queue: when the collector is slow or gone, spans are dropped, never waited for.
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(timeout=5), max_queue_size=2048, export_timeout_millis=10000))
     trace.set_tracer_provider(provider)
     HTTPXClientInstrumentor().instrument(request_hook=_name_http_span, async_request_hook=_name_http_span_async)
     if app is not None:
@@ -245,6 +287,37 @@ def setup_tracing(service_name: str, app=None) -> None:
 
     if db._engine is not None:  # created before tracing was set up
         instrument_engine(db._engine)
+
+
+def sampler(ratio: float):
+    """Children follow their parent. A new trace starts at `ratio`, except an outgoing call with no parent:
+    a background HTTP call (search probe, outbox flush) made outside any request or job is a one-span
+    trace that says nothing, and on mk4 such spans were three quarters of the worker's traces."""
+    from opentelemetry.sdk.trace.sampling import Decision, ParentBased, Sampler, SamplingResult, TraceIdRatioBased
+    from opentelemetry.trace import SpanKind
+
+    ratio_sampler = TraceIdRatioBased(max(0.0, min(1.0, ratio)))
+
+    class Roots(Sampler):
+        def should_sample(self, parent_context, trace_id, name, kind=None, attributes=None, links=None, trace_state=None):
+            if kind == SpanKind.CLIENT:
+                return SamplingResult(Decision.DROP)
+            return ratio_sampler.should_sample(parent_context, trace_id, name, kind, attributes, links, trace_state)
+
+        def get_description(self) -> str:
+            return f"MoksRoots({ratio_sampler.get_description()})"
+
+    return ParentBased(root=Roots())
+
+
+@contextmanager
+def unrecorded() -> Iterator[None]:
+    """Keeps the current trace id for log lines but records nothing beneath it. For loops inside a span
+    that would otherwise add a child per iteration (an event stream polls twice a second for ten minutes)."""
+    from opentelemetry import trace
+
+    with trace.use_span(trace.NonRecordingSpan(trace.get_current_span().get_span_context()), end_on_exit=False):
+        yield
 
 
 def tracing_enabled() -> bool:

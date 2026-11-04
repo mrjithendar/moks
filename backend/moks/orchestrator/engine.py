@@ -35,7 +35,7 @@ from ..llm.providers import LLMError, provider_for
 from ..models import Environment, Evidence, Investigation, InvestigationCheckpoint, InvestigationEvent, LLMConfig, LLMUsage, RoleBinding, SkillVersion, User
 from opentelemetry import trace as trace_api
 
-from ..observability import INVESTIGATION_DURATION, INVESTIGATIONS, INVESTIGATIONS_RUNNING, bind, bound, continue_trace, error_fields, mark_failed, span
+from ..observability import INVESTIGATION_DURATION, INVESTIGATIONS, INVESTIGATIONS_RUNNING, bind, bound, continue_trace, error_fields, llm_answer_unused, mark_failed, span
 from ..rbac import Binding, P, Principal
 from ..redaction import redact_obj
 from ..scope import ScopeError, effective_scope
@@ -1383,6 +1383,7 @@ class Investigator:
                 rep.response_type = rtype
                 return rep, None
             except (LLMError, BudgetExceeded, ValueError) as exc:
+                llm_answer_unused("report", exc)
                 self.notes.append(f"LLM report unavailable ({getattr(exc, 'message', str(exc))}); showing the rule-based report.")
         rep = rules_report(question, self.findings, self._views(), self.notes)
         rep.response_type = rtype

@@ -29,7 +29,7 @@ from ..db import session_scope
 from ..llm import budget
 from ..llm.providers import LLMError, provider_for
 from ..models import Chunk, Document, DocumentIndexState, EmbeddingIndex, IndexOutbox, KnowledgeSource, LLMConfig, SearchBackendStatus
-from ..observability import RETRIEVAL_FALLBACKS, RETRIEVAL_LATENCY, RETRIEVAL_MODES, SEARCH_BACKEND
+from ..observability import RETRIEVAL_FALLBACKS, RETRIEVAL_LATENCY, RETRIEVAL_MODES, SEARCH_BACKEND, span as traced
 from ..rbac import Principal
 from . import access, rerank as reranking
 from .backends import MAPPING_VERSION, OpenSearchBackend, PineconeBackend, PostgresBackend, rrf
@@ -980,10 +980,28 @@ def _mode(retrieval: str, qv: list[float] | None, backend_reason: str | None) ->
     return "hybrid" if qv is not None and not backend_reason else "keyword"
 
 
-async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8, environment: str | None = None,
-                 namespace: str | None = None, service: str | None = None, neighbors: bool = False, reranker: reranking.Reranker | None = None,
-                 retrieval: str = "hybrid", rerank: bool | None = None, sources: list[str] | None = None, resource_type: str | None = None,
-                 prepared: tuple[list[float] | None, str | None] | None = None) -> dict:
+async def search(db: AsyncSession, principal: Principal, query: str, k: int = 8, retrieval: str = "hybrid", **kwargs: Any) -> dict:
+    """One span per search with what a trace needs to explain an answer: the mode that ran, how many results
+    survived the access check, whether it fell back or reranked. Never the query, which can name anything."""
+    with traced("rag.search", **{"moks.rag.requested_mode": retrieval, "moks.rag.k": k}) as span:
+        out = await _search(db, principal, query, k=k, retrieval=retrieval, **kwargs)
+        span.set_attribute("moks.rag.mode", out.get("mode") or "none")
+        span.set_attribute("moks.rag.results", len(out.get("results") or []))
+        span.set_attribute("moks.rag.abstain", bool(out.get("abstain")))
+        span.set_attribute("moks.rag.considered", int((out.get("candidates") or {}).get("considered", 0)))
+        if out.get("fallback_reason"):
+            span.set_attribute("moks.rag.fallback", True)
+        if out.get("reranking"):
+            span.set_attribute("moks.rag.rerank", str(out["reranking"].get("state")))
+        if out.get("note"):  # nothing to search, or no access: the reason, not a failure
+            span.set_attribute("moks.rag.note", "no_access" if out.get("mode") == "none" else "empty_index")
+        return out
+
+
+async def _search(db: AsyncSession, principal: Principal, query: str, k: int = 8, environment: str | None = None,
+                  namespace: str | None = None, service: str | None = None, neighbors: bool = False, reranker: reranking.Reranker | None = None,
+                  retrieval: str = "hybrid", rerank: bool | None = None, sources: list[str] | None = None, resource_type: str | None = None,
+                  prepared: tuple[list[float] | None, str | None] | None = None) -> dict:
     """question and scope, then identifiers, then keyword and vector candidates under whole-binding filters, then
     PostgreSQL's lifecycle and access check, then optional reranking, then diverse selection, citations and an
     evidence report. `retrieval`, `rerank` and `sources` are what the test workspace varies: each can only narrow."""

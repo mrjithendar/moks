@@ -266,7 +266,7 @@ def worker() -> None:
     from .orchestrator.worker import run_worker
 
     s = get_settings()
-    setup_logging(s.log_level)
+    setup_logging(s.log_level, s.otel_service_name + "-worker")
     setup_tracing(s.otel_service_name + "-worker")
     start_metrics_server(s.metrics_port)
 
@@ -292,7 +292,7 @@ def executor() -> None:
     from .observability import setup_logging, setup_tracing, start_metrics_server
 
     s = get_settings()
-    setup_logging(s.log_level)
+    setup_logging(s.log_level, s.otel_service_name + "-executor")
     setup_tracing(s.otel_service_name + "-executor")
     start_metrics_server(s.metrics_port)
 

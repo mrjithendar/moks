@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -22,7 +24,7 @@ import httpx
 
 from ..connectors.base import ConnectorError, resolve_credential
 from ..models import LLMConfig
-from ..observability import LLM_COST, LLM_LATENCY, LLM_REQUESTS, LLM_TOKENS, error_fields, mark_failed, span as traced
+from ..observability import LLM_COST, LLM_FALLBACKS, LLM_LATENCY, LLM_REQUESTS, LLM_RETRIES, LLM_TOKENS, error_fields, mark_failed, span as traced
 
 
 RETRY_STATUS = {429, 500, 502, 503, 504, 529}
@@ -31,6 +33,28 @@ MAX_WAIT = 10.0
 
 
 log = logging.getLogger("moks.llm")
+
+# Retries made inside the current model call, counted where MOKS retries itself (_post). The Anthropic SDK
+# retries on its own over httpx2, which this cannot see; its attempts are not counted.
+_retries: ContextVar[list[int] | None] = ContextVar("moks_llm_retries", default=None)
+
+
+@contextmanager
+def counting_retries():
+    box = [0]
+    token = _retries.set(box)
+    try:
+        yield lambda: box[0]
+    finally:
+        _retries.reset(token)
+
+
+def note_retry(provider: str = "") -> None:
+    box = _retries.get()
+    if box is not None:
+        box[0] += 1
+    if provider:
+        LLM_RETRIES.labels(provider).inc()
 
 
 class LLMError(Exception):
@@ -48,6 +72,8 @@ class LLMResponse:
     provider: str
     model: str
     cost_usd: Decimal = Decimal("0")
+    response_model: str | None = None  # what the provider says answered, when it says
+    fallback: bool = False  # a different model answered, by the provider's own signal
 
 
 Message = dict[str, str]  # {"role": "user"|"assistant", "content": str}
@@ -82,6 +108,7 @@ class Provider:
                     raise LLMError("unavailable", f"cannot reach {self.name} ({type(exc).__name__})") from None
                 if r.status_code not in RETRY_STATUS or attempt == RETRIES:
                     break
+                note_retry(self.cfg.provider)
                 await asyncio.sleep(_wait(r, attempt))
         if r.status_code in (401, 403):
             raise LLMError("auth", f"{self.name} rejected the credentials (HTTP {r.status_code})")
@@ -105,6 +132,34 @@ class Provider:
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         raise LLMError("config", f"embeddings are not implemented for {self.name}")
+
+
+# (endpoint, model) -> parameter changes the server needed, for this process.
+_ADJUSTED: dict[tuple[str, str], list[str]] = {}
+
+
+def _refused(text: str, body: dict) -> str | None:
+    """Which change a 400/422 asks for, or None when it is about something else."""
+    if "temperature" in text and "temperature" in body:
+        return "drop_temperature"  # reasoning models accept only their default
+    if "response_format" in text and "response_format" in body:
+        return "drop_response_format"  # the instruction in the prompt still asks for JSON
+    if "max_completion_tokens" in text and "max_completion_tokens" in body:
+        return "use_max_tokens"
+    if "max_tokens" in text and "max_tokens" in body:
+        return "use_max_completion_tokens"
+    return None
+
+
+def _adjust(body: dict, fix: str) -> None:
+    if fix == "drop_temperature":
+        body.pop("temperature", None)
+    elif fix == "drop_response_format":
+        body.pop("response_format", None)
+    elif fix == "use_max_tokens" and "max_completion_tokens" in body:
+        body["max_tokens"] = body.pop("max_completion_tokens")
+    elif fix == "use_max_completion_tokens" and "max_tokens" in body:
+        body["max_completion_tokens"] = body.pop("max_tokens")
 
 
 def _wait(r: httpx.Response, attempt: int) -> float:
@@ -137,6 +192,12 @@ class OpenAIProvider(Provider):
         return "max_completion_tokens" if "api.openai.com" in base else "max_tokens"
 
     async def _chat(self, base: str, body: dict) -> dict:
+        """A server that refuses a parameter gets the request again without it, and the change is remembered for
+        this endpoint and model, so later calls skip the refused attempt. On mk4 every call to one model began
+        with a 400 and paid 0.3 to 1.5 s for it, visible only as a failed POST under llm.complete."""
+        learned = _ADJUSTED.setdefault((base, self.cfg.model), [])
+        for fix in learned:
+            _adjust(body, fix)
         for _ in range(3):
             try:
                 return await self._post(f"{base}/chat/completions", body, self._headers())
@@ -144,16 +205,19 @@ class OpenAIProvider(Provider):
                 text = exc.message.lower()
                 if exc.kind != "bad_response" or " 400" not in text and " 422" not in text:
                     raise
-                if "temperature" in text and "temperature" in body:
-                    del body["temperature"]  # reasoning models accept only their default
-                elif "response_format" in text and "response_format" in body:
-                    del body["response_format"]  # the instruction in the prompt still asks for JSON
-                elif "max_completion_tokens" in text and "max_completion_tokens" in body:
-                    body["max_tokens"] = body.pop("max_completion_tokens")
-                elif "max_tokens" in text and "max_tokens" in body:
-                    body["max_completion_tokens"] = body.pop("max_tokens")
-                else:
+                fix = _refused(text, body)
+                if fix is None:
                     raise
+                _adjust(body, fix)
+                learned.append(fix)
+                try:
+                    from opentelemetry import trace
+
+                    here = trace.get_current_span()
+                    here.set_attribute("moks.llm.adjusted", ",".join(learned))
+                except Exception:  # pragma: no cover - tracing optional
+                    pass
+                log.info("llm parameter adjusted", extra={"event": "llm_parameter_adjusted", "dependency": self.cfg.provider, "operation": fix})
         return await self._post(f"{base}/chat/completions", body, self._headers())
 
     async def complete(self, system, messages, *, json_mode, max_tokens, temperature=0.1):
@@ -177,7 +241,8 @@ class OpenAIProvider(Provider):
             why = choice["message"].get("refusal") or choice.get("finish_reason") or "unknown reason"
             raise LLMError("bad_response", f"{self.name} returned no text ({str(why)[:200]})")
         usage = data.get("usage") or {}
-        return LLMResponse(text, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)), self.name, self.cfg.model)
+        served = data.get("model") if isinstance(data.get("model"), str) else None
+        return LLMResponse(text, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)), self.name, self.cfg.model, response_model=served)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         body: dict[str, Any] = {"model": self.cfg.model, "input": texts}
@@ -251,7 +316,10 @@ class AnthropicProvider(Provider):
         text = "".join(b.text for b in data.content if b.type == "text")
         if not text:
             raise LLMError("bad_response", f"{self.name} returned no text (stop reason {data.stop_reason})")
-        return LLMResponse(text, int(data.usage.input_tokens or 0), int(data.usage.output_tokens or 0), self.name, self.cfg.model)
+        # Server-side fallback: usage.iterations holds a fallback_message entry when another model served the turn.
+        fell_back = any(getattr(i, "type", None) == "fallback_message" for i in (getattr(data.usage, "iterations", None) or []))
+        return LLMResponse(text, int(data.usage.input_tokens or 0), int(data.usage.output_tokens or 0), self.name, self.cfg.model,
+                           response_model=getattr(data, "model", None) if isinstance(getattr(data, "model", None), str) else None, fallback=fell_back)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         raise LLMError("config", "Anthropic has no embedding API; use another provider for the embedding model")
@@ -431,10 +499,12 @@ def estimate_cost(cfg: LLMConfig, tokens_in: int, tokens_out: int) -> Decimal:
 async def complete_metered(provider: Provider, system: str, messages: list[Message], *, json_mode: bool, max_tokens: int) -> LLMResponse:
     cfg = provider.cfg
     start = time.monotonic()
-    with traced("llm.complete", **{"gen_ai.system": cfg.provider, "gen_ai.request.model": cfg.model, "gen_ai.request.max_tokens": max_tokens}) as span:
+    with traced("llm.complete", **{"gen_ai.system": cfg.provider, "gen_ai.request.model": cfg.model, "gen_ai.request.max_tokens": max_tokens}) as span, \
+            counting_retries() as retries:
         try:
             resp = await provider.complete(system, messages, json_mode=json_mode, max_tokens=max_tokens)
         except LLMError as exc:
+            span.set_attribute("moks.llm.retries", retries())
             LLM_REQUESTS.labels(cfg.provider, cfg.model, exc.kind).inc()
             LLM_LATENCY.labels(cfg.provider).observe(time.monotonic() - start)
             span.set_attribute("moks.outcome", exc.kind)
@@ -443,11 +513,18 @@ async def complete_metered(provider: Provider, system: str, messages: list[Messa
             raise
         span.set_attribute("gen_ai.usage.input_tokens", resp.tokens_in)
         span.set_attribute("gen_ai.usage.output_tokens", resp.tokens_out)
+        span.set_attribute("moks.llm.retries", retries())
+        if resp.response_model:
+            span.set_attribute("gen_ai.response.model", resp.response_model)
+        if resp.fallback:
+            span.set_attribute("moks.llm.fallback", True)
+            LLM_FALLBACKS.labels(cfg.provider, cfg.model).inc()
     resp.cost_usd = estimate_cost(cfg, resp.tokens_in, resp.tokens_out)
     LLM_REQUESTS.labels(cfg.provider, cfg.model, "ok").inc()
     LLM_LATENCY.labels(cfg.provider).observe(time.monotonic() - start)
     LLM_TOKENS.labels(cfg.provider, cfg.model, "input").inc(resp.tokens_in)
     LLM_TOKENS.labels(cfg.provider, cfg.model, "output").inc(resp.tokens_out)
     LLM_COST.labels(cfg.provider, cfg.model).inc(float(resp.cost_usd))
-    log.info("llm call", extra={"event": "llm_call", "dependency": cfg.provider, "operation": "complete", "outcome": "success", "durationMs": int((time.monotonic() - start) * 1000)})
+    log.info("llm call", extra={"event": "llm_call", "dependency": cfg.provider, "operation": "complete_fallback" if resp.fallback else "complete", "outcome": "success",
+                                "durationMs": int((time.monotonic() - start) * 1000)})
     return resp

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -27,6 +28,7 @@ from sqlalchemy import func, select, text, update
 from ..config import get_settings
 from ..db import session_scope
 from ..models import LLMConfig, LLMReservation, LLMUsage
+from ..observability import EMBED_LATENCY, EMBED_REQUESTS, span as traced
 from .providers import LLMError, Message, Provider, complete_metered
 
 log = logging.getLogger("moks.budget")
@@ -150,13 +152,19 @@ async def embed(provider: Provider, cfg: LLMConfig, texts: list[str], *, user_id
     """The one way to call an embedding model. Providers do not report usage, so the estimate is the cost."""
     est = estimate(cfg, sum(len(t) for t in texts), 0)
     rid = await reserve(cfg, est, user_id=user_id, purpose=purpose, wait_seconds=wait_seconds)
+    start = time.monotonic()
     try:
-        out = await provider.embed(texts)
+        with traced("llm.embed", **{"gen_ai.system": cfg.provider, "gen_ai.request.model": cfg.model, "moks.purpose": purpose, "moks.embed.texts": len(texts)}):
+            out = await provider.embed(texts)  # a failure is marked on the span by type and kind, never by message
     except LLMError as exc:
+        EMBED_REQUESTS.labels(cfg.provider, exc.kind).inc()
+        EMBED_LATENCY.labels(cfg.provider).observe(time.monotonic() - start)
         await close(rid, "released" if exc.kind in DEFINITE else "uncertain")
         raise
     except BaseException:
         await asyncio.shield(_unknown(rid))
         raise
+    EMBED_REQUESTS.labels(cfg.provider, "ok").inc()
+    EMBED_LATENCY.labels(cfg.provider).observe(time.monotonic() - start)
     await settle(rid, cfg, est, sum(len(t) for t in texts) // CHARS_PER_TOKEN, 0)
     return out

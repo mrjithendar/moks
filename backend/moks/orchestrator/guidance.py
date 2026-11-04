@@ -17,6 +17,7 @@ from typing import Any
 
 import yaml
 
+from ..observability import llm_answer_unused
 from . import evidence as ev
 from . import prompts
 from .intent import RequestContext, match_repositories, namespace_candidates
@@ -607,6 +608,7 @@ async def compose(inv: Any, provider: Any, cfg: Any, req: RequestContext) -> tup
             if str(raw.get("summary") or "").strip():
                 summary = (execution["note"].split(". ")[0] + ". " if execution else "") + str(raw["summary"])[:1200]
         except inv.llm_failures as exc:
+            llm_answer_unused("guidance", exc)
             notes.append(f"LLM guidance unavailable ({getattr(exc, 'message', str(exc))}); showing guidance extracted from the sources.")
     answer = {**g, "conflicts": conflicts(used, g), "gaps": gaps, "assumptions": [], "question_for_user": _question_for_user(req, gaps, [s for s in used if s["target_specific"]]),
               "sources": [{k: v for k, v in s.items() if k != "text"} for s in inv.sources], "retrieval": inv.retrieval_notes,
@@ -651,6 +653,7 @@ async def explain(inv: Any, executor: Any, provider: Any, cfg: Any, req: Request
                 answer["examples"] = [str(x)[:400] for x in (raw.get("examples") or [])[:4] if str(x).strip()]
                 return Report(summary=text[:2000], generated_by="llm", notes=list(inv.notes), response_type=req.response_type, answer=answer), "llm"
         except inv.llm_failures as exc:
+            llm_answer_unused("concept", exc)
             inv.notes.append(f"LLM answer unavailable ({getattr(exc, 'message', str(exc))}).")
     passages = [s for s in docs if s["text"].strip()][:3]
     if passages:

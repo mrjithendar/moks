@@ -166,6 +166,7 @@ class Settings(BaseSettings):
     metrics_port: int = 9464
     log_level: str = "INFO"
     otel_service_name: str = "moks"
+    trace_sample_ratio: float = 1.0  # share of new traces kept; children always follow their parent
 
     @field_validator("base_path")
     @classmethod

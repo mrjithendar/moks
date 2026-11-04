@@ -68,6 +68,7 @@ data:
   {{- end }}
   {{- with .Values.config.otelEndpoint }}
   OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
+  MOKS_TRACE_SAMPLE_RATIO: {{ $.Values.config.traceSampleRatio | quote }}
   {{- end }}
 ---
 apiVersion: v1

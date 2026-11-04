@@ -19,6 +19,12 @@
         "type": "datasource",
         "query": "prometheus",
         "label": "Data source"
+      },
+      {
+        "name": "logs",
+        "type": "datasource",
+        "query": "loki",
+        "label": "Logs"
       }
     ]
   },
@@ -1126,6 +1132,247 @@
         "type": "prometheus",
         "uid": "${datasource}"
       }
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "Agent runs, model answers and telemetry pipeline",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 80
+      },
+      "panels": []
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Model answers not used (rule-based report written instead)",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 81
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (stage, reason) (increase(moks_llm_answers_unused_total{job=\"moks\"}[1h]))",
+          "legendFormat": "{{stage}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Model retries and server-side fallbacks",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 81
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (provider) (increase(moks_llm_retries_total{job=\"moks\"}[1h]))",
+          "legendFormat": "retries {{provider}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (model) (increase(moks_llm_fallbacks_total{job=\"moks\"}[1h]))",
+          "legendFormat": "fallback from {{model}}",
+          "refId": "B"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Embedding calls by outcome / p95",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 81
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (provider, outcome) (rate(moks_embedding_requests_total{job=\"moks\"}[5m]))",
+          "legendFormat": "{{provider}} {{outcome}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, provider) (rate(moks_embedding_latency_seconds_bucket{job=\"moks\"}[15m])))",
+          "legendFormat": "p95 {{provider}} (s)",
+          "refId": "B"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Event streams open / closed by outcome",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 88
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(moks_sse_streams_open{job=\"moks\"})",
+          "legendFormat": "open",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (outcome) (increase(moks_sse_streams_total{job=\"moks\"}[1h]))",
+          "legendFormat": "closed: {{outcome}}",
+          "refId": "B"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Jobs waiting: oldest due job and queue",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 88
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "max by (job_class) (moks_jobs_oldest_age_seconds{job=\"moks\"})",
+          "legendFormat": "oldest {{job_class}} (s)",
+          "refId": "A"
+        },
+        {
+          "expr": "max by (job_class) (moks_jobs_queued{job=\"moks\"})",
+          "legendFormat": "queued {{job_class}}",
+          "refId": "B"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Trace pipeline: spans in, out, refused",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 88
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(otelcol_receiver_accepted_spans{job=\"otel-collector\"}[5m]))",
+          "legendFormat": "accepted",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(otelcol_exporter_sent_spans{job=\"otel-collector\"}[5m]))",
+          "legendFormat": "sent to Jaeger",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(otelcol_receiver_refused_spans{job=\"otel-collector\"}[5m]))",
+          "legendFormat": "refused",
+          "refId": "C"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "id": 18,
+      "type": "logs",
+      "title": "MOKS warnings and errors (open a trace from trace_id)",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 95
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${logs}"
+      },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "expr": "{namespace=\"moks\", level=~\"warn|error\"}",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "${logs}"
+          }
+        }
+      ]
     }
   ]
 }

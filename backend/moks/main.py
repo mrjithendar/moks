@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     s = get_settings()
-    setup_logging(s.log_level)
+    setup_logging(s.log_level, s.otel_service_name)
     api = s.api_prefix
     app = FastAPI(
         title="MOKS", version=__version__, lifespan=lifespan,
