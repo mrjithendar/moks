@@ -9,10 +9,10 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import text
 
-from .. import jobs
+from .. import errors, jobs
 from ..config import get_settings
 from ..db import dispose, session_scope
-from ..observability import setup_logging, setup_tracing, start_metrics_server
+from ..observability import bound, current_trace_ids, setup_logging, setup_tracing, start_metrics_server
 from . import api, service
 from .profiles import profiles
 
@@ -57,14 +57,26 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def headers(request: Request, call_next) -> Response:
-        response: Response = await call_next(request)
+        rid = errors.request_id(request)
+        request.state.request_id = rid
+        with bound(request_id=rid):
+            try:
+                response: Response = await call_next(request)
+            except Exception as exc:
+                response = errors.internal_error(request, exc)
+        response.headers["X-Request-ID"] = rid
+        trace_id, _ = current_trace_ids()
+        if trace_id:
+            response.headers["X-Trace-ID"] = trace_id
         response.headers.setdefault("Cache-Control", "no-store")
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         return response
 
+    errors.install(app)
+
     @app.exception_handler(jobs.QueueFull)
     async def queue_full(_request, exc: jobs.QueueFull):
-        return JSONResponse({"detail": str(exc)}, status_code=429)
+        return errors.response(429, str(exc), "queue_full")
 
     router = APIRouter(prefix=s.api_prefix)
     router.include_router(api.router)

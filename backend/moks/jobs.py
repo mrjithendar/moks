@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
+from opentelemetry import trace
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +28,7 @@ from . import audit
 from .config import get_settings
 from .db import session_scope
 from .models import BackupRun, Environment, Job, KnowledgeSource
-from .observability import (continue_trace, traceparent, tracer, BACKUP_LAST_RUN_OK, BACKUP_LAST_SUCCESS, DATABASE_SIZE, DATABASE_VOLUME, JOB_DELAY, JOB_RETRIES, JOB_RUNTIME, JOBS_ABANDONED, JOBS_OLDEST_AGE,
+from .observability import (bound, continue_trace, error_fields, mark_failed, span, traceparent, BACKUP_LAST_RUN_OK, BACKUP_LAST_SUCCESS, DATABASE_SIZE, DATABASE_VOLUME, JOB_DELAY, JOB_RETRIES, JOB_RUNTIME, JOBS_ABANDONED, JOBS_OLDEST_AGE,
                             JOBS_QUEUED, JOBS_REJECTED, JOBS_RUNNING)
 
 log = logging.getLogger("moks.jobs")
@@ -237,13 +238,13 @@ async def run_one(job_id: uuid.UUID) -> None:
     async with session_scope() as db:
         job = await db.get(Job, job_id)
         payload, type_, attempts, worker = dict(job.payload), job.type, job.attempts, job.worker_id
-    with tracer().start_as_current_span(f"job {type_}", context=continue_trace(payload.get("_traceparent"))) as span:
-        span.set_attribute("moks.job.id", str(job_id))
-        span.set_attribute("moks.job.attempt", attempts)
-        await _run_one(job_id, payload, type_, attempts, worker)
+    with bound(job_id=str(job_id), job_type=type_, attempt=attempts), \
+            span(f"job {type_}", context=continue_trace(payload.get("_traceparent")), **{"moks.job.id": str(job_id), "moks.job.type": type_, "moks.job.attempt": attempts}) as s:
+        status = await _run_one(job_id, payload, type_, attempts, worker)
+        s.set_attribute("moks.job.status", status or "unknown")
 
 
-async def _run_one(job_id: uuid.UUID, payload: dict, type_: str, attempts: int, worker: str | None) -> None:
+async def _run_one(job_id: uuid.UUID, payload: dict, type_: str, attempts: int, worker: str | None) -> str | None:
     policy = POLICIES.get(type_, DEFAULT_POLICY)
     fn = handlers().get(type_)
     status, result, error = "succeeded", None, None
@@ -260,9 +261,12 @@ async def _run_one(job_id: uuid.UUID, payload: dict, type_: str, attempts: int, 
         beat.cancel()
         if draining.is_set():
             await asyncio.shield(_release(job_id, worker))
-        return  # otherwise the lease is gone: whoever holds it now owns the outcome
+        return "cancelled"  # otherwise the lease is gone: whoever holds it now owns the outcome
     except Exception as exc:
-        log.warning("job failed", extra={"event": "job_failed", "operation": type_, "errorType": type(exc).__name__})
+        # A connector or LLM error (it has a kind) is an expected failure; anything else is a bug and keeps its stack.
+        log.warning("job failed", exc_info=None if getattr(exc, "kind", None) else exc,
+                    extra={"event": "job_failed", "operation": type_, **error_fields(exc)})
+        mark_failed(trace.get_current_span(), exc)
         error = str(getattr(exc, "message", exc))[:1000]
         wait = getattr(exc, "retry_after", None) if type_ != "eval_run" else None
         status = "queued" if wait is not None or attempts < policy.max_attempts else "failed"
@@ -271,7 +275,7 @@ async def _run_one(job_id: uuid.UUID, payload: dict, type_: str, attempts: int, 
         job = await db.get(Job, job_id)
         if job.status != "running" or job.worker_id != worker:
             log.warning("late job result ignored", extra={"event": "job_late_result"})
-            return
+            return "late"
         job.status, job.result, job.error, job.lease_expires_at = status, result, error, None
         JOB_RUNTIME.labels(job_class(type_), type_).observe(time.monotonic() - started)
         log.info("job finished", extra={"event": "job_finished", "operation": type_, "outcome": "failure" if error else "success", "durationMs": int((time.monotonic() - started) * 1000)})
@@ -282,6 +286,7 @@ async def _run_one(job_id: uuid.UUID, payload: dict, type_: str, attempts: int, 
                 job.attempts -= 1  # waiting out a rate limit is not a failed attempt
         else:
             job.finished_at = datetime.now(timezone.utc)
+    return status
 
 
 draining = asyncio.Event()  # set on shutdown: cancelled work hands itself back at once

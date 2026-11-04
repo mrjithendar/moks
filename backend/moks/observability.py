@@ -7,14 +7,20 @@
   errorType, errorCode, logger_name). Alloy forwards only those, so the rest stay in `kubectl logs`.
 - OpenTelemetry traces exported over OTLP/HTTP when OTEL_EXPORTER_OTLP_ENDPOINT is set.
   Spans carry metadata only: never prompts, model output or log contents.
+- A log context (request, user, job, investigation, plan) bound once per unit of work and
+  stamped on every line written inside it, so one id finds every line of a request or a run.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import sys
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator
 
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
@@ -85,11 +91,66 @@ def start_metrics_server(port: int) -> None:
         logging.getLogger("moks").warning("metrics server not started", extra={"event": "metrics_port_busy", "errorType": type(exc).__name__})
 
 
+# ---- Log context -------------------------------------------------------------------------
+
+# Bound per request (middleware), per job, per investigation and per action plan. asyncio
+# tasks copy it when created, so work started inside a unit keeps that unit's ids.
+_log_context: ContextVar[dict[str, Any]] = ContextVar("moks_log_context", default={})
+
+
+@contextmanager
+def bound(**fields: Any) -> Iterator[None]:
+    """Adds fields (None values skipped) to every log line written inside the block."""
+    token = _log_context.set({**_log_context.get(), **{k: v for k, v in fields.items() if v is not None}})
+    try:
+        yield
+    finally:
+        _log_context.reset(token)
+
+
+def bind(**fields: Any) -> None:
+    """Adds fields for the rest of the current context, e.g. the user once a request is authenticated."""
+    _log_context.set({**_log_context.get(), **{k: v for k, v in fields.items() if v is not None}})
+
+
+def log_context() -> dict[str, Any]:
+    return dict(_log_context.get())
+
+
+def current_trace_ids() -> tuple[str | None, str | None]:
+    """(trace_id, span_id) of the current span as hex, or (None, None) when tracing is off."""
+    try:
+        from opentelemetry import trace
+
+        ctx = trace.get_current_span().get_span_context()
+        if ctx.is_valid:
+            return format(ctx.trace_id, "032x"), format(ctx.span_id, "016x")
+    except Exception:  # pragma: no cover - tracing optional
+        pass
+    return None, None
+
+
+MAX_ERROR = 500
+
+
+def error_fields(exc: BaseException) -> dict[str, str]:
+    """errorType, errorCode (a ConnectorError/LLMError kind) and a redacted, shortened message.
+    Only errorType and errorCode pass the Alloy allowlist; the message stays in `kubectl logs`."""
+    from .redaction import redact
+
+    out = {"errorType": type(exc).__name__, "error": redact(str(getattr(exc, "message", None) or exc))[:MAX_ERROR]}
+    kind = getattr(exc, "kind", None)
+    if isinstance(kind, str) and kind:
+        out["errorCode"] = kind
+    return out
+
+
 # ---- Logging -----------------------------------------------------------------------------
 
 _EXTRA_FIELDS = (
     "event", "route", "method", "status", "durationMs", "outcome", "errorType", "operation",
     "dependency", "investigation_id", "tool", "action", "decision", "connector_type", "request_id", "errorCode",
+    "error", "user_id", "job_id", "job_type", "attempt", "plan_id", "environment", "namespace", "node",
 )
 MAX_STACK = 4000
 
@@ -103,27 +164,38 @@ class JsonFormatter(logging.Formatter):
             "logger_name": record.name,
             "message": record.getMessage(),
         }
+        out.update(getattr(record, "_moks_context", None) or _log_context.get())  # what the line is part of; the record's own fields win
         for key in _EXTRA_FIELDS:
             if hasattr(record, key):
                 out[key] = getattr(record, key)
         out.setdefault("event", record.getMessage().replace(" ", "_")[:60])
-        try:
-            from opentelemetry import trace
-
-            ctx = trace.get_current_span().get_span_context()
-            if ctx.is_valid:
-                out["trace_id"] = format(ctx.trace_id, "032x")
-        except Exception:  # pragma: no cover - tracing optional
-            pass
+        trace_id, span_id = current_trace_ids()
+        if trace_id:
+            out["trace_id"], out["span_id"] = trace_id, span_id
         if record.exc_info:
-            out["errorType"] = record.exc_info[0].__name__ if record.exc_info[0] else "Exception"
+            out.setdefault("errorType", record.exc_info[0].__name__ if record.exc_info[0] else "Exception")
             from .redaction import redact
 
+            if record.exc_info[1] is not None and "error" not in out:
+                out["error"] = redact(str(record.exc_info[1]))[:MAX_ERROR]
             out["stack"] = redact(self.formatException(record.exc_info))[-MAX_STACK:]  # the end of a traceback says the most
         return json.dumps(out, default=str)
 
 
+def _with_context(factory):
+    """Snapshots the log context onto each record when it is created, so a handler that formats
+    later (a queue, a test capture) still writes the ids of the work that logged it."""
+    def make(*args, **kwargs):
+        record = factory(*args, **kwargs)
+        record._moks_context = _log_context.get()
+        return record
+    make._moks = True
+    return make
+
+
 def setup_logging(level: str = "INFO") -> None:
+    if not getattr(logging.getLogRecordFactory(), "_moks", False):
+        logging.setLogRecordFactory(_with_context(logging.getLogRecordFactory()))
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
     root = logging.getLogger()
@@ -163,18 +235,123 @@ def setup_tracing(service_name: str, app=None) -> None:
         "service.instance.id": os.environ.get("HOSTNAME", ""), "vcs.ref.head.revision": get_settings().build_commit}))
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
     trace.set_tracer_provider(provider)
-    HTTPXClientInstrumentor().instrument()
+    HTTPXClientInstrumentor().instrument(request_hook=_name_http_span, async_request_hook=_name_http_span_async)
     if app is not None:
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
         FastAPIInstrumentor.instrument_app(app, excluded_urls="healthz,readyz", exclude_spans=["send", "receive"])
     _tracing_ready = True
+    from . import db
+
+    if db._engine is not None:  # created before tracing was set up
+        instrument_engine(db._engine)
+
+
+def tracing_enabled() -> bool:
+    return _tracing_ready
+
+
+def _name_http_span(span, request) -> None:
+    """"GET" alone says nothing in a waterfall: name the span after the host it calls. The host only,
+    never the path or query, which can hold PromQL, LogQL or search terms."""
+    try:
+        method = request.method.decode() if isinstance(request.method, bytes) else str(request.method)
+        host = request.url.host.decode() if isinstance(request.url.host, bytes) else request.url.host
+        span.update_name(f"{method} {host}")
+        span.set_attribute("server.address", host)
+    except Exception:  # pragma: no cover - naming is cosmetic
+        pass
+
+
+async def _name_http_span_async(span, request) -> None:
+    _name_http_span(span, request)
+
+
+_SQL_VERB = re.compile(r"^\s*(?:/\*.*?\*/\s*)?([A-Za-z]+)", re.S)
+
+
+def instrument_engine(engine) -> None:
+    """A child span per SQL statement, only inside a span that is already recording, so queries
+    show in the request or run that made them and background polling makes no root traces.
+    The span names the verb (SELECT, UPDATE...) and never carries the statement or parameters."""
+    if not _tracing_ready or getattr(engine.sync_engine, "_moks_traced", False):
+        return
+    from opentelemetry import trace
+    from opentelemetry.trace import SpanKind, Status, StatusCode
+    from sqlalchemy import event
+
+    sync = engine.sync_engine
+
+    @event.listens_for(sync, "before_cursor_execute")
+    def _start(conn, cursor, statement, parameters, context, executemany):
+        if context is None or not trace.get_current_span().is_recording():
+            return
+        m = _SQL_VERB.match(statement or "")
+        verb = m.group(1).upper() if m else "SQL"
+        context._moks_span = tracer().start_span(f"db {verb}", kind=SpanKind.CLIENT, attributes={
+            "db.system.name": "postgresql", "db.operation.name": verb, "db.batch": bool(executemany)})
+
+    @event.listens_for(sync, "after_cursor_execute")
+    def _end(conn, cursor, statement, parameters, context, executemany):
+        span = getattr(context, "_moks_span", None)
+        if span is not None:
+            span.end()
+            context._moks_span = None
+
+    @event.listens_for(sync, "handle_error")
+    def _failed(exc_ctx):
+        context = exc_ctx.execution_context
+        span = getattr(context, "_moks_span", None) if context is not None else None
+        if span is not None:
+            err = exc_ctx.original_exception
+            span.set_attribute("error.type", type(err).__name__)
+            code = getattr(err, "sqlstate", None) or getattr(getattr(err, "orig", None), "sqlstate", None)
+            if code:
+                span.set_attribute("db.response.status_code", str(code))
+            span.set_status(Status(StatusCode.ERROR, type(err).__name__))
+            span.end()
+            context._moks_span = None
+
+    sync._moks_traced = True
 
 
 def tracer():
     from opentelemetry import trace
 
     return trace.get_tracer("moks")
+
+
+def mark_failed(span, error: BaseException | str, code: str | None = None) -> None:
+    """Marks a span as failed with the error's type and code only. The collector drops exception
+    text on purpose (it can hold SQL, addresses or secrets), so the type and code are what a
+    trace keeps."""
+    from opentelemetry.trace import Status, StatusCode
+
+    kind = error if isinstance(error, str) else type(error).__name__
+    code = code or (None if isinstance(error, str) else getattr(error, "kind", None))
+    span.set_attribute("error.type", kind)
+    if code:
+        span.set_attribute("moks.error_code", str(code))
+    span.set_status(Status(StatusCode.ERROR, f"{kind}: {code}" if code else kind))
+
+
+@contextmanager
+def span(name: str, context=None, **attributes: Any):
+    """A span whose failures are recorded by type and code, never by exception message (OTel's
+    default puts str(exc) in the status description, which the collector does not strip).
+    Cancellation is not a failure: it is recorded as moks.outcome=cancelled."""
+    import asyncio
+
+    with tracer().start_as_current_span(name, context=context, record_exception=False, set_status_on_exception=False,
+                                        attributes={k: v for k, v in attributes.items() if v is not None}) as s:
+        try:
+            yield s
+        except asyncio.CancelledError:
+            s.set_attribute("moks.outcome", "cancelled")
+            raise
+        except BaseException as exc:
+            mark_failed(s, exc)
+            raise
 
 
 def traceparent() -> str | None:

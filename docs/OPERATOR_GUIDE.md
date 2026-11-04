@@ -590,6 +590,42 @@ Useful events: `http_request`, `tool_call`, `llm_call`, `job_finished`, `investi
 Traces go to `OTEL_EXPORTER_OTLP_ENDPOINT` as `moks`, `moks-worker` and `moks-executor`. A request that queues work
 shares one trace with it: investigations and jobs continue the request's trace, with tool and LLM calls as children.
 
+### Following one failure from the browser to the trace
+
+Every API error has one shape:
+
+```json
+{"detail": "Prometheus did not answer within 10s",
+ "error": {"code": "connector_timeout", "message": "Prometheus did not answer within 10s", "status": 504,
+           "request_id": "4bf92f3577b34da6a3ce929d0e0e4736", "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}}
+```
+
+`detail` is still a plain string. Validation errors (422) also list `error.fields`. An unexpected exception becomes
+a 500 with `code: internal` and a generic message; the redacted stack goes to the log, never to the client. A
+`ConnectorError` that escapes a route maps to a status by kind (timeout → 504, unavailable → 503, auth → 502 …).
+
+With tracing on, the request id **is** the trace id (unless the caller sent a plain `X-Request-ID`). The UI shows it
+as **Reference** on server errors, and every response carries `X-Request-ID` and `X-Trace-ID`. One id then finds:
+
+- the trace in Jaeger (`/api/v3/traces/<id>` on the jaeger service, or the search box in the UI);
+- the lines in Loki: `{namespace="moks"} |= "trace_id=<id>"` (trace_id passes the Alloy allowlist);
+- the full lines in `kubectl -n moks logs deploy/moks-api | grep <id>`.
+
+Each line written inside a unit of work carries that unit's ids without the call site passing them: `request_id` and
+`user_id` for API requests; `job_id`, `job_type` and `attempt` for jobs; `investigation_id`, `environment`,
+`namespace` and `node` (graph stage) for investigations; `plan_id` for actions. Plus `trace_id` and `span_id`.
+Failures add `errorType`, `errorCode` (the connector or LLM error kind) and `error` (redacted, at most 500 chars).
+Only `errorType`/`errorCode` reach Loki; the rest stays in `kubectl logs`.
+
+`http_request` is logged at `error` for 5xx and `warning` for 4xx other than 401/404, so `level="warn"` in Loki
+lists real client trouble. A failed tool call or action logs at `warning`.
+
+Spans record failures by `error.type` and `moks.error_code` with ERROR status, never by exception message (the
+collector strips exception events, and OTel's default status text would otherwise carry `str(exc)`). Inside a
+recording span every SQL statement is a `db SELECT`/`db UPDATE`… child span (verb only, no statement or
+parameters); queries outside any span, such as background polling, create no traces. HTTP client spans are named
+`GET <host>` — host only, since paths hold PromQL and LogQL.
+
 ## LLM providers
 
 **LLM providers** offers presets for Anthropic, OpenAI, Google AI, Azure OpenAI, Bedrock, Mistral, Groq, DeepSeek, xAI,

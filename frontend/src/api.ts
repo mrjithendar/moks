@@ -15,9 +15,46 @@ export function clearLocalWork() {
   for (const key of Object.keys(sessionStorage)) if (key.startsWith("moks.")) sessionStorage.removeItem(key);
 }
 
+export interface FieldError { field: string; message: string }
+
+/** A failed API call. `requestId` is the reference the server logged the request under (the trace
+ *  id when tracing is on); `code` is a stable machine name such as "not_found" or "connector_timeout". */
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(
+    public status: number,
+    message: string,
+    public code?: string,
+    public requestId?: string,
+    public fields: FieldError[] = [],
+  ) {
     super(message);
+    this.name = "ApiError";
+  }
+}
+
+/** Builds an ApiError from a response body in the server's error shape
+ *  ({detail, error: {code, message, request_id, fields}}), or from whatever came back instead. */
+export function toApiError(status: number, data: unknown, statusText: string, headerRequestId?: string | null): ApiError {
+  const body = data && typeof data === "object" ? (data as Record<string, any>) : null;
+  const err = body?.error && typeof body.error === "object" ? body.error : null;
+  const requestId = (err?.request_id as string | undefined) || headerRequestId || undefined;
+  let message: string;
+  if (typeof err?.message === "string" && err.message) message = err.message;
+  else if (typeof body?.detail === "string" && body.detail) message = body.detail;
+  else if (Array.isArray(body?.detail)) message = body.detail.map((d: any) => `${(d.loc ?? []).slice(1).join(".") || "request"}: ${d.msg}`).join("; ");
+  else if (status >= 502 && status <= 504) message = `MOKS is not reachable right now (HTTP ${status}). Try again in a moment.`;
+  else message = statusText || `Request failed (HTTP ${status})`;
+  return new ApiError(status, message, err?.code, requestId, Array.isArray(err?.fields) ? err.fields : []);
+}
+
+const OFFLINE = "Could not reach MOKS. Check your connection and try again.";
+
+async function send(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") throw e;
+    throw new ApiError(0, OFFLINE, "network_error");
   }
 }
 
@@ -28,7 +65,7 @@ export async function api<T = any>(path: string, opts: { method?: string; body?:
   const headers: Record<string, string> = { Accept: "application/json" };
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";
   if (method !== "GET" && csrfToken) headers["X-CSRF-Token"] = csrfToken;
-  const res = await fetch(`${API}${path}`, {
+  const res = await send(`${API}${path}`, {
     method,
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
@@ -43,10 +80,7 @@ export async function api<T = any>(path: string, opts: { method?: string; body?:
   }
   const text = await res.text();
   const data = text ? safeJson(text) : null;
-  if (!res.ok) {
-    const detail = data && typeof data === "object" && "detail" in data ? (data as any).detail : res.statusText;
-    throw new ApiError(res.status, typeof detail === "string" ? detail : JSON.stringify(detail));
-  }
+  if (!res.ok) throw toApiError(res.status, data, res.statusText, res.headers.get("x-request-id"));
   return data as T;
 }
 
@@ -69,8 +103,8 @@ export function qs(params: Record<string, string | number | boolean | undefined 
 export async function apiForm<T = any>(path: string, form: FormData): Promise<T> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
-  const res = await fetch(`${API}${path}`, { method: "POST", headers, body: form, credentials: "same-origin" });
+  const res = await send(`${API}${path}`, { method: "POST", headers, body: form, credentials: "same-origin" });
   const data = await res.json().catch(() => null);
-  if (!res.ok) throw new ApiError(res.status, (data && data.detail) || res.statusText);
+  if (!res.ok) throw toApiError(res.status, data, res.statusText, res.headers.get("x-request-id"));
   return data as T;
 }

@@ -19,6 +19,9 @@ def engine() -> AsyncEngine:
             s.database_url, pool_size=s.database_pool_size, max_overflow=5, pool_pre_ping=True
         )
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
+        from .observability import instrument_engine
+
+        instrument_engine(_engine)
     return _engine
 
 

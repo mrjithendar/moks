@@ -142,7 +142,7 @@ def spans():
 
 async def test_queued_work_continues_the_trace_that_queued_it(spans, monkeypatch):
     exporter, tracer = spans
-    monkeypatch.setattr(jobs, "tracer", lambda: tracer)
+    monkeypatch.setattr(observability, "tracer", lambda: tracer)  # jobs open spans through observability.span
     with tracer.start_as_current_span("request") as parent:
         jid = await jobs.enqueue("eval_run", {"run_id": str(uuid.uuid4())})
     async with session_scope() as db:

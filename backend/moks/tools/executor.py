@@ -24,7 +24,7 @@ from ..config import get_settings
 from ..connectors.base import ConnectorError
 from ..models import Evidence
 from ..orchestrator.evidence import ACCESS_DENIED, classify
-from ..observability import POLICY_DENIALS, TOOL_CALLS, tracer
+from ..observability import POLICY_DENIALS, TOOL_CALLS, mark_failed, span as traced
 from ..rbac import P
 from ..redaction import redact_obj
 from ..scope import ScopeError
@@ -197,9 +197,8 @@ class ToolExecutor:
 
         start = time.monotonic()
         started_at = time.time()
-        with tracer().start_as_current_span(f"tool {tool}") as span:
-            span.set_attribute("moks.tool", tool)
-            span.set_attribute("moks.environment", self.ctx.environment.name)
+        with traced(f"tool {tool}", **{"moks.tool": tool, "moks.dependency": spec.connector_type, "moks.environment": self.ctx.environment.name,
+                                       "moks.namespace": clean_args.get("namespace") if isinstance(clean_args.get("namespace"), str) else None}) as span:
             try:
                 result = await asyncio.wait_for(spec.handler(self.ctx, parsed), timeout=self.timeout)
                 outcome = ToolOutcome(True, tool, clean_args, result.summary, data=result.data, source=result.source)
@@ -210,17 +209,20 @@ class ToolExecutor:
             except asyncio.TimeoutError:
                 outcome = ToolOutcome(False, tool, clean_args, f"timed out after {self.timeout:.0f}s", error="timeout", error_kind="timeout")
             except Exception as exc:  # defensive: a tool bug must not kill the investigation
-                log.exception("tool failed", extra={"event": "tool_failed", "tool": tool})
+                log.exception("tool failed", extra={"event": "tool_failed", "tool": tool, "dependency": spec.connector_type})
                 outcome = ToolOutcome(False, tool, clean_args, f"internal error in {tool} ({type(exc).__name__})", error=type(exc).__name__, error_kind="internal")
             span.set_attribute("moks.outcome", "ok" if outcome.ok else (outcome.error_kind or "error"))
+            if not outcome.ok:
+                mark_failed(span, "tool_failed", outcome.error_kind or "error")
         outcome.duration_ms = int((time.monotonic() - start) * 1000)
         outcome.collected_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at))
         if outcome.ok:
             outcome.data, outcome.truncated = truncate_json(redact_obj(outcome.data), self.settings.max_result_bytes)
         outcome.kind = classify(ok=outcome.ok, tool=tool, truncated=outcome.truncated, partial=bool((outcome.source or {}).get("partial")))
         TOOL_CALLS.labels(tool, "ok" if outcome.ok else (outcome.error_kind or "error")).inc()
-        log.info("tool call", extra={"event": "tool_call", "tool": tool, "operation": tool, "dependency": spec.connector_type, "outcome": "success" if outcome.ok else "failure",
-                                     "durationMs": outcome.duration_ms, **({} if outcome.ok else {"errorCode": outcome.error_kind or "error"})})
+        log.log(logging.INFO if outcome.ok else logging.WARNING, "tool call", extra={
+            "event": "tool_call", "tool": tool, "operation": tool, "dependency": spec.connector_type, "outcome": "success" if outcome.ok else "failure",
+            "durationMs": outcome.duration_ms, **({} if outcome.ok else {"errorCode": outcome.error_kind or "error", "error": str(outcome.error or "")[:500]})})
 
         if self.db is not None and self._next_ref is not None:
             ref = self._next_ref()

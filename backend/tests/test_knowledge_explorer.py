@@ -87,7 +87,12 @@ async def test_filtering_on_an_unreadable_value_finds_nothing(client, world):
 async def test_direct_links_answer_like_a_missing_document(client, world):
     for path in (f"/explorer/documents/{world['hidden']}", f"/explorer/documents/{world['hidden']}/chunks", f"/documents/{world['hidden']}"):
         hidden, missing = await get(client, world["email"], path), await get(client, world["email"], path.replace(str(world["hidden"]), str(uuid.uuid4())))
-        assert hidden.status_code == missing.status_code == 404 and hidden.json() == missing.json()
+        assert hidden.status_code == missing.status_code == 404 and _without_ids(hidden.json()) == _without_ids(missing.json())
+
+
+def _without_ids(body: dict) -> dict:
+    """Every response carries its own request id; nothing else may differ."""
+    return {**body, "error": {k: v for k, v in body.get("error", {}).items() if k not in ("request_id", "trace_id")}}
 
 
 async def test_status_shows_a_reader_only_their_own_totals(client, world):

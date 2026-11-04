@@ -28,7 +28,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from ..observability import tracer
+from ..observability import bound, span
 
 
 class State(TypedDict, total=False):
@@ -45,7 +45,7 @@ class State(TypedDict, total=False):
 
 def _traced(inv: Any, name: str, fn: Callable[[State], Awaitable[dict]], route: Callable[[State], str]) -> Callable[[State], Awaitable[dict]]:
     async def node(state: State) -> dict:
-        with tracer().start_as_current_span(f"node {name}"):
+        with bound(node=name), span(f"node {name}", **{"moks.node": name}):
             out = await fn(state)
         merged = {**state, **out}
         await inv._checkpoint(name, route(merged), merged)

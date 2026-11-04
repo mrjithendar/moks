@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import audit
 from ..config import get_settings
 from ..db import get_db
-from ..observability import POLICY_DENIALS
+from ..observability import POLICY_DENIALS, bind
 from ..rbac import P
 from .ratelimit import limiter
 from .sessions import COOKIE, AuthContext, client_ip, csrf_ok, load
@@ -37,6 +37,7 @@ async def get_auth(request: Request, db: AsyncSession = Depends(get_db, scope="f
             POLICY_DENIALS.labels("csrf").inc()
             raise HTTPException(403, "CSRF check failed; reload the page and try again")
     request.state.auth = ctx
+    bind(user_id=ctx.principal.user_id)
     return ctx
 
 
@@ -45,7 +46,7 @@ async def deny(request: Request, ctx: AuthContext, perm: P | str, environment: s
     await audit.record(None, action="authz.deny", actor_id=ctx.user.id, actor_email=ctx.user.email,
                        resource_type="permission", resource_id=str(perm), environment=environment, namespace=namespace,
                        decision="deny", outcome="denied", details={"path": request.url.path, "method": request.method, "reason": reason},
-                       ip=client_ip(request), request_id=request.headers.get("x-request-id"))
+                       ip=client_ip(request), request_id=getattr(request.state, "request_id", None))
     return HTTPException(403, reason)
 
 

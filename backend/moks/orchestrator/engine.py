@@ -35,7 +35,7 @@ from ..llm.providers import LLMError, provider_for
 from ..models import Environment, Evidence, Investigation, InvestigationCheckpoint, InvestigationEvent, LLMConfig, LLMUsage, RoleBinding, SkillVersion, User
 from opentelemetry import trace as trace_api
 
-from ..observability import INVESTIGATION_DURATION, INVESTIGATIONS, INVESTIGATIONS_RUNNING, continue_trace, tracer
+from ..observability import INVESTIGATION_DURATION, INVESTIGATIONS, INVESTIGATIONS_RUNNING, bind, bound, continue_trace, error_fields, mark_failed, span
 from ..rbac import Binding, P, Principal
 from ..redaction import redact_obj
 from ..scope import ScopeError, effective_scope
@@ -210,8 +210,8 @@ class Investigator:
             await self._adopt()
         async with session_scope() as db:
             queued = (await db.execute(select(InvestigationEvent.payload).where(InvestigationEvent.investigation_id == self.id, InvestigationEvent.seq == 0))).scalar_one_or_none()
-        with tracer().start_as_current_span("investigation", context=continue_trace((queued or {}).get("traceparent"))) as span:
-            span.set_attribute("moks.investigation.id", str(self.id))
+        with bound(investigation_id=str(self.id)), \
+                span("investigation", context=continue_trace((queued or {}).get("traceparent")), **{"moks.investigation.id": str(self.id), "moks.attempt": self.attempt}):
             await self._run()
 
     async def _run(self) -> None:
@@ -242,7 +242,7 @@ class Investigator:
             if isinstance(exc, AccessRevoked):
                 self.revoked = error
         except Exception as exc:
-            log.exception("investigation failed", extra={"event": "investigation_failed", "investigation_id": str(self.id)})
+            log.exception("investigation failed", extra={"event": "investigation_failed", "investigation_id": str(self.id), **error_fields(exc)})
             status, error = "failed", f"internal error ({type(exc).__name__})"
         finally:
             watcher.cancel()
@@ -266,6 +266,11 @@ class Investigator:
             log.warning("stopped: this worker no longer owns the investigation", extra={"event": "investigation_abandoned", "investigation_id": str(self.id)})
         INVESTIGATIONS.labels(status, mode).inc()
         INVESTIGATION_DURATION.labels(mode).observe(time.monotonic() - start)
+        root = trace_api.get_current_span()
+        root.set_attribute("moks.investigation.status", status)
+        root.set_attribute("moks.mode", mode)
+        if status == "failed":
+            mark_failed(root, "investigation_failed", "timeout" if error and error.startswith("time limit") else "not_permitted" if error and error.startswith("not permitted") else "internal" if error and error.startswith("internal") else None)
         log.info("investigation finished", extra={"event": "investigation_finished", "investigation_id": str(self.id), "operation": mode, "outcome": "success" if status == "completed" else "failure",
                                                   "durationMs": int((time.monotonic() - start) * 1000), **({} if status == "completed" else {"errorCode": status})})
 
@@ -480,6 +485,10 @@ class Investigator:
             self.environment_info = {"name": env.name, "is_production": bool(env.is_production), "reason": queued.get("environment_reason"), "namespace_reason": queued.get("namespace_reason")}
             self._window = (t_from, t_to)
             env_name = env.name
+            bind(environment=env.name, namespace=namespace)
+            here = trace_api.get_current_span()
+            here.set_attribute("moks.environment", env.name)
+            here.set_attribute("moks.namespace", namespace)
             max_window = timedelta(minutes=min(env.max_query_window_minutes, self.settings.max_query_window_minutes))
             db.expunge(env)
 

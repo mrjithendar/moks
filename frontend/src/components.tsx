@@ -28,7 +28,22 @@ export function StatusBadge({ status }: { status: string }) {
 export function ErrorBox({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
   if (!error) return null;
   if (error instanceof ApiError && error.status === 403) return <div className="alert warn" role="alert"><strong>You don't have access to this.</strong> <span className="small">{error.message}</span></div>;
-  return <div className="alert error row between" role="alert"><span className="grow">{error instanceof Error ? error.message : String(error)}</span>{onRetry && <button type="button" className="ghost small" onClick={onRetry}>Try again</button>}</div>;
+  const api = error instanceof ApiError ? error : null;
+  return (
+    <div className="alert error row between" role="alert">
+      <span className="grow">
+        {error instanceof Error ? error.message : String(error)}
+        {api && api.fields.length > 1 && <ul className="small">{api.fields.map((f) => <li key={f.field}><code>{f.field}</code>: {f.message}</li>)}</ul>}
+        {api?.requestId && (api.status >= 500 || api.status === 0) && <ErrorReference id={api.requestId} />}
+      </span>
+      {onRetry && <button type="button" className="ghost small" onClick={onRetry}>Try again</button>}
+    </div>
+  );
+}
+
+/** The id the server logged the failure under: searchable as trace_id in Loki and Jaeger. */
+function ErrorReference({ id }: { id: string }) {
+  return <span className="small muted"> Reference <code>{id}</code> <CopyButton text={id} /></span>;
 }
 
 export interface Col<T> {

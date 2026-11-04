@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import session_scope
 from .models import AuditEvent
+from .observability import log_context
 from .redaction import redact_obj
 
 log = logging.getLogger("moks.audit")
@@ -50,7 +51,7 @@ async def record(
         outcome=outcome,
         details=redact_obj(details or {}),
         ip=ip,
-        request_id=request_id,
+        request_id=request_id or log_context().get("request_id"),
     )
     log.info(
         "audit",

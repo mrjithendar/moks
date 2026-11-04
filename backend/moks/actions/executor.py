@@ -40,7 +40,7 @@ from ..connectors.base import ConnectorError
 from ..db import session_scope
 from ..incidents import add_event
 from ..models import ActionPlan, Connector, DatabaseBackup, DatabaseBackupSchedule, Environment
-from ..observability import ACTIONS, tracer
+from ..observability import ACTIONS, bound, mark_failed, span as traced
 from .catalog import CATALOG, check_patch, get_path, patch_leaves, paths_patch
 from .service import PlanError, verify_for_execution
 
@@ -530,12 +530,18 @@ async def _perform(fence: Fence, snapshot: dict, identity: dict | None, env, tim
 
 async def execute_plan(claim: Claim) -> None:
     start = time.monotonic()
-    with tracer().start_as_current_span("action.execute") as span:
-        span.set_attribute("moks.plan.id", str(claim[0]))
+    with bound(plan_id=str(claim[0])), traced("action.execute", **{"moks.plan.id": str(claim[0])}) as span:
         await _execute_plan(claim)
-    async with session_scope() as db:
-        plan = await db.get(ActionPlan, claim[0])
-    log.info("action finished", extra={"event": "action_finished", "operation": plan.action, "action": plan.action, "outcome": "success" if plan.status == "succeeded" else "failure", "durationMs": int((time.monotonic() - start) * 1000)})
+        async with session_scope() as db:
+            plan = await db.get(ActionPlan, claim[0])
+        span.set_attribute("moks.action", plan.action)
+        span.set_attribute("moks.plan.status", plan.status)
+        ok = plan.status == "succeeded"
+        if not ok:
+            mark_failed(span, "action_failed", plan.status)
+        log.log(logging.INFO if ok else logging.WARNING, "action finished", extra={
+            "event": "action_finished", "operation": plan.action, "action": plan.action, "outcome": "success" if ok else "failure",
+            "durationMs": int((time.monotonic() - start) * 1000), **({} if ok else {"errorCode": plan.status, "error": str(getattr(plan, "error", None) or "")[:500]})})
 
 
 async def _execute_plan(claim: Claim) -> None:

@@ -22,7 +22,7 @@ import httpx
 
 from ..connectors.base import ConnectorError, resolve_credential
 from ..models import LLMConfig
-from ..observability import LLM_COST, LLM_LATENCY, LLM_REQUESTS, LLM_TOKENS, tracer
+from ..observability import LLM_COST, LLM_LATENCY, LLM_REQUESTS, LLM_TOKENS, error_fields, mark_failed, span as traced
 
 
 RETRY_STATUS = {429, 500, 502, 503, 504, 529}
@@ -431,16 +431,15 @@ def estimate_cost(cfg: LLMConfig, tokens_in: int, tokens_out: int) -> Decimal:
 async def complete_metered(provider: Provider, system: str, messages: list[Message], *, json_mode: bool, max_tokens: int) -> LLMResponse:
     cfg = provider.cfg
     start = time.monotonic()
-    with tracer().start_as_current_span("llm.complete") as span:
-        span.set_attribute("gen_ai.system", cfg.provider)
-        span.set_attribute("gen_ai.request.model", cfg.model)
+    with traced("llm.complete", **{"gen_ai.system": cfg.provider, "gen_ai.request.model": cfg.model, "gen_ai.request.max_tokens": max_tokens}) as span:
         try:
             resp = await provider.complete(system, messages, json_mode=json_mode, max_tokens=max_tokens)
         except LLMError as exc:
             LLM_REQUESTS.labels(cfg.provider, cfg.model, exc.kind).inc()
             LLM_LATENCY.labels(cfg.provider).observe(time.monotonic() - start)
             span.set_attribute("moks.outcome", exc.kind)
-            log.warning("llm call failed", extra={"event": "llm_call", "dependency": cfg.provider, "operation": "complete", "outcome": "failure", "errorCode": exc.kind, "durationMs": int((time.monotonic() - start) * 1000)})
+            log.warning("llm call failed", extra={"event": "llm_call", "dependency": cfg.provider, "operation": "complete", "outcome": "failure",
+                                                  "durationMs": int((time.monotonic() - start) * 1000), **error_fields(exc)})
             raise
         span.set_attribute("gen_ai.usage.input_tokens", resp.tokens_in)
         span.set_attribute("gen_ai.usage.output_tokens", resp.tokens_out)

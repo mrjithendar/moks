@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -23,7 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import __version__, jobs, versions
+from . import __version__, errors, jobs, versions
 from .api import actions, admin, alerts, assist, backups, proposals, conversations, detections, diagnostics, environments, evals, explorer, finops, incidents, investigations, knowledge, knowledge_explorer, logs, metrics, multi, skills
 from .auth import routes as auth_routes
 from .auth.deps import get_auth
@@ -31,7 +30,7 @@ from .auth.sessions import AuthContext
 from .config import get_settings
 from .connectors import registry
 from .db import dispose, get_db, session_scope
-from .observability import HTTP_LATENCY, HTTP_REQUESTS, setup_logging, setup_tracing, start_metrics_server
+from .observability import HTTP_LATENCY, HTTP_REQUESTS, bound, current_trace_ids, mark_failed, setup_logging, setup_tracing, start_metrics_server
 
 log = logging.getLogger("moks.api")
 
@@ -92,23 +91,29 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def observe(request: Request, call_next):
-        rid = request.headers.get("x-request-id") or uuid.uuid4().hex
+        rid = errors.request_id(request)
+        request.state.request_id = rid
         start = time.monotonic()
-        try:
-            response: Response = await call_next(request)
-        except Exception:
-            log.exception("unhandled error", extra={"event": "http_unhandled", "request_id": rid})
-            response = JSONResponse({"detail": "Internal error"}, status_code=500)
-        route = request.scope.get("route")
-        template = getattr(route, "path", None) or ("spa" if request.url.path.startswith(s.base_path) else "other")
-        dur = time.monotonic() - start
-        if template not in ("/healthz", "/readyz"):
-            HTTP_REQUESTS.labels(request.method, template, str(response.status_code)).inc()
-            HTTP_LATENCY.labels(request.method, template).observe(dur)
-            if template.startswith(api):
-                log.info("request", extra={"event": "http_request", "route": template, "method": request.method,
-                                           "status": response.status_code, "durationMs": int(dur * 1000), "request_id": rid})
+        with bound(request_id=rid):
+            try:
+                response: Response = await call_next(request)
+            except Exception as exc:
+                response = errors.internal_error(request, exc)
+            route = request.scope.get("route")
+            template = getattr(route, "path", None) or ("spa" if request.url.path.startswith(s.base_path) else "other")
+            if template.startswith("/") and request.url.path.startswith(api + "/") and not template.startswith(api):
+                template = api + template  # FastAPI 0.16x leaves the including router's prefix out of route.path
+            dur = time.monotonic() - start
+            auth = getattr(request.state, "auth", None)
+            if template not in ("/healthz", "/readyz"):
+                HTTP_REQUESTS.labels(request.method, template, str(response.status_code)).inc()
+                HTTP_LATENCY.labels(request.method, template).observe(dur)
+                if template.startswith(api):
+                    log_request(request, response, template, dur, auth)
+        trace_id, _ = current_trace_ids()
         response.headers["X-Request-ID"] = rid
+        if trace_id:
+            response.headers["X-Trace-ID"] = trace_id
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "same-origin")
         response.headers.setdefault("X-Frame-Options", "DENY")
@@ -127,9 +132,11 @@ def create_app() -> FastAPI:
     for extra in (incidents, knowledge, knowledge_explorer, finops, actions, diagnostics, assist, alerts, evals, skills, multi, metrics, logs, detections, conversations, backups, proposals):
         router.include_router(extra.router)
 
+    errors.install(app)
+
     @app.exception_handler(jobs.QueueFull)
     async def queue_full(_request, exc: jobs.QueueFull):
-        return JSONResponse({"detail": str(exc)}, status_code=429, headers={"Retry-After": "30"})
+        return errors.response(429, str(exc), "queue_full", headers={"Retry-After": "30"})
 
     @router.get("/health", tags=["health"])
     async def public_health() -> dict[str, str]:
@@ -160,6 +167,24 @@ def create_app() -> FastAPI:
 
     _mount_spa(app)
     return app
+
+
+def log_request(request: Request, response: Response, template: str, dur: float, auth) -> None:
+    """One line per API request. 5xx is an error, 4xx a warning except the routine ones (session
+    probes, missing pages), so `level=warn` lists real client trouble."""
+    status = response.status_code
+    level = logging.ERROR if status >= 500 else logging.WARNING if status >= 400 and status not in (401, 404) else logging.INFO
+    extra = {"event": "http_request", "route": template, "method": request.method, "status": status, "durationMs": int(dur * 1000),
+             "outcome": "failure" if status >= 500 else "success"}
+    if auth is not None:
+        extra["user_id"] = auth.principal.user_id
+    if status >= 400:
+        extra["errorCode"] = errors.code_for(status)
+    log.log(level, "request", extra=extra)
+    if status >= 500:
+        from opentelemetry import trace
+
+        mark_failed(trace.get_current_span(), f"http_{status}", errors.code_for(status))
 
 
 def _mount_spa(app: FastAPI) -> None:
