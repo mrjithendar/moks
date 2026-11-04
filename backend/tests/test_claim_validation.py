@@ -242,3 +242,18 @@ async def test_a_reservation_covers_what_the_provider_really_requests(monkeypatc
     assert seen["est"] == budget.estimate(C, 2, 4000)  # the provider's floor, not the 500 asked for
     C.max_output_tokens = 1000
     assert AnthropicProvider(C).output_tokens(500) == 1000  # the configured cap beats the floor
+
+
+def test_alerts_on_services_that_do_not_exist_say_so():
+    """mk4, 2026-11-04: RoboShopServiceDown fired for 8 services in an empty roboshop-ai, and the report said the
+    Kubernetes checks found nothing wrong. Both were true; the message hid why."""
+    gone = [{"name": "RoboShopServiceDown", "active": [{"labels": {"instance": f"{n}.roboshop-ai.svc.cluster.local:4107", "job": "roboshop"}, "state": "firing"}
+                                                      for n in ("cart-service", "payment-service")]}]
+    empty = item("E1", data={"findings": [], "services": [], "workloads": []}, namespace="roboshop-ai")
+    out = ev.conflicts(ledger(empty, item("E2", "prom_alerts", summary="2 firing", data=gone, namespace=None), namespace="roboshop-ai"), [])
+    assert out[0]["subject"] == "alerts on absent services" and "cart-service, payment-service" in out[0]["detail"] and "no Service in roboshop-ai" in out[0]["detail"]
+    assert "found nothing wrong" not in out[0]["detail"]
+    # A Service that exists keeps the plain disagreement: then something really is unexplained
+    present = item("E1", data={"findings": [], "services": [{"name": "cart-service"}], "workloads": []}, namespace="roboshop-ai")
+    out = ev.conflicts(ledger(present, item("E2", "prom_alerts", summary="2 firing", data=gone, namespace=None), namespace="roboshop-ai"), [])
+    assert out[0]["subject"] == "firing alerts"

@@ -152,6 +152,26 @@ def _firing_in_scope(ledger: Ledger, data: Any) -> int:
     return count
 
 
+SVC_TARGET = re.compile(r"^([a-z0-9-]+)\.([a-z0-9-]+)\.svc\b")
+
+
+def _absent_targets(data: Any, triage: list[Entry]) -> tuple[list[str], int]:
+    """(alerted services that have no Service in a triaged namespace, firing instances checked). Only for
+    namespaces whose triage listed its Services, so a namespace that was not read proves nothing."""
+    listed = {t.namespace: {str(s.get("name")) for s in t.data.get("services") or []} for t in triage if isinstance(t.data, dict) and "services" in t.data}
+    absent, checked = [], 0
+    for rule in data if isinstance(data, list) else []:
+        for inst in (rule.get("active") if isinstance(rule, dict) and "active" in rule else [rule]) if isinstance(rule, dict) else []:
+            if inst.get("state", "firing") != "firing":
+                continue
+            m = SVC_TARGET.match(str((inst.get("labels") or {}).get("instance") or ""))
+            if m and m.group(2) in listed:
+                checked += 1
+                if m.group(1) not in listed[m.group(2)]:
+                    absent.append(f"{m.group(1)}.{m.group(2)}")
+    return sorted(set(absent)), checked
+
+
 def conflicts(ledger: Ledger, findings: list[dict]) -> list[dict]:
     """Sources that disagree. Marked for the engineer: MOKS does not decide which one is right."""
     out = []
@@ -161,6 +181,15 @@ def conflicts(ledger: Ledger, findings: list[dict]) -> list[dict]:
             continue
         triage = [t for t in ledger.by_kind(OBSERVATION) if t.tool == "k8s_triage" and ledger.in_scope(t)]
         if triage and not faults:
+            absent, checked = _absent_targets(e.data, triage)
+            if absent and len(absent) == checked:
+                # Both are right: the targets are down because nothing by those names runs. Usually a scrape job or rule outlived its workloads.
+                where = sorted({a.split(".", 1)[1] for a in absent})
+                detail = (f"Prometheus alerts on {len(absent)} target(s) ({', '.join(a.split('.')[0] for a in absent[:6])}{', …' if len(absent) > 6 else ''}) "
+                          f"that have no Service in {', '.join(where)}, so the Kubernetes checks have nothing of theirs to find failing. "
+                          "The scrape targets or alert rules are likely stale, or the workloads were removed.")
+                out.append({"subject": "alerts on absent services", "evidence": [e.ref, *[t.ref for t in triage[:2]]], "detail": detail, "absent": absent[:20]})
+                continue
             out.append({"subject": "firing alerts", "evidence": [e.ref, *[t.ref for t in triage[:2]]],
                         "detail": "Prometheus has firing alerts, but the Kubernetes checks found nothing wrong."})
     seen: dict[tuple, Entry] = {}
