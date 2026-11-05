@@ -18,7 +18,7 @@ spec:
       securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: payments
-          image: busybox:1.37
+          image: busybox:1.38
           envFrom: [{configMapRef: {name: payments-config}}]
           command: [sh, -c]
           args:
