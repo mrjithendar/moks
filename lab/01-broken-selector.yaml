@@ -82,7 +82,7 @@ spec:
       securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: traffic
-          image: busybox:1.37
+          image: busybox:1.38
           command: [sh, -c]
           args:
             - |
