@@ -138,7 +138,7 @@ Pods restart with the new configuration; a search during the rollout uses whiche
 
 ### 7. Soak, then retire the original
 
-Keep the original for at least the retention window. To retire it: set `secure.retireOriginal: true`, push, sync `moks-foundation` and `moks-opensearch`, and delete the StatefulSet, Service and NetworkPolicy by hand. Its PVC stays until the data deletion below.
+Keep the original for at least the retention window. Before retiring it, run `scripts/opensearch-migrate.sh validate` once more against the active cluster and run the same real searches you ran at cutover. Only when both pass, record it: `secure.cutoverVerified: "<active generation> validated <YYYY-MM-DD>"`. The chart refuses `retireOriginal` without that line, because a cluster being active does not show it was verified. Then set `secure.retireOriginal: true`, push, sync `moks-foundation` and `moks-opensearch`, and delete the StatefulSet, Service and NetworkPolicy by hand. Its PVC stays until the data deletion below.
 
 ## Rollback
 

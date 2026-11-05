@@ -17,6 +17,7 @@ class Fact(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     kind: str = "observation"  # observation | collection | documentation | historical; set by validate_claims, never by the model
     qualifiers: list[str] = Field(default_factory=list)
+    passages: list[str] = Field(default_factory=list)  # knowledge passage ids (E3.2) this claim cites; set by validate_llm_report, never by the model
 
 
 class Cause(BaseModel):
@@ -27,6 +28,7 @@ class Cause(BaseModel):
     verified: bool = False  # set only by verify_causes; never by the model
     contradicting: list[str] = Field(default_factory=list)  # evidence refs against this cause
     origin: str = "model"  # model | rules | demoted_fact, the last being a statement that could not stand as a fact
+    passages: list[str] = Field(default_factory=list)  # as Fact.passages
 
 
 class Remediation(BaseModel):
@@ -77,22 +79,52 @@ def parse_json_object(text: str) -> dict[str, Any]:
     return obj
 
 
-def validate_llm_report(raw: dict[str, Any], valid_refs: set[str], notes: list[str]) -> Report:
-    """Structure and the fields a model may not set. Whether its claims stand is validate_claims' job."""
+PASSAGE = re.compile(r"^E\d{1,3}\.\d{1,2}$")
+
+
+def _split_passages(refs: list[str], supplied: dict[str, str], rejected: list[str]) -> tuple[list[str], list[str]]:
+    """A citation of a passage (E3.2) is a citation of its evidence (E3) for claim validation, and the passage
+    is kept beside it. A passage id the model was not given is dropped and recorded."""
+    out, passages = [], []
+    for r in refs:
+        r = str(r)
+        if PASSAGE.match(r):
+            if r in supplied:
+                passages.append(r)
+                r = supplied[r]
+            else:
+                rejected.append(r)
+                continue
+        if r not in out:
+            out.append(r)
+    return out, passages
+
+
+def validate_llm_report(raw: dict[str, Any], valid_refs: set[str], notes: list[str], supplied: dict[str, str] | None = None) -> Report:
+    """Structure and the fields a model may not set. Whether its claims stand is validate_claims' job.
+    `supplied` maps the passage ids the model was given to their evidence refs."""
+    supplied = supplied or {}
     try:
         rep = Report.model_validate({**raw, "generated_by": "llm", "notes": notes})
     except ValidationError as exc:
         raise ValueError(f"report schema invalid: {exc.errors()[0]['msg']}") from None
+    rejected: list[str] = []
     for f in rep.observed_facts:
         f.kind, f.qualifiers = "observation", []
+        f.evidence, f.passages = _split_passages(f.evidence, supplied, rejected)
     for c in rep.suspected_causes:
         c.verified, c.origin = False, "model"
+        c.evidence, c.passages = _split_passages(c.evidence, supplied, rejected)
+        c.contradicting, more = _split_passages(c.contradicting, supplied, rejected)
+        c.passages += [x for x in more if x not in c.passages]
     for r in rep.proposed_remediation:
         r.requires_approval = True
         r.executable = False
     rep.verified_causes, rep.verified_findings, rep.conflicts = [], [], []
     rep.response_type, rep.answer = "troubleshooting", {}
     rep.validation = {"valid_refs": sorted(valid_refs, key=lambda r: int(r[1:]))}
+    if rejected:
+        rep.validation["passage_citations_rejected"] = sorted(set(rejected))
     return rep
 
 
@@ -118,7 +150,8 @@ def validate_claims(rep: Report, ledger: ev.Ledger, findings: list[dict], *, che
             continue
         decisions[v.disposition].append({"statement": f.statement[:200], "reasons": v.reasons})
         if v.disposition == "hypothesis":
-            demoted.append(Cause(cause=f.statement, evidence=v.refs, contradicting=v.contradicting, reasoning=f"Not shown as a fact: {'; '.join(v.reasons)}.", origin="demoted_fact"))
+            demoted.append(Cause(cause=f.statement, evidence=v.refs, contradicting=v.contradicting, reasoning=f"Not shown as a fact: {'; '.join(v.reasons)}.", origin="demoted_fact",
+                                 passages=[x for x in f.passages if x.rsplit(".", 1)[0] in v.refs]))
         elif v.disposition == "missing":
             rep.missing_evidence.append(f"Not established: {f.statement} ({'; '.join(v.reasons)}).")
     rep.observed_facts = facts

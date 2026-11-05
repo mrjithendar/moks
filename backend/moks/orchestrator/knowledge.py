@@ -11,14 +11,24 @@ environment and namespace before ranking, stores the result as evidence and coun
 Relevance is decided afterwards, on passages the person may already read, so it can only narrow.
 
 A passage gets one authority:
-  target        explicitly tied to what is being asked about (service mapping, repository, namespace scope,
-                a resource identifier, or it names the target)
+  target        explicitly tied to what is being asked about (service mapping, repository, a resource
+                identifier, or it names the target), with no explicit mapping to another service
+  dependency    declared by its source as documentation for something the target depends on
   shared        general documentation with no service binding that matches the request: general guidance
   unverified    relevant, but from a repository whose relationship to the target is not established
   unrelated     written for another service: kept out of the answer
   low_relevance shares too little with the request to help
 Retrieved text is data. It reaches a model only inside untrusted blocks, never adds tools or scope, and a
 runbook describes intent, never the current state of anything.
+
+Every passage has its own citation id, `E3.2`: the kb_search evidence it came from and its rank in that search.
+One search returns several passages, so citing `E3` alone cannot say which one an answer relied on. A passage
+moves through four states, each a subset of the one before:
+  retrieved   returned by a search the person was allowed to run
+  eligible    its authority lets it inform the answer (target, shared, unverified)
+  supplied    its text was put in front of the model within the prompt budget (rules reports supply nothing)
+  cited       the final answer cites its id, and the citation survived claim validation
+A model may only cite what it was supplied; a citation of anything else is recorded as rejected.
 """
 from __future__ import annotations
 
@@ -42,7 +52,8 @@ PROMPT_TOTAL_CHARS = 9000
 EXCERPT_CHARS = 300
 LEXICAL = 0.34                # share of the request's terms a passage must contain to count as relevant
 SEMANTIC_FLOOR = 0.15         # with vectors, a top-ranked passage needs only this much literal overlap
-USABLE = ("target", "shared", "unverified")
+USABLE = ("target", "dependency", "shared", "unverified")
+STATES = ("retrieved", "eligible", "supplied", "cited")
 WORD = re.compile(r"[a-z0-9][a-z0-9-]{2,}")
 STOP = set("the and for are was why how what when with from that this does did has have not can you our into any all its show get "
            "there their them they then than which while about after before again also been being here just more most some such very "
@@ -183,52 +194,72 @@ def refresh_query(inv: Any) -> str | None:
 
 
 def classify(hit: dict, cx: dict, rank: int, mode: str | None) -> tuple[str, list[str], str | None]:
-    """(authority, basis, why it is left out). Runs on passages the person may already read."""
+    """(authority, basis, why it is left out). Runs on passages the person may already read: relevance only
+    narrows what authorization allowed and never stands in for it.
+
+    Order matters. Explicit relationships are decided first: the source's service mapping, a declared
+    dependency, and a mapping to some other service (a conflict). Weaker signals (the repository's name,
+    identifiers, the target's name in the text) count only when nothing explicit contradicts them. A namespace
+    is supporting context: several services share one, so a namespace match alone never makes a passage the
+    target's."""
     cit, scope = hit.get("citation") or {}, hit.get("scope") or {}
     applies = scope.get("applies_to") or {}
     services = {str(s).lower() for s in [scope.get("service"), *(applies.get("services") or [])] if s}
+    dependents = {str(s).lower() for s in applies.get("dependency_of") or [] if s}  # documents a dependency these services use
+    declared_shared = bool(applies.get("shared"))  # the source owner says it applies to every service in its scope
     repo = str(cit.get("repository") or "")
     short = repo.split("/")[-1].lower() if repo else ""
     ns = scope.get("namespace") or "*"
     path = str(cit.get("path") or "")
     hay = f"{hit.get('title') or ''} {hit.get('heading') or ''} {hit.get('text') or ''} {path}".lower()
     names = cx["names"]
-    basis: list[str] = []
+    support = [f"scoped to namespace {ns} (supporting context only: other services may share it)"] if ns != "*" and ns in cx["namespaces"] else []
+    lexical = _overlap(cx["terms"], hay)
+    share = f"shares {round(lexical * 100)}% of the request's terms"
+    relevant = lexical >= LEXICAL or (mode in ("hybrid", "vector") and rank < 3 and lexical >= SEMANTIC_FLOOR)
+    mentioned = sorted(n for n in names if re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z0-9])", hay))
+
+    # 1. explicit relationships
     if services & names:
-        basis.append(f"source maps it to service {', '.join(sorted(services & names))}")
-    elif services & cx["terms"]:
-        basis.append(f"source maps it to service {', '.join(sorted(services & cx['terms']))}, which the question names")
+        return "target", [f"source maps it to service {', '.join(sorted(services & names))}", *support], None
+    if services & cx["terms"] and not names:
+        return "target", [f"source maps it to service {', '.join(sorted(services & cx['terms']))}, which the question names", *support], None
+    if dependents & (names | cx["terms"]):
+        return "dependency", [f"declared as documentation for a dependency of {', '.join(sorted(dependents & (names | cx['terms'])))}", *support], None
+    if services and names:  # written for another service: nothing weaker overrides that
+        others = ", ".join(sorted(services))
+        if mentioned and relevant:
+            return "unverified", [f"source maps it to service {others}", f"mentions {', '.join(mentioned[:3])}", share], None
+        return "unrelated", [f"source maps it to service {others}", *support], f"written for {others}, not {', '.join(sorted(names)[:3])}"
+    # 2. repository, identifiers and names, with no explicit mapping against them
+    basis: list[str] = []
     if repo and cx["repository"] and repo == cx["repository"]:
         basis.append(f"from the target's repository {repo}")
     elif short and short in names:
         basis.append(f"repository {repo} is named like the target")
-    if ns != "*" and ns in cx["namespaces"]:
-        basis.append(f"scoped to namespace {ns}")
     ids = sorted(i for i in cx["identifiers"] if i in hay)
     if ids:
         basis.append(f"names {', '.join(ids[:3])}")
-    mentioned = sorted(n for n in names if re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z0-9])", hay))
     if mentioned:
         basis.append(f"mentions {', '.join(mentioned[:3])}")
-    if basis:
-        return "target", basis, None
-    if services and names:
-        return "unrelated", [f"source maps it to service {', '.join(sorted(services))}"], f"written for {', '.join(sorted(services))}, not {', '.join(sorted(names)[:3])}"
+    if basis and not services:
+        return "target", basis + support, None
     if services and not names and not cx["repository"]:
-        lexical = _overlap(cx["terms"], hay)
         if lexical < LEXICAL:
-            return "low_relevance", [f"shares {round(lexical * 100)}% of the request's terms"], "shares too little with this request to help"
-        return "unverified", [f"source maps it to service {', '.join(sorted(services))}", "nothing yet shows that is what the question is about"], None
-    lexical = _overlap(cx["terms"], hay)
-    relevant = lexical >= LEXICAL or (mode in ("hybrid", "vector") and rank < 3 and lexical >= SEMANTIC_FLOOR)
+            return "low_relevance", [share], "shares too little with this request to help"
+        return "unverified", [f"source maps it to service {', '.join(sorted(services))}", "nothing yet shows that is what the question is about", *support], None
+    # 3. relevance by content
     if not relevant:
-        return "low_relevance", [f"shares {round(lexical * 100)}% of the request's terms"], "shares too little with this request to help"
-    why = [f"shares {round(lexical * 100)}% of the request's terms"] + (["ranked high by hybrid search"] if mode in ("hybrid", "vector") and lexical < LEXICAL else [])
-    if not services and ns == "*" and kind_of(path) in ("markdown", "text"):
-        return "shared", why + ["documentation with no service binding: general guidance"], None
+        return "low_relevance", [share, *support], "shares too little with this request to help"
+    why = [share] + (["ranked high by hybrid search"] if mode in ("hybrid", "vector") and lexical < LEXICAL else [])
+    if declared_shared:
+        return "shared", why + ["the source declares it shared documentation for every service in its scope", *support], None
+    if not services and kind_of(path) in ("markdown", "text") and (ns == "*" or support):
+        label = "documentation with no service binding: general guidance" if ns == "*" else f"documentation for namespace {ns} with no service binding: not specific to the target"
+        return "shared", why + [label, *support], None
     if not names and not cx["repository"]:
-        return "shared", why + ["the request names no target, so nothing ties it more closely"], None
-    return "unverified", why + [f"{repo or 'its source'} is not established as the target's"], None
+        return "shared", why + ["the request names no target, so nothing ties it more closely", *support], None
+    return "unverified", why + [f"{repo or 'its source'} is not established as the target's", *support], None
 
 
 def reclassify(inv: Any, question: str) -> None:
@@ -244,13 +275,22 @@ def reclassify(inv: Any, question: str) -> None:
             continue
         mode = (st["queries"][p["query"]] if p["query"] < len(st["queries"]) else {}).get("mode")
         p["authority"], p["basis"], p["excluded"] = classify(hit, cx, p["rank"] - 1, mode)
+        if not p.get("cited"):
+            p["state"] = "supplied" if p.get("provided") and p["authority"] in USABLE else "eligible" if p["authority"] in USABLE else "retrieved"
     _settle(st)
+
+
+def passage_id(ref: str, rank: int) -> str:
+    """E3.2: the second passage of the search stored as E3. Stable for the life of the investigation, because
+    the search result it points into is stored evidence."""
+    return f"{ref}.{rank}"
 
 
 def _passage(hit: dict, ref: str, query_index: int, rank: int, authority: str, basis: list[str], excluded: str | None) -> dict:
     cit, fr = hit.get("citation") or {}, hit.get("freshness") or {}
-    return {"ref": ref, "chunk_id": hit.get("chunk_id"), "query": query_index, "rank": rank + 1, "authority": authority, "basis": basis, "excluded": excluded,
-            "used": False, "provided": False, "source": cit.get("source"), "source_type": cit.get("source_type"), "repository": cit.get("repository"),
+    return {"id": passage_id(ref, rank + 1), "ref": ref, "chunk_id": hit.get("chunk_id"), "document_id": hit.get("document_id"), "query": query_index, "rank": rank + 1,
+            "authority": authority, "basis": basis, "excluded": excluded, "state": "eligible" if authority in USABLE else "retrieved",
+            "used": False, "cited": False, "cited_by": None, "provided": False, "source": cit.get("source"), "source_type": cit.get("source_type"), "repository": cit.get("repository"),
             "path": cit.get("path"), "revision": cit.get("revision"), "lines": cit.get("lines"), "url": cit.get("url"), "title": hit.get("title"), "heading": hit.get("heading"),
             "freshness": {k: fr.get(k) for k in ("state", "reason", "trust", "last_checked", "source_synced", "possible_conflict") if fr.get(k) is not None},
             "excerpt": redact(" ".join(str(hit.get("text") or "").split()))[:EXCERPT_CHARS]}
@@ -384,11 +424,21 @@ def restore(inv: Any, saved: dict | None) -> dict:
     body = texts(inv)
     for p in st["passages"]:
         p.setdefault("excerpt", redact(" ".join(body.get(p.get("chunk_id"), "").split()))[:EXCERPT_CHARS])
+        _upgrade(p)
     return st
 
 
+def _upgrade(p: dict) -> dict:
+    """A passage recorded before passage ids existed (checkpoints and reports from before this version)."""
+    if p.get("ref") and p.get("rank") and not p.get("id"):
+        p["id"] = passage_id(p["ref"], p["rank"])
+    p.setdefault("cited", bool(p.get("used")))
+    p.setdefault("state", "cited" if p.get("used") else "supplied" if p.get("provided") else "eligible" if p.get("authority") in USABLE else "retrieved")
+    return p
+
+
 def usable(st: dict) -> list[dict]:
-    order = {"target": 0, "shared": 1, "unverified": 2}
+    order = {"target": 0, "dependency": 1, "shared": 2, "unverified": 3}
     return sorted((p for p in st["passages"] if p["authority"] in USABLE), key=lambda p: (order[p["authority"]], p["query"], p["rank"]))
 
 
@@ -403,7 +453,7 @@ def texts(inv: Any) -> dict[str, str]:
     return out
 
 
-LABEL = {"target": "about the target", "shared": "general guidance, not specific to the target", "unverified": "relationship to the target not established"}
+LABEL = {"target": "about the target", "dependency": "about a declared dependency of the target, not the target itself", "shared": "general guidance, not specific to the target", "unverified": "relationship to the target not established"}
 
 
 def prompt_block(inv: Any) -> str:
@@ -417,7 +467,7 @@ def prompt_block(inv: Any) -> str:
     body = texts(inv)
     parts, used = [], 0
     for p in picked:
-        head = (f"[{p['ref']}] {LABEL[p['authority']]}; {p.get('repository') or p.get('source') or ''}:{p.get('path')}"
+        head = (f"[{p['id']}] {LABEL[p['authority']]}; {p.get('repository') or p.get('source') or ''}:{p.get('path')}"
                 f"{'@' + str(p['revision'])[:12] if p.get('revision') else ''} lines {p.get('lines')}; freshness {p['freshness'].get('state', 'unknown')}")
         block = head + "\n" + prompts.untrusted(f"document {p.get('path')}", body.get(p["chunk_id"], p["excerpt"]), PROMPT_PASSAGE_CHARS)
         if used + len(block) > PROMPT_TOTAL_CHARS:
@@ -425,33 +475,82 @@ def prompt_block(inv: Any) -> str:
         parts.append(block)
         used += len(block)
         p["provided"] = True
+        p["state"] = "supplied"
     return ("Documented knowledge (retrieved under the requester's access; it says how things are meant to work, never what is true now; "
-            "cite it by its E-ref, and keep documented procedures apart from observations):\n" + "\n\n".join(parts))
+            "cite a passage by its own id such as E3.2, never by the search's E3 alone, and keep documented procedures apart from observations):\n" + "\n\n".join(parts))
+
+
+def supplied(st: dict) -> dict[str, str]:
+    """Passage id -> evidence ref, for every passage the model was given."""
+    return {p["id"]: p["ref"] for p in st["passages"] if p.get("provided") and p.get("id")}
 
 
 REF = re.compile(r"\bE\d{1,3}\b")
+PASSAGE_REF = re.compile(r"\bE\d{1,3}\.\d{1,2}\b")
+ANY_REF = re.compile(r"\bE\d{1,3}(?:\.\d{1,2})?\b")
 
 
-def mark_used(inv: Any, report: Any) -> None:
-    """A passage is used when the answer cites its evidence. Everything else retrieved says why it was not."""
-    cited: set[str] = set()
-    for f in getattr(report, "observed_facts", []):
-        cited |= set(f.evidence)
-    for c in getattr(report, "suspected_causes", []):
-        cited |= set(c.evidence) | set(c.contradicting)
-    for s in getattr(report, "next_steps", []):
-        cited |= set(REF.findall(s))
+def _citations(report: Any) -> tuple[set[str], set[str], set[tuple[str, str]], set[str]]:
+    """(passage ids, bare evidence refs, (ref, path) pairs from guidance items, ids MOKS itself added).
+    A claim's passage counts only while the claim still cites that passage's evidence after validation."""
+    ids: set[str] = set()
+    bare: set[str] = set()
+    for c in [*getattr(report, "observed_facts", []), *getattr(report, "suspected_causes", [])]:
+        kept = set(getattr(c, "evidence", [])) | set(getattr(c, "contradicting", []))
+        ids |= {x for x in getattr(c, "passages", []) if x.rsplit(".", 1)[0] in kept}
+        bare |= kept
+    for step in getattr(report, "next_steps", []):
+        found = set(ANY_REF.findall(step))
+        ids |= {x for x in found if "." in x}
+        bare |= {x for x in found if "." not in x}
     answer = getattr(report, "answer", None) or {}
-    cited |= set(answer.get("cited") or [])
-    paths: set[tuple[str, str]] = set()  # guidance items name the file as well as the evidence
+    for x in answer.get("cited") or []:
+        (ids if "." in str(x) else bare).add(str(x))
+    paths: set[tuple[str, str]] = set()
     for section in ("overview", "prerequisites", "steps", "verification", "rollback"):
         for item in answer.get(section) or []:
             for ref in item.get("sources") or []:
-                (paths.add((ref, item["path"])) if item.get("path") else cited.add(ref))
-    for p in inv.knowledge["passages"]:
-        p["used"] = p["authority"] in USABLE and (p["ref"] in cited or (p["ref"], p.get("path")) in paths)
-        if not p["used"] and not p["excluded"]:
-            p["excluded"] = ("not cited in the answer" if p["provided"] or report.generated_by == "llm" else "retrieved but not used in the answer")
+                if "." in str(ref):
+                    ids.add(str(ref))
+                elif item.get("path"):
+                    paths.add((ref, item["path"]))
+                else:
+                    bare.add(ref)
+    return ids, bare, paths, set(getattr(report, "validation", {}).get("moks_cited_passages") or [])
+
+
+def mark_used(inv: Any, report: Any) -> None:
+    """A passage is cited when the final answer names its id, it was eligible, and (for a model's answer) the
+    model was given it. A bare search ref names a passage only when exactly one passage of that search was
+    available to the answer; otherwise the citation is recorded as ambiguous and no passage is credited."""
+    st = inv.knowledge
+    ids, bare, paths, by_moks = _citations(report)
+    llm = report.generated_by == "llm"
+    available = [p for p in st["passages"] if p["authority"] in USABLE and (p.get("provided") or not llm or p.get("id") in by_moks)]
+    per_ref: dict[str, list[dict]] = {}
+    for p in available:
+        per_ref.setdefault(p["ref"], []).append(p)
+    known = {p.get("id") for p in st["passages"]}
+    rejected = sorted(i for i in ids if i not in {p.get("id") for p in available})
+    st["citations"] = {"passages": sorted(ids & known), "rejected": [{"id": i, "reason": "no such passage" if i not in known else "cited, but this passage was not available to the answer"}
+                                                                   for i in rejected][:20], "ambiguous": []}
+    avail = {id(p) for p in available}
+    for p in st["passages"]:
+        _upgrade(p)
+        ok = id(p) in avail
+        by_id = ok and p.get("id") in ids
+        by_path = ok and (p["ref"], p.get("path")) in paths and sum(1 for q in per_ref.get(p["ref"], []) if q.get("path") == p.get("path")) == 1
+        by_ref = ok and p["ref"] in bare and len(per_ref.get(p["ref"], [])) == 1
+        p["cited"] = p["used"] = bool(by_id or by_path or by_ref)
+        p["cited_by"] = ("moks" if p.get("id") in by_moks else "model" if llm else "rules") if p["cited"] else None
+        p["state"] = "cited" if p["cited"] else "supplied" if p.get("provided") and p["authority"] in USABLE else "eligible" if p["authority"] in USABLE else "retrieved"
+        if not p["cited"] and ok and p["ref"] in bare and len(per_ref.get(p["ref"], [])) > 1:
+            if p["ref"] not in st["citations"]["ambiguous"]:
+                st["citations"]["ambiguous"].append(p["ref"])
+            p["excluded"] = p["excluded"] or f"the answer cited its search {p['ref']} without naming a passage, and {len(per_ref[p['ref']])} passages of that search were available"
+        elif not p["cited"] and not p["excluded"]:
+            p["excluded"] = ("not cited in the answer" if p.get("provided") else "eligible, but not given to the model within the prompt budget" if llm and p["authority"] in USABLE
+                             else "retrieved but not used in the answer")
 
 
 def documented_steps(inv: Any, limit: int = 3) -> list[str]:
@@ -461,8 +560,8 @@ def documented_steps(inv: Any, limit: int = 3) -> list[str]:
         where = f"{p.get('repository') + ':' if p.get('repository') else ''}{p.get('path')}"
         lines = p.get("lines") or []
         at = f" lines {lines[0]}-{lines[1]}" if len(lines) == 2 and lines[0] else ""
-        label = {"target": "Documented procedure", "shared": "General runbook guidance", "unverified": "Possibly related documentation (relationship to the target not established)"}[p["authority"]]
-        out.append(f"{label}: {p.get('heading') or p.get('title') or where} — {where}{at} ({p['ref']}). Documented, not observed: check it against the live evidence before following it.")
+        label = {"target": "Documented procedure", "dependency": "Documented procedure for a dependency", "shared": "General runbook guidance", "unverified": "Possibly related documentation (relationship to the target not established)"}[p["authority"]]
+        out.append(f"{label}: {p.get('heading') or p.get('title') or where} — {where}{at} ({p.get('id') or p['ref']}). Documented, not observed: check it against the live evidence before following it.")
     return out
 
 
@@ -471,11 +570,16 @@ def summary(inv: Any) -> dict[str, Any]:
     picked = usable(st)
     out = {k: st[k] for k in ("status", "scope", "queries", "hints")}
     out["reasons"] = [REASONS.get(r, r) for r in st["reasons"]]
-    out["passages"] = st["passages"][:40]
-    out["counts"] = {"retrieved": len(st["passages"]), "usable": len(picked), "used": sum(p["used"] for p in st["passages"]),
-                     "excluded": sum(1 for p in st["passages"] if p["authority"] not in USABLE)}
-    if picked and not out["counts"]["used"]:
-        out["reasons"].append("Passages were retrieved but none was used in the answer.")
+    out["passages"] = [_upgrade(p) for p in st["passages"][:40]]
+    cited = sum(bool(p.get("cited")) for p in st["passages"])
+    out["counts"] = {"retrieved": len(st["passages"]), "eligible": len(picked), "supplied": sum(bool(p.get("provided")) for p in st["passages"]), "cited": cited,
+                     "usable": len(picked), "used": cited, "excluded": sum(1 for p in st["passages"] if p["authority"] not in USABLE)}
+    out["citations"] = st.get("citations") or {"passages": [], "rejected": [], "ambiguous": []}
+    out["version"] = 2  # passage ids and states; version 1 reports have only used/provided
+    if picked and not cited:
+        out["reasons"].append("Passages were retrieved but none was cited in the answer.")
+    if out["citations"]["ambiguous"]:
+        out["reasons"].append(f"The answer cited {', '.join(out['citations']['ambiguous'])} without naming a passage, so no passage of those searches is credited.")
     out["note"] = "Documented knowledge says how things are meant to work. It does not show the current state of any system."
     return out
 

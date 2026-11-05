@@ -1,5 +1,26 @@
 # Testing
 
+## Evidence accuracy, readiness and ML (2026-11-05)
+
+Local only: PostgreSQL 17, Python 3.15 venv, Node 26, Helm. Nothing ran against mk4, a real Prometheus, a real
+embedding model or a real chat model. Prometheus series in the anomaly tests are synthetic.
+
+| Check | Result |
+|---|---|
+| Backend suite | 1271 passed, 3 failed, 47 skipped. The 3 are the `test_helm_render.py` terminal defaults, which fail on the committed chart too |
+| New: `test_passage_citations.py` | 17 passed: one cited passage of several, bare refs, unsupplied citations, prompt budget, demoted facts, guidance, historical reports, conflicting service metadata in a shared namespace |
+| New: `test_readiness_parity.py` | 8 passed: readiness `eligible` equals what search returns for stale, review-overdue, source-review-overdue, quarantined, superseded, deprecated, archived and evaluation-realm content; hints never count unreadable sources |
+| New: `test_ml_learning_similar.py` | 17 passed: capture, completed is not resolved, review, judgments, grouped and chronological splits without leakage, redacted export, retention, similar-incident access isolation, hard negatives, search failure and keyword-only fallback, kill switch, the investigation stage, synthetic and reviewed evaluation |
+| New: `test_ml_anomaly_skills.py` | 18 passed: counter resets, sparse traffic, absent telemetry, chunking under the connector caps, insufficient history, tampered and mismatched artifacts (including a pickle), gated promotion, one champion, rollback, shadow mode making no incident, detection state, action plan or audit change, maintenance, scoped observations, skill eligibility before ranking |
+| Synthetic `similar_incidents` evaluation | Recall@3 1.0, MRR 1.0, nDCG@3 1.0, 0 of 3 hard negatives above the match, on 5 cases written for the test. Not a quality measure |
+| `ruff --select F,E9` on changed files | clean, apart from one unused import that was already in `test_knowledge_retrieval.py` |
+| Frontend suite, `tsc --noEmit`, `vite build` | 149 passed, clean, built. ML page chunk 5.5 KB gzip |
+| `helm lint` and `helm template` (minikube, EKS, training CronJob on, retirement gate) | clean |
+| `scripts/validate-argocd-split.py` | 3 failures, the same `values-eks.yaml` terminal ones as before this work |
+
+Not run: the feature PromQL against Prometheus; the training CronJob in a cluster; artifact storage on S3/R2;
+embedding-based skill ranking against a real provider; any UI walkthrough in a browser.
+
 ## Request routing and scope
 
 Results from 2026-11-03, local only (PostgreSQL 17, Node 26). Nothing ran against mk4 or a real model.

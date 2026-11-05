@@ -1,0 +1,41 @@
+name: similar_incidents
+kind: similar
+description: >-
+  Similar-incident retrieval on synthetic incidents written for this test, with hard negatives that share symptoms but
+  not the cause. It checks the method behaves as designed; it is not evidence about real incidents. Real evaluation
+  uses reviewed judgments (`moks ml evaluate-similar`), which need operators to have judged results first.
+k: 3
+gates:
+  min_recall_at_k: 0.9
+  max_hard_negative_above_relevant: 0.0
+incidents:
+  - {id: pay-dburl, namespace: shop, service: payments, days_ago: 20, cause: "PAYMENTS_DB_URL removed from the ConfigMap", resolution: "restored payments-config",
+     features: {symptoms: [crashloop, crash_log_reason], services: [payments], resource_kinds: [pod], signature: [payments_db_url, missing, exit], changes: [{kind: rollout}]}}
+  - {id: bill-lock, namespace: shop, service: billing, days_ago: 15, cause: "ledger lock held after failover", resolution: "billing-ctl unlock",
+     features: {symptoms: [crashloop], services: [billing], resource_kinds: [pod], signature: [ledger, lock, held], changes: []}}
+  - {id: pay-oom, namespace: shop, service: payments, days_ago: 40, cause: "heap above the memory limit after a traffic spike", resolution: "raised the limit and fixed the cache size",
+     features: {symptoms: [oomkilled, crashloop], services: [payments], resource_kinds: [pod], signature: [oomkilled, memory, limit], changes: []}}
+  - {id: cart-image, namespace: shop, service: cart, days_ago: 5, cause: "image tag deleted from the registry", resolution: "re-pushed the tag",
+     features: {symptoms: [image_pull], services: [cart], resource_kinds: [pod], signature: [manifest, unknown, <hex>], changes: [{kind: rollout}]}}
+  - {id: web-probe, namespace: web, service: frontend, days_ago: 9, cause: "readiness probe pointed at a removed path", resolution: "updated the probe path",
+     features: {symptoms: [not_ready, service_no_endpoints], services: [frontend], resource_kinds: [pod, service], signature: [readiness, probe, failed], changes: [{kind: rollout}]}}
+cases:
+  - id: same-dburl-after-deploy
+    current: {symptoms: [crashloop, crash_log_reason], services: [payments], resource_kinds: [pod], signature: [payments_db_url, missing], changes: [{kind: rollout}]}
+    relevant: [pay-dburl]
+    hard_negatives: [bill-lock]
+  - id: oom-on-payments
+    current: {symptoms: [oomkilled], services: [payments], resource_kinds: [pod], signature: [oomkilled, memory]}
+    relevant: [pay-oom]
+    hard_negatives: [pay-dburl]
+  - id: billing-crash
+    current: {symptoms: [crashloop], services: [billing], resource_kinds: [pod], signature: [ledger, lock]}
+    relevant: [bill-lock]
+    hard_negatives: [pay-dburl]
+  - id: missing-image
+    current: {symptoms: [image_pull], services: [cart], resource_kinds: [pod], signature: [manifest, unknown], changes: [{kind: rollout}]}
+    relevant: [cart-image]
+  - id: probe-other-namespace
+    namespace: web
+    current: {symptoms: [not_ready], services: [frontend], resource_kinds: [pod], signature: [readiness, probe]}
+    relevant: [web-probe]

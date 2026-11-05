@@ -324,6 +324,10 @@ export function Readiness({ id }: { id: string }) {
         <dt>Files</dt><dd>{d.upstream.files.listed ?? "—"} listed · {d.upstream.files.included} included · {d.upstream.files.excluded_by_policy ?? "—"} left out by policy · {d.upstream.files.excluded_by_content} excluded on read · {d.upstream.files.failed} failed · {d.upstream.files.pending} pending</dd>
         <dt>Documents</dt><dd>{d.documents.active} active · {d.documents.draft} draft · {d.documents.quarantined} quarantined · {d.documents.archived} archived</dd>
         <dt>Index backlog</dt><dd>{d.indexing.outbox_pending} pending · {d.indexing.outbox_dead} failed · {d.indexing.documents_behind} documents behind</dd>
+        {d.retrieval && <><dt>Retrieval</dt><dd aria-label="Retrieval eligibility">{d.retrieval.ingested} ingested · {d.retrieval.indexed} indexed · <strong>{d.retrieval.eligible} eligible for retrieval</strong>
+          {" "}· excluded: {d.retrieval.excluded.review} awaiting review, {d.retrieval.excluded.freshness} past freshness or review limits, {d.retrieval.excluded.lifecycle} by lifecycle
+          {(d.retrieval.flagged.superseded + d.retrieval.flagged.deprecated + d.retrieval.flagged.stale) > 0 && <> · returned with a warning: {d.retrieval.flagged.superseded} superseded, {d.retrieval.flagged.deprecated} deprecated, {d.retrieval.flagged.stale} stale</>}
+          {" "}· operations: {d.retrieval.operations.pending} pending, {d.retrieval.operations.failed} failed</dd></>}
         <dt>Scope</dt><dd className="mono">{d.source.scope.environment}/{d.source.scope.namespace}{d.source.scope.shared_globally ? " (shared globally)" : ""}{d.source.profiles.length ? ` · ${d.source.profiles.join(", ")}` : ""}</dd>
       </dl>
       {d.reasons.length > 0 && <ul className="small">{d.reasons.map((r: any) => <li key={r.code}>{r.message}{r.detail && <span className="muted"> ({r.detail})</span>}</li>)}</ul>}

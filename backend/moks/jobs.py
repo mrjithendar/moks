@@ -50,6 +50,9 @@ POLICIES: dict[str, Policy] = {
     "alert_poll": Policy(1, False),         # the scheduler queues the next one
     "detection_tick": Policy(1, False),     # the scheduler queues the next one
     "eval_run": Policy(1, False),           # a person starts it again
+    "ml_anomaly_tick": Policy(1, False),    # the scheduler queues the next one
+    "ml_anomaly_train": Policy(1, False),   # an operator or the CronJob starts it again
+    "learning_purge": Policy(2, True),      # deletes by expiry, so a repeat is harmless
 }
 DEFAULT_POLICY = Policy(3, False)
 JOB_CLASSES = {"detection_tick": "detection", "alert_poll": "detection", "knowledge_sync": "knowledge", "knowledge_reindex": "knowledge"}
@@ -231,7 +234,23 @@ def handlers() -> dict[str, Handler]:
     async def detection_tick(db: AsyncSession, p: dict) -> dict:
         return await detection.tick(uuid.UUID(p["environment_id"]))
 
-    return {"detection_tick": detection_tick, "knowledge_sync": knowledge_sync, "knowledge_reindex": knowledge_reindex, "alert_poll": alert_poll, "eval_run": eval_run}
+    async def ml_anomaly_tick(db: AsyncSession, p: dict) -> dict:
+        from .ml import anomaly
+
+        return await anomaly.tick(p["environment"])
+
+    async def ml_anomaly_train(db: AsyncSession, p: dict) -> dict:
+        from .ml import anomaly
+
+        return await anomaly.train(p["environment"], p["namespace"], created_by=uuid.UUID(p["created_by"]) if p.get("created_by") else None, job_id=str(p.get("_job_id")))
+
+    async def learning_purge(db: AsyncSession, p: dict) -> dict:
+        from .ml import learning
+
+        return await learning.purge(db)
+
+    return {"detection_tick": detection_tick, "knowledge_sync": knowledge_sync, "knowledge_reindex": knowledge_reindex, "alert_poll": alert_poll, "eval_run": eval_run,
+            "ml_anomaly_tick": ml_anomaly_tick, "ml_anomaly_train": ml_anomaly_train, "learning_purge": learning_purge}
 
 
 async def run_one(job_id: uuid.UUID) -> None:
@@ -341,6 +360,27 @@ async def update_durability_metrics() -> None:
         BACKUP_LAST_SUCCESS.set(good.finished_at.timestamp())
 
 
+async def _schedule_ml(now: datetime) -> None:
+    """Anomaly scoring per environment that has an active model, no more often than the configured interval, and
+    learning retention once a day. With anomaly_detection disabled nothing is queued."""
+    from .ml import mode
+    from .models import MLModel, MLObservation
+
+    s = get_settings()
+    async with session_scope() as db:
+        if s.ml_learning_retention_days > 0:
+            await enqueue("learning_purge", {}, dedupe_key=f"learning_purge:{now.date().isoformat()}")
+        if await mode(db, "anomaly_detection") == "disabled":
+            return
+        cohorts = (await db.execute(select(MLModel.cohort).where(MLModel.capability == "anomaly_detection", MLModel.status.in_(("champion", "shadow"))))).scalars().all()
+        envs = sorted({c.split("/", 1)[0] for c in cohorts})
+        for env in envs:
+            last = (await db.execute(select(func.max(MLObservation.observed_at)).where(MLObservation.environment == env))).scalar_one()
+            if last is None or now - last >= timedelta(minutes=s.ml_anomaly_interval_minutes):
+                bucket = int(now.timestamp() // (s.ml_anomaly_interval_minutes * 60))
+                await enqueue("ml_anomaly_tick", {"environment": env}, dedupe_key=f"ml_anomaly_tick:{env}:{bucket}")
+
+
 async def schedule_periodic() -> None:
     """Idempotent: dedupe keys keep one pending job per target."""
     s = get_settings()
@@ -365,6 +405,12 @@ async def schedule_periodic() -> None:
             await enqueue("knowledge_sync", {"source_id": str(src.id)}, dedupe_key=f"knowledge_sync:{src.id}")
     except QueueFull as exc:
         log.warning("queue full, scheduling again next tick", extra={"event": "job_queue_full", "operation": exc.job_class})
+    try:
+        await _schedule_ml(now)
+    except QueueFull as exc:
+        log.warning("queue full, scheduling again next tick", extra={"event": "job_queue_full", "operation": exc.job_class})
+    except Exception:
+        log.warning("ML scheduling failed", extra={"event": "ml_schedule_failed"})
     _ = s
     try:
         from .rag import service

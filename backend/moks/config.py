@@ -72,6 +72,28 @@ class Settings(BaseSettings):
     # Searches the knowledge stage may run per investigation (initial plus one refresh after triage). They are
     # counted in tool_calls but come from this allowance, so documented procedures never cost live evidence.
     knowledge_max_searches: int = 3
+    # ML (docs/ML.md). Capability modes live in the ml_capabilities table; these bound the work each one may do.
+    ml_disabled: bool = False                 # MOKS_ML_DISABLED: forces every capability off whatever the database says (the deploy-time kill switch)
+    ml_learning_capture: bool = True          # write a learning record when an investigation finishes; capturing is not training
+    ml_learning_retention_days: int = 365     # records past this are purged by `moks learning purge` and the daily job
+    ml_similar_incidents_k: int = Field(default=5, ge=1, le=10)
+    ml_similar_incidents_candidates: int = Field(default=300, ge=10, le=2000)
+    ml_anomaly_step_seconds: int = Field(default=300, ge=60, le=3600)          # one sample per step, for training and inference alike
+    ml_anomaly_window_minutes: int = Field(default=60, ge=15, le=360)          # the window an observation scores
+    ml_anomaly_training_days: int = Field(default=14, ge=1, le=60)
+    ml_anomaly_min_history_days: float = Field(default=7.0, ge=0.5, le=60)     # less than this is reported as insufficient history
+    ml_anomaly_max_cohorts: int = Field(default=40, ge=1, le=500)               # per environment per tick, and per training run
+    ml_anomaly_max_series: int = Field(default=200, ge=10, le=5000)             # per query; more is refused rather than truncated
+    ml_anomaly_concurrency: int = Field(default=2, ge=1, le=8)
+    ml_anomaly_interval_minutes: int = Field(default=15, ge=5, le=240)
+    ml_anomaly_max_flags_per_day: float = Field(default=3.0, ge=0.1, le=100)   # promotion gate on the validation period
+    ml_anomaly_namespaces: str = ""            # "env:namespace,env:namespace" the scheduled training covers; empty trains nothing
+    ml_artifact_store: Literal["postgres", "s3"] = "postgres"
+    ml_artifact_bucket: str = ""
+    ml_artifact_prefix: str = "moks/ml-artifacts/"
+    ml_artifact_endpoint: str = ""
+    ml_artifact_region: str = ""
+    ml_artifact_max_bytes: int = 5_000_000
     guidance_max_files: int = 6        # repository files read for one guidance answer
     intent_llm_classifier: bool = True  # ask the chat model only when the rules are unsure
     rag_rerank_enabled: bool = False  # stays off until docs/RERANKING.md's gates pass on real questions

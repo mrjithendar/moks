@@ -14,6 +14,7 @@ export const NAV: NavGroup[] = [
     { to: "/metrics", label: "Metrics", icon: "chart", show: live },
     { to: "/logs", label: "Logs", icon: "lines", show: live },
     { to: "/detections", label: "Detection rules", icon: "radar", show: read },
+    { to: "/ml", label: "ML insights", icon: "spark2", end: true, show: (can) => can("ml.read") },
   ] },
   { label: "Investigate", items: [
     { to: "/investigate", label: "New investigation", icon: "plus", show: (can) => can("investigation.run") },
@@ -43,6 +44,7 @@ export const NAV: NavGroup[] = [
     { to: "/admin/llm", label: "LLM providers", icon: "cpu", show: (can) => can("admin.llm") },
     { to: "/admin/users", label: "Users & roles", icon: "users", show: (can) => can("admin.users") },
     { to: "/evals", label: "Evaluation", icon: "chart", show: (can) => can("admin.policies") },
+    { to: "/admin/ml", label: "Machine learning", icon: "cpu", show: (can) => can("ml.admin") || can("learning.review") || can("learning.export") },
   ] },
 ];
 

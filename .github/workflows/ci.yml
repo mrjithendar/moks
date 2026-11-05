@@ -156,6 +156,11 @@ jobs:
           docker tag "$IMAGE" "$LATEST"
           docker push "$LATEST"
           echo "pushed $IMAGE and $LATEST ($DIGEST). Restart mk4 to run it; see docs/RELEASES.md." >> "$GITHUB_STEP_SUMMARY"
+          # The release record: which commit became which digest. scripts/release-record.py reads it; docs/RELEASES.md.
+          mkdir -p release && printf '{"component":"moks","commit":"%s","repository":"%s","tag":"%s","digest":"%s","run":"%s"}\n' \
+            "${{ github.sha }}" "$REPOSITORY" "${{ github.sha }}" "$DIGEST" "${{ github.run_id }}" > release/moks.json
+      - uses: actions/upload-artifact@v4
+        with: {name: release-moks-${{ github.sha }}, path: release/moks.json, retention-days: 400}
 
   reranker:
     runs-on: ubuntu-24.04
@@ -216,6 +221,11 @@ jobs:
           docker tag "$IMAGE" "$LATEST"
           docker push "$LATEST"
           echo "pushed $IMAGE and $LATEST ($DIGEST). Restart moks-reranker to run it." >> "$GITHUB_STEP_SUMMARY"
+          MODEL="$(python3 -c 'import json; l=json.load(open("model.lock.json")); print(l["model_id"] + "@" + l["revision"])')"
+          mkdir -p ../release && printf '{"component":"moks-reranker","commit":"%s","repository":"%s","tag":"%s","digest":"%s","model":"%s","run":"%s"}\n' \
+            "${{ github.sha }}" "$REPOSITORY" "${{ github.sha }}" "$DIGEST" "$MODEL" "${{ github.run_id }}" > ../release/moks-reranker.json
+      - uses: actions/upload-artifact@v4
+        with: {name: release-moks-reranker-${{ github.sha }}, path: release/moks-reranker.json, retention-days: 400}
 
   # moks-search with its S3 and metrics plugins. A digest in values moves the cluster, so this changes nothing
   # until rag.opensearch.secure.image is set to what it reports. Needs the moks-opensearch ECR repository.

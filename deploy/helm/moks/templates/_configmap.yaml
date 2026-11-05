@@ -23,6 +23,26 @@ data:
   MOKS_MAX_QUERY_WINDOW_MINUTES: {{ .Values.config.maxQueryWindowMinutes | quote }}
   MOKS_WORKER_CONCURRENCY: {{ .Values.config.workerConcurrency | quote }}
   MOKS_COOKIE_SECURE: "true"
+  MOKS_ML_DISABLED: {{ .Values.ml.disabled | quote }}
+  MOKS_ML_LEARNING_CAPTURE: {{ .Values.ml.learningCapture | quote }}
+  MOKS_ML_LEARNING_RETENTION_DAYS: {{ .Values.ml.learningRetentionDays | quote }}
+  MOKS_ML_SIMILAR_INCIDENTS_K: {{ .Values.ml.similarIncidents.k | quote }}
+  MOKS_ML_SIMILAR_INCIDENTS_CANDIDATES: {{ .Values.ml.similarIncidents.candidates | quote }}
+  MOKS_ML_ANOMALY_NAMESPACES: {{ .Values.ml.anomaly.namespaces | quote }}
+  MOKS_ML_ANOMALY_STEP_SECONDS: {{ .Values.ml.anomaly.stepSeconds | quote }}
+  MOKS_ML_ANOMALY_WINDOW_MINUTES: {{ .Values.ml.anomaly.windowMinutes | quote }}
+  MOKS_ML_ANOMALY_TRAINING_DAYS: {{ .Values.ml.anomaly.trainingDays | quote }}
+  MOKS_ML_ANOMALY_MIN_HISTORY_DAYS: {{ .Values.ml.anomaly.minHistoryDays | quote }}
+  MOKS_ML_ANOMALY_MAX_COHORTS: {{ .Values.ml.anomaly.maxCohorts | quote }}
+  MOKS_ML_ANOMALY_CONCURRENCY: {{ .Values.ml.anomaly.concurrency | quote }}
+  MOKS_ML_ANOMALY_INTERVAL_MINUTES: {{ .Values.ml.anomaly.intervalMinutes | quote }}
+  MOKS_ML_ANOMALY_MAX_FLAGS_PER_DAY: {{ .Values.ml.anomaly.maxFlagsPerDay | quote }}
+  MOKS_ML_ARTIFACT_STORE: {{ .Values.ml.artifactStore | quote }}
+  {{- if eq .Values.ml.artifactStore "s3" }}
+  MOKS_ML_ARTIFACT_BUCKET: {{ required "ml.artifactStore s3 needs ml.artifactBucket" .Values.ml.artifactBucket | quote }}
+  MOKS_ML_ARTIFACT_ENDPOINT: {{ .Values.ml.artifactEndpoint | quote }}
+  MOKS_ML_ARTIFACT_REGION: {{ .Values.ml.artifactRegion | quote }}
+  {{- end }}
   {{- if .Values.databaseBackups.enabled }}
   MOKS_DATABASE_BACKUP_NAMESPACES: {{ join "," .Values.databaseBackups.namespaces | quote }}
   {{- end }}

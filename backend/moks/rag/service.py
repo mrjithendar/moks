@@ -31,7 +31,7 @@ from ..llm.providers import LLMError, provider_for
 from ..models import Chunk, Document, DocumentIndexState, EmbeddingIndex, IndexOutbox, KnowledgeSource, LLMConfig, SearchBackendStatus
 from ..observability import RETRIEVAL_FALLBACKS, RETRIEVAL_LATENCY, RETRIEVAL_MODES, SEARCH_BACKEND, span as traced
 from ..rbac import Principal
-from . import access, rerank as reranking
+from . import access, eligibility, rerank as reranking
 from .backends import MAPPING_VERSION, OpenSearchBackend, PineconeBackend, PostgresBackend, rrf
 from .query import parts, understand
 from .chunking import CODE_PIPELINE_VERSION, MAX_CHUNKS, PIPELINE_VERSION, chunk, kind_of, lifecycle_of, title_of, version_for
@@ -830,18 +830,7 @@ def _terms(query: str) -> set[str]:
 
 
 def _freshness(s: KnowledgeSource, d: Document, now: datetime) -> tuple[str, str | None]:
-    """current | stale | superseded | deprecated, and why. Age proves nothing unless the source says how old is too old."""
-    if d.review_due_at and now > d.review_due_at and d.doc_state not in ("superseded", "deprecated"):
-        return "stale", "this document's review is overdue"
-    if d.doc_state == "superseded":
-        return "superseded", f"replaced by {d.superseded_by}" if d.superseded_by else "marked superseded"
-    if d.doc_state == "deprecated":
-        return "deprecated", "marked deprecated in the document"
-    if s.review_interval_days and (s.last_reviewed_at is None or now - s.last_reviewed_at > timedelta(days=s.review_interval_days)):
-        return "stale", f"the source's {s.review_interval_days}-day review is overdue"
-    if s.stale_after_days and (d.checked_at is None or now - d.checked_at > timedelta(days=s.stale_after_days)):
-        return "stale", f"not confirmed against its source in {s.stale_after_days} days"
-    return "current", None
+    return eligibility.freshness(s, d, now)
 
 
 def _shingles(text_: str) -> set[str]:
@@ -1035,8 +1024,7 @@ async def _search(db: AsyncSession, principal: Principal, query: str, k: int = 8
         ids = [uuid.UUID(cid) for cid, _ in fused]
         rows = (await db.execute(select(Chunk, Document, KnowledgeSource).join(Document, Document.id == Chunk.document_id)
                                  .join(KnowledgeSource, KnowledgeSource.id == Document.source_id)
-                                 .where(Chunk.id.in_(ids), Document.status == "active", Document.lifecycle == "active", KnowledgeSource.lifecycle == "active",
-                                        Document.realm == access.realm(), KnowledgeSource.realm == access.realm()))).all() if ids else []
+                                 .where(Chunk.id.in_(ids), *eligibility.readable_sql()))).all() if ids else []
         by_id = {str(c.id): (c, d, s) for c, d, s in rows}
         allowed = []
         for cid, score in fused:
@@ -1048,9 +1036,9 @@ async def _search(db: AsyncSession, principal: Principal, query: str, k: int = 8
                 continue
             if wanted_sources and str(d.source_id) not in wanted_sources:
                 continue
-            state, why = _freshness(s, d, now)
-            if state == "stale" and s.stale_policy == "exclude":
+            if eligibility.excluded(s, d, now):  # the rule readiness counts with
                 continue
+            state, why = _freshness(s, d, now)
             allowed.append((cid, score, c, d, s, state, why))
         full = max((len(r) for r in rankings), default=0)
         if len(allowed) >= k * 2 or full < pool or pool >= MAX_POOL:
@@ -1176,9 +1164,8 @@ async def _finish_reranking(db: AsyncSession, principal: Principal, results: lis
     now = datetime.now(timezone.utc)
     ok = set()
     for d, s in rows:
-        usable = d.status == "active" and d.lifecycle == "active" and s.lifecycle == "active" and d.realm == access.realm() and s.realm == access.realm()
         allowed = access.can_read(principal, d.environment, d.namespace) and access.in_request(environment, namespace, d.environment, d.namespace)
-        if usable and allowed and not (_freshness(s, d, now)[0] == "stale" and s.stale_policy == "exclude"):
+        if allowed and not eligibility.excluded(s, d, now):
             ok.add(str(d.id))
     kept = [r for r in results if r["document_id"] in ok]
     applied["public"]["removed_after_recheck"] = len(results) - len(kept)

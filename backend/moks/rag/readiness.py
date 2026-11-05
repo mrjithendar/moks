@@ -9,15 +9,18 @@ sources they may read, never about others: not their names, not their counts.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+import uuid
 
-from ..models import Chunk, Document, DocumentIndexState, IndexOutbox, KnowledgeSource, KnowledgeSyncItem
+from sqlalchemy import and_, exists, func, literal, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
+
+from ..models import Chunk, Document, DocumentIndexState, EmbeddingIndex, IndexOutbox, KnowledgeSource, KnowledgeSyncItem
 from ..rbac import Principal
-from . import access, ingest, service
+from . import access, eligibility, ingest, service
 
 REASON_TEXT = {
     "source_inactive": "The source is not active, so nothing from it is retrieved.",
@@ -31,7 +34,7 @@ REASON_TEXT = {
     "indexing_failed": "Some index operations failed and ran out of retries.",
     "awaiting_review": "Documents are waiting for review (draft or quarantined) and are not retrieved until approved.",
     "no_searchable_documents": "No document of this source is searchable.",
-    "stale_excluded": "Documents past the source's freshness limit are excluded from retrieval.",
+    "stale_excluded": "Documents past the source's freshness or review limit are excluded from retrieval.",
     "file_excluded": "The file is excluded by the ingestion policy.",
     "file_content_excluded": "The file was read but excluded from the index.",
     "file_not_found": "The file is not in the source's latest listing.",
@@ -47,6 +50,54 @@ def _reason(code: str, detail: str | None = None) -> dict:
     return {"code": code, "message": REASON_TEXT[code], **({"detail": detail} if detail else {})}
 
 
+EMPTY_COUNTS = {"ingested": 0, "indexed": 0, "eligible": 0, "eligible_chunks": 0, "excluded": {"review": 0, "freshness": 0, "lifecycle": 0},
+                "flagged": {"superseded": 0, "deprecated": 0, "stale": 0}, "not_indexed": 0, "operations": {"pending": 0, "failed": 0}}
+
+
+async def retrieval_counts(db: AsyncSession, source_ids: list[uuid.UUID], idx: EmbeddingIndex | None) -> dict[uuid.UUID, dict[str, Any]]:
+    """Per source, in two grouped queries whatever the number of documents: what was ingested, what the active
+    index holds at the current revision, and what search would return to someone allowed to read all of it, with
+    every exclusion counted by the reason search applies (eligibility.exclusion_sql)."""
+    if not source_ids:
+        return {}
+    now = datetime.now(timezone.utc)
+    if idx is None:
+        indexed = literal(False)
+    elif service.external():
+        held = aliased(DocumentIndexState)  # aliased: the chunk total below joins the table itself
+        indexed = exists().where(held.document_id == Document.id, held.index_id == idx.id, held.revision == Document.content_revision) & (Document.indexed_revision == Document.content_revision)
+    else:  # PostgreSQL serves keyword search from the chunks table itself
+        any_chunk = aliased(Chunk)
+        indexed = exists().where(any_chunk.document_id == Document.id)
+    reason = eligibility.exclusion_sql(now)
+    eligible = and_(indexed, reason.is_(None))
+    stale = eligibility.stale_sql(now)
+    q = (select(Document.source_id, func.count(), eligibility.count_if(indexed), eligibility.count_if(eligible),
+                eligibility.count_if(reason == "review"), eligibility.count_if(reason == "freshness"), eligibility.count_if(reason == "lifecycle"),
+                eligibility.count_if(and_(eligible, Document.doc_state == "superseded")), eligibility.count_if(and_(eligible, Document.doc_state == "deprecated")),
+                eligibility.count_if(and_(eligible, stale)), eligibility.count_if(and_(~indexed, reason.is_(None))))
+         .join(KnowledgeSource, KnowledgeSource.id == Document.source_id).where(Document.source_id.in_(source_ids), Document.status == "active").group_by(Document.source_id))
+    out: dict[uuid.UUID, dict[str, Any]] = {sid: {**EMPTY_COUNTS, "excluded": dict(EMPTY_COUNTS["excluded"]), "flagged": dict(EMPTY_COUNTS["flagged"]),
+                                                  "operations": dict(EMPTY_COUNTS["operations"])} for sid in source_ids}
+    for sid, ingested, ind, elig, review, fresh, life, sup, dep, stl, waiting in (await db.execute(q)).all():
+        out[sid].update(ingested=ingested, indexed=ind, eligible=elig, not_indexed=waiting, excluded={"review": review, "freshness": fresh, "lifecycle": life},
+                        flagged={"superseded": sup, "deprecated": dep, "stale": stl})
+    if idx is not None:
+        chunk_q = (select(Document.source_id, func.coalesce(func.sum(DocumentIndexState.chunks), 0)).select_from(Document)
+                   .join(KnowledgeSource, KnowledgeSource.id == Document.source_id)
+                   .join(DocumentIndexState, (DocumentIndexState.document_id == Document.id) & (DocumentIndexState.index_id == idx.id))
+                   .where(Document.source_id.in_(source_ids), Document.status == "active", eligible).group_by(Document.source_id)) if service.external() else (
+                   select(Document.source_id, func.count(Chunk.id)).select_from(Document).join(KnowledgeSource, KnowledgeSource.id == Document.source_id)
+                   .join(Chunk, Chunk.document_id == Document.id).where(Document.source_id.in_(source_ids), Document.status == "active", eligible).group_by(Document.source_id))
+        for sid, n in (await db.execute(chunk_q)).all():
+            out[sid]["eligible_chunks"] = int(n)
+    ops = (select(Document.source_id, IndexOutbox.status, func.count()).join(Document, Document.id == IndexOutbox.document_id)
+           .where(Document.source_id.in_(source_ids), IndexOutbox.status.in_(("pending", "dead"))).group_by(Document.source_id, IndexOutbox.status))
+    for sid, status, n in (await db.execute(ops)).all():
+        out[sid]["operations"]["pending" if status == "pending" else "failed"] = n
+    return out
+
+
 async def source_health(db: AsyncSession, src: KnowledgeSource) -> dict[str, Any]:
     """Upstream sync, indexing and retrieval readiness of one source, with the reasons it is not ready."""
     cur = src.sync_cursor or {}
@@ -58,20 +109,9 @@ async def source_health(db: AsyncSession, src: KnowledgeSource) -> dict[str, Any
     ids = select(Document.id).where(Document.source_id == src.id).scalar_subquery()
     outbox = dict((await db.execute(select(IndexOutbox.status, func.count()).where(IndexOutbox.document_id.in_(ids), IndexOutbox.status != "done").group_by(IndexOutbox.status))).all())
     idx = await service.active_index(db)
-    searchable_docs = searchable_chunks = 0
-    readable = (Document.source_id == src.id, Document.status == "active", Document.lifecycle == "active")
-    if idx is not None and src.lifecycle == "active":
-        if service.external():  # what the external index holds at the document's current revision
-            row = (await db.execute(select(func.count(), func.coalesce(func.sum(DocumentIndexState.chunks), 0)).select_from(Document)
-                                    .join(DocumentIndexState, (DocumentIndexState.document_id == Document.id) & (DocumentIndexState.index_id == idx.id))
-                                    .where(*readable, DocumentIndexState.revision == Document.content_revision, Document.indexed_revision == Document.content_revision))).one()
-        else:  # PostgreSQL serves keyword search from the chunks table itself
-            row = (await db.execute(select(func.count(func.distinct(Document.id)), func.count(Chunk.id)).select_from(Document).join(Chunk, Chunk.document_id == Document.id).where(*readable))).one()
-        searchable_docs, searchable_chunks = int(row[0]), int(row[1])
-    now = datetime.now(timezone.utc)
-    stale = 0
-    if src.stale_policy == "exclude" and src.stale_after_days:
-        stale = (await db.execute(select(func.count()).select_from(Document).where(*readable, (Document.checked_at.is_(None)) | (Document.checked_at < now - timedelta(days=src.stale_after_days))))).scalar_one()
+    counts = (await retrieval_counts(db, [src.id], idx))[src.id]
+    searchable_docs, searchable_chunks = counts["eligible"], counts["eligible_chunks"]
+    stale = counts["excluded"]["freshness"]
     pending, failed, excluded, done = (items.get(k, 0) for k in ("pending", "failed", "excluded", "done"))
     upstream = ("failed" if cur.get("listing") == "failed" else "never" if src.type in ("github", "web") and not src.last_sync_at and not cur
                 else "in_progress" if pending or cur.get("state") == "ingesting" else "partial" if failed else "complete")
@@ -102,7 +142,7 @@ async def source_health(db: AsyncSession, src: KnowledgeSource) -> dict[str, Any
     if review:
         reasons.append(_reason("awaiting_review", f"{lifecycles.get('quarantined', 0)} quarantined, {lifecycles.get('draft', 0)} draft"))
     if stale:
-        reasons.append(_reason("stale_excluded", f"{stale} documents not confirmed in {src.stale_after_days} days"))
+        reasons.append(_reason("stale_excluded", f"{stale} documents past the freshness or review limit"))
     if not searchable_docs:
         reasons.append(_reason("no_searchable_documents"))
     return {
@@ -119,6 +159,7 @@ async def source_health(db: AsyncSession, src: KnowledgeSource) -> dict[str, Any
         "indexing": {"state": indexing, "backend": service.backend_name(), "index": idx.index_name if idx else None, "mode": ("hybrid" if idx.dimensions else "keyword-only") if idx else None,
                      "outbox_pending": waiting, "outbox_dead": dead, "documents_behind": behind},
         "searchable": {"documents": searchable_docs, "chunks": searchable_chunks},
+        "retrieval": {**counts, "note": "eligible is what search returns to someone allowed to read the whole source; the same rules decide both"},
         "ready": not [r for r in reasons if r["code"] in ("source_inactive", "never_synced", "sync_failed", "no_active_index", "no_searchable_documents")],
         "reasons": reasons,
     }
@@ -173,29 +214,41 @@ async def test_source(db: AsyncSession, principal: Principal, src: KnowledgeSour
 
 async def hints(db: AsyncSession, principal: Principal, environment: str, namespace: str | None) -> list[str]:
     """For an investigation that found nothing: what is wrong with sources this person can read in this scope.
-    Counts of readable sources only; a source outside their grants does not exist here."""
+    Counts of readable sources only; a source outside their grants does not exist here. A fixed number of
+    grouped queries, however many sources there are."""
     idx = await service.active_index(db)
     if idx is None:
         return [REASON_TEXT["no_active_index"]]
-    rows = (await db.execute(select(KnowledgeSource).where(KnowledgeSource.realm == access.realm(), KnowledgeSource.lifecycle != "deleted"))).scalars().all()
-    mine = [s for s in rows[:200] if access.can_read(principal, s.scope_environment, s.scope_namespace) and access.in_request(environment, namespace, s.scope_environment, s.scope_namespace)]
+    rows = (await db.execute(select(KnowledgeSource).where(KnowledgeSource.realm == access.realm(), KnowledgeSource.lifecycle != "deleted").order_by(KnowledgeSource.name))).scalars().all()
+    # Readable first, then the cap: capping first let sources this person cannot read crowd out the ones they can.
+    mine = [s for s in rows if access.can_read(principal, s.scope_environment, s.scope_namespace) and access.in_request(environment, namespace, s.scope_environment, s.scope_namespace)][:200]
     if not mine:
         return ["No knowledge source you can read covers this environment and namespace."]
-    out: list[str] = []
-    counts = {"sync": 0, "index": 0, "review": 0, "inactive": 0}
+    ids = [s.id for s in mine]
+    counts = await retrieval_counts(db, ids, idx)
+    items: dict[uuid.UUID, dict[str, int]] = {}
+    for sid, state, n in (await db.execute(select(KnowledgeSyncItem.source_id, KnowledgeSyncItem.state, func.count()).where(KnowledgeSyncItem.source_id.in_(ids))
+                                           .group_by(KnowledgeSyncItem.source_id, KnowledgeSyncItem.state))).all():
+        items.setdefault(sid, {})[state] = n
+    tally = {"sync": 0, "index": 0, "review": 0, "inactive": 0, "excluded": 0}
     for s in mine:
-        h = await source_health(db, s)
-        codes = {r["code"] for r in h["reasons"]}
-        counts["sync"] += bool(codes & {"never_synced", "sync_failed", "sync_incomplete"})
-        counts["index"] += bool(codes & {"indexing_pending", "indexing_failed"})
-        counts["review"] += "awaiting_review" in codes
-        counts["inactive"] += "source_inactive" in codes
-    if counts["sync"]:
-        out.append(f"{counts['sync']} of the {len(mine)} sources you can read here have not finished syncing.")
-    if counts["index"]:
-        out.append(f"{counts['index']} of them have changes the search index has not applied yet.")
-    if counts["review"]:
-        out.append(f"{counts['review']} of them have documents waiting for review, which are not retrieved until approved.")
-    if counts["inactive"]:
-        out.append(f"{counts['inactive']} of them are not active.")
+        c, cur = counts[s.id], s.sync_cursor or {}
+        pending = items.get(s.id, {}).get("pending", 0)
+        synced = s.type not in ("github", "web") or bool(s.last_sync_at or cur)
+        tally["sync"] += bool(not synced or cur.get("listing") == "failed" or pending or cur.get("state") == "ingesting")
+        tally["index"] += bool(c["operations"]["pending"] or c["operations"]["failed"] or c["not_indexed"])
+        tally["review"] += bool(c["excluded"]["review"])
+        tally["inactive"] += s.lifecycle != "active"
+        tally["excluded"] += bool(c["excluded"]["freshness"])
+    out: list[str] = []
+    if tally["sync"]:
+        out.append(f"{tally['sync']} of the {len(mine)} sources you can read here have not finished syncing.")
+    if tally["index"]:
+        out.append(f"{tally['index']} of them have changes the search index has not applied yet.")
+    if tally["review"]:
+        out.append(f"{tally['review']} of them have documents waiting for review, which are not retrieved until approved.")
+    if tally["excluded"]:
+        out.append(f"{tally['excluded']} of them have documents past their freshness or review limit, which are excluded from retrieval.")
+    if tally["inactive"]:
+        out.append(f"{tally['inactive']} of them are not active.")
     return out

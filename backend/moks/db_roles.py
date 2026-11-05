@@ -20,21 +20,22 @@ APPEND = "SELECT, INSERT"
 
 ROLES = ("moks_api", "moks_worker", "moks_executor", "moks_backup", "moks_terminal")
 
-_API_RW = ("retrieval_feedback", "improvement_proposals", "users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_events", "evidence",
+_API_RW = ("learning_records", "learning_judgments", "learning_datasets", "learning_dataset_items", "ml_capabilities", "ml_models", "ml_artifacts", "ml_observations", "retrieval_feedback", "improvement_proposals", "users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_events", "evidence",
            "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks", "embedding_indexes", "conversations", "conversation_participants", "conversation_reads", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations",
            "conversation_messages", "backup_stores", "database_backups", "database_backup_schedules", "skill_policies", "detection_policies", "detection_states", "maintenance_windows", "saved_queries",
            "diagnostic_sessions", "diagnostic_commands", "alert_events", "eval_runs", "index_outbox", "llm_reservations", "component_versions")
-_WORKER_RW = ("search_backend_status", "llm_usage", "investigations", "investigation_checkpoints", "investigation_events", "evidence", "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks",
+_WORKER_RW = ("learning_records", "ml_models", "ml_artifacts", "ml_observations", "search_backend_status", "llm_usage", "investigations", "investigation_checkpoints", "investigation_events", "evidence", "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks",
               "embedding_indexes", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations", "conversations", "conversation_participants", "conversation_messages", "detection_runs", "detection_states", "alert_events", "eval_runs", "index_outbox", "llm_reservations", "component_versions")
 _EXECUTOR_RW = ("diagnostic_sessions", "diagnostic_commands", "incidents", "incident_events", "component_versions")
 
-TABLES = ("retrieval_feedback", "search_backend_status", "improvement_proposals", "users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_checkpoints", "investigation_events", "evidence", "audit_events",
+TABLES = ("learning_records", "learning_judgments", "learning_datasets", "learning_dataset_items", "ml_capabilities", "ml_models", "ml_artifacts", "ml_observations", "retrieval_feedback", "search_backend_status", "improvement_proposals", "users", "role_bindings", "sessions", "environments", "connectors", "llm_configs", "llm_usage", "investigations", "investigation_checkpoints", "investigation_events", "evidence", "audit_events",
           "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks", "embedding_indexes", "conversations", "conversation_participants", "conversation_reads", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations",
           "conversation_messages", "backup_runs", "backup_stores", "database_backups", "database_backup_schedules", "skill_policies", "detection_policies", "detection_runs", "detection_states", "maintenance_windows",
           "saved_queries", "index_outbox", "llm_reservations", "component_versions", "action_plans", "approvals", "diagnostic_sessions", "diagnostic_commands", "terminal_sessions", "alert_events", "eval_runs", "alembic_version")
 # The gateway signs people in and runs shells, so it sees only that. Its session updates are the two columns load() touches.
 _TERMINAL_READS = {"users", "role_bindings", "sessions", "environments", "terminal_sessions", "alembic_version"}
-HIDDEN = {"moks_worker": {"sessions", "terminal_sessions"}, "moks_executor": {"sessions", "terminal_sessions"},  # session hashes are the API's business
+LEARNING = {"learning_records", "learning_judgments", "learning_datasets", "learning_dataset_items"}  # the executor runs actions and has no use for training data
+HIDDEN = {"moks_worker": {"sessions", "terminal_sessions"}, "moks_executor": {"sessions", "terminal_sessions"} | LEARNING,  # session hashes are the API's business
           "moks_terminal": set(TABLES) - _TERMINAL_READS}
 
 API_PLAN_COLUMNS = ("status", "plan_hash", "executed_by", "queued_at", "finished_at", "result")

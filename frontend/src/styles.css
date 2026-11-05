@@ -511,3 +511,17 @@ button.link { background: none; border: 0; padding: 0; min-height: 0; color: var
   details > summary::before { content: "▸"; flex: none; }
   details[open] > summary::before { content: "▾"; }
 }
+
+/* ML: similar incidents, judgments, observation feedback */
+.similar-list { list-style: none; padding: 0; margin: 8px 0 0; display: grid; gap: 10px; }
+.similar-item { border: 1px solid var(--line, #e3e6ea); border-radius: 8px; padding: 10px 12px; }
+.similar-item .kv { margin: 6px 0; }
+.judge { margin-top: 4px; }
+button.selected, button[aria-pressed="true"] { outline: 2px solid var(--accent, #3b6fd8); outline-offset: 1px; }
+.error-text { color: var(--bad, #b42318); }
+@media (max-width: 820px) {
+  .similar-item { padding: 8px; }
+  .similar-item .kv { display: block; }
+  .similar-item .kv dt { margin-top: 4px; font-weight: 600; }
+  .judge button { min-height: 40px; }
+}

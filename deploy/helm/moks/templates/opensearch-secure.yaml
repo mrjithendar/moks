@@ -5,6 +5,7 @@
 {{- if .Values.rag.opensearch.dashboards.enabled }}{{ fail "rag.opensearch.dashboards reaches the old unauthenticated pod, and cannot follow moks-search without TLS and a login. Turn it off first (docs/OPENSEARCH.md)." }}{{ end -}}
 {{- end -}}
 {{- if and $secure.retireOriginal (not $secure.active) }}{{ fail "rag.opensearch.secure.retireOriginal removes the cluster search is using; set active first" }}{{ end -}}
+{{- if and $secure.retireOriginal (not (regexMatch "^moks-chunks-[a-z0-9-]+ validated [0-9]{4}-[0-9]{2}-[0-9]{2}$" (toString $secure.cutoverVerified))) }}{{ fail "rag.opensearch.secure.retireOriginal needs secure.cutoverVerified: \"<generation> validated <YYYY-MM-DD>\", recorded after validate passed on the active cluster and the soak ended (docs/OPENSEARCH.md step 7)" }}{{ end -}}
 {{- if and $secure.snapshots.enabled (not $secure.pluginsInstalled) }}{{ fail "rag.opensearch.secure.snapshots needs the image from deploy/opensearch/Dockerfile and pluginsInstalled: true" }}{{ end -}}
 {{- if and $secure.enabled (eq .Values.rag.backend "opensearch") -}}
 {{- if .Values.rag.opensearch.url }}{{ fail "rag.opensearch.secure is the bundled cluster; rag.opensearch.url names an external one" }}{{ end -}}

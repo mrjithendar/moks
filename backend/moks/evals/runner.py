@@ -134,11 +134,13 @@ async def execute(run_id: uuid.UUID) -> dict[str, Any]:
         run = await db.get(EvalRun, run_id)
         dataset, mode = run.dataset, run.mode
     data = load(dataset)
-    if data.get("kind") in ("rag", "skills", "rerank"):
+    if data.get("kind") in ("rag", "skills", "rerank", "similar"):
         async def skills_run() -> dict:
             return await gates.run_skills(data, await _execute_skills(data, run_id))
 
-        out = await {"rag": lambda: gates.run_rag(data, run_id), "skills": skills_run, "rerank": lambda: rerank_eval.run(data, run_id)}[data["kind"]]()
+        from ..ml import evaluation as ml_eval
+
+        out = await {"rag": lambda: gates.run_rag(data, run_id), "skills": skills_run, "rerank": lambda: rerank_eval.run(data, run_id), "similar": lambda: ml_eval.run_similar(data, run_id)}[data["kind"]]()
         async with session_scope() as db:
             run = await db.get(EvalRun, run_id)
             run.results, run.score, run.status, run.finished_at = out["results"], Decimal(str(out["score"])), "completed", datetime.now(timezone.utc)

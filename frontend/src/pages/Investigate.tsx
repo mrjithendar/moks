@@ -8,6 +8,7 @@ import { Markdown } from "../markdown";
 import { CopyButton, Dialog, Drawer, Truncate } from "../ui";
 import { proposalPlan } from "./Conversations";
 import { PlanForm } from "./Ops";
+import { Judge, SimilarIncidents, SkillRecommendations } from "./MLParts";
 
 const SUGGESTIONS = [
   "Why is checkout returning 502 errors?",
@@ -212,7 +213,7 @@ export function InvestigationView() {
               {inv.trace_id && TERMINAL.has(inv.status) && (
                 <div className="small muted">Trace <code>{inv.trace_id}</code> <CopyButton text={inv.trace_id} label="Copy trace id" /> finds this run in Jaeger and its log lines in Loki.</div>
               )}
-              {report ? <Report report={report} evidence={evidence} onCite={setOpen} onPropose={can("action.request") && inv.namespace !== "*" ? setPropose : undefined} /> : (
+              {report ? <Report report={report} evidence={evidence} onCite={setOpen} onPropose={can("action.request") && inv.namespace !== "*" ? setPropose : undefined} investigationId={inv.id} /> : (
                 <div className="card empty">{TERMINAL.has(inv.status) ? "No report was produced." : "Collecting evidence…"}</div>
               )}
               {report?.findings?.length > 0 && <Findings findings={report.findings} onCite={setOpen} />}
@@ -358,7 +359,7 @@ const KNOWLEDGE_STATUS: Record<string, [("ok" | "warn" | "bad" | "neutral"), str
   retrieved: ["ok", "retrieved"], partial: ["warn", "partly failed"], empty: ["neutral", "nothing relevant"], failed: ["bad", "search failed"], not_attempted: ["neutral", "not searched"],
 };
 const AUTHORITY: Record<string, [("ok" | "info" | "warn" | "neutral"), string]> = {
-  target: ["ok", "about the target"], shared: ["info", "general guidance"], unverified: ["warn", "relationship not established"], unrelated: ["neutral", "other service"], low_relevance: ["neutral", "low relevance"],
+  target: ["ok", "about the target"], dependency: ["info", "declared dependency"], shared: ["info", "general guidance"], unverified: ["warn", "relationship not established"], unrelated: ["neutral", "other service"], low_relevance: ["neutral", "low relevance"],
 };
 const EMPTY_KNOWLEDGE: Record<string, string> = {
   empty: "MOKS searched the knowledge index and found no passage you may read that matches this request. The answer rests on live evidence only.",
@@ -367,49 +368,70 @@ const EMPTY_KNOWLEDGE: Record<string, string> = {
 };
 const safeLink = (url?: string | null) => (url && /^https?:\/\//i.test(url) ? url : undefined);
 
-function Passage({ p, onCite }: { p: any; onCite: (r: string) => void }) {
+const PASSAGE_STATE: Record<string, [("ok" | "info" | "warn" | "neutral"), string]> = {
+  cited: ["ok", "cited"], supplied: ["info", "given to the model, not cited"], eligible: ["neutral", "eligible, not supplied"], retrieved: ["neutral", "retrieved only"],
+};
+
+/** Reports from before passage ids (knowledge version 1) have only used/provided; derive the state the same way the backend does. */
+export function passageState(p: any): string {
+  if (p.state) return p.state;
+  if (p.used) return "cited";
+  if (p.provided) return "supplied";
+  return ["target", "dependency", "shared", "unverified"].includes(p.authority) ? "eligible" : "retrieved";
+}
+
+function Passage({ p, onCite, investigationId }: { p: any; onCite: (r: string) => void; investigationId?: string }) {
   const [tone, label] = AUTHORITY[p.authority] ?? ["neutral", p.authority];
+  const state = passageState(p);
+  const [stone, slabel] = PASSAGE_STATE[state] ?? ["neutral", state];
   const lines = p.lines?.[0] ? `L${p.lines[0]}${p.lines[1] && p.lines[1] !== p.lines[0] ? `-${p.lines[1]}` : ""}` : "";
   const where = `${p.repository ? `${p.repository}:` : ""}${p.path}`;
   const href = safeLink(p.url);
   return <li className="passage">
-    <div className="row tight wrap"><Cites refs={[p.ref]} onCite={onCite} /><Badge kind={tone}>{label}</Badge>
+    <div className="row tight wrap"><Cites refs={[p.id ?? p.ref]} onCite={onCite} /><Badge kind={tone}>{label}</Badge><Badge kind={stone}>{slabel}</Badge>
+      {p.cited_by === "moks" && <span className="small muted">added by MOKS</span>}
       {p.freshness?.state && p.freshness.state !== "current" && <Badge kind="warn">{p.freshness.state}</Badge>}
       {href ? <a className="mono small" href={href} target="_blank" rel="noreferrer noopener">{where} {lines}</a> : <span className="mono small">{where} {lines}</span>}
       {p.revision && <span className="mono small muted">@ {String(p.revision).slice(0, 10)}</span>}</div>
     {p.heading && <div className="small">{p.heading}</div>}
     {p.excerpt && <div className="small muted excerpt">{p.excerpt}</div>}
     <div className="small muted">{p.excluded ? `Not used: ${p.excluded}` : p.basis?.join("; ")}{p.freshness?.last_checked ? ` · checked ${new Date(p.freshness.last_checked).toLocaleDateString()}` : ""}</div>
+    {p.chunk_id && <Judge kind="passage" target={p.chunk_id} investigationId={investigationId} options={[["relevant", "Relevant"], ["irrelevant", "Not relevant"], ["outdated", "Outdated"]]} />}
   </li>;
 }
 
 /** What was searched, what came back and why each passage was or was not used. Documentation, never current state. */
-export function KnowledgeUsed({ k, onCite }: { k?: any; onCite: (r: string) => void }) {
+export function KnowledgeUsed({ k, onCite, investigationId }: { k?: any; onCite: (r: string) => void; investigationId?: string }) {
   if (!k) return null;
   const [tone, label] = KNOWLEDGE_STATUS[k.status] ?? ["neutral", k.status];
-  const used = (k.passages ?? []).filter((p: any) => p.used);
-  const rest = (k.passages ?? []).filter((p: any) => !p.used);
+  const passages = k.passages ?? [];
+  const used = passages.filter((p: any) => passageState(p) === "cited");
+  const rest = passages.filter((p: any) => passageState(p) !== "cited");
+  const c = k.counts ?? {};
   const scope = k.scope ?? {};
   return <details className="rs knowledge" open={k.status === "failed"}>
-    <summary>Knowledge used<span className="count">{k.counts?.used ?? 0} of {k.counts?.retrieved ?? 0}</span> <Badge kind={tone}>{label}</Badge></summary>
+    <summary>Knowledge used<span className="count">{c.cited ?? c.used ?? 0} of {c.retrieved ?? 0}</span> <Badge kind={tone}>{label}</Badge></summary>
     <div className="small muted">{k.note}</div>
+    {c.eligible !== undefined && <div className="small" aria-label="Passage counts">Retrieved {c.retrieved} · eligible {c.eligible} · given to the model {c.supplied} · cited {c.cited}</div>}
     <div className="small">Searched {scope.environment ? <>environment <span className="mono">{scope.environment}</span></> : "all environments you can read"}
       {scope.namespace ? <>, namespace <span className="mono">{scope.namespace}</span></> : ", every namespace you can read"}
       {scope.target && <>, about <strong>{scope.target}</strong></>}{scope.repository && <> (repository <span className="mono">{scope.repository}</span>)</>}
       {scope.history_used && ", with this conversation's earlier turns"}.</div>
     {!used.length && EMPTY_KNOWLEDGE[k.status] && <div className="alert info small">{EMPTY_KNOWLEDGE[k.status]}</div>}
     {k.reasons?.length > 0 && <ul className="small">{k.reasons.map((r: string, i: number) => <li key={i}>{r}</li>)}</ul>}
+    {k.citations?.rejected?.length > 0 && <div className="small muted">Citations not accepted: {k.citations.rejected.map((r: any) => `${r.id} (${r.reason})`).join("; ")}</div>}
     {k.hints?.length > 0 && <div className="small"><strong>Why the index may hold less than expected:</strong><ul>{k.hints.map((h: string, i: number) => <li key={i}>{h}</li>)}</ul></div>}
     {k.queries?.length > 0 && <details className="small"><summary>Queries ({k.queries.length})</summary>
       <ul>{k.queries.map((q: any, i: number) => <li key={i}><span className="mono">{q.query}</span> <Badge kind={q.status === "ok" ? "neutral" : q.status === "failed" ? "bad" : "warn"}>{q.stage} · {q.status === "ok" ? `${q.results} result(s)` : q.status.replace("_", " ")}</Badge>
         {q.mode && <span className="muted"> {q.mode}{q.fallback ? ` (${q.fallback})` : ""}</span>}{q.reused && <span className="muted"> · reused after a restart</span>}{q.reason && <div className="muted">{q.reason}</div>}</li>)}</ul></details>}
-    {used.length > 0 && <><div className="small"><strong>Used in this answer</strong></div><ul className="passages">{used.map((p: any) => <Passage key={p.chunk_id} p={p} onCite={onCite} />)}</ul></>}
-    {rest.length > 0 && <details className="small"><summary>Retrieved, not used ({rest.length})</summary><ul className="passages">{rest.map((p: any) => <Passage key={p.chunk_id} p={p} onCite={onCite} />)}</ul></details>}
+    {used.length > 0 && <><div className="small"><strong>Cited in this answer</strong></div><ul className="passages">{used.map((p: any) => <Passage key={p.chunk_id} p={p} onCite={onCite} investigationId={investigationId} />)}</ul></>}
+    {rest.length > 0 && <details className="small"><summary>Retrieved, not cited ({rest.length})</summary><ul className="passages">{rest.map((p: any) => <Passage key={p.chunk_id} p={p} onCite={onCite} />)}</ul></details>}
   </details>;
 }
 
-function Cites({ refs, onCite }: { refs: string[]; onCite: (r: string) => void }) {
-  return <>{refs.map((r) => <button type="button" key={r} className="cite" onClick={() => onCite(r)}>{r}</button>)}</>;
+/** E3.2 is passage 2 of the search stored as evidence E3: the button names the passage and opens the evidence. */
+export function Cites({ refs, onCite }: { refs: string[]; onCite: (r: string) => void }) {
+  return <>{refs.map((r) => <button type="button" key={r} className="cite" onClick={() => onCite(r.replace(/\.\d+$/, ""))}>{r}</button>)}</>;
 }
 
 const CONF: Record<string, "bad" | "warn" | "neutral"> = { high: "bad", medium: "warn", low: "neutral" };
@@ -418,13 +440,13 @@ function Section({ title, count, open = true, children }: { title: string; count
   return <details className="rs" open={open}><summary>{title}{count !== undefined && <span className="count">{count}</span>}</summary>{children}</details>;
 }
 
-export function Report({ report, evidence = [], hideSummary, onCite, onPropose }: { report: any; evidence?: any[]; hideSummary?: boolean; onCite: (r: string) => void; onPropose?: (r: any) => void }) {
+export function Report({ report, evidence = [], hideSummary, onCite, onPropose, investigationId }: { report: any; evidence?: any[]; hideSummary?: boolean; onCite: (r: string) => void; onPropose?: (r: any) => void; investigationId?: string }) {
   if (GUIDED.has(report.response_type) || report.response_type === "conceptual") {
     return <div className="report">
       <Routing report={report} />
       {!hideSummary && <div className="rs static"><h3>Answer</h3><Markdown text={report.summary ?? ""} /><div className="small muted">{report.generated_by === "llm" ? "Organized by the LLM; every command is checked against the cited sources" : "Extracted from the sources by rules"}</div></div>}
       <Answer report={report} onCite={onCite} />
-      <KnowledgeUsed k={report.knowledge} onCite={onCite} />
+      <KnowledgeUsed k={report.knowledge} onCite={onCite} investigationId={investigationId} />
       {report.observed_facts?.length > 0 && <Section title="Current state" count={report.observed_facts.length}><ul>{report.observed_facts.map((f: any, i: number) => <li key={i}>{f.statement}<Cites refs={f.evidence} onCite={onCite} /></li>)}</ul></Section>}
       {evidence.length > 0 && <Section title="Supporting evidence" count={evidence.length} open={false}>
         <ul>{evidence.slice(0, 40).map((e) => <li key={e.ref}><button type="button" className="cite" style={{ marginLeft: 0 }} onClick={() => onCite(e.ref)}>{e.ref}</button> <span className="small">{e.summary}</span></li>)}</ul>
@@ -501,6 +523,8 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose }
         </div>)}
         {report.skill_rejected?.length > 0 && <div className="small muted">Not used: {report.skill_rejected.map((r: any) => `${r.skill} (${r.reason})`).join("; ")}</div>}
       </Section>}
+      <SimilarIncidents s={report.similar_incidents} investigationId={investigationId} />
+      <SkillRecommendations rec={report.skill_recommendations} investigationId={investigationId} />
       {report.skills?.length > 0 && <div className="small" style={{ marginTop: 8 }}>Skills applied: {report.skills.map((s: any) => (
         <Link key={s.name} to="/skills" title={s.reasons.join("; ")}><Badge kind="info">{s.name}</Badge></Link>))}</div>}
       {report.notes?.length > 0 && <details><summary className="small">Investigation notes ({report.notes.length})</summary><ul className="small">{report.notes.map((n: string, i: number) => <li key={i}>{n}</li>)}</ul></details>}

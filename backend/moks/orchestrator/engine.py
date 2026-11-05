@@ -143,6 +143,8 @@ class Investigator:
         self.skill_rejected: list[dict] = []
         self.skill_generation: int | None = None
         self.requested_skill: str | None = None
+        self.skill_eligible: list[str] = []
+        self.skill_recommendations: dict[str, Any] = {}
         self.focus_namespace: str | None = None
         self.versions: dict[str, Any] = {}
         # The validated request (orchestrator/intent.py) and what was decided about it, for the report and traces.
@@ -157,6 +159,7 @@ class Investigator:
         self.conversation_namespace: str | None = None
         self.llm_failures: tuple = (Exception,)
         self.knowledge: dict[str, Any] = knowledge.new_state()  # the retrieval stage: queries, passages, why each was or was not used
+        self.similar: dict[str, Any] = {"status": "not_attempted", "calls": 0}  # similar approved incidents (moks/ml/similar.py)
         self.started = time.monotonic()
 
     def time_left(self) -> float:
@@ -166,10 +169,11 @@ class Investigator:
     def tool_budget(self) -> int:
         """Tool calls this request may use: the intent's budget, never above the global ceiling."""
         cap = self.settings.max_tool_calls
+        extra = self.knowledge.get("calls", 0) + self.similar.get("calls", 0)  # the knowledge stage and the similar-incident lookup have their own allowance
         if self.request is None:
-            return cap + self.knowledge.get("calls", 0)
+            return cap + extra
         own = (self.settings.intent_tool_budgets or {}).get(self.request.primary) or cap
-        return max(1, min(cap, own)) + self.knowledge.get("calls", 0)  # the knowledge stage has its own allowance
+        return max(1, min(cap, own)) + extra
 
     async def _fence(self, db) -> None:
         """Inside a transaction that is about to write: the row lock holds off the reaper until the
@@ -351,7 +355,7 @@ class Investigator:
             "version": CHECKPOINT_VERSION, "completed": self.completed_nodes, "ref": self.ref, "tool_calls": self.tool_calls, "evidence_refs": [e["ref"] for e in self.evidence],
             "graph": {k: (report.model_dump() if k == "report" and report is not None else state.get(k)) for k in ("namespace", "round", "calls", "use_rules", "finished", "mode", "report", "workflow")},
             "request": self.request.model_dump() if self.request else None, "trace": self.trace, "gaps": self.gaps, "retrieval_notes": self.retrieval_notes, "knowledge": knowledge.for_checkpoint(self.knowledge),
-            "sources": [{k: v for k, v in x.items() if k != "text"} for x in self.sources], "shared_findings": self.shared_findings, "excluded": self.excluded,
+            "similar": self.similar, "skill_recommendations": self.skill_recommendations, "skill_eligible": self.skill_eligible, "sources": [{k: v for k, v in x.items() if k != "text"} for x in self.sources], "shared_findings": self.shared_findings, "excluded": self.excluded,
             "notes": self.notes, "findings": self.findings, "calls_seen": sorted(self.calls_seen), "rejected": self.rejected[-20:], "focus_namespace": self.focus_namespace,
             "skills": [{"digest": sk.digest, "score": score, "reasons": why} for sk, score, why in self.skills], "skill_runs": self.skill_runs, "skill_rejected": self.skill_rejected,
             "skill_generation": self.skill_generation, "connectors": self.connector_ids, "versions": self.versions,
@@ -402,6 +406,8 @@ class Investigator:
         self.trace = cp.get("trace") or self.trace
         self.gaps, self.retrieval_notes = cp.get("gaps") or [], cp.get("retrieval_notes") or []
         self.knowledge = knowledge.restore(self, cp.get("knowledge"))  # completed stages are not searched again
+        self.similar = cp.get("similar") or self.similar
+        self.skill_recommendations, self.skill_eligible = cp.get("skill_recommendations") or {}, cp.get("skill_eligible") or []
         self.shared_findings, self.excluded = cp.get("shared_findings") or [], cp.get("excluded") or []
         by_ref = {e["ref"]: e.get("data") for e in self.evidence}
 
@@ -537,6 +543,8 @@ class Investigator:
         payload["skill_runs"] = self.skill_runs
         payload["skill_rejected"] = self.skill_rejected
         payload["skill_generation"] = self.skill_generation
+        if self.skill_recommendations:
+            payload["skill_recommendations"] = self.skill_recommendations
         payload["skill_actions"] = await self._skill_actions(namespace, env_name)
         payload["notes"] = list(dict.fromkeys([*(payload.get("notes") or []), *self.notes]))
         payload["execution"] = {"attempt": self.attempt, "resumed_after": self.resumed_from, "versions": self.versions}
@@ -544,6 +552,10 @@ class Investigator:
         payload["excluded"] = self.excluded
         payload["request"] = req.trace()
         await self._knowledge_outcome(report, payload, ledger, env_name, namespace)
+        if self.similar.get("status") not in (None, "not_attempted") or self.similar.get("reason"):
+            from ..ml.similar import NOTE as SIMILAR_NOTE
+
+            payload["similar_incidents"] = {**{k: v for k, v in self.similar.items() if k != "calls"}, "note": SIMILAR_NOTE}
         verdict = relevance.check(payload, req, ledger, self.findings)
         payload["relevance"] = verdict
         self.trace["relevance"] = {"status": verdict["status"], "failed": [c["name"] for c in verdict.get("first_pass", verdict["checks"]) if not c["passed"]], "corrections": verdict["corrections"]}
@@ -555,7 +567,20 @@ class Investigator:
         if not await self._finish("completed", payload, None):
             raise OwnershipLost(str(self.id))
         await self._emit("report", {"report": payload})
+        await self._learning_record(env_name, payload)
         return mode
+
+    async def _learning_record(self, env_name: str, payload: dict) -> None:
+        """Best effort, after the answer is stored: a learning record never delays or fails an investigation."""
+        from ..ml import learning
+
+        try:
+            async with session_scope() as db:
+                row = await db.get(Investigation, self.id)
+                if row is not None:
+                    await learning.capture(db, row, env_name, payload, knowledge=payload.get("knowledge") or {}, eligible=self.skill_eligible, versions=self.versions or {})
+        except Exception:
+            log.warning("learning record not written", extra={"event": "learning_record_failed", "investigation_id": str(self.id)}, exc_info=True)
 
     def _ledger(self, namespace: str) -> Ledger:
         return Ledger.build(self.evidence, namespace=namespace, max_age_seconds=self.settings.evidence_max_age_seconds)
@@ -772,16 +797,53 @@ class Investigator:
             await self._emit("phase", {"phase": "knowledge", "label": "Searching the runbooks for these symptoms"})
         await knowledge.run(self, executor, stage, question)
 
+    async def _similar_incidents(self, executor: ToolExecutor) -> None:
+        """One bounded lookup of approved past incidents like this one, after triage named the symptoms. Through
+        the executor like any read, with its own one-call allowance. Leads, never evidence of the current cause."""
+        from ..ml import learning, mode
+
+        if self.similar.get("status") != "not_attempted" or (self.request is not None and self.request.response_type != "troubleshooting"):
+            return
+        async with session_scope() as db:
+            state = await mode(db, "similar_incidents")
+        if state == "disabled":
+            self.similar = {"status": "disabled", "mode": state, "calls": 0, "results": []}
+            return
+        mine = [f for f in self.findings if self.request is None or f.get("namespace") is None or self.request.in_scope(f.get("namespace"))]
+        feat = learning.features({"findings": mine, "request": self.request.trace() if self.request else {}}, self.request.question if self.request else "")
+        if not feat["symptoms"] and not feat["signature"]:
+            self.similar = {"status": "not_attempted", "mode": state, "calls": 0, "results": [], "reason": "triage found nothing to compare with past incidents"}
+            return
+        if self.time_left() < knowledge.MIN_SECONDS_LEFT:
+            self.similar = {"status": "skipped", "mode": state, "calls": 0, "results": [], "reason": "too close to the time limit"}
+            return
+        ok = lambda rx, xs, n: [x for x in xs if re.fullmatch(rx, x)][:n]  # the tool's argument contract, so one odd name cannot refuse the call
+        args = {"symptoms": ok(r"[a-z][a-z0-9_]{1,40}", feat["symptoms"], 12), "services": ok(r"[a-z0-9]([-a-z0-9.]{0,61}[a-z0-9])?", feat["services"], 5),
+                "resource_kinds": ok(r"[a-z]{2,40}", feat["resource_kinds"], 6), "signature": ok(r"(<[a-z]+>|[a-z][a-z0-9_]{1,40})", feat["signature"], 40),
+                "changes": bool(feat["changes"]), "k": self.settings.ml_similar_incidents_k}
+        self.similar = {"status": "running", "mode": state, "calls": 1, "results": []}
+        await self._emit("phase", {"phase": "similar", "label": "Looking for similar past incidents"})
+        out = await self._call(executor, "similar_incidents", args, "similar approved incidents: historical leads only")
+        if out is None:
+            self.similar = {**self.similar, "status": "skipped", "calls": 0, "reason": "already asked, or the tool-call budget is used up"}
+        elif not out.ok:
+            self.similar = {**self.similar, "status": "failed", "ref": out.evidence_ref, "reason": (out.error_kind or "error") + ": " + str(out.error or "")[:200]}
+        else:
+            self.similar = {**self.similar, "status": "ok" if out.data else "empty", "ref": out.evidence_ref, "results": out.data or [], "considered": (out.source or {}).get("considered"),
+                            "text": (out.source or {}).get("text"), "method": (out.source or {}).get("method")}
+
     async def _knowledge_outcome(self, report: Report, payload: dict, ledger: Ledger, env_name: str, namespace: str) -> None:
         """Which passages the answer used, what remains unverified, and why the index may have had less than hoped."""
         st = self.knowledge
-        if report.generated_by == "llm" and payload.get("response_type") == "troubleshooting":
-            cited = {r for f in report.observed_facts for r in f.evidence} | {r for c in report.suspected_causes for r in c.evidence} | {r for x in report.next_steps for r in knowledge.REF.findall(x)}
-            if not cited & {p["ref"] for p in knowledge.usable(st) if p["authority"] == "target"}:
-                report.next_steps = [*report.next_steps, *knowledge.documented_steps(self, 2)]
-                payload["next_steps"] = report.next_steps
         knowledge.reclassify(self, self.request.question if self.request else "")
         knowledge.mark_used(self, report)
+        if report.generated_by == "llm" and payload.get("response_type") == "troubleshooting" and not any(p["cited"] and p["authority"] == "target" for p in st["passages"]):
+            added = knowledge.documented_steps(self, 2)
+            if added:  # MOKS's own pointer to the target's runbook, credited to MOKS rather than the model
+                report.next_steps = [*report.next_steps, *added]
+                report.validation["moks_cited_passages"] = [i for x in added for i in knowledge.PASSAGE_REF.findall(x)]
+                payload["next_steps"] = report.next_steps
+                knowledge.mark_used(self, report)
         if st["status"] in ("empty", "failed", "not_attempted") and self.owner is not None:
             async with session_scope() as db:
                 principal = await load_principal(db, self.owner)
@@ -1079,6 +1141,49 @@ class Investigator:
             if seen.get(key) is not None:
                 f["controller"] = seen[key]
 
+    async def _recommend_skills(self, question: str, kinds: set[str], ready: dict, chosen: list) -> list:
+        """Semantic ranking over skills policy already allows. Shadow records it; enabled may fill places the rules
+        left empty. Whatever happens, the deterministic choice stands (moks/ml/skill_rank.py)."""
+        from .. import skills as skill_lib
+        from ..ml import mode, skill_rank
+
+        try:
+            async with session_scope() as db:
+                state = await mode(db, "skill_recommendations")
+            if state == "disabled":
+                return chosen
+            eligible = [sk for sk in skill_lib.library().skills.values() if sk.name in ready]
+            if not eligible:
+                self.skill_recommendations = {"mode": state, "method": None, "ranked": [], "added": [], "deterministic": [sk.name for sk, _, _ in chosen], "eligible": 0}
+                return chosen
+            ranked, method = await skill_rank.rank(question, kinds, eligible, await self._embedder())
+            final, added = skill_rank.combine(state, chosen, ranked, {sk.name: sk for sk in eligible}, skill_lib.SELECT_LIMIT)
+            self.skill_recommendations = {"mode": state, "method": method, "ranked": ranked[:8], "added": added, "deterministic": [sk.name for sk, _, _ in chosen],
+                                          "eligible": len(eligible), "floor": skill_rank.MIN_SIMILARITY,
+                                          "note": "ranks only skills policy allows here; the rules' choice and an operator's choice are never removed"}
+            return final
+        except Exception as exc:
+            from ..observability import ML_FALLBACKS
+
+            ML_FALLBACKS.labels("skill_recommendations", "error").inc()
+            log.warning("skill recommendation fell back to the rules", extra={"event": "skill_rank_failed", "investigation_id": str(self.id), "error_type": type(exc).__name__})
+            self.skill_recommendations = {"mode": "fallback", "method": None, "ranked": [], "added": [], "error": type(exc).__name__}
+            return chosen
+
+    async def _embedder(self):
+        """The knowledge index's embedding model, when it has one; otherwise None and ranking is lexical."""
+        from ..rag import service
+
+        async with session_scope() as db:
+            idx = await service.active_index(db)
+        if idx is None or not idx.dimensions:
+            return None
+
+        async def embed(texts: list[str]):
+            async with session_scope() as db:
+                return await service._embed(db, idx, texts, tries=1)
+        return embed
+
     async def _still_allowed(self, sk, env_name: str) -> str | None:
         """Why a pinned skill must stop now, if it must. Replacing a version does not stop it: only a
         decision against the skill does."""
@@ -1102,11 +1207,13 @@ class Investigator:
         await self._resolve_owners(ctx)
         kinds = {f["kind"] for f in self.findings}
         ready, refused = await self._eligible(ctx)
+        self.skill_eligible = sorted(ready)
         self.skill_generation = snapshot()["generation"]
         resources = skill_lib.resources_of(self.findings)
         if self.requested_skill and self.requested_skill in refused:
             self.notes.append(f"Skill {self.requested_skill} was asked for but cannot run: {refused[self.requested_skill]}.")
         chosen = skill_lib.select(question, kinds, eligible=lambda sk: sk.name in ready, requested=self.requested_skill, resources=resources)
+        chosen = await self._recommend_skills(question, kinds, ready, chosen)
         rejected = [{"skill": n, "reason": why} for n, why in sorted(refused.items()) if n in {s.name for s, _, _ in skill_lib.select(question, kinds, limit=6)}]
         for r in rejected:
             self.notes.append(f"Skill {r['skill']} not used: {r['reason']}.")
@@ -1395,7 +1502,7 @@ class Investigator:
                               prompts.report_user(question, scope_info, self._views(), self.findings, self.notes, self.request, self.shared_findings, knowledge.prompt_block(self)),
                               REPORT_TOKENS, MIN_REPORT_TOKENS)
         refs = {e["ref"] for e in self.evidence if e["ref"]}
-        return validate_llm_report(raw, refs, self.notes)
+        return validate_llm_report(raw, refs, self.notes, knowledge.supplied(self.knowledge))
 
     def _correlate(self) -> None:
         """Time correlation between rollouts and problem onset (correlation, not causation), and

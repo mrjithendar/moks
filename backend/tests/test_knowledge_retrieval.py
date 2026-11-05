@@ -204,7 +204,7 @@ async def test_the_model_sees_passages_inside_untrusted_blocks_with_their_author
         seen.append(messages[-1]["content"] if isinstance(messages[-1], dict) else str(messages[-1]))
         if "tool_calls" in system:
             return LLMResponse(plan(done=True), 10, 5, "fake", "m")
-        ref = re.search(r"\[(E\d+)\] about the target", seen[-1]).group(1)
+        ref = re.search(r"\[(E\d+\.\d+)\] about the target", seen[-1]).group(1)  # a passage id, not the search's ref
         return LLMResponse(json.dumps({"summary": "payments crash-loops; the runbook says to read previous logs.", "observed_facts": [], "suspected_causes": [],
                                        "missing_evidence": [], "next_steps": [f"Documented in docs/runbook.md ({ref}): read the previous container's logs."], "proposed_remediation": []}), 10, 5, "fake", "m")
     monkeypatch.setattr(budget, "complete", complete)

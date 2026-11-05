@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field
 
@@ -203,6 +203,31 @@ async def kb_search(ctx: ToolContext, a: KbArgs) -> ToolResult:
         summary += f" {r['evidence']['reason']}"
     return ToolResult(summary, hits, {"index": r.get("index"), "citations": [h["citation"] for h in hits], "evidence": r["evidence"], "fallback_reason": r.get("fallback_reason"), "reranking": r.get("reranking"), "ranking": ranking,
                                       "mode": r.get("mode"), "latency_ms": r.get("latency_ms"), "note": r.get("note"),
+                                      "scope": {"environment": ctx.environment.name, "namespace": ctx.focus_namespace or None}})
+
+
+class SimilarArgs(ToolArgs):
+    symptoms: list[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{1,40}$")]] = Field(default_factory=list, max_length=12, description="finding kinds, e.g. crashloop, oomkilled")
+    services: list[Annotated[str, Field(pattern=K8S_NAME, max_length=63)]] = Field(default_factory=list, max_length=5)
+    resource_kinds: list[Annotated[str, Field(pattern=r"^[a-z]{2,40}$")]] = Field(default_factory=list, max_length=6)
+    signature: list[Annotated[str, Field(pattern=r"^(<[a-z]+>|[a-z][a-z0-9_]{1,40})$")]] = Field(default_factory=list, max_length=40, description="normalized error tokens")
+    changes: bool = Field(default=False, description="a rollout preceded the problem")
+    text: str = Field(default="", max_length=300, description="free-text symptoms")
+    k: int = Field(default=5, ge=1, le=10)
+
+
+async def similar_incidents(ctx: ToolContext, a: SimilarArgs) -> ToolResult:
+    """Approved past incidents like this one, under the person's access and the request's scope. Read-only."""
+    from ..ml import similar
+
+    current = {"symptoms": a.symptoms, "services": a.services, "resource_kinds": a.resource_kinds, "signature": a.signature, "changes": [{"kind": "rollout"}] if a.changes else []}
+    async with session_scope() as db:
+        r = await similar.find(db, ctx.principal, current, environment=ctx.environment.name, namespace=ctx.focus_namespace, text=a.text, k=a.k)
+    if r["status"] == "disabled":
+        raise ConnectorError("config", "similar-incident search is disabled (ML capability similar_incidents)")
+    hits = r["results"]
+    summary = (f"{len(hits)} similar approved incident(s) of {r.get('considered', 0)} considered. " if hits else f"No similar approved incident ({r.get('reason', 'none matched')}). ") + similar.NOTE
+    return ToolResult(summary, hits, {"mode": r["mode"], "considered": r.get("considered"), "text": r.get("text"), "method": r.get("method"), "note": similar.NOTE,
                                       "scope": {"environment": ctx.environment.name, "namespace": ctx.focus_namespace or None}})
 
 
@@ -456,6 +481,8 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("git_read_file", "Read one file (manifest, config, runbook) from an allowed repository; secrets are never read.", "git", ReadFileArgs, git_read_file, cluster_scoped=True, namespace_arg=None),
     ToolSpec("git_compare_deployment", "Tie a running Deployment to its Git commit when image tags/annotations carry a SHA; never guesses.", "git", CompareDeployArgs, git_compare_deployment),
     ToolSpec("kb_search", "Search runbooks, docs, manifests and approved postmortems you may read (cited passages).", "knowledge", KbArgs, kb_search, namespace_arg=None),
+    ToolSpec("similar_incidents", "Approved past incidents with similar symptoms, signatures and services, with what differs and how they were resolved. "
+             "Historical leads only: never evidence of the current cause.", "knowledge", SimilarArgs, similar_incidents, namespace_arg=None),  # ml.read is checked per incident in ml.similar
     ToolSpec("finops_aws_costs", "AWS cost by service/account/region/usage type/tag (Cost Explorer, cached).", "aws_cost", CostArgs, finops_aws_costs,
              cluster_scoped=True, namespace_arg=None, extra_permission=P.FINOPS_READ),
     ToolSpec("finops_aws_forecast", "AWS cost forecast.", "aws_cost", DaysArgs, finops_aws_forecast, cluster_scoped=True, namespace_arg=None, extra_permission=P.FINOPS_READ),

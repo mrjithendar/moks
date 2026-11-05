@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -930,3 +931,156 @@ class EvalRun(Base):
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class LearningRecord(Base):
+    """What one investigation or incident was about, retrieved, cited and ran, and what a person later confirmed.
+    Training reads only approved labels (moks/ml/learning.py); a finished investigation is not a resolved incident."""
+    __tablename__ = "learning_records"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    schema_version: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(20))  # investigation | incident
+    investigation_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), nullable=True)
+    incident_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("incidents.id", ondelete="SET NULL"), nullable=True)
+    environment: Mapped[str] = mapped_column(String(100))
+    namespace: Mapped[str] = mapped_column(String(253), default="*")
+    service: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    resource: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    realm: Mapped[str] = mapped_column(String(20), default="operational")  # evaluation runs never mix with operational data
+    event_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    event_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    features: Mapped[dict] = mapped_column(JSONB, default=dict)
+    retrieval: Mapped[dict] = mapped_column(JSONB, default=dict)
+    skills: Mapped[dict] = mapped_column(JSONB, default=dict)
+    outcome: Mapped[dict] = mapped_column(JSONB, default=dict)
+    label: Mapped[dict] = mapped_column(JSONB, default=dict)
+    label_state: Mapped[str] = mapped_column(String(20), default="unreviewed")  # unreviewed | approved | rejected
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    versions: Mapped[dict] = mapped_column(JSONB, default=dict)
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class LearningJudgment(Base):
+    """One person's verdict on one passage, similar incident, skill recommendation or anomaly observation.
+    Review input: nothing trains on it until a reviewer marks it reviewed."""
+    __tablename__ = "learning_judgments"
+    __table_args__ = (UniqueConstraint("created_by", "target_kind", "target_id", "context_id"),)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    record_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("learning_records.id", ondelete="CASCADE"), nullable=True)
+    context_id: Mapped[str] = mapped_column(String(64), default="")  # the investigation it was given in, if any
+    target_kind: Mapped[str] = mapped_column(String(30))
+    target_id: Mapped[str] = mapped_column(String(200))
+    verdict: Mapped[str] = mapped_column(String(20))
+    note: Mapped[str] = mapped_column(Text, default="")
+    environment: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    namespace: Mapped[str | None] = mapped_column(String(253), nullable=True)
+    state: Mapped[str] = mapped_column(String(20), default="open")  # open | reviewed | dismissed
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LearningDataset(Base):
+    __tablename__ = "learning_datasets"
+    __table_args__ = (UniqueConstraint("name", "version"),)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(100))
+    version: Mapped[int] = mapped_column(Integer)
+    purpose: Mapped[str] = mapped_column(String(30))
+    realm: Mapped[str] = mapped_column(String(20), default="operational")
+    feature_schema: Mapped[str] = mapped_column(String(40))
+    filters: Mapped[dict] = mapped_column(JSONB, default=dict)
+    split: Mapped[dict] = mapped_column(JSONB, default=dict)
+    counts: Mapped[dict] = mapped_column(JSONB, default=dict)
+    checksum: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(20), default="built")
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class LearningDatasetItem(Base):
+    __tablename__ = "learning_dataset_items"
+    dataset_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("learning_datasets.id", ondelete="CASCADE"), primary_key=True)
+    record_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("learning_records.id", ondelete="CASCADE"), primary_key=True)
+    split: Mapped[str] = mapped_column(String(10))  # train | eval
+    group_key: Mapped[str] = mapped_column(String(200))  # every record of one group lands in one split
+
+
+class MLArtifact(Base):
+    """A model artifact by its SHA-256. JSON only; MOKS never loads a pickle."""
+    __tablename__ = "ml_artifacts"
+    sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    media_type: Mapped[str] = mapped_column(String(80))
+    body: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    uri: Mapped[str | None] = mapped_column(Text, nullable=True)  # set when the body lives in object storage instead
+    size: Mapped[int] = mapped_column("bytes", Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MLModel(Base):
+    __tablename__ = "ml_models"
+    __table_args__ = (UniqueConstraint("capability", "cohort", "algorithm", "version"),)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    capability: Mapped[str] = mapped_column(String(40))
+    cohort: Mapped[str] = mapped_column(String(300))
+    algorithm: Mapped[str] = mapped_column(String(40))
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), default="candidate")  # candidate | shadow | champion | retired | rejected
+    feature_schema: Mapped[str] = mapped_column(String(40))
+    dataset_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("learning_datasets.id", ondelete="SET NULL"), nullable=True)
+    dataset_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    artifact_sha256: Mapped[str | None] = mapped_column(ForeignKey("ml_artifacts.sha256"), nullable=True)
+    library_versions: Mapped[dict] = mapped_column(JSONB, default=dict)
+    params: Mapped[dict] = mapped_column(JSONB, default=dict)
+    metrics: Mapped[dict] = mapped_column(JSONB, default=dict)
+    training: Mapped[dict] = mapped_column(JSONB, default=dict)
+    provenance: Mapped[dict] = mapped_column(JSONB, default=dict)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    promoted_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MLObservation(Base):
+    """One scored window for one cohort. In shadow mode it is shown and judged, and changes nothing else."""
+    __tablename__ = "ml_observations"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    capability: Mapped[str] = mapped_column(String(40))
+    model_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("ml_models.id", ondelete="SET NULL"), nullable=True)
+    algorithm: Mapped[str] = mapped_column(String(40))
+    environment: Mapped[str] = mapped_column(String(100))
+    namespace: Mapped[str] = mapped_column(String(253))
+    service: Mapped[str] = mapped_column(String(200), default="")
+    cohort: Mapped[str] = mapped_column(String(300))
+    window_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    window_to: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    status: Mapped[str] = mapped_column(String(30))  # scored | insufficient_history | no_telemetry | maintenance | model_invalid
+    mode: Mapped[str] = mapped_column(String(20))
+    score: Mapped[float | None] = mapped_column(nullable=True)
+    threshold: Mapped[float | None] = mapped_column(nullable=True)
+    unusual: Mapped[bool] = mapped_column(Boolean, default=False)
+    deviations: Mapped[list] = mapped_column(JSONB, default=list)
+    data_quality: Mapped[dict] = mapped_column(JSONB, default=dict)
+    context: Mapped[dict] = mapped_column(JSONB, default=dict)
+    feedback: Mapped[dict] = mapped_column(JSONB, default=dict)
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class MLCapability(Base):
+    """disabled | shadow | enabled. Read on every use, so switching to disabled is the kill switch."""
+    __tablename__ = "ml_capabilities"
+    name: Mapped[str] = mapped_column(String(40), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(20))
+    reason: Mapped[str] = mapped_column(Text, default="")
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

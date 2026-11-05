@@ -437,8 +437,12 @@ def test_at_cutover_each_component_gets_its_own_identity():
 
 
 def test_the_original_pod_goes_only_after_cutover_and_only_when_asked():
-    docs = render("values-minikube.yaml", *ACTIVE, "rag.opensearch.secure.retireOriginal=true")
+    verified = "rag.opensearch.secure.cutoverVerified=moks-chunks-ab12cd34 validated 2026-11-20"
+    docs = render("values-minikube.yaml", *ACTIVE, "rag.opensearch.secure.retireOriginal=true", verified)
     assert not any(d["metadata"]["name"] == "moks-opensearch" for d in docs) and of(docs, "StatefulSet", "moks-search")
+    with pytest.raises(subprocess.CalledProcessError) as e:  # active is not the same as verified
+        render("values-minikube.yaml", *ACTIVE, "rag.opensearch.secure.retireOriginal=true")
+    assert "cutoverVerified" in str(e.value.stderr)
     with pytest.raises(subprocess.CalledProcessError) as e:
         render("values-minikube.yaml", *SECURE, "rag.opensearch.secure.retireOriginal=true")
     assert "set active first" in str(e.value.stderr)

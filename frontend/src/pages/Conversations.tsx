@@ -218,7 +218,7 @@ function AssistantDetail({ id, onCite, onPropose }: { id: string; onCite: (inv: 
   return (
     <>
       {d.error && <div className="alert error">{d.error}</div>}
-      {d.report ? <Report report={d.report} evidence={d.evidence} hideSummary onCite={(r) => onCite(id, r)}
+      {d.report ? <Report report={d.report} evidence={d.evidence} hideSummary onCite={(r) => onCite(id, r)} investigationId={id}
         onPropose={can("action.request") && d.namespace !== "*" ? (r) => onPropose(d, r) : undefined} /> : <div className="small muted">No report was produced.</div>}
       <Actions actions={d.actions} />
       <div className="small muted row" style={{ marginTop: 6 }}>

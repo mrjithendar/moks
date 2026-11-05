@@ -22,7 +22,7 @@ ACCESS_DENIED = "access_denied"
 DOCUMENTATION = "documentation"  # what someone wrote down, not the state of the system
 HISTORICAL = "historical"        # true when collected; collected before this run resumed or in an earlier one
 
-DOCUMENTATION_TOOLS = {"kb_search", "git_read_file"}
+DOCUMENTATION_TOOLS = {"kb_search", "git_read_file", "similar_incidents"}  # a past incident is a record, not the state of anything now
 LIVE = {OBSERVATION, INCOMPLETE}
 FAILED = {TOOL_ERROR, ACCESS_DENIED}
 

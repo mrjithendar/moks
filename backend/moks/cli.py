@@ -482,6 +482,40 @@ def _backup_fetch(key: str | None, out: str) -> None:
     print(f"{key} -> {out}")
 
 
+async def _ml(a) -> dict:
+    from sqlalchemy import select
+
+    from .config import get_settings
+    from .db import session_scope
+    from .ml import anomaly, learning
+    from .models import Environment, Incident
+
+    if a.ml_cmd == "train":
+        pairs = [(a.environment, a.namespace)] if a.environment and a.namespace else [
+            tuple(x.strip().split(":", 1)) for x in get_settings().ml_anomaly_namespaces.split(",") if ":" in x]
+        if not pairs:
+            raise SystemExit("give --environment and --namespace, or set MOKS_ML_ANOMALY_NAMESPACES (env:namespace,...)")
+        return {"trained": [await anomaly.train(env, ns) for env, ns in pairs]}
+    if a.ml_cmd == "evaluate-similar":
+        from .ml import evaluation
+
+        return await evaluation.reviewed_similar()
+    if a.ml_cmd == "tick":
+        async with session_scope() as db:
+            names = (await db.execute(select(Environment.name))).scalars().all()
+        return {n: await anomaly.tick(n) for n in names}
+    if a.ml_cmd == "index-incidents":
+        done = 0
+        async with session_scope() as db:
+            rows = (await db.execute(select(Incident, Environment.name).join(Environment, Environment.id == Incident.environment_id).where(Incident.postmortem_status == "approved"))).all()
+            for inc, env_name in rows:
+                await learning.capture_incident(db, inc, env_name, inc.postmortem_approved_by)
+                done += 1
+        return {"incident_records": done}
+    async with session_scope() as db:
+        return await learning.purge(db)
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="moks")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -543,6 +577,14 @@ def main(argv: list[str] | None = None) -> None:
     bk.add_parser("compare", help="report drift between MOKS_COMPARE_SOURCE_URL and MOKS_COMPARE_TARGET_URL")
     bd = bk.add_parser("drill", help="restore a backup into a new isolated database, prove it, drop it")
     bd.add_argument("--key")
+    ml = sub.add_parser("ml", help="ML capabilities (docs/ML.md)").add_subparsers(dest="ml_cmd", required=True)
+    mt = ml.add_parser("train", help="offline anomaly training for one namespace, or every namespace in MOKS_ML_ANOMALY_NAMESPACES; registers candidates, promotes nothing")
+    mt.add_argument("--environment")
+    mt.add_argument("--namespace")
+    ml.add_parser("tick", help="score every active anomaly model once (shadow output only)")
+    ml.add_parser("index-incidents", help="write learning records for postmortems approved before learning records existed")
+    ml.add_parser("purge", help="apply learning-record and dataset retention")
+    ml.add_parser("evaluate-similar", help="similar-incident retrieval measured on reviewed operator judgments (read-only)")
     a = p.parse_args(argv)
 
     if a.cmd == "migrate":
@@ -583,6 +625,8 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_opensearch(a))
     elif a.cmd == "skills":
         asyncio.run(_skills(a))
+    elif a.cmd == "ml":
+        print(json.dumps(asyncio.run(_ml(a)), indent=1, default=str))
     elif a.cmd == "backup":
         if a.backup_cmd == "run":
             asyncio.run(_backup_run(a.dump, a.manifest))

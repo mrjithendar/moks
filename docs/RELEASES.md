@@ -4,6 +4,28 @@ An image is built once and tagged with its commit, and CI moves `latest` to it. 
 
 Git does not record which build is running. Check it with `/api/health`.
 
+## What was released, and with what
+
+Each `master` build uploads a **release record** as a CI artifact, kept 400 days:
+
+- `release-moks-<sha>/moks.json`: `{component, commit, repository, tag, digest, run}`
+- `release-moks-reranker-<sha>/moks-reranker.json`: the same, plus `model`, the reranker's `model_id@revision`
+  from `reranker/model.lock.json`
+
+Together with what MOKS records at runtime, that links a running build to its model and its evaluation:
+
+| Question | Where |
+|---|---|
+| Which commit is each pod running? | `/api/health` and the profile menu (`component_versions`), from the commit baked into the image |
+| Which digest is that commit? | the release record for that commit, or `aws ecr describe-images --repository-name moks --image-ids imageTag=<sha>` |
+| Which reranker model revision? | the reranker release record, `reranking.revision` on each search, and `MOKS_RAG_RERANK_REVISION` |
+| Which evaluation backed it? | `eval_runs.versions` (dataset, skills, model, index) for knowledge and rerank evaluations; `ml_models.metrics` and `ml_models.provenance.commit` for ML models |
+
+Images stay on `:latest` with `pullPolicy: Always` (the rule since 2026-11-03), so nothing here needs a values change
+to release. The chart still accepts `image.digest` and `reranker.image.digest` if a release must be held still,
+for example during a rollback investigation. Set the digest from a release record, never typed by hand, and remove
+it again afterwards so CI releases resume.
+
 ## Release
 
 1. A pull request passes the `check` job, which runs on pull requests only. Merging it to `master` builds one image, tags it with the commit SHA and moves `latest` to it. A failed image build or smoke test leaves `latest` where it was. A direct push to `master` is released without `check`, so require `check` in branch protection.
@@ -31,6 +53,11 @@ aws ecr put-image --region us-east-1 --repository-name moks --image-tag latest -
 ```
 
 The next successful `master` build moves `latest` forward again. Revert the bad commit first if it would break again.
+
+To hold a component on an earlier build instead (for instance, while `master` keeps building), pin it from its
+release record: `image.digest: sha256:...` (or `reranker.image.digest`) in `values-minikube.yaml`, push, and sync that
+one Application. Remove the pin once the fix is released. ML models roll back separately and without a release:
+see [ML.md](ML.md#roll-back).
 
 The schema stays where it is, because migrations are forward-only. That is safe when releases follow the rule below.
 

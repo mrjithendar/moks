@@ -207,18 +207,44 @@ passage gets one authority, with its reasons:
 
 | Authority | When | Used |
 |---|---|---|
-| `target` | the source's `service` or `applies_to.services` matches the target or a service the question names, the repository is the target's, the document is scoped to the target's namespace, it names a resource from the findings, or it names the target | yes |
-| `shared` | documentation with no service binding that shares enough of the request's terms (or ranks top 3 in hybrid search with some overlap) | yes, labeled general guidance |
-| `unverified` | relevant, but from a repository or service binding not established as the target's | given to the model with that label; never used for guidance steps |
+| `target` | the source's `service` or `applies_to.services` matches the target or a service the question names; or, with no mapping to another service, the repository is the target's, it names a resource from the findings, or it names the target | yes |
+| `dependency` | the source declares it in `applies_to.dependency_of` for the target (a database, queue or shared platform the target uses) | yes, labeled as about a dependency, not the target |
+| `shared` | documentation with no service binding that shares enough of the request's terms (or ranks top 3 in hybrid search with some overlap), or a source that declares `applies_to.shared: true` | yes, labeled general guidance |
+| `unverified` | relevant, but from a repository or service binding not established as the target's, or written for another service while mentioning the target | given to the model with that label; never used for guidance steps |
 | `unrelated` | bound to another service | no, with the reason |
 | `low_relevance` | shares too little with the request | no, with the reason |
+
+The order is explicit relationships first: the service mapping, a declared dependency, then a mapping to some other
+service. Only when nothing explicit decides does the repository name, an identifier or a mention count. **A namespace
+is supporting context, never proof**: several services share one, so a runbook scoped to `shop` and mapped to
+`billing` stays `unrelated` to `payments` in `shop`, and a namespace-scoped document with no service binding is
+`shared`, not `target`. The namespace still shows in the basis. Before 2026-11-05 a namespace match alone made a
+passage `target`, ahead of a conflicting service mapping.
 
 Passages are judged again as context grows (triage names the workloads), so a billing runbook found before
 triage is marked unrelated once the run knows it is about payments. To make a repository authoritative for a
 service, set the source's **Service** (or `applies_to.services`) or the `services` path map.
 
 Passages reach the planner and the report once, in a bounded block (9,000 characters, 1,200 per passage) inside
-untrusted-data fences, labeled with authority, path, commit, lines and freshness. The prompts say documentation
+untrusted-data fences, labeled with authority, path, commit, lines and freshness.
+
+**Passage citations.** One `kb_search` is one evidence ref, say `E3`, and holds up to six passages. Each passage
+has its own id, `E3.2` (its rank in that search), tied to the chunk, document, revision and line range. The model
+is told to cite the passage id. Claim validation maps `E3.2` back to `E3` and keeps the passage beside the claim. If
+validation removes the citation, the passage stops counting. Each passage moves through four states:
+
+| State | Meaning |
+|---|---|
+| `retrieved` | returned by a search the person was allowed to run |
+| `eligible` | its authority lets it inform the answer |
+| `supplied` | its text was in the prompt; passages past the budget are eligible but not supplied |
+| `cited` | the final answer cites it, and the citation survived validation (`cited_by`: model, rules or moks) |
+
+A model may cite only what it was supplied. A citation of any other passage is recorded in
+`knowledge.citations.rejected`. A bare `E3` names a passage only when exactly one passage of that search was
+available; otherwise it is recorded as ambiguous and no passage is credited. Before this change, citing `E3` marked
+every usable passage of the search as used, including passages the model never saw. Reports from before it
+(`knowledge.version` absent) have only `used` and `provided`, and the UI derives their state from those. The prompts say documentation
 describes intent and never proves current state; claim validation still turns a fact that cites only
 documentation into a hypothesis. Without a model, or when the model cites none of the target's passages, MOKS
 adds the documented procedures to next steps, labeled "Documented, not observed". Retrieved text grants no tools
@@ -241,6 +267,12 @@ fallback, timing and counts, never passage text; `moks_knowledge_retrievals_tota
 - **documents**: active, draft, quarantined and archived, and vector state;
 - **indexing**: backend, mode, outbox pending and dead, documents behind;
 - **searchable**: documents and chunks the active backend can return now;
+- **retrieval**: `ingested`, `indexed` (at the current revision in the active backend), `eligible` (what search returns
+  to someone allowed to read the whole source), `excluded.review | freshness | lifecycle`, `flagged.superseded |
+  deprecated | stale` (returned, with a warning), and `operations.pending | failed`. Search and these counts share one
+  rule set, `rag/eligibility.py`, applied per row by search and as grouped SQL here. That means a fixed number of
+  queries per call, not one per document. Before 2026-11-05 a document whose own review date had passed was dropped
+  by search under `stale_policy: exclude` but still counted as searchable here;
 - **reasons**, each with a code: `source_inactive`, `never_synced`, `sync_failed`, `sync_incomplete`, `sync_partial`,
   `no_active_index`, `indexing_pending`, `indexing_failed`, `awaiting_review`, `stale_excluded`, `no_searchable_documents`.
 

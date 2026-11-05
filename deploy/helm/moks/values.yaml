@@ -73,6 +73,36 @@ worker:
     requests: {cpu: 100m, memory: 192Mi}
     limits: {cpu: "1", memory: 512Mi}
 
+# Machine learning (docs/ML.md). Capability modes (disabled, shadow, enabled) are switched in the admin screen
+# and stored in PostgreSQL; these bound the work. ml.disabled is the deploy-time kill switch for all of it.
+ml:
+  disabled: false
+  learningCapture: true
+  learningRetentionDays: 365
+  similarIncidents: {k: 5, candidates: 300}
+  anomaly:
+    namespaces: ""          # "env:namespace,env:namespace": what training covers. Empty trains nothing.
+    stepSeconds: 300
+    windowMinutes: 60
+    trainingDays: 14
+    minHistoryDays: 7
+    maxCohorts: 40
+    concurrency: 2
+    intervalMinutes: 15
+    maxFlagsPerDay: 3
+  artifactStore: postgres   # or s3, through the backup client: set artifactBucket (and endpoint/region for R2)
+  artifactBucket: ""
+  artifactEndpoint: ""
+  artifactRegion: ""
+  training:
+    enabled: false          # the offline CronJob; an ml_admin can also start one run from the admin screen
+    suspend: false
+    schedule: "17 3 * * 0"  # weekly, outside the backup window
+    activeDeadlineSeconds: 3600
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {cpu: "1", memory: 768Mi}
+
 serviceAccount:
   create: true
   name: moks
@@ -170,6 +200,9 @@ rag:
       enabled: false
       active: false
       retireOriginal: false   # stops rendering the pod above, once active has soaked. Its volume stays until you delete it.
+      # Required before retireOriginal renders: the generation that passed `opensearch-migrate.sh validate` after cutover and
+      # the date the soak ended, e.g. "moks-chunks-ab12cd34 validated 2026-11-20". Being active is not the same as being verified.
+      cutoverVerified: ""
       cluster: secure      # names its generations in PostgreSQL, apart from the original cluster's
       # The upstream image: security and TLS, no snapshots, no Prometheus exporter. To have those, set this to
       # the digest CI reports for deploy/opensearch/Dockerfile, and pluginsInstalled to true.

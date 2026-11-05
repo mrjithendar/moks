@@ -95,6 +95,7 @@ def build(inv: Any, executor: Any, ctx: Any, question: str, scope_info: dict, pr
 
     async def refresh(state: State) -> dict:
         await inv._retrieve(executor, question, "refresh", state["namespace"])
+        await inv._similar_incidents(executor)
         await committed()
         return {}
 

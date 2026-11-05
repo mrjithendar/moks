@@ -187,6 +187,9 @@ async def approve_postmortem(iid: uuid.UUID, request: Request, ctx: AuthContext 
     inc.postmortem_status, inc.postmortem_approved_by = "approved", ctx.user.id
     md = report_markdown(await incident_detail(db, inc))
     doc = await ingest.add_postmortem(db, inc, env.name, md, get_settings().public_url)
+    from ..ml import learning
+
+    await learning.capture_incident(db, inc, env.name, ctx.user.id)  # the approved outcome similar-incident search and datasets read
     await add_event(db, inc.id, "note", {"text": "Postmortem approved and added to the knowledge base", "document": doc.path}, ctx.user.id)
     await audit.record(db, action="incident.postmortem_approve", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="incident",
                        resource_id=str(inc.id), environment=env.name, namespace=inc.namespace)

@@ -30,6 +30,8 @@ const Detections = lazy(() => import("./pages/Detections").then((m) => ({ defaul
 const Metrics = lazy(() => import("./pages/Metrics").then((m) => ({ default: m.Metrics })));
 const Actions = page(ops, "Actions"), DiagnosticView = page(ops, "DiagnosticView"), Diagnostics = page(ops, "Diagnostics"), IncidentView = page(ops, "IncidentView"), Incidents = page(ops, "Incidents"), PlanView = page(ops, "PlanView");
 const Overview = lazy(() => import("./pages/Overview"));
+const ml = () => import("./pages/ML");
+const MLInsights = page(ml, "MLInsights"), MLAdmin = page(ml, "MLAdmin");
 
 /** Explains a page the role cannot use, instead of an empty page and a 403. The backend still decides. */
 function Need({ any, children }: { any: string[]; children: ReactNode }) {
@@ -74,6 +76,8 @@ export default function App() {
         <Route path="/finops" element={<Need any={["finops.read"]}><FinOps /></Need>} />
         <Route path="/evals" element={<Need any={["admin.policies"]}><Evals /></Need>} />
         <Route path="/skills" element={<Skills />} />
+        <Route path="/ml" element={<Need any={["ml.read"]}><MLInsights /></Need>} />
+        <Route path="/admin/ml" element={<Need any={["ml.admin", "learning.review", "learning.export"]}><MLAdmin /></Need>} />
         <Route path="/audit" element={<Need any={["audit.read"]}><Audit /></Need>} />
         <Route path="/admin/environments" element={<Need any={["admin.policies"]}><Environments /></Need>} />
         <Route path="/admin/connectors" element={<Need any={["admin.connectors"]}><Connectors /></Need>} />

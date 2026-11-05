@@ -171,11 +171,11 @@ async def _knowledge(inv: Any, executor: Any, req: RequestContext) -> list[dict]
         text = f"{hit.get('title') or ''}\n{hit.get('heading') or ''}\n{hit.get('text') or ''}"
         if any(s["path"] == p.get("path") and s["text"] == text for s in inv.sources):
             continue
-        why = "; ".join(p["basis"]) if p["authority"] in ("target", "shared") else (p["excluded"] or "; ".join(p["basis"]))
+        why = "; ".join(p["basis"]) if p["authority"] in ("target", "dependency", "shared") else (p["excluded"] or "; ".join(p["basis"]))
         if p["authority"] == "unverified":
             why = f"not used for steps: {why}"
-        found.append(_source(inv, ref=p["ref"], tool="kb_search", path=str(p.get("path") or ""), repository=p.get("repository"), kind="indexed", text=text, freshness=hit.get("freshness"),
-                             target_specific=p["authority"] == "target", general=p["authority"] == "shared", authority=p["authority"], why=why, lines=p.get("lines"), revision=p.get("revision")))
+        found.append(_source(inv, ref=p.get("id") or p["ref"], tool="kb_search", path=str(p.get("path") or ""), repository=p.get("repository"), kind="indexed", text=text, freshness=hit.get("freshness"),
+                             target_specific=p["authority"] == "target", general=p["authority"] in ("shared", "dependency"), authority=p["authority"], why=why, lines=p.get("lines"), revision=p.get("revision")))
     return found
 
 
@@ -637,7 +637,7 @@ async def compose(inv: Any, provider: Any, cfg: Any, req: RequestContext) -> tup
 async def explain(inv: Any, executor: Any, provider: Any, cfg: Any, req: RequestContext) -> tuple[Report, str]:
     """A direct answer. Documentation may be cited; nothing live is read."""
     await _knowledge(inv, executor, req)
-    docs = [s for s in inv.sources if s.get("authority") in ("target", "shared", "unverified")]
+    docs = [s for s in inv.sources if s.get("authority") in ("target", "dependency", "shared", "unverified")]
     for s in docs:
         s["used"] = True  # a concept is not tied to a target, so any relevant readable passage may help
     refs = {s["ref"] for s in docs}
