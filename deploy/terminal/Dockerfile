@@ -7,11 +7,20 @@
 FROM debian:trixie-20261027-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS base
 ARG DEBIAN_SNAPSHOT=20261031T000000Z
 # Plain http is only for the base image, which has no CA certificates yet: apt verifies every package's signature.
+# snapshot.debian.org throttles and often answers 504, so apt retries with backoff, uses one connection at a time,
+# and gives up on a stalled download sooner so the retry gets its turn. CI builds failed on this on 2026-11-05.
 RUN printf '%s\n' \
       "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} trixie main" \
       "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} trixie-updates main" \
       "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} trixie-security main" \
-      > /etc/apt/sources.list && rm -f /etc/apt/sources.list.d/*
+      > /etc/apt/sources.list && rm -f /etc/apt/sources.list.d/* \
+    && printf '%s\n' \
+      'Acquire::Retries "8";' \
+      'Acquire::Retries::Delay::Maximum "30";' \
+      'Acquire::http::Timeout "30";' \
+      'Acquire::Queue-Mode "access";' \
+      'Acquire::http::Pipeline-Depth "0";' \
+      > /etc/apt/apt.conf.d/80-snapshot-retries
 
 FROM base AS tools
 ARG TARGETARCH
