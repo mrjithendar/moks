@@ -118,6 +118,10 @@ rbac:
 
 ingress:
   enabled: true
+  # traefik: render the Ingresses, Middlewares and IngressRoutes below. external: render none of them; a gateway
+  # that keeps routes in its own store (Kong in database mode on mk4, docs in the tools repo: docs/kong) serves
+  # the same paths. Either way ingress.host and the OpenSearch route settings still shape the app.
+  controller: traefik
   className: traefik
   host: jithendar.com
   tlsSecretName: ""        # empty: Traefik's default TLSStore certificate

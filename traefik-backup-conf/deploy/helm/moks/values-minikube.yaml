@@ -1,0 +1,158 @@
+# mk4 (Hetzner, 4-node Minikube, arm64) behind Traefik at https://jithendar.com/moks
+image:
+  repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
+  # CI moves latest on every master build. Pods get it when they restart (docs/RELEASES.md).
+  tag: latest
+  pullPolicy: Always
+imagePullSecrets: [{name: ecr-pull}]   # refreshed by the ecr-refresh CronJob (tools repo); see docs/OPERATOR_GUIDE.md
+
+# Cluster backups. Velero itself is the Argo CD app in deploy/argocd/velero.yaml.
+velero:
+  enabled: true
+
+# Investigations read Argo CD's sync status and errors.
+argocd:
+  enabled: true
+
+publicUrl: https://jithendar.com/moks
+basePath: /moks
+
+config:
+  env: production
+  # local: email + password; no self-registration, so the site is closed until you run
+  # `moks create-user` (docs/OPERATOR_GUIDE.md). Switch to oidc once an IdP client exists.
+  authMode: local
+  bootstrapAdmins: ""
+  otelEndpoint: http://otel-collector.observability.svc.cluster.local:4318
+
+seed:
+  environments:
+    - name: mk4
+      display_name: Hetzner Minikube (mk4)
+      kind: minikube
+      is_default: true
+      is_production: true
+      allowed_namespaces: ["*"]
+      denied_namespaces: []
+      max_query_window_minutes: 360
+      grafana_url: https://jithendar.com/grafana/
+      connectors:
+        - type: kubernetes
+          name: in-cluster
+          config: {mode: in_cluster, timeout_seconds: 15, executor: {mode: in_cluster}}
+        - type: prometheus
+          name: prometheus
+          config: {base_url: "http://prometheus.monitoring.svc.cluster.local:9090/prometheus", public_url: "https://jithendar.com/prometheus", timeout_seconds: 15}
+        - type: loki
+          name: loki
+          config: {base_url: "http://loki.monitoring.svc.cluster.local:3100", timeout_seconds: 20}
+        - type: grafana
+          name: grafana
+          config: {base_url: "http://grafana.monitoring.svc.cluster.local/grafana", public_url: "https://jithendar.com/grafana", timeout_seconds: 15}
+          credential_ref: {type: env, name: MOKS_CRED_GRAFANA_TOKEN}   # Grafana service-account token (Viewer) in moks-secrets
+        - type: git
+          name: github
+          config: {provider: github, repositories: [mrjithendar/moks, mrjithendar/roboshop-ai, mrjithendar/tools, mrjithendar/jithendar.com]}
+        - type: cost_model
+          name: hetzner
+          config: {monthly_cost_usd: 0, cpu_share: 0.5, currency: USD}   # SET the server's real monthly price
+        # AWS spend (Cost Explorer, anomalies, budgets) using the moks-mk4-runtime keys (deploy/terraform):
+        # - type: aws_cost
+        #   name: aws
+        #   config: {cache_minutes: 60, max_requests_per_hour: 60}
+  # LLM providers are configured in the portal (Administration > LLM providers), not seeded here.
+  knowledge_sources:
+    - name: moks-docs
+      type: github
+      config: {repository: mrjithendar/moks, include: ["docs/**", "lab/**", "backend/moks/skills/**"], sync_interval_minutes: 360}
+
+api:
+  replicas: 2
+worker:
+  replicas: 1
+
+ingress:
+  host: jithendar.com
+  tlsSecretName: ""     # Traefik default TLSStore (jithendar-com-tls) covers jithendar.com
+
+postgres:
+  bundled: true
+  storage: 10Gi
+  nodeName: mk4-m04     # hostPath PVs have no node affinity; keep the pod on the node holding the data
+  fixVolumePermissions: true   # hostPath ignores fsGroup; chown the data dir to postgres (uid 70)
+
+rag:
+  backend: opensearch    # ~2.5 GiB; mk4 nodes have ~32 GiB. Changing this moves nothing: run `moks reindex` after.
+  # backend: pinecone    # needs MOKS_CRED_PINECONE_API_KEY, and a reindex
+  opensearch:
+    storage: 20Gi
+    nodeName: mk4-m02    # hostPath volume: keep OpenSearch on the node holding its data
+    fixVolumePermissions: true   # hostPath ignores fsGroup; chown the data dir to opensearch (uid 1000)
+    # All mk4 nodes share one disk, already past the default 90% limit on a 150 GiB volume. Bytes free
+    # say what is really left. Below 1gb OpenSearch stops writes, which protects the other databases.
+    diskWatermarks: {low: 3gb, high: 2gb, floodStage: 1gb}
+    publicRoute: {enabled: true}   # https://jithendar.com/opensearch, needs Secret moks-opensearch-auth
+    dashboards: {enabled: true}    # https://jithendar.com/opensearch-dashboards, needs Secret moks-opensearch-dashboards-auth
+    # The secured cluster beside this one (docs/OPENSEARCH.md). Off until you run that document's steps.
+    secure:
+      enabled: false
+      active: false
+      nodeName: mk4-m02
+      fixVolumePermissions: true
+      allowMmap: true      # mk4 nodes report vm.max_map_count 1048576
+      diskWatermarks: {low: 3gb, high: 2gb, floodStage: 1gb}
+
+executor:
+  enabled: true
+  namespaces: [moks-lab]   # add namespaces (e.g. roboshop-ai) only when you want MOKS to act there
+
+databaseBackups:
+  enabled: true
+  namespaces: [moks, jithendar]   # namespaces must exist; roboshop-ai on mk4 only holds ecr-refresh
+
+diagnostics:
+  enabled: true
+  namespace: moks-diagnostics
+
+# Web terminal (docs/TERMINAL.md). enabled: true fails to render until image.digest is set, so set both together.
+terminal:
+  enabled: true
+  image:
+    digest: sha256:d509b91e99867f1333859970984904122c327dbee537c14be94d1620a2794679   # multi-arch index, built from 90a43b6
+  imagePullSecrets: [ecr-pull]   # created in every namespace by the ecr-refresh CronJob (tools repo)
+  profiles:
+    - name: mk4-readonly
+      label: mk4, read-only
+      environment: mk4
+      account: "881026659929"
+      roleArn: arn:aws:iam::881026659929:role/moks/moks-terminal-readonly
+      regions: [us-east-1]
+      eksClusters: []
+      inCluster: true
+  kubernetes:
+    namespaces: [moks-lab]       # add namespaces only when a shell should read them
+  network:
+    apiServer: true
+    egress:                      # AWS needs HTTPS, so sessions reach any public HTTPS host
+      - cidr: 0.0.0.0/0
+        except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+        ports: [443]
+
+networkPolicy:
+  apiServer:
+    cidrs: [10.96.0.1/32, 192.168.49.2/32]   # kubernetes Service VIP and the endpoint behind it
+    ports: [443, 8443]
+
+logCollector:
+  enabled: true         # monitoring/alloy; also add "moks" to Alloy's namespaces in the tools repo
+
+ecrRefresh:
+  enabled: true         # also add "moks" to TARGET_NAMESPACES of the ecr-refresh CronJob (tools repo)
+
+# docs/RERANKING.md. CI moves latest on every master build, and a pod gets it when it restarts.
+reranker:
+  enabled: true
+  image:
+    tag: latest
+  client:
+    enabled: true

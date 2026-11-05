@@ -103,7 +103,7 @@ spec:
     - to: [{podSelector: {matchLabels: {app: moks-search}}}]
       ports: [{port: 9200, protocol: TCP}]
 {{- end }}
-{{- if and .ingress.enabled (include "moks.inGroup" (dict "root" $ "group" "routing")) }}
+{{- if and .ingress.enabled (include "moks.inGroup" (dict "root" $ "group" "routing")) (eq $.Values.ingress.controller "traefik") }}
 ---
 # Optional. Everything behind this path needs an OpenSearch login: the security plugin refuses anonymous users,
 # and Dashboards serves its base path itself, so nothing strips the prefix.

@@ -1,0 +1,54 @@
+# AppProject for MOKS: only this repository, only namespace moks, and only the cluster-scoped
+# kinds the chart needs (its read-only ClusterRole/Binding and the namespace).
+# The child Applications in minikube/apps run here. The root does not: it writes Applications, so it has
+# its own project (project-root.yaml) and this one never gains the argocd namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: moks
+  namespace: argocd
+spec:
+  description: MOKS SRE portal
+  sourceRepos:
+    - https://github.com/mrjithendar/moks.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: moks
+    - server: https://kubernetes.default.svc
+      namespace: moks-diagnostics      # diagnostic session namespace (chart-managed)
+    - server: https://kubernetes.default.svc
+      namespace: moks-terminals        # terminal session namespace, when terminal.enabled is true (chart-managed)
+    - server: https://kubernetes.default.svc
+      namespace: moks-lab              # executor RoleBinding; add every namespace listed in executor.namespaces
+    - server: https://kubernetes.default.svc
+      namespace: jithendar          # Role for database backups (databaseBackups.namespaces)
+    - server: https://kubernetes.default.svc
+      namespace: roboshop-ai        # Role for database backups (databaseBackups.namespaces)
+    - server: https://kubernetes.default.svc
+      namespace: velero                # Roles for MOKS to use Velero, when velero.enabled is true
+  clusterResourceWhitelist:
+    - {group: "", kind: Namespace}
+    - {group: rbac.authorization.k8s.io, kind: ClusterRole}
+    - {group: rbac.authorization.k8s.io, kind: ClusterRoleBinding}
+  namespaceResourceWhitelist:
+    - {group: "", kind: ConfigMap}
+    - {group: "", kind: Service}
+    - {group: "", kind: ServiceAccount}
+    - {group: "", kind: PersistentVolumeClaim}
+    - {group: apps, kind: Deployment}
+    - {group: apps, kind: ReplicaSet}  # Argo CD leaves unlisted kinds out of the app tree, so these
+    - {group: "", kind: Pod}           # two are what show the portal's pods, logs and events
+    - {group: apps, kind: StatefulSet}
+    - {group: networking.k8s.io, kind: Ingress}
+    - {group: networking.k8s.io, kind: NetworkPolicy}
+    - {group: policy, kind: PodDisruptionBudget}
+    - {group: traefik.io, kind: Middleware}
+    - {group: traefik.io, kind: IngressRoute}
+    - {group: rbac.authorization.k8s.io, kind: Role}
+    - {group: "", kind: ResourceQuota}
+    - {group: "", kind: LimitRange}
+    - {group: batch, kind: CronJob}
+    - {group: batch, kind: Job}        # moks-migrate, when secrets.split is true
+    - {group: rbac.authorization.k8s.io, kind: RoleBinding}
+  # Secrets are deliberately absent: they are created out of band (deploy/secrets) and Argo CD
+  # can neither create nor prune them.

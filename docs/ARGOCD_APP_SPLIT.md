@@ -17,7 +17,7 @@ The roots run in `argocd` on mk4 and only write Application objects. Sync everyt
 | worker | `moks-worker` | `roboshop-demo-moks-worker` | Worker Deployments, including `worker.pools` |
 | executor | `moks-executor` | `roboshop-demo-moks-executor` | Executor, its identity and action RBAC, database-backup Roles, Velero write Role, diagnostics namespace and controls |
 | terminal | `moks-terminal` | none, the terminal stays off on EKS | Gateway, session identities, terminal namespace, quota and NetworkPolicy |
-| routing | `moks-routing` | `roboshop-demo-moks-routing` | mk4: Traefik Ingresses, IngressRoute and Middleware. EKS: VirtualService, PeerAuthentication, AuthorizationPolicies |
+| routing | none (was `moks-routing`, see below) | `roboshop-demo-moks-routing` | mk4: nothing; Kong serves the routes (below). EKS: VirtualService, PeerAuthentication, AuthorizationPolicies |
 
 Three more wait in `deploy/argocd/<environment>/optional/`, because each would be empty today. The root reads `apps/` only.
 
@@ -51,6 +51,17 @@ These cross Application boundaries, and Argo CD does not enforce them. The root'
 | migrate, when split | api, worker, executor | Runtime pods wait in `wait-schema`, then crash-loop until the Job finishes |
 | opensearch, when bundled | api, worker | Search and reindexing need it |
 
+
+
+### mk4 routing moved to Kong (branch feat/kong-db-migration)
+
+On mk4, `/moks`, `/moks/api/terminal`, `/opensearch` and `/opensearch-dashboards` are routes in Kong's database
+(tools repository: `kong-config/seed/kong.yaml`, `docs/kong/`). `values-minikube.yaml` sets
+`ingress.controller: external`, so the routing group renders nothing there, and `moks-routing.yaml` left
+`deploy/argocd/minikube/apps/` (copy in `traefik-backup-conf/`). Because `moks-root` never prunes and the
+Application carries `Delete=false`, the live `moks-routing` Application and its Traefik objects stay until the
+Kong cutover is accepted; the tools runbook removes them then. NetworkPolicies admit both `kong` and `traefik`
+until that point, so rolling back needs no MOKS change.
 
 ## 1. Old-to-new ownership
 

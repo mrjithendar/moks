@@ -73,7 +73,10 @@ worker:
 
 ingress:
   host: jithendar.com
-  tlsSecretName: ""     # Traefik default TLSStore (jithendar-com-tls) covers jithendar.com
+  # Kong Gateway (tools repo, kong-config/seed/kong.yaml) serves /moks, /moks/api/terminal, /opensearch and
+  # /opensearch-dashboards. The Traefik objects this chart rendered are in traefik-backup-conf/.
+  controller: external
+
 
 postgres:
   bundled: true
@@ -139,6 +142,9 @@ terminal:
         ports: [443]
 
 networkPolicy:
+  # Kong's proxy pods (tools repo, docs/kong). traefik stays until the cutover is accepted, so rollback needs no
+  # MOKS change; then drop it (docs/kong/06-cutover-runbook.md, step 11).
+  ingressNamespaces: [kong, traefik]
   apiServer:
     cidrs: [10.96.0.1/32, 192.168.49.2/32]   # kubernetes Service VIP and the endpoint behind it
     ports: [443, 8443]

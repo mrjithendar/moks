@@ -1,5 +1,6 @@
 {{- if include "moks.inGroup" (dict "root" . "group" "routing") }}
-{{- if .Values.ingress.enabled }}
+{{- if and .Values.ingress.enabled (eq .Values.ingress.controller "traefik") }}
+# ingress.controller "external": the gateway (Kong on mk4) holds these routes in its own database; nothing here.
 # Prefix match on the base path WITHOUT prefix stripping: MOKS serves the SPA, API, SSE and
 # auth callbacks under {{ .Values.basePath }} itself. A Prefix rule on /moks also matches /moks/...,
 # and Traefik prefers it over the site's "/" rule because it is longer.

@@ -1,0 +1,394 @@
+# Defaults. Environment-specific files (values-minikube.yaml, values-eks.yaml) override these.
+
+# What to render: all, or one of foundation, database, migrate, opensearch, api, worker, executor,
+# terminal, reranker, routing, backup. Each child Argo CD Application sets its own group as a parameter and
+# shares the environment's values file, so shared checksums match. See docs/ARGOCD_APP_SPLIT.md.
+resourceGroup: all
+
+image:
+  repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
+  # mk4 runs tag latest. A digest (sha256:...), if set, replaces the tag.
+  digest: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+publicUrl: https://jithendar.com/moks
+basePath: /moks          # served natively by the app; the ingress must not strip it
+
+# Non-secret settings (MOKS_* environment variables).
+config:
+  env: production
+  authMode: oidc          # oidc | local (dev is refused in production)
+  oidcIssuer: ""
+  oidcClientId: ""
+  oidcScopes: "openid email profile"
+  oidcAllowedDomains: ""
+  oidcGroupsClaim: groups
+  oidcGroupRoles: "{}"    # JSON: {"sre-admins": ["admin"], "sre": ["investigator:mk4:*"]}
+  bootstrapAdmins: ""     # comma separated emails that become Administrator at first sign-in
+  apiDocs: false
+  logLevel: INFO
+  maxToolCalls: 24
+  knowledgeMaxSearches: 3  # knowledge-stage searches per investigation, on top of maxToolCalls (docs/KNOWLEDGE.md)
+  maxDurationSeconds: 180
+  maxQueryWindowMinutes: 360
+  workerConcurrency: 2
+  otelEndpoint: ""        # e.g. http://otel-collector.observability:4318
+  traceSampleRatio: 1     # share of new traces kept when otelEndpoint is set; children follow their parent
+  alertPollSeconds: 60    # Prometheus alert polling for environments with auto_investigate
+  # Alertmanager/Grafana webhook: put MOKS_ALERT_WEBHOOK_TOKEN in existingSecret (unset = webhook disabled)
+
+# Existing Secret with MOKS_DATABASE_URL, MOKS_SESSION_SECRET, MOKS_OIDC_CLIENT_SECRET and any
+# MOKS_CRED_* connector/LLM credentials. Never committed; see deploy/secrets/.
+existingSecret: moks-secrets
+# Extra Secret mounted at /var/run/moks-credentials for file credential references (kubeconfigs).
+credentialsSecret: ""
+
+# One Secret, ServiceAccount and database role per component. Off by default so an upgrade never
+# changes who holds what by surprise: follow docs/SECRET_SPLIT.md before setting split to true.
+secrets:
+  split: false
+  api: moks-api-secrets
+  worker: moks-worker-secrets
+  executor: moks-executor-secrets
+  migrate: moks-migrate-secrets
+  credentials: {api: "", worker: "", executor: "", migrate: ""}   # file credentials, per component
+
+# Seeded at start-up (create-only; edits made in the admin UI are kept). See dev/seed.local.yaml.
+seed: {}
+
+api:
+  replicas: 2
+  resources:
+    requests: {cpu: 100m, memory: 192Mi}
+    limits: {cpu: "1", memory: 512Mi}
+worker:
+  replicas: 1
+  # Sized for mk4: everything in one pod, with capacity kept apart per class.
+  classes: "detection,interactive,knowledge,maintenance"
+  capacity: "detection=2,knowledge=1,maintenance=1"
+  pools: []                # [{name, classes, capacity, replicas}]: one Deployment each (values-eks.yaml)
+  resources:
+    requests: {cpu: 100m, memory: 192Mi}
+    limits: {cpu: "1", memory: 512Mi}
+
+# Machine learning (docs/ML.md). Capability modes (disabled, shadow, enabled) are switched in the admin screen
+# and stored in PostgreSQL; these bound the work. ml.disabled is the deploy-time kill switch for all of it.
+ml:
+  disabled: false
+  learningCapture: true
+  learningRetentionDays: 365
+  similarIncidents: {k: 5, candidates: 300}
+  anomaly:
+    namespaces: ""          # "env:namespace,env:namespace": what training covers. Empty trains nothing.
+    stepSeconds: 300
+    windowMinutes: 60
+    trainingDays: 14
+    minHistoryDays: 7
+    maxCohorts: 40
+    concurrency: 2
+    intervalMinutes: 15
+    maxFlagsPerDay: 3
+  artifactStore: postgres   # or s3, through the backup client: set artifactBucket (and endpoint/region for R2)
+  artifactBucket: ""
+  artifactEndpoint: ""
+  artifactRegion: ""
+  training:
+    enabled: false          # the offline CronJob; an ml_admin can also start one run from the admin screen
+    suspend: false
+    schedule: "17 3 * * 0"  # weekly, outside the backup window
+    activeDeadlineSeconds: 3600
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {cpu: "1", memory: 768Mi}
+
+serviceAccount:
+  create: true
+  name: moks
+  annotations: {}          # EKS IRSA: eks.amazonaws.com/role-arn
+  # Once secrets.split is on, one identity each, so short-lived AWS roles can differ per component.
+  componentAnnotations: {api: {}, worker: {}, executor: {}, migrate: {}, backup: {}}
+
+# In-cluster Kubernetes connector permissions (read-only, no Secrets).
+rbac:
+  create: true
+  clusterWide: true        # false: bind the ClusterRole only in rbac.namespaces
+  namespaces: []
+
+ingress:
+  enabled: true
+  className: traefik
+  host: jithendar.com
+  tlsSecretName: ""        # empty: Traefik's default TLSStore certificate
+  httpRedirect: true       # HTTP -> HTTPS via a Traefik middleware in this namespace
+  annotations: {}
+
+# Route through an existing Istio Gateway instead of an Ingress. Set ingress.enabled false with it.
+istio:
+  enabled: false
+  gateway: ""              # <namespace>/<name>
+  host: ""
+  # STRICT mTLS and deny-by-default policies. Needs istio-injection on the namespace.
+  mtls: false
+  gatewayPrincipal: ""     # cluster.local/ns/<namespace>/sa/<ingress gateway ServiceAccount>
+
+postgres:
+  bundled: true            # false: point MOKS_DATABASE_URL at an external database (e.g. RDS)
+  image: postgres:17.11-alpine
+  storage: 10Gi
+  storageClass: ""
+  nodeName: ""             # hostPath storage (minikube): pin to the node holding the volume
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  passwordSecret: moks-postgres   # key: password
+  uid: 70                         # 70 for postgres:*-alpine; 999 for Debian images such as pgvector/pgvector
+  fixVolumePermissions: false     # true for storage that ignores fsGroup (minikube hostPath)
+
+# Encrypted, off-cluster backups of the bundled database. On EKS use RDS backups instead.
+# Needs the moks-backup Secret: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, MOKS_BACKUP_ENCRYPTION_KEY.
+backup:
+  enabled: false
+  schedule: "17 * * * *"    # hourly, so at most about an hour of data is lost
+  bucket: ""
+  prefix: moks/mk4
+  endpoint: ""              # empty for AWS S3; https://<account>.r2.cloudflarestorage.com for R2
+  region: ""                # us-east-1 for S3, auto for R2
+  secret: moks-backup
+  workspace: 2Gi            # scratch space for one dump; raise it as the database grows
+  retention: {hourly: 48, daily: 30, monthly: 12}
+
+# Retrieval (RAG) backend. Exactly one runs:
+#   postgres   - full-text search in the MOKS database (no extra pods; keyword-only)
+#   pgvector   - postgres + vectors: set postgres.image to pgvector/pgvector:0.8.7-pg17 and postgres.uid 999
+#                (fresh installs; moving an existing alpine database to the Debian image needs dump/restore)
+#   pinecone   - keyword search in the MOKS database, vectors in Pinecone (no extra pods). Needs
+#                MOKS_CRED_PINECONE_API_KEY in the Secret, an active embedding model and a reindex.
+#   opensearch - BM25 + k-NN. Without rag.opensearch.url: single-node pod, ~2.5 GiB memory, persistent
+#                volume. With it: Amazon OpenSearch Service (deploy/terraform/opensearch.tf), no pod,
+#                requests signed with the pod's AWS identity. Moving backend needs a reindex.
+rag:
+  backend: postgres
+  pinecone: {cloud: aws, region: us-east-1}
+  opensearch:
+    url: ""                # https://<domain endpoint> for Amazon OpenSearch Service; set awsRegion too
+    awsRegion: ""
+    image: opensearchproject/opensearch:3.9.0
+    heapSize: 1g           # container limit = heap x 2
+    storage: 20Gi
+    nodeName: ""
+    fixVolumePermissions: false   # true for storage that ignores fsGroup (minikube hostPath)
+    diskWatermarks: {}     # {low: 3gb, high: 2gb, floodStage: 1gb} replaces the percentages. All three or none.
+    # Publish the bundled pod's read endpoints on ingress.host behind a basic-auth login. The pod has no
+    # security of its own, and this bypasses MOKS document access: the login reads every indexed chunk.
+    publicRoute:
+      enabled: false
+      path: /opensearch
+      authSecret: moks-opensearch-auth   # created out of band, see docs/OPERATOR_GUIDE.md
+    # OpenSearch Dashboards for the bundled pod, on ingress.host. This login can write and delete, because
+    # Dashboards reaches the pod directly, and it reads every chunk regardless of MOKS document access.
+    dashboards:
+      enabled: false
+      image: opensearchproject/opensearch-dashboards:3.9.0@sha256:256d4cea5928868ac09bca642a0ac8285a2b7e4b7fdd45c4ec06e75a5cf3184c   # keep on the server's version
+      path: /opensearch-dashboards
+      authSecret: moks-opensearch-dashboards-auth   # created out of band, see docs/OPERATOR_GUIDE.md
+    # moks-search: a second, secured single node beside the pod above (docs/OPENSEARCH.md). Persistence, not
+    # high availability. enabled deploys it and moves nothing. active points search and indexing at it, and
+    # the pod above stays as the way back until you remove it.
+    secure:
+      enabled: false
+      active: false
+      retireOriginal: false   # stops rendering the pod above, once active has soaked. Its volume stays until you delete it.
+      # Required before retireOriginal renders: the generation that passed `opensearch-migrate.sh validate` after cutover and
+      # the date the soak ended, e.g. "moks-chunks-ab12cd34 validated 2026-11-20". Being active is not the same as being verified.
+      cutoverVerified: ""
+      cluster: secure      # names its generations in PostgreSQL, apart from the original cluster's
+      # The upstream image: security and TLS, no snapshots, no Prometheus exporter. To have those, set this to
+      # the digest CI reports for deploy/opensearch/Dockerfile, and pluginsInstalled to true.
+      image: opensearchproject/opensearch:3.9.0@sha256:3b55f6b6249cfdb92b52ee59adc8a266203ba9ef9f5d82544fad6f1af2f3609e
+      pluginsInstalled: false
+      heapSize: 1g         # measured on mk4: 254 MiB of 1 GiB heap used, 1487 MiB pod, at 1,942 chunks and 3072 dimensions
+      resources:
+        requests: {cpu: 250m, memory: 2Gi}
+        limits: {cpu: "2", memory: 2Gi}
+      storage: 10Gi        # a label on hostPath: nothing enforces it, and the class cannot expand
+      nodeName: ""
+      fixVolumePermissions: false
+      allowMmap: false     # true only where the node has vm.max_map_count >= 262144
+      diskWatermarks: {}   # as above
+      secrets:             # created by scripts/opensearch-secrets.sh, never by Helm
+        tls: moks-search-tls
+        adminTls: moks-search-admin-tls
+        users: moks-search-users
+        clients: moks-search-clients
+      # OpenSearch Dashboards for administrators (docs/OPENSEARCH.md). Off by default, ClusterIP, port-forward first.
+      # It does not follow MOKS RBAC: a login sees what its OpenSearch role allows, whatever its MOKS bindings.
+      dashboards:
+        enabled: false
+        image: opensearchproject/opensearch-dashboards:3.9.0@sha256:256d4cea5928868ac09bca642a0ac8285a2b7e4b7fdd45c4ec06e75a5cf3184c   # keep on the server's version
+        secret: moks-search-dashboards   # keys password, cookie-password, from scripts/opensearch-secrets.sh
+        resources:
+          requests: {cpu: 100m, memory: 512Mi}
+          limits: {cpu: "1", memory: 1Gi}
+        ingress:              # never needed; port-forward works without it. Refused while publicRoute holds the same path
+          enabled: false
+          path: /opensearch
+      snapshots:           # needs pluginsInstalled
+        enabled: false
+        repository: moks-knowledge
+        policy: moks-knowledge
+        endpoint: ""       # https://<account>.r2.cloudflarestorage.com
+        region: auto
+        pathStyle: true
+        credentialsSecret: moks-search-snapshots   # keys access-key, secret-key
+
+# Phase 3 executor: the only component with write access. It acts only in these namespaces
+# (one RoleBinding each, verbs limited to the allowlisted actions), plus diagnostics.namespace.
+executor:
+  enabled: true
+  replicas: 1
+  namespaces: []
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 384Mi}
+
+# Cluster backups through Velero (docs/CLUSTER_BACKUPS.md). Needs Velero installed in this cluster.
+velero:
+  enabled: false
+  namespace: velero
+
+# Database backups from the Backups page (docs/CLUSTER_BACKUPS.md). PostgreSQL and MongoDB. The executor
+# gets pods/exec in these namespaces only; the dump is encrypted as it arrives, and workspace bounds
+# the encrypted size of one dump.
+databaseBackups:
+  enabled: false
+  namespaces: []
+  workspace: 10Gi
+
+# Lets investigations read Argo CD Application status (docs/CONNECTORS.md). Read-only. With
+# rbac.clusterWide false, also list the argocd namespace in rbac.namespaces.
+argocd:
+  enabled: false
+
+# Disposable diagnostic session pods (no service account token, quota, egress-only network policy).
+diagnostics:
+  enabled: true
+  namespace: moks-diagnostics
+  quota: {pods: "5", cpu: "1", memory: 1Gi}
+
+# Web terminal (docs/TERMINAL.md). Off, and nobody holds the terminal role until an admin grants it.
+# Internal PyTorch reranking (docs/RERANKING.md). enabled deploys the service; client.enabled makes
+# search use it. They are separate so it can run and be evaluated before anyone's results change.
+reranker:
+  enabled: false
+  image:
+    repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-reranker
+    tag: latest             # CI moves it on every master build. Pods get it when they restart (docs/RELEASES.md).
+    digest: ""              # if set, replaces the tag
+  model:                    # must equal what the service reports, or search keeps its existing order
+    id: cross-encoder/ms-marco-MiniLM-L6-v2
+    revision: 233902d25c440f23af6f7d6e94d2946bac0bee0a
+  tokenSecret: moks-reranker-secrets  # key MOKS_CRED_RERANKER_TOKEN; the same key goes in the API and worker Secrets
+  replicas: 1
+  threads: 2
+  batchSize: 16
+  concurrency: 1
+  queue: 4
+  maxCandidates: 30
+  maxQueryChars: 1000
+  maxPassageChars: 2000
+  drainSeconds: 20
+  # PROVISIONAL: from an arm64 Mac (peak about 480 MiB, under 1 CPU-second per request). Measure on the
+  # cluster before relying on these. docs/RERANKING.md has the method.
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "2", memory: 1Gi}
+  client:
+    enabled: false
+    candidates: 30
+    results: 12
+    timeoutMs: 1500
+    maxQueryChars: 1000
+    maxPassageChars: 2000
+
+terminal:
+  enabled: false
+  namespace: moks-terminals
+  image:
+    repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-terminal
+    digest: ""             # required: terminals run a pinned, scanned image, never a tag
+  imagePullSecrets: []     # must exist in terminal.namespace
+  idleMinutes: 15
+  maxMinutes: 60           # a role session of over an hour needs the role's MaxSessionDuration raised
+  userSessions: 2
+  resources: {cpu: 500m, memory: 512Mi}       # limits of each session pod
+  quota: {pods: "4", cpu: "2", memory: 2Gi, ephemeralStorage: 2Gi}
+  # What may be opened. Nothing else can be selected, and a session never falls back to another identity.
+  profiles: []
+  #  - name: mk4-readonly
+  #    label: mk4, read-only
+  #    environment: mk4
+  #    account: "123456789012"
+  #    roleArn: arn:aws:iam::123456789012:role/moks/moks-terminal-readonly
+  #    regions: [us-east-1]
+  #    eksClusters: []     # EKS clusters this role has an access entry on
+  #    inCluster: true     # offer this cluster, through terminal.kubernetes.namespaces
+  kubernetes:
+    namespaces: []         # where a session's in-cluster identity may read
+  network:
+    apiServer: false       # needed by inCluster profiles: allows networkPolicy.apiServer.cidrs
+    egress: []             # default deny. AWS needs HTTPS; see docs/TERMINAL.md for why this is by address
+    #  - cidr: 0.0.0.0/0
+    #    except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+    #    ports: [443]
+  gateway:
+    replicas: 1
+    existingSecret: moks-terminal-secrets
+    serviceAccountAnnotations: {}   # EKS: eks.amazonaws.com/role-arn of the gateway's base role
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 384Mi}
+
+networkPolicy:
+  enabled: true
+  ingressNamespaces: [traefik]       # who may reach the API port
+  metricsNamespaces: [monitoring]    # who may scrape :9464
+  apiServer:                         # Kubernetes API endpoints (kubectl get endpointslices -n default)
+    cidrs: []
+    ports: [443, 6443, 8443]
+  inCluster:                         # in-cluster connector targets
+    - namespace: monitoring
+      ports: [9090, 3100, 80, 3000]
+    - namespace: observability
+      ports: [4318]
+  internetEgress: true               # LLM providers, AWS APIs, OIDC issuer (HTTPS only)
+
+podDisruptionBudget:
+  enabled: true
+
+# Grant a cluster log collector read access to MOKS's own pod logs.
+logCollector:
+  enabled: false
+  serviceAccount: alloy
+  namespace: monitoring
+
+# Grant an image-pull-secret refresher access to this namespace's ecr-pull Secret.
+ecrRefresh:
+  enabled: false
+  serviceAccount: ecr-refresh
+  namespace: roboshop-ai
+
+# Extra SRE skills (SKILL.md content keyed by skill name), mounted at /etc/moks-skills and loaded
+# alongside the built-in ones; a custom skill with a built-in's name replaces it. Review like code:
+# skills are trusted instructions for the investigator (steps are still read-only and policy-checked).
+customSkills: {}
+#  checkout-runbook: |
+#    ---
+#    name: checkout-runbook
+#    description: "Checkout-specific triage: payment provider timeouts and cart service dependencies."
+#    triggers: {keywords: [checkout, payment], findings: []}
+#    steps:
+#      - {tool: loki_search, args: {namespace: "{namespace}", contains: "payment timeout", limit: 50}}
+#    ---
+#    # Checkout runbook ...

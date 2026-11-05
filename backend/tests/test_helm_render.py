@@ -218,6 +218,10 @@ def test_velero_project_allows_everything_the_chart_renders():
 TERMINAL = ("terminal.enabled=true", "terminal.image.digest=sha256:" + "a" * 64, "terminal.profiles[0].name=ro", "terminal.kubernetes.namespaces={moks-lab}", "terminal.network.apiServer=true")
 
 
+# mk4 routes through Kong (ingress.controller external); these tests pin the chart's Traefik mode.
+TRAEFIK = "ingress.controller=traefik"
+
+
 def of(docs, kind, name):
     return next(d for d in docs if d["kind"] == kind and d["metadata"]["name"] == name)
 
@@ -234,7 +238,7 @@ def test_a_tag_or_no_profile_is_refused():
 
 
 def test_the_gateway_is_routed_under_the_base_path_and_keeps_to_its_own_identity():
-    docs = render("values-minikube.yaml", *TERMINAL)
+    docs = render("values-minikube.yaml", *TERMINAL, TRAEFIK)
     paths = of(docs, "Ingress", "moks")["spec"]["rules"][0]["http"]["paths"]
     assert paths[0]["path"] == "/moks/api/terminal" and paths[0]["backend"]["service"]["name"] == "moks-terminal"
     assert paths[1]["path"] == "/moks" and paths[1]["backend"]["service"]["name"] == "moks-api"
@@ -331,7 +335,7 @@ def test_the_mesh_allows_only_the_callers():
 
 
 def test_opensearch_public_route_is_read_only_behind_a_login():
-    docs = render("values-minikube.yaml")
+    docs = render("values-minikube.yaml", TRAEFIK)
     route = of(docs, "IngressRoute", "opensearch")["spec"]
     match = route["routes"][0]["match"]
     assert route["entryPoints"] == ["websecure"] and "tls" in route
@@ -343,7 +347,7 @@ def test_opensearch_public_route_is_read_only_behind_a_login():
 
 
 def test_opensearch_dashboards_has_its_own_login_and_a_writable_config():
-    docs = render("values-minikube.yaml")
+    docs = render("values-minikube.yaml", TRAEFIK)
     pod = of(docs, "Deployment", "moks-opensearch-dashboards")["spec"]["template"]["spec"]
     env = {e["name"]: e["value"] for e in pod["containers"][0]["env"]}
     assert env["SERVER_BASEPATH"] == "/opensearch-dashboards" and env["SERVER_REWRITEBASEPATH"] == "true"
@@ -530,7 +534,7 @@ def test_secured_dashboards_may_reach_moks_search_and_nothing_else_may_through_t
 
 
 def test_secured_dashboards_can_sit_behind_a_base_path():
-    docs = render("values-minikube.yaml", *ROUTED)
+    docs = render("values-minikube.yaml", *ROUTED, TRAEFIK)
     cfg = dashboards_config(docs)
     assert cfg["server.basePath"] == "/opensearch" and cfg["server.rewriteBasePath"] is True and cfg["opensearch_security.cookie.secure"] is True
     pod = of(docs, "Deployment", "moks-search-dashboards")["spec"]["template"]["spec"]["containers"][0]
@@ -560,3 +564,14 @@ def test_the_dashboards_identities_have_least_privilege():
     mapping = yaml.safe_load((CHART / "files/opensearch/roles_mapping.yml").read_text())
     assert "moks_dashboards" not in mapping["all_access"]["users"] and "moks_viewer" not in mapping["all_access"]["users"]
     assert mapping["kibana_server"]["users"] == ["moks_dashboards"]
+
+
+def test_mk4_renders_no_traefik_objects_and_admits_kong():
+    """On mk4, Kong holds the routes in its database (tools repo, kong-config/seed/kong.yaml): the chart must
+    render no Ingress or Traefik object, but keep the workloads the routes need and let Kong's pods in."""
+    docs = render("values-minikube.yaml")
+    assert not [d for d in docs if d["kind"] in ("Ingress", "IngressRoute", "Middleware")]
+    assert of(docs, "Deployment", "moks-opensearch-dashboards")
+    kong = {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kong"}}}
+    for name in ("moks", "moks-opensearch", "moks-opensearch-dashboards"):
+        assert any(kong in rule.get("from", []) for rule in of(docs, "NetworkPolicy", name)["spec"]["ingress"]), name
