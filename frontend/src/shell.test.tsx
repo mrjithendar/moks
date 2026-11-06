@@ -12,7 +12,7 @@ import { Layout } from "./shell";
 function app(path = "/") {
   return render(<MemoryRouter initialEntries={[path]}><Layout><Routes><Route path="*" element={<p>page</p>} /></Routes></Layout></MemoryRouter>);
 }
-const open = () => fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+const open = () => fireEvent.click(screen.getByRole("button", { name: "Menu" }));
 
 beforeEach(() => { auth.perms = ["investigation.read", "investigation.run", "explorer.read", "admin.users"]; });
 afterEach(() => { cleanup(); document.body.className = ""; });
@@ -23,14 +23,14 @@ describe("navigation drawer", () => {
     open();
     const d = screen.getByRole("dialog", { name: "Navigation" });
     const links = within(d).getAllByRole("link").map((a) => a.textContent);
-    for (const l of ["Overview", "Metrics", "Conversations", "Incidents", "Users & roles"]) expect(links).toContain(l);
+    for (const l of ["Overview", "Metrics", "Investigations", "Incidents", "Users & roles"]) expect(links).toContain(l);
     expect(d.contains(document.activeElement)).toBe(true);
     expect(document.body.classList.contains("scroll-locked")).toBe(true);
   });
 
   it("closes on Escape, unlocks the page and returns focus to the menu button", () => {
     app();
-    const btn = screen.getByRole("button", { name: "Open navigation" });
+    const btn = screen.getByRole("button", { name: "Menu" });
     btn.focus();
     fireEvent.click(btn);
     fireEvent.keyDown(document, { key: "Escape" });
@@ -68,7 +68,7 @@ describe("navigation drawer", () => {
 describe("RBAC visibility", () => {
   it("lists only what the role may use, and drops empty groups", () => {
     const groups = navFor((p) => p === "investigation.read");
-    expect(groups.map((g) => g.label)).toEqual(["Monitor", "Investigate", "Knowledge"]);
+    expect(groups.map((g) => g.label)).toEqual(["Investigate", "Monitor", "Knowledge"]);
     const items = groups.flatMap((g) => g.items.map((i) => i.label));
     expect(items).not.toContain("New investigation");
     expect(items).not.toContain("Audit log");
@@ -85,7 +85,7 @@ describe("RBAC visibility", () => {
   });
 
   it("names deep links for the header", () => {
-    expect(titleFor("/conversations/abc").label).toBe("Conversations");
+    expect(titleFor("/conversations/abc").label).toBe("Investigations");
     expect(titleFor("/admin/users").group).toBe("Admin");
   });
 });
@@ -98,7 +98,7 @@ describe("/moks deep links", () => {
     expect(within(screen.getByRole("dialog", { name: "Navigation" })).getByRole("link", { name: "Overview" }).getAttribute("href")).toBe("/moks");
   });
   it("names every destination the header needs, with or without a conversation open", () => {
-    expect(titleFor("/conversations/abc").label).toBe("Conversations");
+    expect(titleFor("/conversations/abc").label).toBe("Investigations");
     expect(titleFor("/logs").label).toBe("Logs");
   });
 });

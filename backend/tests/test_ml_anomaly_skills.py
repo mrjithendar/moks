@@ -50,7 +50,10 @@ class FakePrometheus:
             raise RuntimeError("down")
         if name in self.absent:
             return [], True
-        ts = features.grid(a, b, step)
+        ts, t = [], int(a.timestamp())  # as Prometheus answers: from the requested start, end included
+        while t <= b.timestamp():
+            ts.append(t)
+            t += step
         assert len(ts) <= features.CHUNK_POINTS  # never above the connector's downsampling threshold
         out = []
         for wl in self.workloads:
@@ -97,7 +100,7 @@ def test_counter_resets_sparse_traffic_and_absent_telemetry_are_kept_apart():
 async def test_collection_is_chunked_below_the_point_cap_and_a_failed_query_is_named():
     prom = FakePrometheus(fail={"latency_p95"})
     frames = await features.collect(prom, "e", "shop", NOW - timedelta(days=1), NOW, STEP)
-    assert {c[0] for c in prom.calls} == set(features.queries("shop")) and all(len(features.grid(a, b, s)) <= 144 for _, a, b, s in prom.calls)
+    assert {c[0] for c in prom.calls} == set(features.queries("shop")) and all((b - a).total_seconds() // s + 1 <= 144 for _, a, b, s in prom.calls)
     assert "latency_p95" in frames[0].quality["incomplete_queries"] and "latency_p95" in frames[0].quality["absent"]
     with pytest.raises(ValueError):
         features.queries('shop"} or vector(1) #')

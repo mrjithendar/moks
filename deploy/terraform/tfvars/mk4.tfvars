@@ -22,4 +22,4 @@ eks_runtime_cluster_name     = ""   # roboshop-demo was deleted on 2026-11-02; M
 cloudwatch_log_group_arns    = []   # CloudWatch connector: list allowed log group ARNs
 finops_enabled               = true # Cost Explorer + Budgets read for the FinOps page
 terminal_enabled             = true # read-only role and gateway user for web terminals (docs/TERMINAL.md)
-opensearch_domain_name       = "" # billed hourly: see opensearch.tf and docs/OPERATOR_GUIDE.md
+opensearch_domain_name       = ""   # billed hourly: see opensearch.tf and docs/OPERATOR_GUIDE.md

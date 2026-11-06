@@ -3,6 +3,11 @@ output "repository_url" {
   value       = aws_ecr_repository.moks.repository_url
 }
 
+output "crewai_repository_url" {
+  description = "The CrewAI image (moks built with MOKS_CREWAI=true); set image.repository to this in values-minikube.yaml to run it."
+  value       = aws_ecr_repository.crewai.repository_url
+}
+
 output "ci_role_arn" {
   description = "Set as the GitHub repository variable AWS_ROLE_ARN (used by .github/workflows/ci.yml)."
   value       = aws_iam_role.ci.arn

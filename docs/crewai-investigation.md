@@ -144,8 +144,10 @@ reaper instead of resuming.
 
 CI builds and Argo CD deploys (`.github/workflows/ci.yml`):
 
-- **release** builds the arm64 image on every push to master. Repository variable `MOKS_CREWAI=true` builds it with
-  the crewai extra, and CI then checks that crewai imports at the pinned version on a read-only root with telemetry off.
+- **release** builds the default arm64 image on every push to master and pushes it as `moks:latest`.
+- **release-crewai** builds the same commit with `--build-arg MOKS_CREWAI=true` and pushes it as `moks-crewai:latest`
+  (ECR repository `aws_ecr_repository.crewai` in `deploy/terraform/ecr.tf`). Before it pushes, it checks that crewai
+  imports at the pinned version on a read-only root with no network and telemetry off.
 - **deploy** runs when variable `MK4_DEPLOY=true`. It asks Argo CD to sync the MOKS Applications from master in the
   documented order, then runs Argo CD's restart action on `moks-worker`, `moks-api`, `moks-executor` and `moks-terminal`,
   so they pull the new `:latest`. Finally it checks that `/moks/api/health` reports the commit. CI holds no Kubernetes credentials, only a
@@ -155,9 +157,11 @@ CI builds and Argo CD deploys (`.github/workflows/ci.yml`):
 One-time setup, then every push to master deploys:
 
 ```sh
+terraform -chdir=deploy/terraform apply -var-file=tfvars/mk4.tfvars   # creates ECR moks-crewai, lets CI push to it
 scripts/setup-argocd-ci.sh                          # applies the AppProject with role ci, stores ARGOCD_AUTH_TOKEN, sets MK4_DEPLOY
-gh variable set MOKS_CREWAI --repo mrjithendar/moks --body true
-# deploy/helm/moks/values-minikube.yaml: crewai.enabled: true, then commit and push to master
+# deploy/helm/moks/values-minikube.yaml: image.repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-crewai
+#                                        crewai.enabled: true
+# then commit and push to master: the deploy job syncs and restarts onto moks-crewai:latest
 ```
 
 Verify:
@@ -173,14 +177,14 @@ Expected results: for `web`, an ImagePullBackOff on `busybox:1.38-does-not-exist
 `namespace_health`, `describe_pod` and events. For `worker`, a CrashLoopBackOff with `QUEUE_URL is not set`
 from the previous container's logs. The injected log line must change nothing.
 
-Roll back: set `crewai.enabled: false` and push (the route answers 404 again and the option disappears), or set
-`MOKS_CREWAI=false` so the next build is the default image (the capability then reports "not installed"). There is no migration.
+Roll back: set `crewai.enabled: false` and push (the route answers 404 again and the option disappears), and point
+`image.repository` back at `moks` so mk4 runs the default image again. There is no migration.
 To stop CI deploying, set `MK4_DEPLOY=false`.
 
 ## What is still unverified
 
 - No real model has run the crew. Small models may not follow the Action/Observation format. A model that
   writes no valid JSON at the end gets the rule-based report, which is correct but less useful.
-- The image with `MOKS_CREWAI=true` has never been built; CI's release job is the first place it will be. Its import check
+- The `moks-crewai` image has never been built; CI's release-crewai job is the first place it will be. Its import check
   fails the build if a linux/arm64 wheel is missing (onnxruntime, google-re2, lancedb and pyarrow are the likely ones).
 - No mk4 smoke test has been run: the demo namespace needs a cluster write, and the run needs the image.

@@ -5,7 +5,8 @@ GET /multi/{kind}?environment=all|<name>&namespace=all|<name>&<tool args>
 Runs the corresponding read-only tool in every environment the user can read (and, for
 namespace-bound tools, every permitted namespace), with bounded concurrency, through the same
 ToolExecutor (RBAC, scope, bounds, redaction). Successful reads are audited once per request;
-denials and errors per call. Partial failures are returned per environment/namespace.
+denials and errors per call. Partial failures are returned per environment/namespace, and results the
+executor cut to its size bound are listed in `truncated` with how many rows came back.
 """
 from __future__ import annotations
 
@@ -120,6 +121,7 @@ async def _read(kind: str, params: dict[str, Any], request: Request, environment
     items: list[dict] = []
     errors: list[dict] = []
     meta: dict[str, Any] = {"queries": {}, "collected_at": None}
+    truncated: list[dict] = []
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async def run_one(ex, env_name: str, ns: str | None) -> None:
@@ -144,6 +146,8 @@ async def _read(kind: str, params: dict[str, Any], request: Request, environment
                 meta.setdefault("step", data.get("step"))
             for ref in data.get("missing_references", []):
                 meta.setdefault("missing_references", []).append({**ref, "environment": env_name, "namespace": ns})
+        if out.truncated:  # the executor kept the first part of a large result: say so, never show it as everything
+            truncated.append({"environment": env_name, "namespace": ns, "shown": len(rows), "summary": out.summary})
         for r in rows:
             if isinstance(r, dict):
                 r = dict(r)
@@ -194,4 +198,4 @@ async def _read(kind: str, params: dict[str, Any], request: Request, environment
     await audit.record(db, action="dashboard.read", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="view", resource_id=kind,
                        environment=None if environment == "all" else environment, namespace=None if namespace == "all" else namespace,
                        decision="allow", details={"tool": tool, "args": args, "environments": names, "items": len(items), "errors": len(errors)})
-    return {"items": items, "errors": errors, "environments": names, **meta}
+    return {"items": items, "errors": errors, "environments": names, "truncated": truncated, **meta}

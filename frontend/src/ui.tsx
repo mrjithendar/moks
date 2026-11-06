@@ -61,7 +61,7 @@ export function Drawer({ title, heading, onClose, children, footer }: { title: s
 }
 
 /** Floats beside its trigger in a portal, so no scroll container can clip it. On phones the CSS makes it a sheet. */
-function Floating({ anchor, onClose, className, label, role, children, onKeyDown }: { anchor: HTMLElement | null; onClose: () => void; className: string; label: string; role?: string; children: ReactNode; onKeyDown?: (e: ReactKeyboardEvent) => void }) {
+export function Floating({ anchor, onClose, className, label, role, children, onKeyDown }: { anchor: HTMLElement | null; onClose: () => void; className: string; label: string; role?: string; children: ReactNode; onKeyDown?: (e: ReactKeyboardEvent) => void }) {
   const box = useRef<HTMLDivElement>(null);
   const close = useRef(onClose);
   close.current = onClose;

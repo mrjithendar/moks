@@ -18,5 +18,6 @@ export default defineConfig({
       [`${base}api`]: { target: "http://localhost:8080", changeOrigin: false },
     },
   },
-  test: { environment: "jsdom", globals: false, env: { BASE_URL: base } },
+  // e2e/ holds the Playwright browser tests (npm run test:e2e), not vitest's.
+  test: { environment: "jsdom", globals: false, env: { BASE_URL: base }, exclude: ["e2e/**", "node_modules/**", "dist/**"] },
 });

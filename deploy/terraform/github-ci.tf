@@ -42,14 +42,14 @@ resource "aws_iam_role_policy" "ci_push" {
     Statement = [
       { Sid = "Login", Effect = "Allow", Action = "ecr:GetAuthorizationToken", Resource = "*" },
       {
-        Sid    = "PushThisRepositoryOnly"
+        Sid    = "PushTheseRepositoriesOnly"
         Effect = "Allow"
         Action = [
           "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
           "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage",
           "ecr:DescribeImages", "ecr:DescribeRepositories",
         ]
-        Resource = [aws_ecr_repository.moks.arn, aws_ecr_repository.terminal.arn, aws_ecr_repository.reranker.arn, aws_ecr_repository.opensearch.arn]
+        Resource = [aws_ecr_repository.moks.arn, aws_ecr_repository.terminal.arn, aws_ecr_repository.reranker.arn, aws_ecr_repository.opensearch.arn, aws_ecr_repository.crewai.arn]
       },
     ]
   })

@@ -19,3 +19,7 @@ kubeconfig*
 .DS_Store
 
 *-secrets.yaml
+
+# Playwright output
+frontend/test-results/
+frontend/playwright-report/
