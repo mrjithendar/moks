@@ -17,13 +17,19 @@ the restart counter is read raw and a decrease is treated as a reset.
 
 The connector caps a query at 25 series and 240 points, so reads are split into chunks below that, and a query
 that hits the series cap is reported as incomplete rather than silently scored on part of the namespace.
+
+Completeness is tracked per query and per chunk: `success`, `failed` (an error, a timeout, a Prometheus status
+other than success) or `partial` (warnings, a truncated result, the series cap). A missing sample in a failed or
+partial chunk is unknown. It becomes zero only where the metric's definition says absence means zero, and only
+inside a chunk that succeeded completely.
 """
 from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 FEATURE_SCHEMA = "metrics-anomaly/1"
@@ -65,19 +71,72 @@ def queries(namespace: str, metrics: dict[str, str] | None = None) -> dict[str, 
     }
 
 
-def grid(start: datetime, end: datetime, step: int) -> list[int]:
-    """Timestamps aligned to multiples of the step, so two runs sample the same instants."""
-    a = math.ceil(start.timestamp() / step) * step
-    b = math.floor(end.timestamp() / step) * step
-    return list(range(a, b + 1, step))
+@dataclass(frozen=True)
+class MetricDefinition:
+    """What a query's silence means. absent_means_zero: a complete answer with no sample at an instant is a true
+    zero, as with rate() over a 5xx selector that matches nothing when there are no errors."""
+    absent_means_zero: bool = False
 
 
-def chunks(start: datetime, end: datetime, step: int) -> list[tuple[datetime, datetime]]:
-    out, cur, span = [], start, timedelta(seconds=step * (CHUNK_POINTS - 1))
-    while cur < end:
-        nxt = min(end, cur + span)
-        out.append((cur, nxt))
-        cur = nxt + timedelta(seconds=step)
+METRIC_DEFINITIONS: dict[str, MetricDefinition] = {
+    "request_rate": MetricDefinition(),
+    "errors_rate": MetricDefinition(absent_means_zero=True),  # no 5xx series means no 5xx responses
+    "latency_p95": MetricDefinition(),
+    "cpu_throttling": MetricDefinition(),
+    "memory_working_set": MetricDefinition(),
+    "memory_limit": MetricDefinition(),
+    "restarts": MetricDefinition(),  # no kube-state-metrics is not zero restarts
+}
+
+
+class WindowError(ValueError):
+    """A window with no whole step in it: reported as `status`, never scored as 0% coverage."""
+
+    def __init__(self, status: str, reason: str):
+        super().__init__(reason)
+        self.status, self.reason = status, reason
+
+
+@dataclass(frozen=True)
+class Window:
+    start: int  # epoch seconds, a multiple of step, included
+    end: int    # epoch seconds, a multiple of step, excluded
+    step: int
+    grid: list[int]
+    status: str  # "ok" or "insufficient_window"
+    reason: str = ""
+
+    def request(self) -> tuple[datetime, datetime]:
+        """The bounds to send to /api/v1/query_range. Prometheus answers start, start + step, ... up to and
+        including end, so the request starts on the first grid timestamp and ends one second before `end`:
+        exactly this window's grid, and never the first timestamp of the next one."""
+        return datetime.fromtimestamp(self.start, timezone.utc), datetime.fromtimestamp(self.end - 1, timezone.utc)
+
+
+def align_window(start: datetime, end: datetime, step: int) -> Window:
+    """The one grid every feature query and frame uses, in training, validation and scoring alike.
+
+    Policy: start and end are floored to a multiple of `step` in UTC epoch seconds, and the window is half-open,
+    [start, end). The grid is start, start + step, ... < end, so two runs over overlapping periods sample the same
+    instants and adjacent windows share no timestamp. A window shorter than one step, or one that holds no
+    whole grid timestamp after flooring, is `insufficient_window` with an empty grid."""
+    if step < 2:
+        raise ValueError("step must be at least 2 seconds")
+    s, e = start.timestamp(), end.timestamp()
+    a, b = math.floor(s / step) * step, math.floor(e / step) * step
+    if e - s < step or b <= a:
+        why = "empty or reversed window" if e <= s else f"window of {e - s:.0f}s holds no whole {step}s step"
+        return Window(a, a, step, [], "insufficient_window", why)
+    return Window(a, b, step, list(range(a, b, step)), "ok")
+
+
+def chunks(window: Window) -> list[Window]:
+    """The window split on the grid into pieces of at most CHUNK_POINTS timestamps: each grid timestamp falls in
+    exactly one chunk, with no overlap at the edges and no gap between them."""
+    out = []
+    for i in range(0, len(window.grid), CHUNK_POINTS):
+        g = window.grid[i:i + CHUNK_POINTS]
+        out.append(Window(g[0], g[-1] + window.step, window.step, g, "ok"))
     return out
 
 
@@ -126,9 +185,18 @@ class CohortFrame:
         return [(t, [self.values[f][i] for f in FEATURES]) for i, t in enumerate(self.timestamps)]
 
 
-def assemble(environment: str, namespace: str, step: int, ts: list[int], raw: dict[str, list[dict]], incomplete: set[str] | None = None) -> list[CohortFrame]:
-    """Raw query results to one frame per workload. Pure, so the arithmetic is tested without Prometheus."""
-    incomplete = incomplete or set()
+ChunkStatus = dict[str, list[tuple[Window, str]]]  # query -> each chunk and how it ended: success | failed | partial
+
+
+def assemble(environment: str, namespace: str, step: int, ts: list[int], raw: dict[str, list[dict]], status: ChunkStatus | None = None,
+             definitions: dict[str, MetricDefinition] | None = None) -> list[CohortFrame]:
+    """Raw query results to one frame per workload. Pure, so the arithmetic is tested without Prometheus.
+    `status` says how the chunk holding each timestamp ended, per query; None means every query succeeded."""
+    defs = definitions or METRIC_DEFINITIONS
+    ok_at = {q: {t for ch, outcome in log if outcome == "success" for t in ch.grid} for q, log in (status or {}).items()}
+    complete = lambda q, t: status is None or t in ok_at.get(q, ())
+    incomplete = sorted(q for q, log in (status or {}).items() if any(outcome != "success" for _, outcome in log))
+    chunk_counts = {q: Counter(outcome for _, outcome in log) for q, log in (status or {}).items()}
     per = {k: _by_workload(v) for k, v in raw.items()}
     workloads = sorted({w for d in per.values() for w in d})
     frames = []
@@ -139,15 +207,23 @@ def assemble(environment: str, namespace: str, step: int, ts: list[int], raw: di
         inc = increases(restarts, step)
         resets = sum(1 for t in sorted(restarts) if t - step in restarts and restarts[t] < restarts[t - step])
         values: dict[str, list[float | None]] = {f: [] for f in FEATURES}
-        sparse = 0
+        sparse = unknown_errors = inferred_zero = 0
         for t in ts:
             r = req.get(t)
             values["request_rate"].append(r)
             if r is None or r < SPARSE_RPS:
                 values["error_ratio"].append(None)
                 sparse += r is not None
+            elif not complete("errors_rate", t):
+                values["error_ratio"].append(None)  # the error query failed or came back partial here: unknown, not 0
+                unknown_errors += 1
+            elif err.get(t) is not None:
+                values["error_ratio"].append(min(1.0, max(0.0, err[t] / r)))
+            elif defs["errors_rate"].absent_means_zero:
+                values["error_ratio"].append(0.0)  # a complete answer with traffic and no 5xx series: no errors
+                inferred_zero += 1
             else:
-                values["error_ratio"].append(min(1.0, max(0.0, (err.get(t) or 0.0) / r)))
+                values["error_ratio"].append(None)
             values["latency_p95"].append(lat.get(t) if lat.get(t) is not None and math.isfinite(lat[t]) else None)
             values["cpu_throttling"].append(thr.get(t))
             limit = lim.get(t)
@@ -156,7 +232,8 @@ def assemble(environment: str, namespace: str, step: int, ts: list[int], raw: di
         sources = {"request_rate": req, "error_ratio": req, "latency_p95": lat, "cpu_throttling": thr, "memory_utilization": lim, "restart_rate": restarts}
         quality = {"points": len(ts), "coverage": {f: round(sum(v is not None for v in values[f]) / len(ts), 3) if ts else 0.0 for f in FEATURES},
                    "absent": [f for f in FEATURES if not sources[f]], "sparse_traffic_points": sparse, "counter_resets": resets,
-                   "incomplete_queries": sorted(incomplete)}
+                   "unknown_error_points": unknown_errors, "inferred_zero_error_points": inferred_zero,
+                   "incomplete_queries": incomplete, "chunks": {q: {k: c.get(k, 0) for k in ("success", "failed", "partial")} for q, c in chunk_counts.items()}}
         frames.append(CohortFrame(environment, namespace, wl, step, ts, values, quality))
     return frames
 
@@ -164,24 +241,38 @@ def assemble(environment: str, namespace: str, step: int, ts: list[int], raw: di
 Query = Callable[[str, datetime, datetime, int], Awaitable[tuple[list[dict], bool]]]
 
 
+def _on_grid(series: list[dict], grid: set[int]) -> list[dict]:
+    """Keeps only samples on this chunk's own grid, so one chunk can never fill or overwrite another's instants."""
+    out = []
+    for s in series:
+        vals = [p for p in s.get("values") or [] if float(p[0]) == int(float(p[0])) and int(float(p[0])) in grid]
+        out.append({**s, "values": vals})
+    return out
+
+
 async def collect(query: Query, environment: str, namespace: str, start: datetime, end: datetime, step: int, metrics: dict[str, str] | None = None,
                   workloads: set[str] | None = None) -> list[CohortFrame]:
-    """Runs every feature query in chunks and assembles the frames. `query` returns (series, complete) and is
-    the caller's authorized path to Prometheus; a failed query leaves its features absent and says so."""
+    """Runs every feature query in chunks of the aligned window and assembles the frames. `query` returns
+    (series, complete) and is the caller's authorized path to Prometheus. Each chunk of each query is recorded
+    as success, failed (it raised) or partial (complete=False, or the series cap was reached). Raises
+    WindowError when the window holds no whole step."""
+    win = align_window(start, end, step)
+    if win.status != "ok":
+        raise WindowError(win.status, win.reason)
     qs = queries(namespace, metrics)
     raw: dict[str, list[dict]] = {k: [] for k in qs}
-    incomplete: set[str] = set()
-    for a, b in chunks(start, end, step):
+    status: ChunkStatus = {k: [] for k in qs}
+    for ch in chunks(win):
+        a, b = ch.request()
         for name, promql in qs.items():
             try:
                 series, complete = await query(promql, a, b, step)
             except Exception:
-                incomplete.add(name)
+                status[name].append((ch, "failed"))
                 continue
-            if not complete or len(series) >= SERIES_CAP:
-                incomplete.add(name)
-            raw[name] += series
-    frames = assemble(environment, namespace, step, grid(start, end, step), raw, incomplete)
+            status[name].append((ch, "success" if complete and len(series) < SERIES_CAP else "partial"))
+            raw[name] += _on_grid(series, set(ch.grid))
+    frames = assemble(environment, namespace, step, win.grid, raw, status)
     return [f for f in frames if workloads is None or f.workload in workloads]
 
 

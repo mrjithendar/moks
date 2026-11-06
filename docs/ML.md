@@ -137,7 +137,19 @@ cohorts. They are sampled on one aligned grid (`ml.anomaly.stepSeconds`, 300):
 
 A feature with no series is `absent`, and absent is never treated as healthy. Reads go through the automation
 principal's executor (`prom_query`), in chunks under the connector's 25-series and 240-point limits; a query that
-hits the series cap is reported as incomplete. Request metrics default to `http_requests_total` and
+hits the series cap is reported as incomplete.
+
+The grid comes from one function, `features.align_window`, which training, validation and scoring all use. Both
+ends of a window are floored to a multiple of the step (UTC epoch seconds) and the window is half-open,
+`[start, end)`. Chunk boundaries fall on the grid, and each request ends one second before the next chunk starts,
+because Prometheus includes `end`. That way each timestamp is requested exactly once. A window shorter than one step
+is `insufficient_window`; it is never scored as 0% coverage.
+
+Each chunk of each query is recorded as `success`, `failed` (an error, a timeout, a Prometheus status other than
+success) or `partial` (warnings, a truncated result, the series cap), and the counts are in `data_quality.chunks`.
+An error ratio inside a failed or partial chunk is unknown, not 0. Zero errors are inferred only from a complete
+chunk with traffic and no 5xx series, because `errors_rate` is declared `absent_means_zero` in
+`features.METRIC_DEFINITIONS`. Coverage counts known values only. Request metrics default to `http_requests_total` and
 `http_request_duration_seconds_bucket`; restarts use kube-state-metrics, which mk4 does not run, so expect that
 feature to be absent there.
 
