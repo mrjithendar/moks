@@ -3,8 +3,15 @@ name: moks
 # check   -> pull requests only: backend tests against PostgreSQL, frontend typecheck/build,
 #            Helm lint/render, Argo CD child Applications against the chart
 # terminal -> pull requests and pushes: diagnostic image build, scan and isolation test on kind
-# release -> default branch: build the arm64 image once, tag it with the commit and move latest to it.
-#            mk4 runs latest, and new pods pull it when restarted. CI never touches the cluster.
+# crewai  -> pull requests: the backend suite again on the CrewAI dependency set (pydantic 2.12.5 + crewai,
+#            backend/requirements-crewai.txt), which is what an image built with MOKS_CREWAI=true runs
+# release -> default branch: build the arm64 image once and push it as latest, the only tag. The commit is baked in.
+# release-crewai -> the same image with the CrewAI extra (MOKS_CREWAI=true), pushed as moks-crewai:latest. mk4 runs
+#            it only when values-minikube.yaml points image.repository there (docs/crewai-investigation.md).
+# deploy  -> after release, only when repository variable MK4_DEPLOY is "true": Argo CD deploys. CI asks it to
+#            sync the MOKS Applications from master in order, then to restart the Deployments that run
+#            moks:latest, and checks the site reports the new commit. CI has no Kubernetes credentials: only an
+#            Argo CD token for project role moks/ci (get, sync, restart; scripts/setup-argocd-ci.sh).
 
 on:
   push:
@@ -142,7 +149,8 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
       - name: Build, smoke-test and push
         run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:${{ github.sha }}"
+          # One tag, latest. The commit is inside the image (GIT_COMMIT, reported by /moks/api/health), not in the tag.
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
           docker build --build-arg GIT_COMMIT=${{ github.sha }} -t "$IMAGE" .
           # The image must start and answer its probes without a database (readyz reports 503).
           docker run -d --name smoke -e MOKS_ENV=development -e MOKS_AUTH_MODE=local -p 8080:8080 "$IMAGE"
@@ -152,18 +160,140 @@ jobs:
           docker rm -f smoke
           docker push "$IMAGE"
           DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2)"
-          LATEST="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
-          docker tag "$IMAGE" "$LATEST"
-          docker push "$LATEST"
-          echo "pushed $IMAGE and $LATEST ($DIGEST). Restart mk4 to run it; see docs/RELEASES.md." >> "$GITHUB_STEP_SUMMARY"
+          echo "pushed $IMAGE (commit ${{ github.sha }}, $DIGEST). The deploy job restarts mk4 when MK4_DEPLOY is true; see docs/RELEASES.md." >> "$GITHUB_STEP_SUMMARY"
           # The release record: which commit became which digest (docs/RELEASES.md).
           mkdir -p release && printf '{"component":"moks","commit":"%s","repository":"%s","tag":"%s","digest":"%s","run":"%s"}\n' \
-            "${{ github.sha }}" "$REPOSITORY" "${{ github.sha }}" "$DIGEST" "${{ github.run_id }}" > release/moks.json
+            "${{ github.sha }}" "$REPOSITORY" latest "$DIGEST" "${{ github.run_id }}" > release/moks.json
       - uses: actions/upload-artifact@v4
         with:
           name: release-moks-${{ github.sha }}
           path: release/moks.json
           retention-days: 400
+
+  release-crewai:
+    needs: check
+    if: ${{ !cancelled() && needs.check.result == 'skipped' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      REPOSITORY: moks-crewai   # deploy/terraform/ecr.tf aws_ecr_repository.crewai
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: moks-ci-crewai-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build, smoke-test and push
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
+          docker build --build-arg GIT_COMMIT=${{ github.sha }} --build-arg MOKS_CREWAI=true -t "$IMAGE" .
+          # As in the pods: read-only root, no home directory, no network. crewai must import at the pinned version
+          # with its telemetry off, or the capability would report it unavailable.
+          docker run --rm --read-only --tmpfs /tmp --network none --entrypoint python "$IMAGE" -c \
+            'from moks.crew import PINNED, installed_version, prepare_environment; prepare_environment(); import crewai, os; assert installed_version() == PINNED, installed_version(); assert os.environ["CREWAI_DISABLE_TELEMETRY"] == "true"; print("crewai", crewai.__version__)'
+          docker run -d --name smoke -e MOKS_ENV=development -e MOKS_AUTH_MODE=local -p 8080:8080 "$IMAGE"
+          for _ in $(seq 1 30); do curl -fsS localhost:8080/healthz && break; sleep 1; done
+          curl -fsS localhost:8080/moks/api/health | grep -q '${{ github.sha }}'
+          docker rm -f smoke
+          docker images "$IMAGE" --format 'image size {{ .Size }}' >> "$GITHUB_STEP_SUMMARY"
+          docker push "$IMAGE"
+          DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2)"
+          echo "pushed $IMAGE (commit ${{ github.sha }}, $DIGEST)." >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p release && printf '{"component":"moks-crewai","commit":"%s","repository":"%s","tag":"%s","digest":"%s","run":"%s"}\n' \
+            "${{ github.sha }}" "$REPOSITORY" latest "$DIGEST" "${{ github.run_id }}" > release/moks-crewai.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-moks-crewai-${{ github.sha }}
+          path: release/moks-crewai.json
+          retention-days: 400
+
+  deploy:
+    # Waits for both images, so a restart pulls the new build whichever repository values-minikube.yaml runs.
+    needs: [release, release-crewai]
+    if: ${{ !cancelled() && needs.release.result == 'success' && needs.release-crewai.result == 'success' && vars.MK4_DEPLOY == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: moks-deploy-mk4
+      cancel-in-progress: false
+    env:
+      # Argo CD at https://jithendar.com/argocd. The token is project role moks/ci (deploy/argocd/minikube/project.yaml):
+      # get, sync and restart Applications of project moks, nothing else. scripts/setup-argocd-ci.sh issues it.
+      ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER || 'jithendar.com' }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      ARGOCD_OPTS: --grpc-web --grpc-web-root-path /argocd
+    steps:
+      - name: Install the argocd CLI
+        run: |
+          [[ -n "$ARGOCD_AUTH_TOKEN" ]] || { echo "::error::ARGOCD_AUTH_TOKEN is not set; run scripts/setup-argocd-ci.sh"; exit 1; }
+          curl -fsSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/download/v3.5.6/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+          argocd version --client --short
+      # Git first: sync every child in the order docs/ARGOCD_APP_SPLIT.md section 6 sets, so the ConfigMap
+      # (foundation) is current before the pods that hash it roll. Never --prune.
+      - name: Sync the MOKS Applications from master
+        run: |
+          set -euo pipefail
+          for app in foundation database api worker executor terminal routing opensearch reranker; do
+            argocd app get "moks-$app" -o name > /dev/null 2>&1 || { echo "moks-$app does not exist; skipped"; continue; }
+            argocd app get "moks-$app" --refresh > /dev/null
+            argocd app sync "moks-$app" --timeout 600
+            argocd app wait "moks-$app" --sync --health --timeout 600
+          done
+      # Then the image: the tag is always latest, which a sync cannot see change, so Argo CD's restart action
+      # rolls the Deployments that run moks:latest (imagePullPolicy Always). The worker goes first: running
+      # investigations finish within its termination grace period, and the first API pod runs pending migrations.
+      - name: Restart onto the new image
+        run: |
+          set -euo pipefail
+          for pair in worker:moks-worker api:moks-api executor:moks-executor terminal:moks-terminal; do
+            app="moks-${pair%%:*}"; deploy="${pair#*:}"
+            argocd app actions run "$app" restart --kind Deployment --resource-name "$deploy" --namespace moks
+            argocd app wait "$app" --health --timeout 600
+          done
+      - name: The site runs this commit
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS https://jithendar.com/moks/api/health | grep -q '${{ github.sha }}'; then
+              echo "mk4 runs ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::https://jithendar.com/moks/api/health does not report ${{ github.sha }}"; exit 1
+
+  crewai:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: {POSTGRES_USER: moks, POSTGRES_PASSWORD: moks, POSTGRES_DB: postgres}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U moks" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@v7
+        with: {python-version: "3.12"}
+      - name: Backend tests on the CrewAI dependency set
+        working-directory: backend
+        env:
+          MOKS_TEST_DATABASE_URL: postgresql://moks:moks@localhost:5432/postgres
+        run: |
+          grep -v '^pydantic==' requirements.txt > /tmp/base.txt
+          pip install -r /tmp/base.txt -r requirements-crewai.txt pytest pytest-asyncio
+          pip install --no-deps -e .
+          python -c "import crewai; print('crewai', crewai.__version__)"
+          python -m pytest -q
 
   reranker:
     runs-on: ubuntu-24.04
@@ -202,7 +332,7 @@ jobs:
       - name: Build, smoke-test and push
         working-directory: reranker
         run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:${{ github.sha }}"
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
           docker build --build-arg GIT_COMMIT=${{ github.sha }} -t "$IMAGE" .
           # No network, so a runtime download would fail here rather than in production.
           docker run -d --name smoke -e RERANKER_TOKEN=ci -e RERANKER_METRICS_PORT=0 --network none --read-only --tmpfs /tmp --user 10001:10001 "$IMAGE"
@@ -220,13 +350,10 @@ jobs:
           docker images "$IMAGE" --format 'image size {{ .Size }}' >> "$GITHUB_STEP_SUMMARY"
           docker push "$IMAGE"
           DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2)"
-          LATEST="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
-          docker tag "$IMAGE" "$LATEST"
-          docker push "$LATEST"
-          echo "pushed $IMAGE and $LATEST ($DIGEST). Restart moks-reranker to run it." >> "$GITHUB_STEP_SUMMARY"
+          echo "pushed $IMAGE (commit ${{ github.sha }}, $DIGEST). Restart moks-reranker to run it." >> "$GITHUB_STEP_SUMMARY"
           MODEL="$(python3 -c 'import json; l=json.load(open("model.lock.json")); print(l["model_id"] + "@" + l["revision"])')"
           mkdir -p ../release && printf '{"component":"moks-reranker","commit":"%s","repository":"%s","tag":"%s","digest":"%s","model":"%s","run":"%s"}\n' \
-            "${{ github.sha }}" "$REPOSITORY" "${{ github.sha }}" "$DIGEST" "$MODEL" "${{ github.run_id }}" > ../release/moks-reranker.json
+            "${{ github.sha }}" "$REPOSITORY" latest "$DIGEST" "$MODEL" "${{ github.run_id }}" > ../release/moks-reranker.json
       - uses: actions/upload-artifact@v4
         with:
           name: release-moks-reranker-${{ github.sha }}
@@ -258,7 +385,7 @@ jobs:
       - name: Build, smoke-test and push for arm64 and amd64
         working-directory: deploy/opensearch
         run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:${{ github.sha }}"
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
           docker build -t smoke .
           docker run --rm smoke bin/opensearch-plugin list | tee plugins
           grep -q repository-s3 plugins && grep -q prometheus-exporter plugins
@@ -289,6 +416,6 @@ jobs:
       - uses: docker/setup-buildx-action@v4
       - name: Build and push for arm64 and amd64
         run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:${{ github.sha }}"
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
           docker buildx build --platform linux/arm64,linux/amd64 --provenance=false --build-arg GIT_COMMIT=${{ github.sha }} -t "$IMAGE" --push --metadata-file meta.json deploy/terminal
           echo "pushed $IMAGE. Set terminal.image.digest to $(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")." >> "$GITHUB_STEP_SUMMARY"

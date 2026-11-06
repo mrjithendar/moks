@@ -28,6 +28,7 @@ from sqlalchemy.dialects.postgresql import insert
 from .. import audit
 from ..config import get_settings
 from ..connectors import registry
+from ..crew import CrewUnavailable
 from ..db import session_scope
 from ..auth.revocation import CHECK_SECONDS as WATCH_SECONDS, AccessGuard, AccessRevoked
 from ..llm.lc import MoksChatModel
@@ -241,6 +242,8 @@ class Investigator:
                 uncancel()
         except TimeoutError:
             status, error = "failed", f"time limit of {self.settings.max_duration_seconds}s reached"
+        except CrewUnavailable as exc:
+            status, error = "failed", str(exc)
         except ScopeError as exc:
             status, error = "failed", f"not permitted: {exc}"
             if isinstance(exc, AccessRevoked):
@@ -488,6 +491,7 @@ class Investigator:
                 conv = await db.get(Conversation, inv.conversation_id)
                 self.conversation_namespace = conv.namespace if conv and conv.id != inv.id else None
             queued = (await db.execute(select(InvestigationEvent.payload).where(InvestigationEvent.investigation_id == inv.id, InvestigationEvent.seq == 0))).scalar_one_or_none() or {}
+            crew_request = queued.get("crewai") if isinstance(queued.get("crewai"), dict) else None
             self.environment_info = {"name": env.name, "is_production": bool(env.is_production), "reason": queued.get("environment_reason"), "namespace_reason": queued.get("namespace_reason")}
             self._window = (t_from, t_to)
             env_name = env.name
@@ -522,7 +526,12 @@ class Investigator:
             executor = ToolExecutor(db, ctx, next_ref=self._next_ref, timeout_seconds=min(45, self.settings.max_duration_seconds))
             if resumed:
                 await self._recollect(executor, resumed.get("namespace") or namespace)
-            final = await graph.run(self, executor, ctx, question, namespace, scope_info, provider, llm_cfg, (LLMError, BudgetExceeded), resumed)
+            if crew_request:  # the opt-in CrewAI flow (moks/crew); the graph stays the default
+                from ..crew import runner as crew_runner
+
+                final = await crew_runner.run(self, executor, ctx, question, namespace, scope_info, provider, llm_cfg, crew_request)
+            else:
+                final = await graph.run(self, executor, ctx, question, namespace, scope_info, provider, llm_cfg, (LLMError, BudgetExceeded), resumed)
             await db.commit()
         namespace, report = final["namespace"], final["report"]
         mode = final.get("mode") or mode
@@ -551,6 +560,8 @@ class Investigator:
         payload["shared_findings"] = self.shared_findings
         payload["excluded"] = self.excluded
         payload["request"] = req.trace()
+        if final.get("crewai"):
+            payload["crewai"] = final["crewai"]
         await self._knowledge_outcome(report, payload, ledger, env_name, namespace)
         if self.similar.get("status") not in (None, "not_attempted") or self.similar.get("reason"):
             from ..ml.similar import NOTE as SIMILAR_NOTE

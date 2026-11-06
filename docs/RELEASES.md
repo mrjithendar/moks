@@ -1,6 +1,6 @@
 # Releases
 
-An image is built once and tagged with its commit, and CI moves `latest` to it. mk4 always runs `latest` with `pullPolicy: Always`, and that setting does not change between releases.
+An image is built once and pushed as `latest`, its only tag. The commit is baked into the image (`GIT_COMMIT`), not into a tag. mk4 always runs `latest` with `pullPolicy: Always`, and that setting does not change between releases. An earlier build is reachable only by its digest, which the release record keeps.
 
 Git does not record which build is running. Check it with `/api/health`.
 
@@ -17,7 +17,7 @@ Together with what MOKS records at runtime, that links a running build to its mo
 | Question | Where |
 |---|---|
 | Which commit is each pod running? | `/api/health` and the profile menu (`component_versions`), from the commit baked into the image |
-| Which digest is that commit? | the release record for that commit, or `aws ecr describe-images --repository-name moks --image-ids imageTag=<sha>` |
+| Which digest is that commit? | the release record for that commit (`release-moks-<sha>`); ECR has no commit tags |
 | Which reranker model revision? | the reranker release record, `reranking.revision` on each search, and `MOKS_RAG_RERANK_REVISION` |
 | Which evaluation backed it? | `eval_runs.versions` (dataset, skills, model, index) for knowledge and rerank evaluations; `ml_models.metrics` and `ml_models.provenance.commit` for ML models |
 
@@ -28,12 +28,13 @@ it again afterwards so CI releases resume.
 
 ## Release
 
-1. A pull request passes the `check` job, which runs on pull requests only. Merging it to `master` builds one image, tags it with the commit SHA and moves `latest` to it. A failed image build or smoke test leaves `latest` where it was. A direct push to `master` is released without `check`, so require `check` in branch protection.
+1. A pull request passes the `check` job, which runs on pull requests only. Merging it to `master` builds one image and pushes it as `latest`. A failed image build or smoke test pushes nothing, so `latest` stays where it was. A direct push to `master` is released without `check`, so require `check` in branch protection.
 2. Check any migration the release brings. Migrations run when the new API pods start, or in the `moks-migrate` Job once `secrets.split` is true. A mutable tag never changes that Job's name, so it needs the steps in [ARGOCD_APP_SPLIT.md](ARGOCD_APP_SPLIT.md#upgrades-and-migrations) before this restart.
-3. Restart the pods, which pull `latest`:
+3. CI's `deploy` job (when variable `MK4_DEPLOY` is `true`) has Argo CD sync the MOKS Applications and restart the
+   Deployments that run `latest`. Without it, restart by hand:
 
    ```bash
-   kubectl --context mk4 -n moks rollout restart deploy/moks-api deploy/moks-worker deploy/moks-executor
+   kubectl --context mk4 -n moks rollout restart deploy/moks-api deploy/moks-worker deploy/moks-executor deploy/moks-terminal
    ```
 
 4. Check the running build: `curl https://jithendar.com/moks/api/health` shows the commit, and the profile menu warns if components differ.
@@ -44,11 +45,12 @@ A pod that restarts for any other reason, such as a node restart, also pulls `la
 
 ## Roll back
 
-Point `latest` back at an earlier commit, then restart as in step 3:
+Point `latest` back at an earlier build, then restart as in step 3. Builds have no commit tag, so take the digest
+from that commit's release record (`release-moks-<sha>/moks.json`):
 
 ```bash
-COMMIT=<commit-sha>
-MANIFEST="$(aws ecr batch-get-image --region us-east-1 --repository-name moks --image-ids imageTag=$COMMIT --query 'images[0].imageManifest' --output text)"
+DIGEST=sha256:<digest from the release record>
+MANIFEST="$(aws ecr batch-get-image --region us-east-1 --repository-name moks --image-ids imageDigest=$DIGEST --query 'images[0].imageManifest' --output text)"
 aws ecr put-image --region us-east-1 --repository-name moks --image-tag latest --image-manifest "$MANIFEST"
 ```
 

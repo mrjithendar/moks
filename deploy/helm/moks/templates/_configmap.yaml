@@ -23,6 +23,20 @@ data:
   MOKS_MAX_QUERY_WINDOW_MINUTES: {{ .Values.config.maxQueryWindowMinutes | quote }}
   MOKS_WORKER_CONCURRENCY: {{ .Values.config.workerConcurrency | quote }}
   MOKS_COOKIE_SECURE: "true"
+  MOKS_CREWAI_ENABLED: {{ .Values.crewai.enabled | quote }}
+  {{- if .Values.crewai.enabled }}
+  MOKS_CREWAI_TIMEOUT_SECONDS: {{ .Values.crewai.timeoutSeconds | quote }}
+  MOKS_CREWAI_TOOL_TIMEOUT_SECONDS: {{ .Values.crewai.toolTimeoutSeconds | quote }}
+  MOKS_CREWAI_MAX_ITERATIONS: {{ .Values.crewai.maxIterations | quote }}
+  MOKS_CREWAI_MAX_TOOL_CALLS: {{ .Values.crewai.maxToolCalls | quote }}
+  MOKS_CREWAI_MAX_CONCURRENT: {{ .Values.crewai.maxConcurrent | quote }}
+  MOKS_CREWAI_EXCERPT_CHARS: {{ .Values.crewai.excerptChars | quote }}
+  MOKS_CREWAI_LOG_LINES: {{ .Values.crewai.logLines | quote }}
+  MOKS_CREWAI_HOME: /tmp/moks-crewai
+  CREWAI_DISABLE_TELEMETRY: "true"
+  CREWAI_DISABLE_TRACKING: "true"
+  CREWAI_TRACING_ENABLED: "false"
+  {{- end }}
   MOKS_ML_DISABLED: {{ .Values.ml.disabled | quote }}
   MOKS_ML_LEARNING_CAPTURE: {{ .Values.ml.learningCapture | quote }}
   MOKS_ML_LEARNING_RETENTION_DAYS: {{ .Values.ml.learningRetentionDays | quote }}

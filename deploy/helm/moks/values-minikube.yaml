@@ -150,6 +150,11 @@ ecrRefresh:
   enabled: true         # also add "moks" to TARGET_NAMESPACES of the ecr-refresh CronJob (tools repo)
 
 # docs/RERANKING.md. CI moves latest on every master build, and a pod gets it when it restarts.
+# CrewAI workload investigation (docs/crewai-investigation.md). Off. Turning it on also needs the CrewAI image:
+# set image.repository to 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-crewai (CI pushes it as latest).
+crewai:
+  enabled: false
+
 reranker:
   enabled: true
   image:

@@ -108,6 +108,17 @@ class Settings(BaseSettings):
     rag_decompose: bool = False  # off: the rag dataset measured no gain from it. Turn on only with a dataset that shows one.
     rag_activation: str = "strict"  # strict: a reindex with any incomplete document fails. degraded: it activates and says so.
     evidence_max_age_seconds: int = 900  # older evidence cannot back a claim about the current state without saying so
+    # Opt-in CrewAI workload investigation (docs/crewai-investigation.md). Off unless MOKS_CREWAI_ENABLED is true and the
+    # image was built with the crewai extra. The global ceilings (max_tool_calls, max_duration_seconds) still apply.
+    crewai_enabled: bool = False
+    crewai_timeout_seconds: int = Field(default=120, ge=10, le=900)
+    crewai_tool_timeout_seconds: int = Field(default=30, ge=1, le=120)
+    crewai_max_iterations: int = Field(default=5, ge=1, le=20)  # per agent
+    crewai_max_tool_calls: int = Field(default=20, ge=1, le=100)  # across the whole crew
+    crewai_max_concurrent: int = Field(default=2, ge=1, le=10)  # crews per worker process
+    crewai_slot_wait_seconds: int = Field(default=20, ge=0, le=300)
+    crewai_excerpt_chars: int = Field(default=2000, ge=200, le=20000)  # what one tool result shows the model and the report
+    crewai_log_lines: int = Field(default=100, ge=10, le=500)
 
     # Rate limits (per process; see docs/SECURITY.md)
     rate_login_per_minute: int = 10

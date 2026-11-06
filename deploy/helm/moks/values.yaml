@@ -73,6 +73,19 @@ worker:
     requests: {cpu: 100m, memory: 192Mi}
     limits: {cpu: "1", memory: 512Mi}
 
+# Opt-in CrewAI workload investigation (docs/crewai-investigation.md). Needs an image built with
+# --build-arg MOKS_CREWAI=true; with the default image the capability endpoint reports it unavailable.
+# It uses the active chat LLM through MOKS's budget and nothing else; CrewAI telemetry is forced off in code.
+crewai:
+  enabled: false
+  timeoutSeconds: 120       # per investigation; config.maxDurationSeconds still bounds the whole run
+  toolTimeoutSeconds: 30
+  maxIterations: 5          # per agent
+  maxToolCalls: 20          # across the crew, never above config.maxToolCalls
+  maxConcurrent: 2          # crews per worker pod
+  excerptChars: 2000
+  logLines: 100
+
 # Machine learning (docs/ML.md). Capability modes (disabled, shadow, enabled) are switched in the admin screen
 # and stored in PostgreSQL; these bound the work. ml.disabled is the deploy-time kill switch for all of it.
 ml:

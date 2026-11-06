@@ -7,7 +7,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -81,8 +81,11 @@ async def investigate_config(ctx: AuthContext = Depends(get_auth), db: AsyncSess
 
     cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none()
     envs = (await db.execute(select(Environment).where(~Environment.name.startswith("eval-")).order_by(Environment.name))).scalars().all()
+    from ..crew import capability
+
     return {"llm": {"provider": cfg.provider, "model": cfg.model} if cfg else None,
-            "skills": sorted(skills.library().skills), "environments": [e.name for e in envs if ctx.principal.namespace_patterns(P.INVESTIGATION_RUN, e.name)]}
+            "skills": sorted(skills.library().skills), "environments": [e.name for e in envs if ctx.principal.namespace_patterns(P.INVESTIGATION_RUN, e.name)],
+            "crewai": capability(get_settings(), cfg)}
 
 
 async def resolve_scope(db: AsyncSession, ctx: AuthContext, question: str, environment: str | None, namespace: str | None) -> tuple[Environment, str, str]:
@@ -165,8 +168,36 @@ async def create(body: CreateIn, request: Request, ctx: AuthContext = Depends(ge
     return await start_investigation(body, request, ctx, db)
 
 
+class CrewIn(BaseModel):
+    """The CrewAI flow investigates one workload in one namespace; both are required, nothing is inferred."""
+    environment: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,99}$")
+    namespace: str = Field(pattern=r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
+    workload: str = Field(pattern=r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
+    kind: Literal["Deployment", "StatefulSet", "DaemonSet"] = "Deployment"
+    question: str | None = Field(default=None, min_length=3, max_length=2000)
+    minutes: int | None = Field(default=None, ge=5, le=10080)
+
+
+@router.post("/investigations/crewai", status_code=201)
+async def create_crewai(body: CrewIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """Opt-in (docs/crewai-investigation.md). While MOKS_CREWAI_ENABLED is false this route answers 404, as if it did not exist."""
+    from ..crew import capability
+    from ..models import LLMConfig
+
+    s = get_settings()
+    if not s.crewai_enabled:
+        raise HTTPException(404, "Not Found")
+    cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none()
+    state = capability(s, cfg)
+    if not state["available"]:
+        raise HTTPException(503, f"CrewAI investigation unavailable: {state['reason']}")
+    question = body.question or f"Why is {body.kind} {body.workload} in namespace {body.namespace} unhealthy?"
+    inner = CreateIn(question=question, environment=body.environment, namespace=body.namespace, minutes=body.minutes)
+    return await start_investigation(inner, request, ctx, db, crewai={"workload": body.workload, "kind": body.kind})
+
+
 async def start_investigation(body: CreateIn, request: Request, ctx: AuthContext, db: AsyncSession, conversation_id: uuid.UUID | None = None,
-                              inherited_namespace: str | None = None) -> dict[str, Any]:
+                              inherited_namespace: str | None = None, crewai: dict[str, str] | None = None) -> dict[str, Any]:
     """conversation_id is never taken from a request body: callers have checked the person may post there.
     inherited_namespace is the conversation's: a default for a follow-up that names no target of its own, never an
     override, so a question about something new is not pinned to the namespace of the last one."""
@@ -224,10 +255,11 @@ async def start_investigation(body: CreateIn, request: Request, ctx: AuthContext
         await add_event(db, inv.incident_id, "investigation", {"text": f"Investigation started: {body.question[:200]}", "investigation_id": str(inv.id)}, ctx.user.id)
     db.add(InvestigationEvent(investigation_id=inv.id, seq=0, type="queued",
                               payload={"window_minutes": int(window.total_seconds() // 60), "requested_minutes": minutes,
-                                       "environment": env.name, "environment_reason": why_env, "namespace": ns, "namespace_reason": why_ns, "traceparent": traceparent()}))
+                                       "environment": env.name, "environment_reason": why_env, "namespace": ns, "namespace_reason": why_ns, "traceparent": traceparent(),
+                                       **({"crewai": crewai} if crewai else {})}))
     await audit.record(db, action="investigation.create", actor_id=ctx.user.id, actor_email=ctx.user.email,
                        resource_type="investigation", resource_id=str(inv.id), environment=env.name, namespace=body.namespace,
-                       decision="allow", details={"question_chars": len(body.question), "window_minutes": int(window.total_seconds() // 60)},
+                       decision="allow", details={"question_chars": len(body.question), "window_minutes": int(window.total_seconds() // 60), **({"workflow": "crewai", **crewai} if crewai else {})},
                        ip=client_ip(request))
     await db.flush()
     if conversation_id:
