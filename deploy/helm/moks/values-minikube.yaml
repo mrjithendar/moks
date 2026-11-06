@@ -1,6 +1,7 @@
 # mk4 (Hetzner, 4-node Minikube, arm64) behind Traefik at https://jithendar.com/moks
 image:
-  repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
+  # moks-crewai is the default image plus the CrewAI extra (docs/crewai-investigation.md). Back to .../moks to drop it.
+  repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-crewai
   # CI moves latest on every master build. Pods get it when they restart (docs/RELEASES.md).
   tag: latest
   pullPolicy: Always
@@ -149,12 +150,11 @@ logCollector:
 ecrRefresh:
   enabled: true         # also add "moks" to TARGET_NAMESPACES of the ecr-refresh CronJob (tools repo)
 
-# docs/RERANKING.md. CI moves latest on every master build, and a pod gets it when it restarts.
-# CrewAI workload investigation (docs/crewai-investigation.md). Off. Turning it on also needs the CrewAI image:
-# set image.repository to 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-crewai (CI pushes it as latest).
+# CrewAI workload investigation (docs/crewai-investigation.md). On; it needs the moks-crewai image set above.
 crewai:
-  enabled: false
+  enabled: true
 
+# docs/RERANKING.md. CI moves latest on every master build, and a pod gets it when it restarts.
 reranker:
   enabled: true
   image:
