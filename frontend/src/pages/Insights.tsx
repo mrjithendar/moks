@@ -3,8 +3,10 @@ import { useNavigate } from "react-router-dom";
 import { api, apiForm, qs } from "../api";
 import { useAuth } from "../auth";
 import { Badge, DataTable, type Env, ErrorBox, LineChart, Loading, PageHead, Stat, Time, useInterval, useLoad } from "../components";
-import { PlanForm } from "./Ops";
+import { useUrlFilters } from "../filters";
+import { fmtBytesMi, fmtCores, recsOf } from "../rightsizing";
 import { Drawer, Empty, Truncate, useFeedback } from "../ui";
+import { RIGHTSIZING_CSV, RightsizingList, rightsizingCsvRows } from "./Rightsizing";
 
 // ---- Knowledge ----------------------------------------------------------------------------------
 
@@ -477,6 +479,13 @@ function download(name: string, csv: string) {
   URL.revokeObjectURL(a.href);
 }
 
+/** Reserved capacity that reduce recommendations give back, summed over replicas. */
+function freedText(rows: any[]): string {
+  let cpu = 0, mem = 0;
+  for (const rec of rows.flatMap(recsOf)) if (rec.action === "reduce") { cpu += rec.capacity.cpu_cores ?? 0; mem += rec.capacity.memory_bytes ?? 0; }
+  return `${fmtCores(cpu)} CPU · ${fmtBytesMi(mem)}`;
+}
+
 function Share({ value, total }: { value: number; total: number }) {
   const pct = total > 0 ? Math.round((value / total) * 100) : 0;
   return <div className="row"><div className="bar" style={{ flex: 1 }}><span style={{ width: `${pct}%` }} /></div><span className="small muted">{pct}%</span></div>;
@@ -486,12 +495,13 @@ export function FinOps() {
   const { can } = useAuth();
   const nav = useNavigate();
   const envs = useLoad(() => api<Env[]>("/environments"), []);
-  const [env, setEnv] = useState("all");
-  const [ns, setNs] = useState("");
-  const [days, setDays] = useState(7);
+  const [scope, setScope] = useUrlFilters({ env: "all", ns: "", days: 7 }); // shareable, and Back keeps it
+  const { env, ns, days } = scope;
+  const setEnv = (v: string) => setScope({ env: v, ns: "" });
+  const setNs = (v: string) => setScope({ ns: v });
+  const setDays = (v: number) => setScope({ days: v });
   const [text, setText] = useState("");
   const [kind, setKind] = useState("");
-  const [propose, setPropose] = useState<any>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<unknown>();
   const one = env !== "all";
@@ -516,8 +526,8 @@ export function FinOps() {
   const unallocated = rows.reduce((n, r) => n + (r.kubernetes?.unallocated ?? 0), 0);
   const exportWorkloads = () => download(`moks-workload-costs-${days}d.csv`, toCsv(shownWorkloads, [["Environment", (w) => w.environment], ["Namespace", (w) => w.namespace], ["Team", (w) => w.team], ["Workload", (w) => w.workload], ["Kind", (w) => w.kind], ["Pods", (w) => w.pods],
     ["CPU request", (w) => w.cpu_request], ["CPU used", (w) => w.cpu_avg], ["Memory request MiB", (w) => w.mem_request_mib], ["Memory used MiB", (w) => w.mem_avg_mib], ["CPU cost", (w) => w.cost_by_resource.cpu], ["Memory cost", (w) => w.cost_by_resource.memory], ["Storage cost", (w) => w.cost_by_resource.storage], ["Total cost", (w) => w.cost], ["Idle cost", (w) => w.idle_cost]]));
-  const exportRecs = () => download(`moks-rightsizing-${days}d.csv`, toCsv(recs.filter(match), [["Environment", (r) => r.environment], ["Namespace", (r) => r.namespace], ["Workload", (r) => r.workload], ["Container", (r) => r.container], ["Action", (r) => r.action], ["Confidence", (r) => r.confidence],
-    ["Data coverage", (r) => r.coverage], ["CPU now", (r) => r.current.cpu_request], ["CPU recommended", (r) => r.recommended.cpu_request], ["Memory now", (r) => r.current.mem_request], ["Memory recommended", (r) => r.recommended.mem_request], ["Saving per month", (r) => r.monthly_saving], ["Findings", (r) => r.findings.join("; ")]]));
+  const pricingOf = (e: string) => rows.find((r) => r.environment === e)?.rightsizing_pricing ?? null;
+  const exportRecs = () => download(`moks-rightsizing-${days}d.csv`, toCsv(rightsizingCsvRows(recs.filter(match), pricingOf), RIGHTSIZING_CSV));
   const aws = rows.flatMap((r) => (r.aws?.groups ?? []).map(tag(r))).sort((a, b) => b.amount - a.amount);
   const kinds = [...new Set(workloads.map((w) => w.kind))];
   const match = (w: any) => (!kind || w.kind === kind) && (!text || JSON.stringify([w.workload, w.namespace, w.environment]).toLowerCase().includes(text.toLowerCase()));
@@ -572,7 +582,8 @@ export function FinOps() {
           <Stat value={`$${money(t.aws)}`} label="cloud services" />
           <Stat value={`$${money(t.llm)}`} label={`LLM (${d.llm.calls} calls)`} />
           <Stat value={`$${money(t.idle)}`} label="idle (requested, unused)" />
-          <Stat value={`$${money(saving)}`} label="possible saving / month" />
+          {rows.some((r) => r.rightsizing_pricing?.kind === "per_unit") ? <Stat value={`$${money(saving)}`} label="estimated saving / month (Estimate)" />
+            : <Stat value={freedText(recs)} label="capacity rightsizing could free" />}
           {clusterCost > 0 && <Stat value={`$${money(unallocated)}`} label={`unallocated of $${money(clusterCost)} cluster`} />}
         </div>
         {unpriced && <div className="alert warn small" style={{ marginBottom: 14 }}>Kubernetes costs are $0 until a cost_model connector has a price: set monthly_cost_usd, or cpu_hour_usd and gib_hour_usd, under Connectors.</div>}
@@ -639,21 +650,8 @@ export function FinOps() {
         <div className="card" style={{ marginTop: 14 }}>
           <div className="row between"><h2>Rightsizing</h2>{recs.length > 0 && <button className="ghost small" onClick={exportRecs}>Export CSV</button>}</div>
           <div className="small muted">From p95 CPU and max memory over {days} days (+25% headroom).</div>
-          <div className="table-wrap" role="region" aria-label="Rightsizing recommendations" tabIndex={0}>
-            <table>
-              <thead><tr><th>Scope</th><th>Container</th><th>Action</th><th>Current → recommended</th><th>Saving / mo</th><th /></tr></thead>
-              <tbody>{recs.filter(match).map((r, i) => (
-                <tr key={i}>
-                  <td className="mono small">{r.environment}/{r.namespace}</td>
-                  <td className="mono small">{r.workload}/{r.container}<div className="muted">{r.findings.join("; ")}</div></td>
-                  <td><Badge kind={r.action === "increase" ? "bad" : r.action === "reduce" ? "ok" : "warn"}>{r.action}</Badge>{r.confidence === "low" && <div><Badge kind="warn">low confidence</Badge><div className="small muted">{Math.round(r.coverage * 100)}% of the window measured</div></div>}</td>
-                  <td className="small mono">cpu {r.current.cpu_request ?? "—"}→{r.recommended.cpu_request}<br />mem {r.current.mem_request ?? "—"}→{r.recommended.mem_request}</td>
-                  <td>{r.monthly_saving < 0 ? <span className="small">+{money(-r.monthly_saving)} cost</span> : money(r.monthly_saving)}</td>
-                  <td>{can("action.request") && r.workload.startsWith("Deployment/") && <button className="small ghost" onClick={() => setPropose(r)}>Propose</button>}</td>
-                </tr>
-              ))}</tbody>
-            </table>
-          </div>
+          {rows.some((r) => r.rightsizing_pricing?.kind === "fixed") && <div className="small muted">Fixed price: a change frees or reserves capacity; the bill stays the same. Money appears only for per-unit prices, as an estimate.</div>}
+          <RightsizingList rows={recs.filter(match)} days={days} pricing={pricingOf} />
           {recBlockers.map((m) => <div key={m} className="alert warn small">{m}</div>)}
           {unmeasured > 0 && <div className="small muted">{unmeasured} container{unmeasured > 1 ? "s" : ""} skipped: no usage data yet.</div>}
           {!recs.length && !recBlockers.length && <div className="empty">Requests match usage.</div>}
@@ -666,12 +664,6 @@ export function FinOps() {
           </table>
         </div>}
       </>}
-      {propose && <Drawer title="Propose resize" onClose={() => setPropose(null)}>
-        <PlanForm env={propose.environment} ns={propose.namespace} initial={{ action: "patch_resources", target_kind: "Deployment", target_name: propose.workload.split("/")[1],
-          params: { container: propose.container, requests: { cpu: propose.recommended.cpu_request, memory: propose.recommended.mem_request },
-            limits: propose.recommended.mem_limit ? { memory: propose.recommended.mem_limit } : {} },
-          reason: `Rightsizing from ${days}-day usage: p95 CPU ${propose.observed.cpu_p95}, max memory ${propose.observed.mem_max}. ${propose.findings.join("; ")}` }}
-          onDone={(id) => nav(`/actions/${id}`)} /></Drawer>}
       {hasAws && <div className="card stack" style={{ marginTop: 14 }}>
         <h2>Anomalies, budgets and forecast · {env}</h2>
         {forecast.data && !forecast.data.error && <div className="small">Forecast next 30 days: ${money(forecast.data.data.total)}</div>}

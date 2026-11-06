@@ -1,0 +1,152 @@
+{
+ "_source": "backend/moks/connectors/finops.py rightsize() on tests/test_rightsizing_changes.py KINDNET; see write_frontend_fixture()",
+ "rows": [
+  {
+   "namespace": "kube-system",
+   "workload": "DaemonSet/kindnet",
+   "container": "kindnet-cni",
+   "replicas": 5,
+   "current": {
+    "cpu_request": "100m",
+    "cpu_limit": "100m",
+    "mem_request": "50Mi",
+    "mem_limit": "50Mi"
+   },
+   "observed": {
+    "cpu_p95": 0.0012,
+    "mem_max": "48Mi"
+   },
+   "recommended": {
+    "cpu_request": "10m",
+    "cpu_limit": "100m",
+    "mem_request": "64Mi",
+    "mem_limit": "96Mi"
+   },
+   "recommendations": [
+    {
+     "resource": "memory",
+     "action": "increase",
+     "changes": [
+      {
+       "field": "mem_request",
+       "direction": "increase",
+       "reason": "max usage 48Mi plus 25% headroom is more than the 50Mi requested",
+       "current": "50Mi",
+       "recommended": "64Mi"
+      },
+      {
+       "field": "mem_limit",
+       "direction": "increase",
+       "reason": "max usage 48Mi is within 10% of the 50Mi limit: OOM risk",
+       "current": "50Mi",
+       "recommended": "96Mi"
+      }
+     ],
+     "monthly_saving": -0.02,
+     "capacity": {
+      "memory_bytes": -73400320
+     },
+     "patch": {
+      "requests": {
+       "memory": "64Mi"
+      },
+      "limits": {
+       "memory": "96Mi"
+      }
+     }
+    },
+    {
+     "resource": "cpu",
+     "action": "reduce",
+     "changes": [
+      {
+       "field": "cpu_request",
+       "direction": "decrease",
+       "reason": "p95 usage 1m plus 25% headroom needs 10m of the 100m requested",
+       "current": "100m",
+       "recommended": "10m"
+      }
+     ],
+     "monthly_saving": 1.35,
+     "capacity": {
+      "cpu_cores": 0.45
+     },
+     "patch": {
+      "requests": {
+       "cpu": "10m"
+      },
+      "limits": {}
+     }
+    }
+   ],
+   "action": "increase",
+   "monthly_saving": 1.33,
+   "findings": [
+    "memory usage within 10% of the limit: OOM risk"
+   ],
+   "coverage": 1.0,
+   "confidence": "high",
+   "environment": "mk4"
+  },
+  {
+   "namespace": "shop",
+   "workload": "Deployment/checkout",
+   "container": "app",
+   "replicas": 5,
+   "current": {
+    "cpu_request": "100m",
+    "cpu_limit": null,
+    "mem_request": "128Mi",
+    "mem_limit": "256Mi"
+   },
+   "observed": {
+    "cpu_p95": 0.18,
+    "mem_max": "128Mi"
+   },
+   "recommended": {
+    "cpu_request": "220m",
+    "cpu_limit": null,
+    "mem_request": "128Mi",
+    "mem_limit": "256Mi"
+   },
+   "recommendations": [
+    {
+     "resource": "cpu",
+     "action": "increase",
+     "changes": [
+      {
+       "field": "cpu_request",
+       "direction": "increase",
+       "reason": "p95 usage 180m is above the 100m requested: throttling and noisy-neighbour risk",
+       "current": "100m",
+       "recommended": "220m"
+      }
+     ],
+     "monthly_saving": -1.8,
+     "capacity": {
+      "cpu_cores": -0.6
+     },
+     "patch": {
+      "requests": {
+       "cpu": "220m"
+      },
+      "limits": {}
+     }
+    }
+   ],
+   "action": "increase",
+   "monthly_saving": -1.8,
+   "findings": [
+    "CPU p95 above the request: under-provisioned (throttling/noisy-neighbour risk)"
+   ],
+   "coverage": 1.0,
+   "confidence": "high",
+   "environment": "mk4"
+  }
+ ],
+ "pricing": {
+  "kind": "fixed",
+  "description": "fixed 60 USD/month split 50% CPU / 50% memory by capacity",
+  "note": "Fixed price: requests change capacity, not the bill. Amounts spread that price over capacity."
+ }
+}

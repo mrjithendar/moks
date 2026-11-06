@@ -178,6 +178,8 @@ export function useRequest<T>() {
 export interface Multi<T = any> {
   items: T[]; errors: { environment: string; namespace: string | null; error: string; denied: boolean }[]; environments: string[];
   queries: Record<string, string>; collected_at: string | null; step?: number; missing_references?: any[];
+  /** Results the server cut to its size bound: how many rows came back, and the tool's summary of the whole. */
+  truncated?: { environment: string; namespace: string | null; shown: number; summary: string }[];
 }
 export interface Scope { environment: string; display_name: string; namespaces: string[]; error?: string }
 

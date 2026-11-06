@@ -190,7 +190,8 @@ describe("inbox", () => {
     fireEvent.change(screen.getByRole("searchbox", { name: "Search conversations" }), { target: { value: "check" } });
     fireEvent.click(screen.getByRole("link", { name: /Checkout down/ }));
     await screen.findByText("answer a");
-    expect((screen.getByRole("link", { name: "Back to inbox" }) as HTMLAnchorElement).getAttribute("href")).toBe("/investigations?environment=mk4");
+    // An old ?environment= link becomes the shared scope (?env=), and keeps filtering
+    expect((screen.getByRole("link", { name: "Back to inbox" }) as HTMLAnchorElement).getAttribute("href")).toBe("/investigations?env=mk4");
     fireEvent.click(screen.getByRole("link", { name: "Back to inbox" }));
     await screen.findByText("Choose a conversation");
     expect((screen.getByRole("searchbox", { name: "Search conversations" }) as HTMLInputElement).value).toBe("check");

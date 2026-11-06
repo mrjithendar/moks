@@ -4,13 +4,16 @@ import { api } from "./api";
 import { useAuth } from "./auth";
 import { Badge, useInterval } from "./components";
 import { navFor, titleFor } from "./nav";
+import { ScopeIndicator, scopeSearch } from "./scope";
 import { Icon, useModal } from "./ui";
 
 const THEME_KEY = "moks.theme";
 const COLLAPSE_KEY = "moks.sidebar";
+const DENSITY_KEY = "moks.density";
 
 export function applyStoredTheme() {
   document.documentElement.dataset.theme = localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark";
+  document.documentElement.dataset.density = localStorage.getItem(DENSITY_KEY) === "compact" ? "compact" : "comfortable";
 }
 
 function Brand({ wordmark = true }: { wordmark?: boolean }) {
@@ -24,14 +27,16 @@ function Brand({ wordmark = true }: { wordmark?: boolean }) {
 
 function NavList({ collapsed = false, label }: { collapsed?: boolean; label: string }) {
   const { can } = useAuth();
+  const loc = useLocation();
   const groups = useMemo(() => navFor(can), [can]);
+  const carry = scopeSearch(loc.search); // scoped pages keep the environment and namespace
   return (
     <nav aria-label={label} className="nav-list">
       {groups.map((g) => (
         <div key={g.label} role="group" aria-label={g.label}>
           {!collapsed && <div className="nav-group">{g.label}</div>}
           {g.items.map((i) => (
-            <NavLink key={i.to} to={i.to} end={i.end} aria-label={collapsed ? i.label : undefined} data-tip={collapsed ? i.label : undefined}>
+            <NavLink key={i.to} to={{ pathname: i.to, search: i.scoped ? carry : "" }} end={i.end} aria-label={collapsed ? i.label : undefined} data-tip={collapsed ? i.label : undefined}>
               <Icon name={i.icon} />{!collapsed && <span>{i.label}</span>}
             </NavLink>
           ))}
@@ -45,6 +50,7 @@ function ProfileMenu({ commit, version }: { commit?: string; version?: string })
   const { me, logout } = useAuth();
   const [open, setOpen] = useState(false);
   const [theme, setTheme] = useState(() => document.documentElement.dataset.theme ?? "dark");
+  const [density, setDensity] = useState(() => document.documentElement.dataset.density ?? "comfortable");
   const box = useRef<HTMLDivElement>(null);
   const [mixed, setMixed] = useState(false);
   useEffect(() => {
@@ -64,6 +70,12 @@ function ProfileMenu({ commit, version }: { commit?: string; version?: string })
     document.documentElement.dataset.theme = next;
     setTheme(next);
   }
+  function toggleDensity() {
+    const next = density === "compact" ? "comfortable" : "compact";
+    localStorage.setItem(DENSITY_KEY, next);
+    document.documentElement.dataset.density = next;
+    setDensity(next);
+  }
   const initial = (me?.display_name || me?.email || "?").slice(0, 1).toUpperCase();
   return (
     <div className="profile" ref={box}>
@@ -73,6 +85,7 @@ function ProfileMenu({ commit, version }: { commit?: string; version?: string })
           <div className="menu-head"><strong>{me?.display_name}</strong><div className="small muted">{me?.email}</div>
             <div className="small muted">{me?.roles.map((r) => `${r.role}@${r.environment}/${r.namespace}`).join(", ") || "no roles"}</div></div>
           <button type="button" className="ghost" onClick={toggleTheme}>{theme === "dark" ? "Use light theme" : "Use dark theme"}</button>
+          <button type="button" className="ghost" onClick={toggleDensity}>{density === "compact" ? "Comfortable tables" : "Compact tables"}</button>
           <button type="button" className="ghost" onClick={logout}>Sign out</button>
           <div className="small muted">MOKS {version} · <span className="mono">{commit?.slice(0, 12)}</span></div>
           {mixed && <div className="alert warn small">Components are running different builds. A rollout may be incomplete.</div>}
@@ -154,10 +167,10 @@ export function Layout({ children }: { children: ReactNode }) {
           </button>
         </aside>
         <header className="top">
-          <button type="button" className="ghost icon menu-btn" aria-label="Open navigation" aria-expanded={drawer} onClick={() => setDrawer(true)}><Icon name="menu" size={22} /></button>
+          <button type="button" className="ghost menu-btn" aria-expanded={drawer} aria-haspopup="dialog" onClick={() => setDrawer(true)}><Icon name="menu" size={20} /><span>Menu</span></button>
           <div className="crumbs">{title.group && <span className="muted crumb-group">{title.group}</span>}<strong>{title.label}</strong></div>
           <div className="top-right">
-            {scope && <span className="scope-chip mono">{scope.environment}{scope.namespace ? `/${scope.namespace}` : ""}</span>}
+            <ScopeIndicator fixed={scope} />
             {scope?.production && <Badge kind="warn">production</Badge>}
             <span className={`conn ${connection}`} role="status" title={connection === "connected" ? "Connected to MOKS" : "Cannot reach MOKS"}>
               <span className="sr-only">{connection === "connected" ? "Connected to MOKS" : "Cannot reach MOKS"}</span>
