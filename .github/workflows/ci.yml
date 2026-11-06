@@ -215,9 +215,11 @@ jobs:
           retention-days: 400
 
   deploy:
-    # Waits for both images, so a restart pulls the new build whichever repository values-minikube.yaml runs.
+    # Waits for both images, so a restart pulls the new build whichever repository values-minikube.yaml runs. Only the
+    # default image must succeed: a failed CrewAI build leaves moks-crewai:latest where it was, and if mk4 runs that
+    # image the commit check at the end fails the job, so the failure still shows.
     needs: [release, release-crewai]
-    if: ${{ !cancelled() && needs.release.result == 'success' && needs.release-crewai.result == 'success' && vars.MK4_DEPLOY == 'true' }}
+    if: ${{ !cancelled() && needs.release.result == 'success' && vars.MK4_DEPLOY == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
