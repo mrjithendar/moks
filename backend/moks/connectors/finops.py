@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -265,14 +266,110 @@ def allocate(workloads: list[dict], cpu_price: float, gib_price: float, hours: f
     return out
 
 
+def exact_cpu(c: float) -> str | None:
+    """A current CPU quantity as it is set, in millicores, never rounded the way recommendations are."""
+    return f"{round(c * 1000)}m" if c else None
+
+
+def exact_mem(b: float) -> str | None:
+    """A current memory quantity as it is set: whole Mi or Ki where it is one, bytes otherwise."""
+    if not b:
+        return None
+    if b % 1024**2 == 0:
+        return f"{int(b // 1024**2)}Mi"
+    return f"{int(b // 1024)}Ki" if b % 1024 == 0 else str(int(b))
+
+
+def _q_cpu(c: float) -> float:
+    return max(10, int(round(c * 1000 / 10.0) * 10)) / 1000  # the value fmt_cpu writes
+
+
+def _q_mem(b: float) -> float:
+    return max(16, int(math.ceil(b / 1024**2 / 16.0) * 16)) * 1024**2  # the value fmt_mem writes
+
+
+RS_ACTIONS = ("increase", "set_requests", "reduce")  # most urgent first
+
+
+def _action(changes: list[dict]) -> str:
+    dirs = {c["direction"] for c in changes}
+    return "increase" if "increase" in dirs else "set_requests" if "set" in dirs else "reduce"
+
+
+def _memory(c: dict, rec_mem: float, gib_price: float, min_saving: float) -> dict | None:
+    req, lim, peak = c["mem_request"], c["mem_limit"], c["mem_max"]
+    oom = bool(lim) and peak >= 0.9 * lim
+    changes, new_req, new_lim = [], req, lim
+    if not req:
+        new_req = min(rec_mem, lim) if lim else rec_mem
+        changes.append({"field": "mem_request", "direction": "set", "reason": f"no memory request, so the scheduler reserves none; max usage {fmt_mem(peak)} plus 25% headroom"})
+    elif rec_mem > req and (oom or peak > req):
+        new_req = rec_mem
+        changes.append({"field": "mem_request", "direction": "increase", "reason": f"max usage {fmt_mem(peak)} plus 25% headroom is more than the {exact_mem(req)} requested"})
+    elif req > rec_mem and (req - rec_mem) / 1024**3 * c["replicas"] * gib_price * 730 >= min_saving:
+        new_req = rec_mem
+        changes.append({"field": "mem_request", "direction": "decrease", "reason": f"max usage {fmt_mem(peak)} plus 25% headroom needs {fmt_mem(rec_mem)} of the {exact_mem(req)} requested"})
+    if oom:
+        new_lim = _q_mem(max(rec_mem * 1.5, lim))
+        changes.append({"field": "mem_limit", "direction": "increase", "reason": f"max usage {fmt_mem(peak)} is within 10% of the {exact_mem(lim)} limit: OOM risk"})
+    elif lim and new_req > lim:
+        new_lim = new_req
+        changes.append({"field": "mem_limit", "direction": "increase", "reason": "a request cannot be above its limit"})
+    if not changes:
+        return None
+    for ch in changes:
+        ch["current"] = exact_mem(req if ch["field"] == "mem_request" else lim)
+        ch["recommended"] = fmt_mem(new_req if ch["field"] == "mem_request" else new_lim)
+    freed = (req - new_req) * c["replicas"]
+    return {"resource": "memory", "action": _action(changes), "changes": changes, "monthly_saving": round(freed / 1024**3 * gib_price * 730, 2),
+            "capacity": {"memory_bytes": int(freed)},
+            "patch": {"requests": {"memory": fmt_mem(new_req)} if new_req != req else {}, "limits": {"memory": fmt_mem(new_lim)} if new_lim != lim else {}}}
+
+
+def _cpu(c: dict, rec_cpu: float, cpu_price: float, min_saving: float) -> dict | None:
+    req, lim, p95 = c["cpu_request"], c["cpu_limit"], c["cpu_p95"]
+    changes, new_req, new_lim = [], req, lim
+    if not req:
+        new_req = rec_cpu
+        changes.append({"field": "cpu_request", "direction": "set", "reason": f"no CPU request, so the scheduler reserves none; p95 usage {round(p95 * 1000)}m plus 25% headroom"})
+    elif p95 > req * 1.1:
+        new_req = rec_cpu
+        changes.append({"field": "cpu_request", "direction": "increase", "reason": f"p95 usage {round(p95 * 1000)}m is above the {exact_cpu(req)} requested: throttling and noisy-neighbour risk"})
+    elif req > rec_cpu and (req - rec_cpu) * c["replicas"] * cpu_price * 730 >= min_saving:
+        new_req = rec_cpu
+        changes.append({"field": "cpu_request", "direction": "decrease", "reason": f"p95 usage {round(p95 * 1000)}m plus 25% headroom needs {fmt_cpu(rec_cpu)} of the {exact_cpu(req)} requested"})
+    if lim and new_req > lim:
+        new_lim = new_req
+        changes.append({"field": "cpu_limit", "direction": "increase", "reason": "a request cannot be above its limit"})
+    if not changes:
+        return None
+    for ch in changes:
+        ch["current"] = exact_cpu(req if ch["field"] == "cpu_request" else lim)
+        ch["recommended"] = fmt_cpu(new_req if ch["field"] == "cpu_request" else new_lim)
+    freed = (req - new_req) * c["replicas"]
+    return {"resource": "cpu", "action": _action(changes), "changes": changes, "monthly_saving": round(freed * cpu_price * 730, 2),
+            "capacity": {"cpu_cores": round(freed, 4)},
+            "patch": {"requests": {"cpu": fmt_cpu(new_req)} if new_req != req else {}, "limits": {"cpu": fmt_cpu(new_lim)} if new_lim != lim else {}}}
+
+
 def rightsize(containers: list[dict], cpu_price: float, gib_price: float, headroom: float = 1.25,
               min_saving_month: float = 0.5) -> list[dict]:
     """containers: {namespace, workload, container, replicas, cpu_request, cpu_limit, mem_request, mem_limit,
-    cpu_p95, mem_max}. Recommends requests at p95 CPU / max memory plus headroom; flags OOM risk."""
+    cpu_p95, mem_max}. One row per container that should change.
+
+    Memory and CPU are separate entries in `recommendations`, each with its own action and with only the fields
+    that change in `changes` (field, current, recommended, direction, reason) and `patch` (exactly those fields,
+    for patch_resources). Requests target p95 CPU and max memory plus headroom; memory within 10% of its limit is
+    an OOM risk and raises the limit; a request never ends up above its limit. Current values are shown as set,
+    recommended ones rounded the way patch_resources accepts them. `capacity` is what the change frees (positive)
+    or reserves (negative) across replicas; `monthly_saving` prices that with the cost model.
+
+    The row keeps its earlier fields: `current` and `recommended` hold all four values (unchanged ones equal),
+    `action` is the most urgent of its recommendations, and `monthly_saving` their sum."""
     recs = []
     for c in containers:
-        rec_cpu = max(0.01, c["cpu_p95"] * headroom)
-        rec_mem = max(32 * 1024**2, c["mem_max"] * headroom)
+        rec_cpu = _q_cpu(max(0.01, c["cpu_p95"] * headroom))
+        rec_mem = _q_mem(max(32 * 1024**2, c["mem_max"] * headroom))
         findings = []
         if c["mem_limit"] and c["mem_max"] >= 0.9 * c["mem_limit"]:
             findings.append("memory usage within 10% of the limit: OOM risk")
@@ -280,25 +377,21 @@ def rightsize(containers: list[dict], cpu_price: float, gib_price: float, headro
             findings.append("CPU p95 above the request: under-provisioned (throttling/noisy-neighbour risk)")
         if not c["cpu_request"] or not c["mem_request"]:
             findings.append("missing requests: the scheduler cannot reserve capacity (BestEffort/Burstable)")
-        d_cpu = (c["cpu_request"] - rec_cpu) * c["replicas"]
-        d_mem = (c["mem_request"] - rec_mem) / 1024**3 * c["replicas"]
-        monthly = (d_cpu * cpu_price + d_mem * gib_price) * 730
-        action = "keep"
-        if monthly >= min_saving_month and c["cpu_request"] and c["mem_request"]:
-            action = "reduce"
-        elif findings:
-            action = "increase" if any("risk" in f or "under" in f for f in findings) else "set_requests"
-        if action == "keep":
+        parts = [r for r in (_memory(c, rec_mem, gib_price, min_saving_month), _cpu(c, rec_cpu, cpu_price, min_saving_month)) if r]
+        if not parts:
             continue
+        current = {"cpu_request": exact_cpu(c["cpu_request"]), "cpu_limit": exact_cpu(c.get("cpu_limit") or 0),
+                   "mem_request": exact_mem(c["mem_request"]), "mem_limit": exact_mem(c["mem_limit"])}
+        recommended = dict(current)
+        for r in parts:
+            for ch in r["changes"]:
+                recommended[ch["field"]] = ch["recommended"]
         recs.append({
             **{k: c[k] for k in ("namespace", "workload", "container", "replicas")},
-            "current": {"cpu_request": fmt_cpu(c["cpu_request"]) if c["cpu_request"] else None,
-                        "mem_request": fmt_mem(c["mem_request"]) if c["mem_request"] else None,
-                        "mem_limit": fmt_mem(c["mem_limit"]) if c["mem_limit"] else None},
+            "current": current,
             "observed": {"cpu_p95": round(c["cpu_p95"], 4), "mem_max": fmt_mem(c["mem_max"])},
-            "recommended": {"cpu_request": fmt_cpu(rec_cpu), "mem_request": fmt_mem(rec_mem),
-                            "mem_limit": fmt_mem(max(rec_mem * 1.5, c["mem_limit"] or 0)) if action != "reduce" else (fmt_mem(c["mem_limit"]) if c["mem_limit"] else None)},
-            "action": action, "monthly_saving": round(monthly, 2), "findings": findings,
+            "recommended": recommended, "recommendations": parts,
+            "action": min((r["action"] for r in parts), key=RS_ACTIONS.index), "monthly_saving": round(sum(r["monthly_saving"] for r in parts), 2), "findings": findings,
             "coverage": round(c.get("coverage", 1.0), 2), "confidence": "low" if c.get("coverage", 1.0) < LOW_COVERAGE else "high",
         })
     recs.sort(key=lambda r: (r["action"] != "increase", -r["monthly_saving"]))

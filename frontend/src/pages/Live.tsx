@@ -2,8 +2,10 @@ import { useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, qs } from "../api";
 import { useAuth } from "../auth";
-import { Badge, type Col, DataTable, EnvNsFilter, ErrorBox, Loading, PageHead, PartialErrors, type Multi, type Scope, SourceRef, Time, useLoad, useScopes } from "../components";
+import { Badge, type Col, DataTable, EnvNsFilter, ErrorBox, PageHead, type Multi, type Scope, SourceRef, Time, useLoad, useScopes } from "../components";
 import { type Chip, FilterPanel, useUrlFilters } from "../filters";
+import { multiStates, StateView } from "../states";
+import { ResourceTable } from "../table";
 import { CopyButton, Drawer, Empty, Identifier, type MenuItem, Skeleton, Truncate } from "../ui";
 import { EvidenceData } from "./Investigate";
 import { PlanForm } from "./Ops";
@@ -81,18 +83,23 @@ function ExplorerTab({ tab, scopes, f, set, clear, onShowPods }: { tab: Tab; sco
     <>
       <FilterPanel chips={chips} onClear={clear}
         search={<input type="search" className="grow" aria-label="Filter rows" value={f.q} onChange={(e) => set({ q: e.target.value })} placeholder="name, image, reason…" />}
-        actions={<button type="button" className="ghost" onClick={r.reload} disabled={r.loading}>{r.loading ? "Loading…" : "Refresh"}</button>}>
-        <EnvNsFilter scopes={scopes} env={f.env} ns={f.ns} onEnv={(env) => set({ env })} onNs={(ns) => set({ ns })} noNamespace={tab === "nodes"} />
-        {problem && <label className="inline"><input type="checkbox" checked={f.only} onChange={(e) => set({ only: e.target.checked })} /> {problem}</label>}
-      </FilterPanel>
-      <Loading load={r} rows={8} />
+        actions={<button type="button" className="ghost" onClick={r.reload} disabled={r.loading}>{r.loading ? "Loading…" : "Refresh"}</button>}
+        advanced={<div className="filters">
+          <EnvNsFilter scopes={scopes} env={f.env} ns={f.ns} onEnv={(env) => set({ env, ns: "all" })} onNs={(ns) => set({ ns })} noNamespace={tab === "nodes"} />
+          {problem && <label className="inline"><input type="checkbox" checked={f.only} onChange={(e) => set({ only: e.target.checked })} /> {problem}</label>}
+        </div>} />
+      {!r.data && r.loading && <StateView kind="loading" title={`Loading ${tab}`} />}
+      {multiStates({ data: r.data, error: r.error, reload: r.reload, what: tab })}
       {r.data && (
         <div className="card mt">
           <div className="row between small muted list-head">
-            <span>{rows.length} of {tab === "ingresses" ? "all" : r.data.items.length} {tab} across {r.data.environments.length} environment(s)</span>
+            <span>{rows.length === r.data.items.length ? `${rows.length} ${tab}` : `${rows.length} of ${r.data.items.length} ${tab} shown`}{r.data.truncated?.length ? " (incomplete: see above)" : ""} across {plural(r.data.environments.length, "environment")}</span>
             <span>collected <Time iso={r.data.collected_at} /></span>
           </div>
-          <PartialErrors errors={r.data.errors} />
+          {!rows.length && (r.data.items.length
+            ? <StateView kind="empty" title={`No ${tab} match the filters`} why={`${r.data.items.length} ${tab} were read, and the filters hide all of them.`} next={<button type="button" className="ghost small" onClick={clear}>Clear all filters</button>} />
+            : <StateView kind="empty" title={`No ${tab} here`} why={f.ns !== "all" ? `Namespace ${f.ns} has no ${tab} right now.` : `None of the namespaces you can read has ${tab} right now.`} next="Choose another namespace or environment." />)}
+          {rows.length > 0 && <>
           {tab === "pods" && <PodTable pods={rows} onOpen={setPod} onInvestigate={(p) => investigate(p.environment, p.namespace, `Why is pod ${p.name} unhealthy?`)} />}
           {tab === "workloads" && <WorkloadTable rows={rows} canManage={canManage} onManage={setManage} onShowPods={onShowPods} />}
           {tab === "services" && <ServiceTable rows={rows} canManage={canManage} onManage={setManage} />}
@@ -114,6 +121,7 @@ function ExplorerTab({ tab, scopes, f, set, clear, onShowPods }: { tab: Tab; sco
             { key: "allocatable", head: "Allocatable", wide: true, cell: (x: any) => show(x.allocatable) },
             { key: "kubelet", head: "Kubelet", cell: (x: any) => show(x.kubelet) },
           ]} />}
+          </>}
           {tab === "config-audit" && <ConfigAudit rows={rows} missing={r.data.missing_references ?? []} />}
         </div>
       )}
@@ -162,26 +170,35 @@ function isProblem(tab: Tab, x: any): boolean {
   return true;
 }
 
+/** What a pod's state means at a glance: a waiting reason (CrashLoopBackOff) wins over the phase (Running). */
+export function podStatus(p: any): { tone: "ok" | "warn" | "bad" | "neutral"; text: string } {
+  const now = p.problems.find((x: any) => x.state === "waiting" || x.state === "terminated" || x.state === "unschedulable");
+  if (now) return { tone: "bad", text: now.reason ?? now.state };
+  const [up, of] = String(p.ready ?? "").split("/").map(Number);
+  if (p.phase === "Running" && of && up < of) return { tone: "warn", text: `Not ready (${p.ready})` };
+  if (p.phase === "Running") return { tone: "ok", text: "Running" };
+  return { tone: p.phase === "Succeeded" ? "neutral" : "warn", text: p.phase };
+}
+
+const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+
 function PodTable({ pods, onOpen, onInvestigate }: { pods: any[]; onOpen: (p: any) => void; onInvestigate: (p: any) => void }) {
   const problems = (p: any) => p.problems.map((x: any) => `${x.reason ?? x.state}${x.exitCode != null ? ` (${x.exitCode})` : ""}`).join(", ");
   return (
-    <DataTable label="Pods" rows={pods} onRow={onOpen} rowKey={(p) => p.environment + p.namespace + p.name}
-      empty={<Empty title="No pods match.">Clear a filter or choose another namespace.</Empty>}
-      menu={(p) => ({ label: `Actions for pod ${p.name}`, items: [
+    <ResourceTable label="Pods" rows={pods} rowKey={(p) => p.environment + p.namespace + p.name} name={(p) => p.name} what="pod name"
+      status={podStatus} action={{ label: "Details", run: onOpen }}
+      menu={(p) => [
         { label: "Copy name", run: () => { navigator.clipboard?.writeText(p.name); } },
-        { label: "View details and full name", run: () => onOpen(p) },
         { label: "Investigate", run: () => onInvestigate(p) },
-      ] })}
-      cols={[
-        { key: "pod", head: "Pod", primary: true, cell: (p) => <Truncate text={p.name} mono /> },
-        { key: "phase", head: "Phase", status: true, cell: (p) => <Badge kind={p.phase === "Running" ? "ok" : p.phase === "Succeeded" ? "neutral" : "warn"}>{p.phase}</Badge> },
-        ...scopeCols<any>().slice(1),
-        { key: "ready", head: "Ready", cell: (p) => p.ready, meta: (p) => `${p.ready} ready` },
-        { key: "restarts", head: "Restarts", cell: (p) => (p.restarts > 0 ? <Badge kind="warn">{p.restarts}</Badge> : 0), meta: (p) => (p.restarts > 0 ? <Badge kind="warn">{p.restarts} restarts</Badge> : "") },
-        { key: "problems", head: "Problems", cell: (p) => <Truncate text={problems(p)} />, meta: (p) => problems(p) },
-        { key: "env", head: "Environment", wide: true, cell: (p) => p.environment },
-        { key: "node", head: "Node", wide: true, cell: (p) => <span className="small muted">{p.node}</span> },
-        { key: "age", head: "Age", wide: true, cell: (p) => p.age },
+      ]}
+      fields={[
+        { key: "ns", head: "Namespace", cell: (p) => <Truncate text={p.namespace} mono /> },
+        { key: "ready", head: "Ready", cell: (p) => p.ready },
+        { key: "restarts", head: "Restarts", cell: (p) => (p.restarts > 0 ? <Badge kind="warn">{plural(p.restarts, "restart")}</Badge> : "0") },
+        { key: "problems", head: "Last problem", cell: (p) => <Truncate text={problems(p) || "—"} /> },
+        { key: "env", head: "Environment", cell: (p) => p.environment },
+        { key: "node", head: "Node", cell: (p) => <span className="small muted">{p.node}</span> },
+        { key: "age", head: "Age", cell: (p) => p.age },
       ]} />
   );
 }

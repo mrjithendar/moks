@@ -1,13 +1,16 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
-import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
 import { Badge, ErrorBox, Time, useInterval, useLoad } from "../components";
 import { type Chip, FilterPanel, useUrlFilters } from "../filters";
 import { useFollow } from "../follow";
 import { type Ev, type StreamState, useInvestigationEvents } from "../investigationStream";
+import { evidenceTarget } from "../evidence";
 import { Markdown } from "../markdown";
+import { useScope } from "../scope";
 import { useHeaderScope } from "../shell";
+import { StateView } from "../states";
 import { ActionMenu, Dialog, Empty, Icon, Skeleton, Truncate, useFeedback, useIsMobile, useModal } from "../ui";
 import { EvidenceBody, Report, Timeline } from "./Investigate";
 import { PlanForm } from "./Ops";
@@ -44,16 +47,22 @@ export function messageKind(m: { role: string; investigation_id?: string | null;
 
 const SEVERITY: Record<string, "bad" | "warn" | "neutral"> = { sev1: "bad", sev2: "bad", sev3: "warn", sev4: "neutral" };
 const STATES: Record<string, string> = { running: "Running", completed: "Completed", failed: "Failed", cancelled: "Cancelled" };
+const STATE_TONE: Record<string, "ok" | "bad" | "info" | "warn"> = { running: "info", completed: "ok", failed: "bad", cancelled: "warn" };
 const stateOf = (c: any) => (c.running ? "running" : c.status ?? "");
-const INBOX = { environment: "", state: "", unread: false, deleted: false, sort: "recent" };
+const INBOX = { state: "", unread: false, deleted: false, sort: "recent" }; // environment and namespace are the shared scope (env, ns)
+const LAST = "moks.inbox.last"; // the conversation last opened, so Back can show where you were
 
-function shortTime(iso: string) {
-  const d = new Date(iso), now = new Date();
-  if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-  return d.toLocaleDateString(undefined, d.getFullYear() === now.getFullYear() ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" });
+export function relativeTime(iso: string, now = Date.now()): string {
+  const s = Math.round((now - Date.parse(iso)) / 1000);
+  if (s < 45) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  if (s < 86400 * 7) return `${Math.round(s / 86400)} d ago`;
+  return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
+const absolute = (iso: string) => new Date(iso).toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZoneName: "short" });
 
-function InboxRow({ c, current, search, onChange, onDelete }: { c: any; current?: string; search: string; onChange: () => void; onDelete: (c: any) => void }) {
+function InboxRow({ c, current, recent, search, onChange, onDelete }: { c: any; current?: string; recent?: boolean; search: string; onChange: () => void; onDelete: (c: any) => void }) {
   const { toast } = useFeedback();
   const state = stateOf(c);
   const items = [
@@ -62,20 +71,20 @@ function InboxRow({ c, current, search, onChange, onDelete }: { c: any; current?
     c.can_manage && !c.deleted_view ? { label: "Delete", danger: true, run: () => onDelete(c) } : null,
   ].filter((x): x is NonNullable<typeof x> => !!x);
   return (
-    <li className={`inbox-row${c.id === current ? " active" : ""}${c.unread ? " unread" : ""}`}>
-      <Link to={{ pathname: `/conversations/${c.id}`, search }} className="inbox-main" aria-current={c.id === current ? "page" : undefined}>
+    <li className={`inbox-row${c.id === current ? " active" : ""}${recent && c.id !== current ? " recent" : ""}${c.unread ? " unread" : ""}`} data-id={c.id}>
+      <Link to={{ pathname: `/conversations/${c.id}`, search }} className="inbox-main" aria-current={c.id === current ? "page" : undefined} onClick={() => sessionStorage.setItem(LAST, c.id)}>
         <span className="inbox-top">
           {c.unread && <span className="inbox-dot" aria-hidden="true" />}{c.unread && <span className="sr-only">Unread: </span>}
           <Truncate text={c.title} />
-          <time className="inbox-time" dateTime={c.updated_at} title={new Date(c.updated_at).toLocaleString(undefined, { timeZoneName: "short" })}>{shortTime(c.updated_at)}</time>
         </span>
         {c.preview && <span className="inbox-preview">{c.preview}</span>}
         <span className="inbox-meta">
-          <span className="mono trunc">{c.environment}/{c.namespace}</span>
+          {state && <Badge kind={STATE_TONE[state] ?? "neutral"}>{STATES[state] ?? state}</Badge>}
           {c.severity && <Badge kind={SEVERITY[c.severity] ?? "neutral"}>{c.severity}</Badge>}
-          {state && state !== "completed" && <Badge kind={state === "failed" ? "bad" : state === "running" ? "info" : "warn"}>{STATES[state] ?? state}</Badge>}
+          <span className="mono trunc">{c.environment}/{c.namespace}</span>
         </span>
       </Link>
+      <time className="inbox-time" dateTime={c.updated_at} data-abs={absolute(c.updated_at)} tabIndex={0} aria-label={`Updated ${absolute(c.updated_at)}`}>{relativeTime(c.updated_at)}</time>
       <ActionMenu label={`Actions for ${c.title}`} items={items} />
     </li>
   );
@@ -87,22 +96,41 @@ function ConversationList({ current }: { current?: string }) {
   const nav = useNavigate();
   const loc = useLocation();
   const Heading = current ? "h2" : "h1"; // with a conversation open, its subject is the page's heading
-  const [f, set, clear] = useUrlFilters(INBOX);
+  const [f, setFilters, clearFilters] = useUrlFilters(INBOX);
+  const [scope, setScope] = useScope();
+  const [params, setParams] = useSearchParams();
+  useEffect(() => { // links from before the shared scope used ?environment=
+    const legacy = params.get("environment");
+    if (legacy === null) return;
+    setParams((prev) => { const n = new URLSearchParams(prev); n.delete("environment"); if (legacy) n.set("env", legacy); return n; }, { replace: true });
+  }, [params, setParams]);
+  const set = setFilters;
+  const clear = () => { clearFilters(); setScope({ env: "all" }); };
   const [search, setSearch] = useState(""); // what someone searches for stays out of the URL
+  const recent = current ? undefined : sessionStorage.getItem(LAST) ?? undefined;
   const list = useLoad(() => api<any[]>(`/conversations?limit=200${f.deleted ? "&deleted=true" : ""}`), [f.deleted]);
   useInterval(() => { if (!list.loading) list.reload(); }, 15000);
   const needle = search.trim().toLowerCase();
   const all = (list.data ?? []).map((c) => ({ ...c, deleted_view: f.deleted }));
   const rows = all.filter((c) => (!needle || `${c.title} ${c.preview} ${c.environment} ${c.namespace} ${c.owner}`.toLowerCase().includes(needle))
-    && (!f.environment || c.environment === f.environment) && (!f.state || stateOf(c) === f.state) && (!f.unread || c.unread));
+    && (scope.env === "all" || c.environment === scope.env) && (scope.ns === "all" || c.namespace === scope.ns) && (!f.state || stateOf(c) === f.state) && (!f.unread || c.unread));
   if (f.sort === "oldest") rows.reverse();
   if (f.sort === "subject") rows.sort((a, b) => a.title.localeCompare(b.title));
   const envs = [...new Set((list.data ?? []).map((c) => c.environment as string))].sort();
 
   // The list is hidden, not unmounted, on phones: the browser forgets its scroll offset, so keep it here.
   const scroller = useRef<HTMLUListElement>(null);
-  const offset = useRef(0);
-  useLayoutEffect(() => { if (!current && scroller.current) scroller.current.scrollTop = offset.current; }, [current]);
+  // The list remounts between the list and detail routes, so its offset is kept for this tab and these filters.
+  const scrollKey = `moks.inbox.scroll${loc.search}`;
+  const offset = useRef(Number(sessionStorage.getItem(scrollKey) ?? 0));
+  const restored = useRef(false);
+  useLayoutEffect(() => {
+    if (current || !scroller.current || !list.data || restored.current) return;
+    restored.current = true;
+    if (offset.current) { scroller.current.scrollTop = offset.current; return; }
+    if (recent) scroller.current.querySelector<HTMLElement>(`[data-id="${CSS.escape(recent)}"]`)?.scrollIntoView?.({ block: "center" });
+  }, [current, recent, list.data]);
+  useEffect(() => { if (current) restored.current = false; }, [current]);
 
   async function remove(c: any) {
     if (!await confirm({ title: "Delete this conversation?", body: "It is hidden from everyone, and you can restore it from Show deleted.", action: "Delete conversation", danger: true })) return;
@@ -113,7 +141,8 @@ function ConversationList({ current }: { current?: string }) {
     } catch (e) { toast(e instanceof Error ? e.message : String(e), "bad"); }
   }
   const chips: Chip[] = [
-    ...(f.environment ? [{ key: "e", label: f.environment, onRemove: () => set({ environment: "" }) }] : []),
+    ...(scope.env !== "all" ? [{ key: "e", label: scope.env, onRemove: () => setScope({ env: "all" }) }] : []),
+    ...(scope.ns !== "all" ? [{ key: "n", label: `namespace ${scope.ns}`, onRemove: () => setScope({ ns: "all" }) }] : []),
     ...(f.state ? [{ key: "s", label: STATES[f.state] ?? f.state, onRemove: () => set({ state: "" }) }] : []),
     ...(f.unread ? [{ key: "u", label: "Unread", onRemove: () => set({ unread: false }) }] : []),
     ...(f.deleted ? [{ key: "d", label: "Deleted", onRemove: () => set({ deleted: false }) }] : []),
@@ -126,7 +155,7 @@ function ConversationList({ current }: { current?: string }) {
         <FilterPanel chips={chips} onClear={clear} label="Filters"
           search={<input type="search" className="grow" aria-label="Search conversations" placeholder="Search subject, preview, scope" value={search} onChange={(e) => setSearch(e.target.value)} />}
           advanced={<div className="filters">
-            <label>Environment<select value={f.environment} onChange={(e) => set({ environment: e.target.value })}><option value="">All</option>{envs.map((e) => <option key={e}>{e}</option>)}</select></label>
+            <label>Environment<select value={scope.env} onChange={(e) => setScope({ env: e.target.value })}><option value="all">All authorized environments</option>{envs.map((e) => <option key={e}>{e}</option>)}</select></label>
             <label>Status<select value={f.state} onChange={(e) => set({ state: e.target.value })}><option value="">Any</option>{Object.entries(STATES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select></label>
             <label>Sort<select value={f.sort} onChange={(e) => set({ sort: e.target.value })}><option value="recent">Newest first</option><option value="oldest">Oldest first</option><option value="subject">Subject</option></select></label>
             <label className="inline"><input type="checkbox" checked={f.unread} onChange={(e) => set({ unread: e.target.checked })} /> Unread only</label>
@@ -135,8 +164,8 @@ function ConversationList({ current }: { current?: string }) {
       </div>
       <ErrorBox error={list.error} onRetry={list.reload} />
       {list.loading && !list.data && <div className="inbox-pad"><Skeleton rows={6} label="Loading conversations" /></div>}
-      <ul className="ws-list-items" ref={scroller} onScroll={(e) => { if (!current || e.currentTarget.offsetParent) offset.current = e.currentTarget.scrollTop; }}>
-        {rows.map((c) => <InboxRow key={c.id} c={c} current={current} search={loc.search} onChange={list.reload} onDelete={remove} />)}
+      <ul className="ws-list-items" ref={scroller} onScroll={(e) => { if (!current || e.currentTarget.offsetParent) { offset.current = e.currentTarget.scrollTop; sessionStorage.setItem(scrollKey, String(offset.current)); } }}>
+        {rows.map((c) => <InboxRow key={c.id} c={c} current={current} recent={c.id === recent} search={loc.search} onChange={list.reload} onDelete={remove} />)}
         {list.data && !rows.length && <li><Empty title={needle || chips.length ? "No conversations match." : "No conversations yet."}>{needle || chips.length ? "Change the search or clear the filters." : "Start a new investigation and it appears here."}</Empty></li>}
       </ul>
     </section>
@@ -271,6 +300,59 @@ const Turn = memo(function Turn({ m, status, conversation, latest, onChange, onC
   );
 }, (a, b) => a.m.id === b.m.id && a.m.deleted === b.m.deleted && a.m.content === b.m.content && a.m.can_delete === b.m.can_delete && a.m.can_restore === b.m.can_restore && a.status === b.status && a.latest === b.latest);
 
+// ---- Reading pane ----------------------------------------------------------------------------
+
+/** The evidence of one investigation, in the order it was collected. Failed reads stay listed with what went
+ *  wrong, and everything already collected stays when a connector fails part-way. */
+function EvidenceList({ id, running, onOpen }: { id: string; running: boolean; onOpen: (ref: string) => void }) {
+  const inv = useLoad(() => api<any>(`/investigations/${id}`), [id]);
+  useInterval(inv.reload, 4000, running);
+  const ev: any[] = inv.data?.id === id ? inv.data.evidence ?? [] : [];
+  if (!inv.data) return inv.error ? <ErrorBox error={inv.error} onRetry={inv.reload} /> : <Skeleton rows={3} label="Loading evidence" />;
+  const failed = ev.filter((e) => !e.ok);
+  return (
+    <>
+      {failed.length > 0 && <StateView kind="partial" why={`${failed.length} of ${ev.length} evidence reads failed. The rest is shown, and the report says what is missing.`} />}
+      {!ev.length ? <StateView kind="empty" title="No evidence yet" why={running ? "MOKS is still collecting evidence." : "No tool returned evidence for this question."} />
+        : <ul className="rp-ev">{ev.map((e) => {
+          const t = evidenceTarget(e);
+          return <li key={e.ref}><button type="button" className="ghost" onClick={() => onOpen(e.ref)} aria-label={`Open evidence ${e.ref}: ${t.kind}`}>
+            <span className="row tight"><span className="cite" style={{ marginLeft: 0 }}>{e.ref}</span><strong>{t.kind}</strong>{!e.ok && <Badge kind="bad">✕ failed</Badge>}</span>
+            <span className="small muted clamp-2">{e.summary}</span>
+            {t.detail && <span className="mono small trunc" style={{ maxWidth: "100%" }}>{t.detail}</span>}
+          </button></li>;
+        })}</ul>}
+    </>
+  );
+}
+
+function ReadingPane({ q, a, status, running, conversation, onChange, onCite, onPropose, onActivity, stopping }: {
+  q: any; a?: any; status?: string; running: boolean; conversation: string; onChange: () => void; onCite: (inv: string, ref?: string) => void;
+  onPropose: (inv: any, r: any) => void; onActivity: () => void; stopping: boolean;
+}) {
+  return (
+    <>
+      <section className="rp-section" aria-labelledby={`q-${q.id}`}>
+        <h2 id={`q-${q.id}`}>Question</h2>
+        <div className="rp-question">{q.content}</div>
+        <div className="small muted">{q.author ?? "unknown"} · <Time iso={q.created_at} /></div>
+      </section>
+      <section className="rp-section" aria-labelledby={`a-${q.id}`}>
+        <h2 id={`a-${q.id}`}>Answer</h2>
+        {a ? <Turn m={a} status={status} conversation={conversation} latest onChange={onChange} onCite={onCite} onPropose={onPropose} />
+          : running ? <RunningTurn id={q.investigation_id} onChange={onChange} onActivity={onActivity} stopping={stopping} />
+          : status === "failed" ? <StateView kind="unavailable" title="This investigation failed" why="MOKS could not finish it. The evidence it collected is below." next="Ask again in the box below, or open the full view for the error." />
+          : status === "cancelled" ? <StateView kind="empty" title="This investigation was cancelled" why="It was stopped before it answered." next="Ask again in the box below." />
+          : <StateView kind="loading" title="Waiting for the answer" />}
+      </section>
+      <section className="rp-section" aria-labelledby={`e-${q.id}`}>
+        <h2 id={`e-${q.id}`}>Evidence</h2>
+        <EvidenceList id={q.investigation_id} running={running} onOpen={(ref) => onCite(q.investigation_id, ref)} />
+      </section>
+    </>
+  );
+}
+
 // ---- Composer --------------------------------------------------------------------------------
 
 export function draftKey(id: string) { return `moks.draft.${id}`; }
@@ -392,7 +474,7 @@ function Conversation({ id }: { id: string }) {
   const started = useRef(false);
   useLayoutEffect(() => {
     if (!count) return;
-    if (!started.current) { started.current = true; jump(); } else notify();
+    if (!started.current) { started.current = true; if (scroller.current) scroller.current.scrollTop = 0; } else notify(); // opens on the question, not the end of the history
   }, [count, jump, notify]);
   const wasRunning = useRef(false);
   useEffect(() => {
@@ -412,13 +494,17 @@ function Conversation({ id }: { id: string }) {
   const onSend = useCallback(async (text: string, ask: boolean) => {
     await api(`/conversations/${id}/messages`, { method: "POST", body: { content: text, ask } });
     await load();
-    jump();
-  }, [id, load, jump]);
+    if (scroller.current) scroller.current.scrollTop = 0; // a new question becomes the one at the top
+  }, [id, load]);
 
   if (!d) return error ? <div className="ws-conv ws-pad"><ErrorBox error={error} onRetry={load} /><Link to="/investigations">Back to inbox</Link></div> : <div className="ws-conv ws-pad"><Skeleton rows={6} label="Loading conversation" /></div>;
 
-  const shown = d.messages.slice(-limit);
-  const hidden = d.messages.length - shown.length;
+  // Reading order: the latest question, its answer, its evidence, then everything else in the order it happened.
+  const lastQ = [...d.messages].reverse().find((m: any) => messageKind(m) === "engineer" && !m.deleted);
+  const lastA = lastQ && d.messages.find((m: any) => m.role === "assistant" && m.investigation_id === lastQ.investigation_id);
+  const past = d.messages.filter((m: any) => m !== lastQ && m !== lastA);
+  const shown = past.slice(-limit);
+  const hidden = past.length - shown.length;
   const answered = new Set(d.messages.filter((m: any) => m.role === "assistant").map((m: any) => m.investigation_id));
   const lastAnswer = [...d.messages].reverse().find((m: any) => m.role === "assistant" && !m.deleted)?.id;
   const active = d.messages.filter((m: any) => m.role === "user" && m.investigation_id && !answered.has(m.investigation_id) && !TERMINAL.has(d.statuses[m.investigation_id] ?? "completed"));
@@ -473,9 +559,19 @@ function Conversation({ id }: { id: string }) {
         {stale && <div className="alert warn small">Cannot refresh this conversation. What you see may be out of date. Retrying.</div>}
         <div className="ws-scroll" ref={scroller}>
           <div className="ws-messages" ref={content}>
-            {hidden > 0 && <button type="button" className="ghost small" style={{ alignSelf: "center" }} onClick={() => { earlier.current = scroller.current?.scrollHeight ?? 0; setLimit(limit + PAGE); }}>Show {Math.min(hidden, PAGE)} earlier messages</button>}
-            {shown.map((m: any) => <Turn key={m.id} m={m} status={m.investigation_id ? d.statuses[m.investigation_id] : undefined} conversation={id} latest={m.id === lastAnswer} onChange={load} onCite={onCite} onPropose={onPropose} />)}
-            {active.map((m: any) => <RunningTurn key={m.investigation_id} id={m.investigation_id} onChange={load} onActivity={notify} stopping={stopping} />)}
+            {lastQ && <ReadingPane q={lastQ} a={lastA} status={d.statuses[lastQ.investigation_id]} running={active.some((m: any) => m.investigation_id === lastQ.investigation_id)}
+              conversation={id} onChange={load} onCite={onCite} onPropose={onPropose} onActivity={notify} stopping={stopping} />}
+            <section className="rp-section" aria-labelledby={`hist-${id}`}>
+              <details className="rp-history" open={!lastQ || past.length <= 6}>
+                <summary id={`hist-${id}`}>Conversation history ({past.length})</summary>
+                <div className="ws-history">
+                  {hidden > 0 && <button type="button" className="ghost small" style={{ alignSelf: "center" }} onClick={() => { earlier.current = scroller.current?.scrollHeight ?? 0; setLimit(limit + PAGE); }}>Show {Math.min(hidden, PAGE)} earlier messages</button>}
+                  {shown.map((m: any) => <Turn key={m.id} m={m} status={m.investigation_id ? d.statuses[m.investigation_id] : undefined} conversation={id} latest={!lastQ && m.id === lastAnswer} onChange={load} onCite={onCite} onPropose={onPropose} />)}
+                  {active.filter((m: any) => m !== lastQ).map((m: any) => <RunningTurn key={m.investigation_id} id={m.investigation_id} onChange={load} onActivity={notify} stopping={stopping} />)}
+                  {!past.length && <div className="small muted">Nothing before this question.</div>}
+                </div>
+              </details>
+            </section>
           </div>
           {fresh && <button type="button" className="ws-new" onClick={jump}>New activity</button>}
         </div>

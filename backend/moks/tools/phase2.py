@@ -407,6 +407,14 @@ async def finops_k8s_allocation(ctx: ToolContext, a: AllocArgs) -> ToolResult:
                       {"queries": list(queries.values())})
 
 
+def _pricing(model: str) -> dict:
+    """A fixed price (a Minikube server, a flat-rate VM) is the same whatever is requested, so a saving there is
+    capacity freed, not money; only per-unit prices make a monetary estimate. describe() starts "fixed" for the first."""
+    fixed = model.startswith("fixed")
+    return {"kind": "fixed" if fixed else "per_unit", "description": model,
+            "note": "Fixed price: requests change capacity, not the bill. Amounts spread that price over capacity." if fixed else "Estimate from the configured unit prices."}
+
+
 async def finops_rightsizing(ctx: ToolContext, a: AllocArgs) -> ToolResult:
     namespaces = await _namespaces(ctx, a.namespace)
     pods_by_ns, skipped = await _pods_by_namespace(ctx, namespaces, a.namespace)
@@ -441,10 +449,10 @@ async def finops_rightsizing(ctx: ToolContext, a: AllocArgs) -> ToolResult:
         raise ConnectorError("not_found", "Prometheus has no container usage (container_cpu_usage_seconds_total, container_memory_working_set_bytes): "
                                           "scrape the kubelet's /metrics/cadvisor endpoint")
     recs = rightsize(measured, cpu_p, gib_p)
-    saving = round(sum(r["monthly_saving"] for r in recs if r["action"] == "reduce"), 2)
+    saving = round(sum(x["monthly_saving"] for r in recs for x in r["recommendations"] if x["action"] == "reduce"), 2)
     risks = sum(1 for r in recs if r["action"] == "increase")
     return ToolResult(f"{a.namespace or f'{len(namespaces)} namespaces'}: {len(recs)} rightsizing recommendations; potential saving {saving}/month; {risks} under-provisioned",
-                      {"recommendations": recs, "monthly_saving": saving, "days": a.days, "cost_model": model, "skipped_namespaces": skipped, "unmeasured": unmeasured,
+                      {"recommendations": recs, "monthly_saving": saving, "days": a.days, "cost_model": model, "pricing": _pricing(model), "skipped_namespaces": skipped, "unmeasured": unmeasured,
                        "note": "Recommendations need a reviewed config patch (action plan) to apply."},
                       {"queries": list(queries.values())})
 

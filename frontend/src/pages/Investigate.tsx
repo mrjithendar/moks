@@ -1,9 +1,10 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useId, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
 import { Badge, ErrorBox, LineChart, LogLines, PageHead, SourceRef, StatusBadge, fmtBytes, useLoad } from "../components";
 import { type Ev, useInvestigationEvents } from "../investigationStream";
+import { ClaimLabel, EvidenceCtx, evidenceTarget, ExactSource, useEvidence } from "../evidence";
 import { Markdown } from "../markdown";
 import { CopyButton, Dialog, Drawer, Truncate } from "../ui";
 import { proposalPlan } from "./Conversations";
@@ -328,7 +329,7 @@ function Routing({ report }: { report: any }) {
 
 function GuidanceItems({ items, onCite }: { items: any[]; onCite: (r: string) => void }) {
   return <ol>{items.map((x: any, i: number) => <li key={i}>
-    {x.command ? <><code className="mono">{x.command}</code>{x.note || x.text !== `Run \`${x.command}\`` ? <span className="small"> — {x.note ?? x.text}</span> : null}</> : <Markdown text={x.text} />}
+    {(x.sources?.length > 0 || x.path) && !x.general && <><ClaimLabel kind="guidance" /> </>}{x.command ? <><code className="mono">{x.command}</code>{x.note || x.text !== `Run \`${x.command}\`` ? <span className="small"> — {x.note ?? x.text}</span> : null}</> : <Markdown text={x.text} />}
     <Cites refs={x.sources ?? []} onCite={onCite} />{x.path && <span className="small muted"> {x.path}</span>}{x.general && <> <Badge kind="info">general guidance</Badge></>}
     {x.placeholders?.length > 0 && <div className="small muted">Placeholder: {x.placeholders.join(", ")}</div>}</li>)}</ol>;
 }
@@ -388,7 +389,7 @@ function Passage({ p, onCite, investigationId }: { p: any; onCite: (r: string) =
   const where = `${p.repository ? `${p.repository}:` : ""}${p.path}`;
   const href = safeLink(p.url);
   return <li className="passage">
-    <div className="row tight wrap"><Cites refs={[p.id ?? p.ref]} onCite={onCite} /><Badge kind={tone}>{label}</Badge><Badge kind={stone}>{slabel}</Badge>
+    <div className="row tight wrap"><ClaimLabel kind="guidance" /><Cites refs={[p.id ?? p.ref]} onCite={onCite} /><Badge kind={tone}>{label}</Badge><Badge kind={stone}>{slabel}</Badge>
       {p.cited_by === "moks" && <span className="small muted">added by MOKS</span>}
       {p.freshness?.state && p.freshness.state !== "current" && <Badge kind="warn">{p.freshness.state}</Badge>}
       {href ? <a className="mono small" href={href} target="_blank" rel="noreferrer noopener">{where} {lines}</a> : <span className="mono small">{where} {lines}</span>}
@@ -431,7 +432,17 @@ export function KnowledgeUsed({ k, onCite, investigationId }: { k?: any; onCite:
 
 /** E3.2 is passage 2 of the search stored as evidence E3: the button names the passage and opens the evidence. */
 export function Cites({ refs, onCite }: { refs: string[]; onCite: (r: string) => void }) {
-  return <>{refs.map((r) => <button type="button" key={r} className="cite" onClick={() => onCite(r.replace(/\.\d+$/, ""))}>{r}</button>)}</>;
+  return <>{refs.map((r) => <Cite key={r} r={r} onCite={onCite} />)}</>;
+}
+
+/** A citation says what it points at (a log query, a metric, an event…) before anyone opens it. */
+function Cite({ r, onCite }: { r: string; onCite: (r: string) => void }) {
+  const ref = r.replace(/\.\d+$/, "");
+  const e = useEvidence(ref);
+  const t = e ? evidenceTarget(e) : null;
+  const kindId = useId();
+  return <span className="cite-wrap"><button type="button" className="cite" onClick={() => onCite(ref)} title={t?.detail} aria-describedby={t ? kindId : undefined}>{r}</button>
+    {t && <span id={kindId} className="cite-kind small muted">{t.kind}</span>}</span>;
 }
 
 const CONF: Record<string, "bad" | "warn" | "neutral"> = { high: "bad", medium: "warn", low: "neutral" };
@@ -442,25 +453,26 @@ function Section({ title, count, open = true, children }: { title: string; count
 
 export function Report({ report, evidence = [], hideSummary, onCite, onPropose, investigationId }: { report: any; evidence?: any[]; hideSummary?: boolean; onCite: (r: string) => void; onPropose?: (r: any) => void; investigationId?: string }) {
   if (GUIDED.has(report.response_type) || report.response_type === "conceptual") {
-    return <div className="report">
+    return <EvidenceCtx.Provider value={evidence}><div className="report">
       <Routing report={report} />
       {!hideSummary && <div className="rs static"><h3>Answer</h3><Markdown text={report.summary ?? ""} /><div className="small muted">{report.generated_by === "llm" ? "Organized by the LLM; every command is checked against the cited sources" : "Extracted from the sources by rules"}</div></div>}
       <Answer report={report} onCite={onCite} />
       <KnowledgeUsed k={report.knowledge} onCite={onCite} investigationId={investigationId} />
-      {report.observed_facts?.length > 0 && <Section title="Current state" count={report.observed_facts.length}><ul>{report.observed_facts.map((f: any, i: number) => <li key={i}>{f.statement}<Cites refs={f.evidence} onCite={onCite} /></li>)}</ul></Section>}
+      {report.observed_facts?.length > 0 && <Section title="Current state" count={report.observed_facts.length}><ul>{report.observed_facts.map((f: any, i: number) => <li key={i}><ClaimLabel kind="observed" /> {f.statement}<Cites refs={f.evidence} onCite={onCite} /></li>)}</ul></Section>}
       {evidence.length > 0 && <Section title="Supporting evidence" count={evidence.length} open={false}>
         <ul>{evidence.slice(0, 40).map((e) => <li key={e.ref}><button type="button" className="cite" style={{ marginLeft: 0 }} onClick={() => onCite(e.ref)}>{e.ref}</button> <span className="small">{e.summary}</span></li>)}</ul>
       </Section>}
       {report.notes?.length > 0 && <details><summary className="small">Notes ({report.notes.length})</summary><ul className="small">{report.notes.map((n: string, i: number) => <li key={i}>{n}</li>)}</ul></details>}
-    </div>;
+    </div></EvidenceCtx.Provider>;
   }
   return (
+    <EvidenceCtx.Provider value={evidence}>
     <div className="report">
       <Routing report={report} />
       {!hideSummary && <div className="rs static"><h3>Summary</h3><Markdown text={report.summary ?? ""} /><div className="small muted">{report.generated_by === "llm" ? "Written by the LLM from cited evidence" : "Rule-based report"}</div></div>}
-      {report.missing_evidence.length > 0 && <div className="rs missing"><strong>Missing evidence</strong><ul>{report.missing_evidence.map((m: string, i: number) => <li key={i}>{m}</li>)}</ul></div>}
+      {report.missing_evidence.length > 0 && <div className="rs missing"><strong>Missing evidence</strong><ul>{report.missing_evidence.map((m: string, i: number) => <li key={i}><ClaimLabel kind="missing" /> {m}</li>)}</ul></div>}
       <Section title="Observed facts" count={report.observed_facts.length}>
-        {report.observed_facts.length ? <ul>{report.observed_facts.map((f: any, i: number) => <li key={i}>{FACT_KINDS[f.kind] && <><Badge kind="neutral">{FACT_KINDS[f.kind]}</Badge> </>}{f.statement}<Cites refs={f.evidence} onCite={onCite} />
+        {report.observed_facts.length ? <ul>{report.observed_facts.map((f: any, i: number) => <li key={i}><ClaimLabel kind="observed" /> {FACT_KINDS[f.kind] && <><Badge kind="neutral">{FACT_KINDS[f.kind]}</Badge> </>}{f.statement}<Cites refs={f.evidence} onCite={onCite} />
           {f.qualifiers?.map((q: string) => <div key={q} className="small muted">{q}</div>)}</li>)}</ul>
           : <div className="muted small">No facts with supporting evidence.</div>}
       </Section>
@@ -469,7 +481,7 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose, 
         const rows = (report.verified_findings ?? report.verified_causes?.map((c: any) => ({ ...c, category: "configuration_defect" })) ?? []).filter((v: any) => v.category === category);
         return rows.length > 0 && <Section key={category} title={title} count={rows.length}>
           <div className="small muted">{note}</div>
-          <ul>{rows.map((c: any, i: number) => <li key={i}>{c.cause}<Cites refs={c.evidence} onCite={onCite} /><div className="small muted">{[c.check, c.target && `target ${c.target}`, c.result, c.at].filter(Boolean).join(" · ")}</div></li>)}</ul>
+          <ul>{rows.map((c: any, i: number) => <li key={i}><ClaimLabel kind="observed" /> {c.cause}<Cites refs={c.evidence} onCite={onCite} /><div className="small muted">{[c.check, c.target && `target ${c.target}`, c.result, c.at].filter(Boolean).join(" · ")}</div></li>)}</ul>
         </Section>;
       })}
       {report.shared_findings?.length > 0 && <Section title="Shared infrastructure" count={report.shared_findings.length}>
@@ -479,7 +491,7 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose, 
       <Section title="Suspected causes" count={report.suspected_causes.length}>
         {report.suspected_causes.length ? (
           <ul>{report.suspected_causes.map((c: any, i: number) => (
-            <li key={i}><Badge kind={CONF[c.confidence]}>{c.confidence} confidence</Badge> {c.cause}<Cites refs={c.evidence} onCite={onCite} />
+            <li key={i}><ClaimLabel kind="hypothesis" /> <Badge kind={CONF[c.confidence]}>{c.confidence} confidence</Badge> {c.cause}<Cites refs={c.evidence} onCite={onCite} />
               {c.contradicting?.length > 0 && <div className="small muted">Evidence against this: <Cites refs={c.contradicting} onCite={onCite} /></div>}
               {c.reasoning && <div className="small muted">{c.reasoning}</div>}
               <div className="small muted">{c.origin === "demoted_fact" ? "Drafted as a fact, but the evidence could not show it. Treat it as a hypothesis." : "Suspected, not verified."}</div></li>
@@ -533,6 +545,7 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose, 
       {report.validation?.method && <div className="small muted">Claims were checked by rules: evidence type, scope, freshness and coverage. That does not prove a passage supports a claim.</div>}
       {report.execution?.resumed_after && <div className="small muted">This run resumed after {report.execution.resumed_after} (attempt {report.execution.attempt}); older evidence is labeled historical.</div>}
     </div>
+    </EvidenceCtx.Provider>
   );
 }
 
@@ -593,8 +606,8 @@ export function EvidenceBody({ e, grafana }: { e: any; grafana?: string | null }
         {e.truncated && <><dt>Note</dt><dd>Result truncated to the size limit.</dd></>}
         {e.error && <><dt>Error</dt><dd className="mono small">{e.error}</dd></>}
       </dl>
+      <ExactSource e={e} />
       <SourceRef source={e.source} />
-      {e.source?.query && <div><CopyButton text={e.source.query} label="Copy query" /></div>}
       {grafana && <a className="small" href={grafana} target="_blank" rel="noreferrer noopener">Open Grafana ↗</a>}
       {e.ok && <EvidenceData tool={e.tool} data={e.data} />}
     </div>

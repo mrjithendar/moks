@@ -149,6 +149,7 @@ async def overview(request: Request, environment: str = "all", namespace: str | 
                 row["errors"]["kubernetes"] = alloc.summary
             if rs.ok:
                 row["rightsizing"] = rs.data["recommendations"]
+                row["rightsizing_pricing"] = rs.data.get("pricing")
                 row["monthly_saving"] = rs.data["monthly_saving"]
                 row["unmeasured"] = rs.data["unmeasured"]
             else:

@@ -72,9 +72,11 @@ async def prometheus(db: AsyncSession, env: Environment) -> features.Query | Non
         ctx = ToolContext(None, env, scope, principal, a, b, found, b - a + timedelta(minutes=1))
         ex = ToolExecutor(None, ctx, timeout_seconds=30, read_permissions=(P.INVESTIGATION_RUN,), audit_success=False)
         out = await ex.run("prom_query", {"promql": promql, "mode": "range", "step": step})
-        if not out.ok:
+        if not out.ok:  # an HTTP error, a timeout, or a Prometheus status other than success
             raise RuntimeError(out.error_kind or "query failed")
-        return (out.data or {}).get("series") or [], not out.truncated
+        data = out.data or {}
+        # Warnings (a partial response from a remote store, say) and a truncated result are both incomplete.
+        return data.get("series") or [], not out.truncated and not data.get("warnings")
     return query
 
 
@@ -164,7 +166,10 @@ async def train(env_name: str, namespace: str, *, query: features.Query | None =
         query = query or await prometheus(db, env)
     if query is None:
         return {"environment": env_name, "namespace": namespace, "status": "no_prometheus", "cohorts": []}
-    frames = (await features.collect(query, env_name, namespace, start, now, s.ml_anomaly_step_seconds, metrics))[: s.ml_anomaly_max_cohorts]
+    try:
+        frames = (await features.collect(query, env_name, namespace, start, now, s.ml_anomaly_step_seconds, metrics))[: s.ml_anomaly_max_cohorts]
+    except features.WindowError as exc:
+        return {"environment": env_name, "namespace": namespace, "status": exc.status, "reason": exc.reason, "cohorts": []}
     results = []
     for fr in frames:
         results.append(await _train_cohort(fr, s, created_by, job_id))
@@ -273,6 +278,9 @@ async def tick(env_name: str, *, query: features.Query | None = None, now: datet
         by_ns.setdefault(_split_cohort(m.cohort)[1], []).append(m)
     gate = asyncio.Semaphore(s.ml_anomaly_concurrency)
     start = now - timedelta(minutes=s.ml_anomaly_window_minutes)
+    win = features.align_window(start, now, s.ml_anomaly_step_seconds)
+    if win.status != "ok":
+        return {"skipped": win.reason, "status": win.status, "observations": 0}
 
     async def one_namespace(ns: str, ms: list) -> list[dict]:
         async with gate:
