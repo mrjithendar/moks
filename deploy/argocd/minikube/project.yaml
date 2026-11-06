@@ -52,3 +52,14 @@ spec:
     - {group: rbac.authorization.k8s.io, kind: RoleBinding}
   # Secrets are deliberately absent: they are created out of band (deploy/secrets) and Argo CD
   # can neither create nor prune them.
+  roles:
+    # CI's deploy job (.github/workflows/ci.yml) after it pushed moks:latest. It may read, sync and restart this
+    # project's Applications: no delete, no parameter override, no exec, no logs, no other project. CI never
+    # passes --prune, and every child carries Prune=false. The token comes from scripts/setup-argocd-ci.sh
+    # (repository secret ARGOCD_AUTH_TOKEN). The root Application is in project moks-root, out of reach.
+    - name: ci
+      description: GitHub Actions deploys MOKS after a release build
+      policies:
+        - p, proj:moks:ci, applications, get, moks/*, allow
+        - p, proj:moks:ci, applications, sync, moks/*, allow
+        - p, proj:moks:ci, applications, action/apps/Deployment/restart, moks/*, allow

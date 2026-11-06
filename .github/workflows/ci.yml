@@ -3,8 +3,14 @@ name: moks
 # check   -> pull requests only: backend tests against PostgreSQL, frontend typecheck/build,
 #            Helm lint/render, Argo CD child Applications against the chart
 # terminal -> pull requests and pushes: diagnostic image build, scan and isolation test on kind
+# crewai  -> pull requests: the backend suite again on the CrewAI dependency set (pydantic 2.12.5 + crewai,
+#            backend/requirements-crewai.txt), which is what an image built with MOKS_CREWAI=true runs
 # release -> default branch: build the arm64 image once, tag it with the commit and move latest to it.
-#            mk4 runs latest, and new pods pull it when restarted. CI never touches the cluster.
+#            Repository variable MOKS_CREWAI=true builds it with the CrewAI extra (docs/crewai-investigation.md).
+# deploy  -> after release, only when repository variable MK4_DEPLOY is "true": Argo CD deploys. CI asks it to
+#            sync the MOKS Applications from master in order, then to restart the Deployments that run
+#            moks:latest, and checks the site reports the new commit. CI has no Kubernetes credentials: only an
+#            Argo CD token for project role moks/ci (get, sync, restart; scripts/setup-argocd-ci.sh).
 
 on:
   push:
@@ -129,6 +135,7 @@ jobs:
     env:
       AWS_REGION: us-east-1
       REPOSITORY: moks
+      MOKS_CREWAI: ${{ vars.MOKS_CREWAI == 'true' && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v7
       # Role moks-github-ci from deploy/terraform (output ci_role_arn), stored as the repository
@@ -143,7 +150,13 @@ jobs:
       - name: Build, smoke-test and push
         run: |
           IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:${{ github.sha }}"
-          docker build --build-arg GIT_COMMIT=${{ github.sha }} -t "$IMAGE" .
+          docker build --build-arg GIT_COMMIT=${{ github.sha }} --build-arg MOKS_CREWAI="$MOKS_CREWAI" -t "$IMAGE" .
+          if [ "$MOKS_CREWAI" = "true" ]; then
+            # As in the pods: read-only root, no home directory. crewai must import, at the pinned version,
+            # with its telemetry off, or the capability would report it unavailable.
+            docker run --rm --read-only --tmpfs /tmp --network none --entrypoint python "$IMAGE" -c \
+              'from moks.crew import PINNED, installed_version, prepare_environment; prepare_environment(); import crewai, os; assert installed_version() == PINNED, installed_version(); assert os.environ["CREWAI_DISABLE_TELEMETRY"] == "true"; print("crewai", crewai.__version__)'
+          fi
           # The image must start and answer its probes without a database (readyz reports 503).
           docker run -d --name smoke -e MOKS_ENV=development -e MOKS_AUTH_MODE=local -p 8080:8080 "$IMAGE"
           for i in $(seq 1 30); do curl -fsS localhost:8080/healthz && break; sleep 1; done
@@ -155,7 +168,7 @@ jobs:
           LATEST="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
           docker tag "$IMAGE" "$LATEST"
           docker push "$LATEST"
-          echo "pushed $IMAGE and $LATEST ($DIGEST). Restart mk4 to run it; see docs/RELEASES.md." >> "$GITHUB_STEP_SUMMARY"
+          echo "pushed $IMAGE and $LATEST ($DIGEST), crewai=$MOKS_CREWAI. The deploy job restarts mk4 when MK4_DEPLOY is true; see docs/RELEASES.md." >> "$GITHUB_STEP_SUMMARY"
           # The release record: which commit became which digest (docs/RELEASES.md).
           mkdir -p release && printf '{"component":"moks","commit":"%s","repository":"%s","tag":"%s","digest":"%s","run":"%s"}\n' \
             "${{ github.sha }}" "$REPOSITORY" "${{ github.sha }}" "$DIGEST" "${{ github.run_id }}" > release/moks.json
@@ -164,6 +177,86 @@ jobs:
           name: release-moks-${{ github.sha }}
           path: release/moks.json
           retention-days: 400
+
+  deploy:
+    needs: release
+    if: ${{ !cancelled() && needs.release.result == 'success' && vars.MK4_DEPLOY == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: moks-deploy-mk4
+      cancel-in-progress: false
+    env:
+      # Argo CD at https://jithendar.com/argocd. The token is project role moks/ci (deploy/argocd/minikube/project.yaml):
+      # get, sync and restart Applications of project moks, nothing else. scripts/setup-argocd-ci.sh issues it.
+      ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER || 'jithendar.com' }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      ARGOCD_OPTS: --grpc-web --grpc-web-root-path /argocd
+    steps:
+      - name: Install the argocd CLI
+        run: |
+          [[ -n "$ARGOCD_AUTH_TOKEN" ]] || { echo "::error::ARGOCD_AUTH_TOKEN is not set; run scripts/setup-argocd-ci.sh"; exit 1; }
+          curl -fsSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/download/v3.5.6/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+          argocd version --client --short
+      # Git first: sync every child in the order docs/ARGOCD_APP_SPLIT.md section 6 sets, so the ConfigMap
+      # (foundation) is current before the pods that hash it roll. Never --prune.
+      - name: Sync the MOKS Applications from master
+        run: |
+          set -euo pipefail
+          for app in foundation database api worker executor terminal routing opensearch reranker; do
+            argocd app get "moks-$app" -o name > /dev/null 2>&1 || { echo "moks-$app does not exist; skipped"; continue; }
+            argocd app get "moks-$app" --refresh > /dev/null
+            argocd app sync "moks-$app" --timeout 600
+            argocd app wait "moks-$app" --sync --health --timeout 600
+          done
+      # Then the image: the tag is always latest, which a sync cannot see change, so Argo CD's restart action
+      # rolls the Deployments that run moks:latest (imagePullPolicy Always). The worker goes first: running
+      # investigations finish within its termination grace period, and the first API pod runs pending migrations.
+      - name: Restart onto the new image
+        run: |
+          set -euo pipefail
+          for pair in worker:moks-worker api:moks-api executor:moks-executor terminal:moks-terminal; do
+            app="moks-${pair%%:*}"; deploy="${pair#*:}"
+            argocd app actions run "$app" restart --kind Deployment --resource-name "$deploy" --namespace moks
+            argocd app wait "$app" --health --timeout 600
+          done
+      - name: The site runs this commit
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS https://jithendar.com/moks/api/health | grep -q '${{ github.sha }}'; then
+              echo "mk4 runs ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::https://jithendar.com/moks/api/health does not report ${{ github.sha }}"; exit 1
+
+  crewai:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: {POSTGRES_USER: moks, POSTGRES_PASSWORD: moks, POSTGRES_DB: postgres}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U moks" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@v7
+        with: {python-version: "3.12"}
+      - name: Backend tests on the CrewAI dependency set
+        working-directory: backend
+        env:
+          MOKS_TEST_DATABASE_URL: postgresql://moks:moks@localhost:5432/postgres
+        run: |
+          grep -v '^pydantic==' requirements.txt > /tmp/base.txt
+          pip install -r /tmp/base.txt -r requirements-crewai.txt pytest pytest-asyncio
+          pip install --no-deps -e .
+          python -c "import crewai; print('crewai', crewai.__version__)"
+          python -m pytest -q
 
   reranker:
     runs-on: ubuntu-24.04

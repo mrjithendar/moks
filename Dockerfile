@@ -14,8 +14,15 @@ RUN MOKS_BASE_PATH=$MOKS_BASE_PATH npm run build
 FROM python:3.12-slim AS build
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /src
-COPY backend/requirements.txt ./
-RUN pip install --prefix=/install -r requirements.txt
+COPY backend/requirements.txt backend/requirements-crewai.txt ./
+# MOKS_CREWAI=true adds the optional CrewAI investigation (docs/crewai-investigation.md). It needs an older pydantic,
+# so its pins replace the base pydantic pin in one resolution. The default image is built exactly as before.
+ARG MOKS_CREWAI=false
+RUN if [ "$MOKS_CREWAI" = "true" ]; then \
+      grep -v '^pydantic==' requirements.txt > /tmp/base.txt && pip install --prefix=/install -r /tmp/base.txt -r requirements-crewai.txt; \
+    else \
+      pip install --prefix=/install -r requirements.txt; \
+    fi
 COPY backend/ ./
 RUN pip install --prefix=/install --no-deps .
 

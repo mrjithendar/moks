@@ -9,6 +9,7 @@ import { CopyButton, Dialog, Drawer, Truncate } from "../ui";
 import { proposalPlan } from "./Conversations";
 import { PlanForm } from "./Ops";
 import { Judge, SimilarIncidents, SkillRecommendations } from "./MLParts";
+import { CrewAIForm, CrewAIPanel, type CrewCapability } from "./CrewAI";
 
 const SUGGESTIONS = [
   "Why is checkout returning 502 errors?",
@@ -28,7 +29,9 @@ export function NewInvestigation() {
   const [error, setError] = useState<unknown>();
   const [busy, setBusy] = useState(false);
   const [everywhere, setEverywhere] = useState(false);
-  const config = useLoad(() => api<{ llm: { provider: string; model: string } | null; skills: string[] }>("/investigate/config"), []);
+  const config = useLoad(() => api<{ llm: { provider: string; model: string } | null; skills: string[]; environments?: string[]; crewai?: CrewCapability }>("/investigate/config"), []);
+  const [flow, setFlow] = useState<"standard" | "crewai">("standard");
+  const crewai = config.data?.crewai?.available ? config.data.crewai : null;
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -77,6 +80,11 @@ export function NewInvestigation() {
             </div>
           )}
         </div>
+        {crewai && <div className="row small" role="radiogroup" aria-label="Investigation type">
+          <label className="inline"><input type="radio" name="flow" checked={flow === "standard"} onChange={() => setFlow("standard")} /> Standard investigation</label>
+          <label className="inline"><input type="radio" name="flow" checked={flow === "crewai"} onChange={() => setFlow("crewai")} /> CrewAI investigation</label>
+        </div>}
+        {!(crewai && flow === "crewai") && <>
         <div className="chat-input">
           <textarea aria-label="Question" rows={3} required minLength={3} maxLength={2000} value={q} onChange={(e) => setQ(e.target.value)}
             placeholder="e.g. Why is checkout returning 502 errors?"
@@ -87,8 +95,10 @@ export function NewInvestigation() {
         <div className="suggestions">
           {SUGGESTIONS.map((s) => <button type="button" key={s} onClick={() => setQ(s)}>{s}</button>)}
         </div>
+        </>}
         <ErrorBox error={error} />
       </form>
+      {crewai && flow === "crewai" && <CrewAIForm capability={crewai} environments={config.data?.environments ?? []} minutes={minutes} />}
       <div className="small muted" style={{ marginTop: 10 }}>
         Investigations are read-only. Remediation runs only through an approved action plan. Evidence and tool calls are recorded in the audit log.
       </div>
@@ -458,6 +468,7 @@ export function Report({ report, evidence = [], hideSummary, onCite, onPropose, 
     <div className="report">
       <Routing report={report} />
       {!hideSummary && <div className="rs static"><h3>Summary</h3><Markdown text={report.summary ?? ""} /><div className="small muted">{report.generated_by === "llm" ? "Written by the LLM from cited evidence" : "Rule-based report"}</div></div>}
+      <CrewAIPanel crew={report.crewai} onCite={onCite} />
       {report.missing_evidence.length > 0 && <div className="rs missing"><strong>Missing evidence</strong><ul>{report.missing_evidence.map((m: string, i: number) => <li key={i}>{m}</li>)}</ul></div>}
       <Section title="Observed facts" count={report.observed_facts.length}>
         {report.observed_facts.length ? <ul>{report.observed_facts.map((f: any, i: number) => <li key={i}>{FACT_KINDS[f.kind] && <><Badge kind="neutral">{FACT_KINDS[f.kind]}</Badge> </>}{f.statement}<Cites refs={f.evidence} onCite={onCite} />
