@@ -222,15 +222,27 @@ def of(docs, kind, name):
     return next(d for d in docs if d["kind"] == kind and d["metadata"]["name"] == name)
 
 
+# The chart's own defaults (values.yaml). values-minikube.yaml is mk4, which turns the terminal on on purpose:
+# see test_mk4_opts_into_the_terminal_with_https_only.
 def test_terminals_are_off_by_default():
-    assert not [d for d in render("values-minikube.yaml") if "terminal" in d["metadata"]["name"]]
+    assert not [d for d in render("values.yaml") if "terminal" in d["metadata"]["name"]]
 
 
 def test_a_tag_or_no_profile_is_refused():
     with pytest.raises(subprocess.CalledProcessError):
-        render("values-minikube.yaml", "terminal.enabled=true", "terminal.profiles[0].name=ro")
+        render("values.yaml", "terminal.enabled=true", "terminal.profiles[0].name=ro")
     with pytest.raises(subprocess.CalledProcessError):
-        render("values-minikube.yaml", "terminal.enabled=true", "terminal.image.digest=sha256:" + "a" * 64)
+        render("values.yaml", "terminal.enabled=true", "terminal.image.digest=sha256:" + "a" * 64)
+
+
+def test_mk4_opts_into_the_terminal_with_https_only():
+    """mk4 runs terminals: a pinned digest, one read-only profile, and egress to public HTTPS only."""
+    docs = render("values-minikube.yaml")
+    assert of(docs, "Namespace", "moks-terminals")["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "restricted"
+    policy = of(docs, "NetworkPolicy", "terminals")["spec"]
+    public = [r for r in policy["egress"] for t in r["to"] if t.get("ipBlock", {}).get("cidr") == "0.0.0.0/0"]
+    assert [r["ports"] for r in public] == [[{"port": 443, "protocol": "TCP"}]]
+    assert {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"} <= set(public[0]["to"][0]["ipBlock"]["except"])
 
 
 def test_the_gateway_is_routed_under_the_base_path_and_keeps_to_its_own_identity():
@@ -262,7 +274,7 @@ def test_the_session_identity_is_read_only_and_never_sees_secrets():
 
 
 def test_the_terminal_namespace_is_restricted_and_closed_by_default():
-    docs = render("values-minikube.yaml", *TERMINAL)
+    docs = render("values.yaml", *TERMINAL)
     ns = of(docs, "Namespace", "moks-terminals")["metadata"]["labels"]
     assert ns["pod-security.kubernetes.io/enforce"] == "restricted"
     policy = of(docs, "NetworkPolicy", "terminals")["spec"]
