@@ -162,8 +162,9 @@ reranker:
 
 # docs/SECRETS_SYNC.md. The chart makes one Role per name and each must exist; a namespace created
 # later needs adding here. Needs Secret moks/moks-secret-sync first (scripts/create-secret-sync-secret.sh),
-# or the executor cannot start.
+# or the executor cannot start. Each one also needs a destination in deploy/argocd/minikube/project.yaml. Never
+# argocd: write access to its Secrets is write access to Argo CD's cluster and repository credentials.
 secretsSync:
   enabled: true
-  namespaces: [argocd, harbor, jithendar, moks, velero, traefik, observability,
+  namespaces: [harbor, jithendar, moks, velero, traefik, observability,
                moks-diagnostics, moks-lab, moks-terminals, monitoring, roboshop-ai ]

@@ -26,6 +26,14 @@ spec:
       namespace: roboshop-ai        # Role for database backups (databaseBackups.namespaces)
     - server: https://kubernetes.default.svc
       namespace: velero                # Roles for MOKS to use Velero, when velero.enabled is true
+    - server: https://kubernetes.default.svc
+      namespace: harbor               # Role for secret sync (secretsSync.namespaces)
+    - server: https://kubernetes.default.svc
+      namespace: monitoring           # Role for secret sync (secretsSync.namespaces)
+    - server: https://kubernetes.default.svc
+      namespace: observability        # Role for secret sync (secretsSync.namespaces)
+    - server: https://kubernetes.default.svc
+      namespace: traefik              # Role for secret sync (secretsSync.namespaces)
   clusterResourceWhitelist:
     - {group: "", kind: Namespace}
     - {group: rbac.authorization.k8s.io, kind: ClusterRole}
