@@ -72,3 +72,31 @@ async def test_each_role_is_refused_the_others_part(world, as_components):  # no
         await refused("moks_terminal", f"SELECT * FROM {t}")
     async with session_scope() as db:  # sanity: the row the refusals aimed at exists
         assert (await db.execute(text("SELECT count(*) FROM secret_plan_items WHERE id = :i"), {"i": item_id})).scalar_one() == 1
+
+
+async def test_schedules_and_reveals_run_under_the_component_roles_and_only_the_api_approves(world, as_components):  # noqa: F811
+    from moks.secrets.seal import open_sealed
+
+    w = world
+    m, _ = await flow._export_one(w, {"p": b"one"}, direction="export")
+    s = (await w.call("op", "POST", "/schedules", {"name": "roles", "mapping_ids": [m["id"]], "interval_minutes": 30}, expect=201)).json()
+    await refused("moks_executor", "INSERT INTO secret_schedule_approvals (id, schedule_id, approver_id, decision, schedule_hash) "
+                                   "SELECT gen_random_uuid(), id, requested_by, 'approve', schedule_hash FROM secret_sync_schedules WHERE id = :s", s=uuid.UUID(s["id"]))
+    await refused("moks_executor", "UPDATE secret_sync_schedules SET schedule_hash = 'x', mapping_versions = '{}' WHERE id = :s", s=uuid.UUID(s["id"]))
+    await refused("moks_worker", "SELECT * FROM secret_sync_schedules")
+    await w.call("ap", "POST", f"/schedules/{s['id']}/decision", {"approve": True, "schedule_hash": s["schedule_hash"]}, expect=200)
+    w.east.put("shop", "db", {"p": b"two"})
+    token = role.set("moks_executor")
+    try:
+        (run,) = await flow.run_schedules()
+    finally:
+        role.reset(token)
+    assert run["status"] == "succeeded", run
+    assert w.aws_content(m["aws_secret_name"]).data == {"p": b"two"}
+
+    rid = next(r["id"] for r in (await w.call("op", "GET", "/inventory?side=kubernetes", expect=200)).json()["items"] if r["name"] == "db")
+    private, jwk = flow._browser_key()
+    job = (await w.call("ap", "POST", "/reveal", {"inventory_id": rid, "public_key": jwk}, expect=202)).json()["job_id"]
+    await flow.run_jobs()
+    sealed = (await w.call("ap", "GET", f"/reveal/{job}", expect=200)).json()["sealed"]
+    assert __import__("json").loads(open_sealed(private, sealed, job))["keys"] == {"p": {"text": "two"}}

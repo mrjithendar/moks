@@ -577,6 +577,9 @@ async def verify_for_execution(db: AsyncSession, plan: SecretPlan, env: Environm
     executor = await principal_of(db, plan.executed_by)
     for ns in namespaces:
         require(executor, P.SECRETS_EXECUTE, env, ns)
+    if (plan.request or {}).get("schedule_id"):
+        await _scheduled_approval(db, plan, env, mappings)
+        return
     if not plan.requires_approval:
         if plan.kind == "delete" or not is_admin(requester):
             raise SyncError(409, "this plan now needs an approval (the requester is no longer an administrator); refresh it")
@@ -594,3 +597,19 @@ async def verify_for_execution(db: AsyncSession, plan: SecretPlan, env: Environm
         except Exception:
             continue
     raise SyncError(403, "no valid approval bound to this plan (approver changed, revoked, or hash differs)")
+
+
+async def _scheduled_approval(db: AsyncSession, plan: SecretPlan, env: Environment, mappings: dict[uuid.UUID, SecretMapping]) -> None:
+    """A scheduled run's approval is the schedule's: still valid, for the hash the run was made under, and covering
+    every mapping in the plan, which the schedule's creator requested."""
+    from . import schedules
+    from ..models import SecretSchedule
+
+    s = await db.get(SecretSchedule, uuid.UUID(plan.request["schedule_id"]))
+    if s is None or s.environment_id != env.id:
+        raise SyncError(403, "the schedule behind this run is gone")
+    await schedules.check(db, s, env)
+    if plan.request.get("schedule_hash") != s.schedule_hash or plan.requested_by != s.requested_by:
+        raise SyncError(403, "the schedule changed after this run started")
+    if not {str(m) for m in mappings} <= set(s.mapping_ids or []):
+        raise SyncError(403, "this run includes a mapping the schedule does not cover")

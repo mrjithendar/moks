@@ -1234,3 +1234,35 @@ class SecretPlanApproval(Base):
     plan_hash: Mapped[str] = mapped_column(String(64))
     comment: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SecretSchedule(Base):
+    __tablename__ = "secret_sync_schedules"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(100))
+    mapping_ids: Mapped[list] = mapped_column(JSONB, default=list)
+    mapping_versions: Mapped[dict] = mapped_column(JSONB, default=dict)  # {mapping_id: version} the approval covers
+    interval_minutes: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending | active | paused | rejected | retired
+    paused_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    schedule_hash: Mapped[str] = mapped_column(String(64), default="")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    requested_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_plan_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("secret_plans.id", ondelete="SET NULL"), nullable=True)
+    last_outcome: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SecretScheduleApproval(Base):
+    __tablename__ = "secret_schedule_approvals"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    schedule_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("secret_sync_schedules.id", ondelete="CASCADE"))
+    approver_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    decision: Mapped[str] = mapped_column(String(10))
+    schedule_hash: Mapped[str] = mapped_column(String(64))
+    comment: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

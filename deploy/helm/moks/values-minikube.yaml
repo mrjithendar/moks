@@ -166,5 +166,6 @@ reranker:
 # argocd: write access to its Secrets is write access to Argo CD's cluster and repository credentials.
 secretsSync:
   enabled: true
+  allowDelete: true   # delete verb on Secrets, for reviewed deletion plans (always someone else's approval); AWS deletion is the connector's allow_delete
   namespaces: [harbor, jithendar, moks, velero, traefik, observability,
                moks-diagnostics, moks-lab, moks-terminals, monitoring, roboshop-ai ]

@@ -909,3 +909,162 @@ async def _env_id(name: str) -> str:
 
     async with session_scope() as db:
         return str((await db.execute(select(Environment.id).where(Environment.name == name))).scalar_one())
+
+
+# ---- bulk mapping ---------------------------------------------------------------------------------------------
+
+
+async def _inventory(w: World, side="kubernetes") -> list[dict]:
+    return (await w.call("op", "GET", f"/inventory?side={side}", expect=200)).json()["items"]
+
+
+async def test_bulk_map_exports_kubernetes_secrets_and_imports_aws_ones(world):
+    w = world
+    w.east.put("shop", "a", {"p": b"1"})
+    w.east.put("shop", "b", {"p": b"2"})
+    w.sm.seed("import/appconfig", string=json.dumps({"url": "https://x"}))
+    await w.discover()
+    kube = {r["name"]: r["id"] for r in await _inventory(w)}
+    r = (await w.call("op", "POST", "/mappings/bulk", {"inventory_ids": [kube["a"], kube["b"]], "aws_connector_id": w.ids["aws"]}, expect=201)).json()
+    assert sorted(m["secret_name"] for m in r["created"]) == ["a", "b"] and not r["skipped"]
+    assert {m["direction"] for m in r["created"]} == {"export"} and {m["aws_secret_name"] for m in r["created"]} == {f"moks/{w.env}/east/shop/a", f"moks/{w.env}/east/shop/b"}
+    await run_jobs()
+    plan = await w.get(r["plan_id"])
+    assert plan["status"] == "draft" and {i["classification"] for i in plan["items"]} == {"missing_aws"}
+    again = (await w.call("op", "POST", "/mappings/bulk", {"inventory_ids": [kube["a"]], "aws_connector_id": w.ids["aws"], "compare": False}, expect=201)).json()
+    assert not again["created"] and "already uses" in again["skipped"][0]["why"]  # mapped once only
+
+    aws = {r["name"]: r["id"] for r in await _inventory(w, "aws")}
+    r = (await w.call("op", "POST", "/mappings/bulk", {"inventory_ids": [aws["import/appconfig"]], "aws_connector_id": w.ids["aws"], "compare": False}, expect=201)).json()
+    assert not r["created"] and "namespace" in r["skipped"][0]["why"]
+    r = (await w.call("op", "POST", "/mappings/bulk", {"inventory_ids": [aws["import/appconfig"]], "aws_connector_id": w.ids["aws"], "namespace": "pay",
+                                                       "kube_connector_id": w.ids["east"], "compare": False}, expect=201)).json()
+    assert r["created"], r["skipped"]
+    m = r["created"][0]
+    assert (m["namespace"], m["secret_name"], m["direction"], m["payload_format"]) == ("pay", "appconfig", "import", "json")
+    r = await w.call("viewer", "POST", "/mappings/bulk", {"inventory_ids": [kube["b"]], "aws_connector_id": w.ids["aws"]})
+    assert r.status_code == 403
+
+
+# ---- schedules ------------------------------------------------------------------------------------------------
+
+
+async def run_schedules() -> list[dict]:
+    """Runs due schedules as the executor loop does."""
+    s = get_settings()
+    old, s.process_role = s.process_role, "executor"
+    out = []
+    try:
+        while (sid := await tasks.due_schedule()) is not None:
+            out.append(await tasks.run_schedule(sid))
+    finally:
+        s.process_role = old
+    return out
+
+
+async def test_an_approved_schedule_syncs_one_sided_changes_and_leaves_conflicts(world):
+    w = world
+    m, done = await _export_one(w, {"p": b"one"}, direction="both")
+    assert done["status"] == "succeeded"
+    s = (await w.call("op", "POST", "/schedules", {"name": "shop db", "mapping_ids": [m["id"]], "interval_minutes": 60}, expect=201)).json()
+    assert s["status"] == "pending" and not s["allowed"]["approve"]
+    assert await run_schedules() == []  # nothing runs before approval
+    r = await w.call("op", "POST", f"/schedules/{s['id']}/decision", {"approve": True, "schedule_hash": s["schedule_hash"]})
+    assert r.status_code == 403  # never one's own
+    assert (await w.call("viewer", "POST", f"/schedules/{s['id']}/decision", {"approve": True, "schedule_hash": s["schedule_hash"]})).status_code == 403
+    s = (await w.call("ap", "POST", f"/schedules/{s['id']}/decision", {"approve": True, "schedule_hash": s["schedule_hash"], "comment": "ok"}, expect=200)).json()
+    assert s["status"] == "active"
+
+    w.east.put("shop", "db", {"p": b"two"})  # changed in Kubernetes only
+    (run,) = await run_schedules()
+    assert run["status"] == "succeeded", run
+    assert w.aws_content(m["aws_secret_name"]).data == {"p": b"two"}
+    s = (await w.call("op", "GET", "/schedules", expect=200)).json()["items"][0]
+    assert s["last_outcome"]["written"] == 1 and not s["last_outcome"]["needs_review"]
+    plan = await w.get(s["last_plan_id"])
+    assert plan["summary"]["schedule"] == "shop db" and plan["requested_by"] == w.users["op"]
+    assert await run_schedules() == []  # not due again for an hour
+
+    versions = len(w.sm.secrets[m["aws_secret_name"]]["versions"])
+    w.east.put("shop", "db", {"p": b"three"})
+    w.sm.external_put(m["aws_secret_name"], to_aws(Content("Opaque", {"p": b"four"}), "moks-k8s-v1", {}).string)
+    await w.call("op", "POST", f"/schedules/{s['id']}/run", expect=200)
+    (run,) = await run_schedules()
+    s = (await w.call("op", "GET", "/schedules", expect=200)).json()["items"][0]
+    assert s["last_outcome"]["written"] == 0 and s["last_outcome"]["needs_review"][0]["classification"] == "changed_both"
+    assert w.east.data("shop", "db") == {"p": b"three"} and len(w.sm.secrets[m["aws_secret_name"]]["versions"]) == versions + 1  # only the outside write
+
+    # editing the mapping voids the approval: the next run pauses instead of writing
+    await w.call("op", "PATCH", f"/mappings/{m['id']}", {"version": m["version"], "direction": "export"}, expect=200)
+    await w.call("op", "POST", f"/schedules/{s['id']}/run", expect=200)
+    (run,) = await run_schedules()
+    assert "edited after" in run["paused"]
+    s = (await w.call("op", "GET", "/schedules", expect=200)).json()["items"][0]
+    assert s["status"] == "paused" and "edited after" in s["paused_reason"] and s["stale_mappings"] == ["shop/db"]
+    s = (await w.call("op", "PATCH", f"/schedules/{s['id']}", {"version": s["version"], "refresh": True}, expect=200)).json()
+    assert s["status"] == "pending" and s["stale_mappings"] == []
+
+
+async def test_a_run_rechecks_the_approver_before_writing(world):
+    w = world
+    m, _ = await _export_one(w, {"p": b"one"}, direction="export")
+    s = (await w.call("op", "POST", "/schedules", {"name": "check", "mapping_ids": [m["id"]], "interval_minutes": 15}, expect=201)).json()
+    await w.call("ap", "POST", f"/schedules/{s['id']}/decision", {"approve": True, "schedule_hash": s["schedule_hash"]}, expect=200)
+    async with session_scope() as db:  # the approver loses the role
+        await db.execute(text("DELETE FROM role_bindings WHERE user_id = (SELECT id FROM users WHERE email = :e)"), {"e": w.users["ap"]})
+    w.east.put("shop", "db", {"p": b"two"})
+    (run,) = await run_schedules()
+    assert "approval is no longer valid" in run["paused"]
+    assert w.aws_content(m["aws_secret_name"]).data == {"p": b"one"}
+
+
+# ---- viewing values -------------------------------------------------------------------------------------------
+
+
+def _browser_key():
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from moks.secrets.seal import _b64
+
+    private = ec.generate_private_key(ec.SECP256R1())
+    n = private.public_key().public_numbers()
+    return private, {"kty": "EC", "crv": "P-256", "x": _b64(n.x.to_bytes(32, "big")), "y": _b64(n.y.to_bytes(32, "big"))}
+
+
+async def test_values_are_sealed_to_the_browser_shown_once_and_audited(world):
+    from moks.secrets.seal import open_sealed
+
+    w = world
+    w.east.put("shop", "db", {"password": SENTINEL.encode(), "blob": b"\x00\xff"})
+    await w.discover()
+    rid = next(r["id"] for r in await _inventory(w) if r["name"] == "db")
+    private, jwk = _browser_key()
+    assert (await w.call("op", "POST", "/reveal", {"inventory_id": rid, "public_key": jwk})).status_code == 403  # operators cannot
+    assert (await w.call("ap", "POST", "/reveal", {"inventory_id": rid, "public_key": {**jwk, "d": "x"}})).status_code == 422  # never a private key
+    job = (await w.call("ap", "POST", "/reveal", {"inventory_id": rid, "public_key": jwk}, expect=202)).json()["job_id"]
+    assert (await w.call("ap", "GET", f"/reveal/{job}", expect=200)).json()["status"] == "queued"
+    await run_jobs()
+    async with session_scope() as db:  # what the database holds is ciphertext
+        stored = (await db.execute(text("SELECT payload::text || result::text FROM jobs WHERE id = :j"), {"j": uuid.UUID(job)})).scalar_one()
+    assert SENTINEL not in stored and base64.b64encode(SENTINEL.encode()).decode() not in stored
+    r = (await w.call("ap", "GET", f"/reveal/{job}", expect=200)).json()
+    doc = json.loads(open_sealed(private, r["sealed"], job))
+    assert doc["keys"] == {"blob": {"base64": "AP8="}, "password": {"text": SENTINEL}} and doc["type"] == "Opaque"
+    assert (await w.call("ap", "GET", f"/reveal/{job}")).status_code == 410  # once
+    assert (await w.call("admin", "GET", f"/reveal/{job}")).status_code == 404  # only to the person who asked
+    async with session_scope() as db:
+        actions = set((await db.execute(text("SELECT action FROM audit_events WHERE resource_id = 'kubernetes:shop/db'"))).scalars().all())
+    assert {"secrets.reveal_request", "secrets.reveal"} <= actions
+    shop_only = (await w.call("viewer", "POST", "/reveal", {"inventory_id": rid, "public_key": jwk})).status_code
+    assert shop_only == 403
+
+
+async def test_the_inventory_filters_by_several_types_and_lists_the_types_found(world):
+    w = world
+    w.east.put("shop", "plain", {"p": b"1"})
+    w.east.put("shop", "cert", {"tls.crt": b"c", "tls.key": b"k"}, "kubernetes.io/tls")
+    w.east.put("shop", "login", {"username": b"u", "password": b"p"}, "kubernetes.io/basic-auth")
+    await w.discover()
+    r = (await w.call("op", "GET", "/inventory?side=kubernetes&type=kubernetes.io/tls&type=Opaque", expect=200)).json()
+    assert {i["name"] for i in r["items"]} >= {"plain", "cert"} and "login" not in {i["name"] for i in r["items"]}
+    assert {"Opaque", "kubernetes.io/tls", "kubernetes.io/basic-auth"} <= set(r["types"])

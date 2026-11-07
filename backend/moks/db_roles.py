@@ -32,10 +32,12 @@ TABLES = ("learning_records", "learning_judgments", "learning_datasets", "learni
           "incidents", "incident_events", "jobs", "knowledge_sources", "documents", "chunks", "embedding_indexes", "conversations", "conversation_participants", "conversation_reads", "knowledge_sync_items", "document_index_state", "skill_versions", "skill_generations",
           "conversation_messages", "backup_runs", "backup_stores", "database_backups", "database_backup_schedules", "skill_policies", "detection_policies", "detection_runs", "detection_states", "maintenance_windows",
           "saved_queries", "index_outbox", "llm_reservations", "component_versions", "action_plans", "approvals", "diagnostic_sessions", "diagnostic_commands", "terminal_sessions", "alert_events", "eval_runs", "alembic_version",
-          "secret_mappings", "secret_inventory", "secret_inventory_scopes", "secret_plans", "secret_plan_items", "secret_plan_approvals")
+          "secret_mappings", "secret_inventory", "secret_inventory_scopes", "secret_plans", "secret_plan_items", "secret_plan_approvals", "secret_sync_schedules",
+          "secret_schedule_approvals")
 # The gateway signs people in and runs shells, so it sees only that. Its session updates are the two columns load() touches.
 _TERMINAL_READS = {"users", "role_bindings", "sessions", "environments", "terminal_sessions", "alembic_version"}
-SECRETS = {"secret_mappings", "secret_inventory", "secret_inventory_scopes", "secret_plans", "secret_plan_items", "secret_plan_approvals"}  # names, key names, versions and keyed digests: the worker never needs them
+SECRETS = {"secret_mappings", "secret_inventory", "secret_inventory_scopes", "secret_plans", "secret_plan_items", "secret_plan_approvals", "secret_sync_schedules",
+           "secret_schedule_approvals"}  # names, key names, versions and keyed digests: the worker never needs them
 LEARNING = {"learning_records", "learning_judgments", "learning_datasets", "learning_dataset_items"}  # the executor runs actions and has no use for training data
 HIDDEN = {"moks_worker": {"sessions", "terminal_sessions"} | SECRETS, "moks_backup": SECRETS, "moks_executor": {"sessions", "terminal_sessions"} | LEARNING,  # session hashes are the API's business
           "moks_terminal": set(TABLES) - _TERMINAL_READS}
@@ -49,6 +51,11 @@ EXECUTOR_SECRET_MAPPING_COLUMNS = ("baseline", "baseline_seq", "last_status", "l
 API_SECRET_PLAN_COLUMNS = ("status", "plan_hash", "requires_approval", "expires_at", "version", "summary", "executed_by", "compare_job_id", "execute_job_id",
                            "submitted_at", "queued_at", "finished_at", "error")
 EXECUTOR_SECRET_PLAN_COLUMNS = ("status", "summary", "version", "error", "finished_at")
+# A scheduled run is a plan the executor creates, compares and queues itself. It may hash and queue it, but never
+# waive its approval (requires_approval) or record one: the approval is the schedule's, which only the API inserts.
+EXECUTOR_SCHEDULED_PLAN_COLUMNS = ("plan_hash", "expires_at", "submitted_at", "queued_at", "executed_by")
+API_SECRET_SCHEDULE_COLUMNS = ("name", "mapping_ids", "mapping_versions", "interval_minutes", "status", "paused_reason", "schedule_hash", "version", "next_run_at", "updated_at")
+EXECUTOR_SECRET_SCHEDULE_COLUMNS = ("status", "paused_reason", "next_run_at", "last_run_at", "last_plan_id", "last_outcome", "updated_at")
 API_SECRET_ITEM_COLUMNS = ("included", "resolution", "key_choices", "targets", "actions", "expected", "diff", "warnings", "blocked", "status", "error", "updated_at")
 EXECUTOR_PLAN_COLUMNS = ("status", "worker_id", "executed_at", "heartbeat_at", "lease_expires_at", "execution_token", "mutation_state", "checkpoint", "finished_at", "result")
 
@@ -76,6 +83,13 @@ def statements() -> list[str]:
             f"GRANT UPDATE ({', '.join(EXECUTOR_SECRET_MAPPING_COLUMNS)}) ON secret_mappings TO moks_executor",
             f"GRANT UPDATE ({', '.join(EXECUTOR_SECRET_PLAN_COLUMNS)}) ON secret_plans TO moks_executor",
             "GRANT UPDATE ON secret_plan_items TO moks_executor",
+            "GRANT INSERT ON secret_sync_schedules, secret_schedule_approvals TO moks_api",
+            f"GRANT UPDATE ({', '.join(API_SECRET_SCHEDULE_COLUMNS)}) ON secret_sync_schedules TO moks_api",
+            f"GRANT UPDATE ({', '.join(EXECUTOR_SECRET_SCHEDULE_COLUMNS)}) ON secret_sync_schedules TO moks_executor",
+            "GRANT INSERT ON secret_plans, secret_plan_items TO moks_executor",
+            f"GRANT UPDATE ({', '.join(EXECUTOR_SCHEDULED_PLAN_COLUMNS)}) ON secret_plans TO moks_executor",
+            # scheduled discovery and secret reveals queue their own jobs
+            "GRANT INSERT ON jobs TO moks_executor",
             # the executor runs secrets-class jobs, so it claims, renews and finishes them
             "GRANT UPDATE (status, worker_id, started_at, heartbeat_at, attempts, lease_expires_at, result, error, finished_at, run_after) ON jobs TO moks_executor"]
     return out

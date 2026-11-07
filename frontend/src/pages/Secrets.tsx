@@ -1,13 +1,15 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, ApiError, qs } from "../api";
 import { Badge, DataTable, ErrorBox, Loading, PageHead, Time, useInterval, useLoad, type Col } from "../components";
 import { FilterPanel, useUrlFilters } from "../filters";
 import { StateView } from "../states";
-import { Dialog, Empty, Identifier, useFeedback } from "../ui";
+import { newKeyPair, openSealed, type Revealed } from "../secretReveal";
+import { Dialog, Drawer, Empty, Identifier, useFeedback } from "../ui";
 
-/** Kubernetes <-> AWS Secrets Manager: inventories, mappings, reviewed plans and history. Nothing on this page ever
- *  shows a secret value: the API returns names, versions, key names (with secrets.compare) and masked fingerprints. */
+/** Kubernetes <-> AWS Secrets Manager: inventories, mappings, reviewed plans, sync schedules and history. The API
+ *  returns names, versions, key names (with secrets.compare) and masked fingerprints. Values appear only in the
+ *  details drawer, for people with secrets.reveal: sealed by the executor to a key made in this tab (secretReveal.ts). */
 
 type Tone = "ok" | "warn" | "bad" | "info" | "neutral";
 const STATUS_TONE: Record<string, Tone> = {
@@ -28,7 +30,11 @@ interface Config { enabled: boolean; environments: { name: string; display_name:
 interface ScopeInfo {
   kubernetes: { id: string; name: string; writable: boolean; cluster_uid: string | null; namespaces: string[]; error: string | null }[];
   aws: { id: string; name: string; account_id?: string; region?: string; allowed_prefixes?: string[]; kubernetes_namespaces?: string[]; allow_delete?: boolean; error?: string }[];
-  cluster_wide: boolean; can: Record<string, boolean>;
+  cluster_wide: boolean; can: Record<string, boolean>; discovery?: { interval_minutes: number; last_at: string | null };
+}
+
+function every(minutes: number): string {
+  return minutes % 1440 === 0 ? `${minutes / 1440} d` : minutes % 60 === 0 ? `${minutes / 60} h` : `${minutes} min`;
 }
 
 function Status({ s }: { s: string }) {
@@ -48,10 +54,10 @@ export function Secrets() {
   if (config.data && !config.data.enabled) {
     return <><PageHead title="Secrets sync" /><StateView kind="unavailable" title="Secret sync is off" why="This MOKS has MOKS_SECRETS_SYNC_ENABLED unset." next="An operator enables secretsSync in the Helm values (docs/SECRETS_SYNC.md)." /></>;
   }
-  const tabs: [string, string][] = [["inventory", "Inventory"], ["mappings", "Mappings"], ["plans", "Plans"], ["history", "History"]];
+  const tabs: [string, string][] = [["inventory", "Inventory"], ["mappings", "Mappings"], ["schedules", "Schedules"], ["plans", "Plans"], ["history", "History"]];
   return (
     <>
-      <PageHead title="Secrets sync" sub="Discover, compare and manually sync Kubernetes Secrets with AWS Secrets Manager. Every write is reviewed and approved; nothing syncs on its own.">
+      <PageHead title="Secrets sync" sub="Discover, compare and sync Kubernetes Secrets with AWS Secrets Manager. Every write is approved: once per plan, or once per schedule, which then syncs one-sided changes on its own.">
         {envs.length > 0 && <label className="inline">Environment
           <select value={env} onChange={(e) => setF({ env: e.target.value })}>{envs.map((e) => <option key={e.name} value={e.name}>{e.display_name}{e.is_production ? " (production)" : ""}</option>)}</select>
         </label>}
@@ -63,9 +69,12 @@ export function Secrets() {
           {tabs.map(([k, label]) => <button key={k} type="button" role="tab" aria-selected={f.tab === k} className={f.tab === k ? "active" : undefined} onClick={() => setF({ tab: k })}>{label}</button>)}
         </div>
         {scope.error ? <ErrorBox error={scope.error} onRetry={scope.reload} /> : null}
+        {scope.data?.discovery && <p className="small muted">Last discovered <Time iso={scope.data.discovery.last_at} />
+          {scope.data.discovery.interval_minutes > 0 ? ` · the executor lists every synced namespace every ${every(scope.data.discovery.interval_minutes)} on its own` : " · discovery runs only when someone asks"}</p>}
         {scope.data && !scope.data.aws.length && <StateView kind="empty" title="No AWS Secrets Manager connector" why={`${env} has no aws_secrets connector.`} next={<>An administrator adds one on <Link to="/admin/connectors">Connectors</Link>.</>} />}
         {scope.data && f.tab === "inventory" && <Inventory env={env} scope={scope.data} />}
-        {scope.data && f.tab === "mappings" && <Mappings env={env} scope={scope.data} />}
+        {scope.data && f.tab === "mappings" && <Mappings env={env} scope={scope.data} onScheduled={() => setF({ tab: "schedules" })} />}
+        {scope.data && f.tab === "schedules" && <Schedules env={env} scope={scope.data} />}
         {f.tab === "plans" && <Plans env={env} />}
         {f.tab === "history" && <History env={env} />}
       </>}
@@ -81,15 +90,23 @@ interface Row { id: string; side: string; connector_id: string; namespace: strin
 
 function Inventory({ env, scope }: { env: string; scope: ScopeInfo }) {
   const [f, setF, clear] = useUrlFilters({ side: "kubernetes", q: "", ns: "", type: "", owner: "", status: "", prefix: "" });
-  const inv = useLoad(() => api<{ items: Row[]; truncated: boolean; hidden: number; scopes: { scope: string; complete: boolean; count: number; error: string | null; discovered_at: string | null }[] }>(
-    `/secrets/${env}/inventory${qs({ side: f.side, q: f.q, namespace: f.ns, type: f.type, owner: f.owner, status: f.status, prefix: f.prefix })}`), [env, f.side, f.q, f.ns, f.type, f.owner, f.status, f.prefix]);
+  const types = f.type ? f.type.split(",") : [];
+  const typeQuery = types.map((t) => `&type=${encodeURIComponent(t)}`).join("");
+  const inv = useLoad(() => api<{ items: Row[]; truncated: boolean; hidden: number; types?: string[]; scopes: { scope: string; complete: boolean; count: number; error: string | null; discovered_at: string | null }[] }>(
+    `/secrets/${env}/inventory${qs({ side: f.side, q: f.q, namespace: f.ns, owner: f.owner, status: f.status, prefix: f.prefix }) || "?"}${typeQuery}`), [env, f.side, f.q, f.ns, f.type, f.owner, f.status, f.prefix]);
+  const setTypes = (next: string[]) => setF({ type: next.join(",") });
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [discovering, setDiscovering] = useState(false);
   const [proposing, setProposing] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  const [open, setOpen] = useState<Row>();
   useEffect(() => setSelected(new Set()), [env, f.side]);
   const rows = inv.data?.items ?? [];
   const namespaces = [...new Set(scope.kubernetes.flatMap((k) => k.namespaces))].sort();
   const toggle = (id: string) => setSelected((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const selectable = rows.filter((r) => !r.excluded && !r.mapping);
+  const allPicked = selectable.length > 0 && selectable.every((r) => selected.has(r.id));
+  const counts = rows.reduce<Record<string, number>>((c, r) => ({ ...c, [r.sync_status]: (c[r.sync_status] ?? 0) + 1 }), {});
   const cols: Col<Row>[] = [
     { key: "pick", head: "", cell: (r) => <input type="checkbox" aria-label={`Select ${r.name}`} disabled={!!r.excluded || !!r.mapping} checked={selected.has(r.id)} onClick={(e) => e.stopPropagation()} onChange={() => toggle(r.id)} /> },
     { key: "name", head: "Name", primary: true, cell: (r) => <Identifier name={f.side === "kubernetes" ? `${r.namespace}/${r.name}` : r.name} what="secret name" /> },
@@ -101,7 +118,7 @@ function Inventory({ env, scope }: { env: string; scope: ScopeInfo }) {
     { key: "mapping", head: "Mapped to", wide: true, cell: (r) => r.mapping ? <span className="small mono">{r.mapping.other}</span> : "—" },
   ];
   const chips = [f.q && { key: "q", label: `Name: ${f.q}`, onRemove: () => setF({ q: "" }) }, f.ns && { key: "ns", label: `Namespace: ${f.ns}`, onRemove: () => setF({ ns: "" }) },
-    f.type && { key: "type", label: `Type: ${f.type}`, onRemove: () => setF({ type: "" }) }, f.owner && { key: "owner", label: `Owner: ${f.owner}`, onRemove: () => setF({ owner: "" }) },
+    ...types.map((t) => ({ key: `type-${t}`, label: `Type: ${t}`, onRemove: () => setTypes(types.filter((x) => x !== t)) })), f.owner && { key: "owner", label: `Owner: ${f.owner}`, onRemove: () => setF({ owner: "" }) },
     f.status && { key: "status", label: `Status: ${STATUS_LABEL[f.status] ?? f.status}`, onRemove: () => setF({ status: "" }) },
     f.prefix && { key: "prefix", label: `Prefix: ${f.prefix}`, onRemove: () => setF({ prefix: "" }) }].filter(Boolean) as { key: string; label: string; onRemove: () => void }[];
   const partial = (inv.data?.scopes ?? []).filter((s) => !s.complete);
@@ -111,10 +128,14 @@ function Inventory({ env, scope }: { env: string; scope: ScopeInfo }) {
         search={<input type="search" aria-label="Search secret names" placeholder="Search names…" defaultValue={f.q} onKeyDown={(e) => { if (e.key === "Enter") setF({ q: (e.target as HTMLInputElement).value }); }} />}
         actions={<>
           {scope.can.discover && <button type="button" className="ghost" onClick={() => setDiscovering(true)}>Discover</button>}
+          {scope.can.map && selectable.length > 0 && <button type="button" className="ghost" onClick={() => setSelected(allPicked ? new Set() : new Set(selectable.map((r) => r.id)))}>
+            {allPicked ? "Clear selection" : `Select all ${selectable.length} unmapped`}</button>}
           {scope.can.map && selected.size > 0 && <button type="button" onClick={() => setProposing(true)}>Map {selected.size} selected</button>}
         </>}
         advanced={<div className="row wrap">
-          <label>Type<input value={f.type} onChange={(e) => setF({ type: e.target.value })} placeholder="Opaque" /></label>
+          <label>Type<select value="" onChange={(e) => e.target.value && setTypes([...types, e.target.value])}>
+            <option value="">{types.length ? "Add another type…" : "Any type"}</option>
+            {(inv.data?.types ?? []).filter((t) => !types.includes(t)).map((t) => <option key={t} value={t}>{t}</option>)}</select></label>
           <label>Owner<select value={f.owner} onChange={(e) => setF({ owner: e.target.value })}><option value="">Any</option><option value="none">None or MOKS</option>
             {["external-secrets", "secrets-store-csi", "cert-manager", "helm", "argocd", "flux", "sealed-secrets", "aws-rotation"].map((o) => <option key={o}>{o}</option>)}</select></label>
           <label>Status<select value={f.status} onChange={(e) => setF({ status: e.target.value })}><option value="">Any</option>{Object.entries(STATUS_LABEL).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select></label>
@@ -124,14 +145,22 @@ function Inventory({ env, scope }: { env: string; scope: ScopeInfo }) {
         {f.side === "kubernetes" && <label>Namespace<select value={f.ns} onChange={(e) => setF({ ns: e.target.value })}><option value="">All you can see</option>{namespaces.map((n) => <option key={n}>{n}</option>)}</select></label>}
       </FilterPanel>
       {inv.error && denied(inv.error) ? <StateView kind="denied" why={(inv.error as Error).message} /> : <Loading load={inv} />}
+      {rows.length > 0 && <div className="row wrap" role="group" aria-label="Sync status summary">
+        {Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([k, n]) => (
+          <button key={k} type="button" className={`ghost small${f.status === k ? " active" : ""}`} aria-pressed={f.status === k} onClick={() => setF({ status: f.status === k ? "" : k })}>
+            <Badge kind={STATUS_TONE[k] ?? "neutral"}>{n}</Badge> {STATUS_LABEL[k] ?? k}</button>))}
+      </div>}
       {partial.length > 0 && <StateView kind="partial" why="The last discovery could not read everything; rows it did not reach are from earlier runs."
         next="Fix the permission or retry Discover."><ul className="small state-list">{partial.map((s) => <li key={s.scope}><span className="mono">{s.scope}</span>: {s.error ?? "incomplete"}</li>)}</ul></StateView>}
       {(inv.data?.hidden ?? 0) > 0 && <p className="small muted">{inv.data!.hidden} secrets are outside your namespaces and not listed.</p>}
       {inv.data?.truncated && <p className="small muted">Showing the first {rows.length}. Filter to narrow the list.</p>}
-      {inv.data && <DataTable label={f.side === "kubernetes" ? "Kubernetes Secrets" : "AWS secrets"} rows={rows} cols={cols} rowKey={(r) => r.id}
+      {inv.data && <DataTable label={f.side === "kubernetes" ? "Kubernetes Secrets" : "AWS secrets"} rows={rows} cols={cols} rowKey={(r) => r.id} onRow={setOpen}
         empty={<Empty title={inv.data.scopes.length ? "No secrets match." : "Nothing discovered yet."}>{!inv.data.scopes.length && "Use Discover to list secret names. Discovery reads metadata and never writes."}</Empty>} />}
       {discovering && <DiscoverDialog env={env} scope={scope} onClose={() => setDiscovering(false)} onDone={() => { setDiscovering(false); inv.reload(); }} />}
-      {proposing && <MappingEditor env={env} scope={scope} ids={[...selected]} onClose={() => setProposing(false)} onDone={() => { setProposing(false); setSelected(new Set()); inv.reload(); }} />}
+      {proposing && <BulkMap env={env} scope={scope} side={f.side} ids={[...selected]} onClose={() => setProposing(false)} onReview={() => { setProposing(false); setReviewing(true); }}
+        onDone={() => { setProposing(false); setSelected(new Set()); inv.reload(); }} />}
+      {reviewing && <MappingEditor env={env} scope={scope} ids={[...selected]} onClose={() => setReviewing(false)} onDone={() => { setReviewing(false); setSelected(new Set()); inv.reload(); }} />}
+      {open && <SecretDetails env={env} scope={scope} row={open} onClose={() => setOpen(undefined)} />}
     </section>
   );
 }
@@ -261,13 +290,14 @@ interface Mapping { id: string; version: number; cluster_name: string; namespace
 
 const DIRECTION: Record<string, string> = { export: "K8s → AWS", import: "AWS → K8s", both: "Both" };
 
-function Mappings({ env, scope }: { env: string; scope: ScopeInfo }) {
+function Mappings({ env, scope, onScheduled }: { env: string; scope: ScopeInfo; onScheduled: () => void }) {
   const nav = useNavigate();
   const list = useLoad(() => api<{ items: Mapping[] }>(`/secrets/${env}/mappings`), [env]);
   const [q, setQ] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [planKind, setPlanKind] = useState<"sync" | "delete">();
   const [editing, setEditing] = useState<Mapping>();
+  const [scheduling, setScheduling] = useState(false);
   const { toast } = useFeedback();
   const rows = (list.data?.items ?? []).filter((m) => !q || `${m.namespace}/${m.secret_name} ${m.aws_secret_name}`.toLowerCase().includes(q.toLowerCase()));
   const toggle = (id: string) => setSelected((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -290,7 +320,9 @@ function Mappings({ env, scope }: { env: string; scope: ScopeInfo }) {
         <input type="search" aria-label="Search mappings" placeholder="Search…" value={q} onChange={(e) => setQ(e.target.value)} />
         <span className="grow" />
         {scope.can.propose && <>
+          <button type="button" className="ghost" onClick={() => setSelected(selected.size === rows.length ? new Set() : new Set(rows.map((m) => m.id)))}>{selected.size === rows.length && rows.length ? "Clear selection" : "Select all"}</button>
           <button type="button" disabled={!selected.size} onClick={() => setPlanKind("sync")}>Compare {selected.size || ""} selected</button>
+          <button type="button" className="ghost" disabled={!selected.size} onClick={() => setScheduling(true)}>Schedule sync</button>
           <button type="button" className="ghost danger" disabled={!selected.size} onClick={() => setPlanKind("delete")}>Propose deletion</button>
         </>}
       </div>
@@ -300,6 +332,7 @@ function Mappings({ env, scope }: { env: string; scope: ScopeInfo }) {
         empty={<Empty title="No mappings yet.">Select discovered secrets on the Inventory tab and map them.</Empty>} />}
       {planKind && <PlanDialog env={env} kind={planKind} ids={[...selected]} onClose={() => setPlanKind(undefined)} onCreated={(id) => nav(`/secrets/plans/${id}?env=${env}`)} />}
       {editing && <EditMapping env={env} m={editing} onClose={() => setEditing(undefined)} onDone={() => { setEditing(undefined); list.reload(); }} />}
+      {scheduling && <ScheduleDialog env={env} ids={[...selected]} onClose={() => setScheduling(false)} onDone={() => { setScheduling(false); toast("Schedule created. It runs once someone else approves it."); onScheduled(); }} />}
     </section>
   );
 }
@@ -334,9 +367,10 @@ function EditMapping({ env, m, onClose, onDone }: { env: string; m: Mapping; onC
   );
 }
 
-function PlanDialog({ env, kind, ids, onClose, onCreated, rollback }: { env: string; kind: "sync" | "delete" | "rollback"; ids: string[]; onClose: () => void; onCreated: (id: string) => void; rollback?: Record<string, any> }) {
+function PlanDialog({ env, kind, ids, onClose, onCreated, rollback, defaultTargets = ["aws"] }: { env: string; kind: "sync" | "delete" | "rollback"; ids: string[]; onClose: () => void;
+  onCreated: (id: string) => void; rollback?: Record<string, any>; defaultTargets?: string[] }) {
   const [reason, setReason] = useState("");
-  const [targets, setTargets] = useState<string[]>(["aws"]);
+  const [targets, setTargets] = useState<string[]>(defaultTargets);
   const [error, setError] = useState<unknown>();
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -368,7 +402,7 @@ function Plans({ env }: { env: string }) {
   const list = useLoad(() => api<{ items: any[] }>(`/secrets/${env}/plans`), [env]);
   useInterval(list.reload, 5000, !!list.data?.items.some((p) => BUSY.includes(p.status)));
   const cols: Col<any>[] = [
-    { key: "what", head: "Plan", primary: true, cell: (p) => <span>{p.kind} · {p.mapping_count} mapping{p.mapping_count === 1 ? "" : "s"}</span> },
+    { key: "what", head: "Plan", primary: true, cell: (p) => <span>{p.kind} · {p.mapping_count} mapping{p.mapping_count === 1 ? "" : "s"}{p.summary?.schedule && <> · <Badge kind="info">schedule {p.summary.schedule}</Badge></>}</span> },
     { key: "status", head: "Status", status: true, cell: (p) => <Badge kind={PLAN_TONE[p.status] ?? "neutral"}>{p.status}{p.expired ? " (expired)" : ""}</Badge> },
     { key: "ns", head: "Namespaces", cell: (p) => p.namespaces.join(", ") },
     { key: "by", head: "Requested by", cell: (p) => p.requested_by ?? "—" },
@@ -558,5 +592,290 @@ function History({ env }: { env: string }) {
       {rollback && <PlanDialog env={env} kind="rollback" ids={[rollback.mapping_id]} rollback={{ [rollback.mapping_id]: { version: rollback.aws_version_before, targets: ["aws", "kubernetes"] } }}
         onClose={() => setRollback(undefined)} onCreated={(id) => nav(`/secrets/plans/${id}?env=${env}`)} />}
     </section>
+  );
+}
+
+// ---- bulk mapping ------------------------------------------------------------------------------------------
+
+const INTERVALS: [number, string][] = [[15, "Every 15 minutes"], [60, "Every hour"], [360, "Every 6 hours"], [1440, "Every day"]];
+
+function BulkMap({ env, scope, side, ids, onClose, onReview, onDone }: { env: string; scope: ScopeInfo; side: string; ids: string[]; onClose: () => void; onReview: () => void; onDone: () => void }) {
+  const nav = useNavigate();
+  const aws0 = side === "aws" ? "import" : "export";
+  const [aws, setAws] = useState(scope.aws[0]?.id ?? "");
+  const [direction, setDirection] = useState(aws0);
+  const writable = scope.kubernetes.filter((k) => k.writable);
+  const [kube, setKube] = useState(writable[0]?.id ?? "");
+  const [ns, setNs] = useState("");
+  const [compareNow, setCompareNow] = useState(!!scope.can.propose);
+  const [schedule, setSchedule] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown>();
+  const [result, setResult] = useState<{ created: Mapping[]; skipped: { secret: string; why: string }[]; plan_id: string | null; schedule?: string }>();
+  const namespaces = writable.find((k) => k.id === kube)?.namespaces ?? [];
+  async function run(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(undefined);
+    try {
+      const r = await api<{ created: Mapping[]; skipped: { secret: string; why: string }[]; plan_id: string | null }>(`/secrets/${env}/mappings/bulk`, { method: "POST", body: {
+        inventory_ids: ids, aws_connector_id: aws, direction, compare: compareNow, ...(side === "aws" ? { kube_connector_id: kube, namespace: ns } : {}) } });
+      let made: string | undefined;
+      if (schedule && r.created.length) {
+        const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
+        try {
+          await api(`/secrets/${env}/schedules`, { method: "POST", body: { name: `Auto-mapped ${stamp}`, mapping_ids: r.created.map((m) => m.id), interval_minutes: schedule } });
+          made = `A schedule (${every(schedule)}) waits for approval on the Schedules tab.`;
+        } catch (err) { made = `The schedule was not created: ${err instanceof Error ? err.message : String(err)}`; }
+      }
+      setResult({ ...r, schedule: made });
+    } catch (err) { setError(err); }
+    setBusy(false);
+  }
+  if (result) return (
+    <Dialog title="Mapped" onClose={onDone}>
+      <div className="stack">
+        <p><Badge kind="ok">{result.created.length}</Badge> mapping{result.created.length === 1 ? "" : "s"} created{result.skipped.length ? <>, <Badge kind="warn">{result.skipped.length}</Badge> skipped</> : null}.</p>
+        {result.skipped.length > 0 && <ul className="small state-list">{result.skipped.map((x) => <li key={x.secret}><span className="mono">{x.secret}</span>: {x.why}</li>)}</ul>}
+        {result.schedule && <p className="small">{result.schedule}</p>}
+        <div className="row end">
+          <button type="button" className="ghost" onClick={onDone}>Close</button>
+          {result.plan_id && <button type="button" onClick={() => nav(`/secrets/plans/${result.plan_id}?env=${env}`)}>Review the comparison</button>}
+        </div>
+      </div>
+    </Dialog>
+  );
+  return (
+    <Dialog title={`Map ${ids.length} secret${ids.length === 1 ? "" : "s"}`} onClose={onClose}>
+      <form className="stack" onSubmit={run}>
+        <p className="small muted">Each one gets the default mapping: names include the cluster and namespace, the lossless moks-k8s-v1 format, and
+          {side === "aws" ? " a Kubernetes name from the last part of the AWS name." : " the Secret's own type."} Secrets that are excluded, already mapped or outside the connector are skipped and listed. Nothing is written to either side until a plan or an approved schedule runs.</p>
+        <label>AWS connector<select value={aws} onChange={(e) => setAws(e.target.value)}>{scope.aws.map((a) => <option key={a.id} value={a.id}>{a.name} ({a.account_id} {a.region})</option>)}</select></label>
+        <label>Direction<select value={direction} onChange={(e) => setDirection(e.target.value)}>
+          {side === "aws" ? <><option value="import">Import: AWS → Kubernetes</option><option value="both">Sync both ways</option></>
+            : <><option value="export">Sync to AWS: Kubernetes → AWS</option><option value="both">Sync both ways</option><option value="import">Import: AWS → Kubernetes</option></>}</select></label>
+        {side === "aws" && <div className="row wrap">
+          <label>Cluster<select value={kube} onChange={(e) => { setKube(e.target.value); setNs(""); }}>{writable.map((k) => <option key={k.id} value={k.id}>{k.name}</option>)}</select></label>
+          <label>Namespace<select required value={ns} onChange={(e) => setNs(e.target.value)}><option value="" disabled>Choose</option>{namespaces.map((n) => <option key={n}>{n}</option>)}</select></label>
+        </div>}
+        {scope.can.propose && <label className="check"><input type="checkbox" checked={compareNow} onChange={(e) => setCompareNow(e.target.checked)} /> Compare them right away (a read-only plan to review)</label>}
+        {scope.can.propose && <label>Keep them in sync<select value={schedule} onChange={(e) => setSchedule(Number(e.target.value))}><option value={0}>No schedule</option>
+          {INTERVALS.map(([m, l]) => <option key={m} value={m}>{l} (after approval)</option>)}</select></label>}
+        <ErrorBox error={error} />
+        <div className="row end">
+          <button type="button" className="ghost" onClick={onReview}>Review each one instead</button>
+          <button disabled={busy || !aws || (side === "aws" && !ns)}>{busy ? "Mapping…" : `Map ${ids.length}`}</button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+
+// ---- details and values ------------------------------------------------------------------------------------
+
+function SecretDetails({ env, scope, row, onClose }: { env: string; scope: ScopeInfo; row: Row; onClose: () => void }) {
+  const nav = useNavigate();
+  const [deleting, setDeleting] = useState(false);
+  const label = row.side === "kubernetes" ? `${row.namespace}/${row.name}` : row.name;
+  const facts: [string, ReactNode][] = [["Source", row.side === "kubernetes" ? "Kubernetes" : "AWS Secrets Manager"], ["Sync status", <Status s={row.sync_status} />],
+    ["Type", row.type ?? "—"], ["Keys", row.keys ? (row.keys.length ? <span className="mono">{row.keys.join(", ")}</span> : "none") : row.key_count != null ? `${row.key_count}` : "after the first comparison"],
+    ["Owner", row.owner?.manager ?? "none"], ["Version", row.version ? <code>{row.version}</code> : "—"], ["Last modified", <Time iso={row.last_modified} />],
+    ["Mapped to", row.mapping ? <span className="mono">{row.mapping.other}</span> : "not mapped"], ...(row.arn ? [["ARN", <span className="mono small">{row.arn}</span>] as [string, ReactNode]] : [])];
+  return (
+    <Drawer title={label} heading={<Identifier name={label} what="secret name" />} onClose={onClose}
+      footer={scope.can.propose && <div className="row end">{row.mapping
+        ? <button type="button" className="ghost danger" onClick={() => setDeleting(true)}>Propose deletion</button>
+        : <span className="small muted">Map this secret to delete it through a reviewed plan.</span>}</div>}>
+      <dl className="kv">{facts.map(([k, v]) => <Fragment key={k}><dt>{k}</dt><dd>{v}</dd></Fragment>)}</dl>
+      {row.excluded && <div className="alert warn small">Not syncable: {row.excluded}</div>}
+      {scope.can.reveal ? <RevealPanel env={env} row={row} /> : <p className="small muted">Values are shown only to people with secrets.reveal (the secrets_approver role) in this namespace.</p>}
+      {deleting && row.mapping && <PlanDialog env={env} kind="delete" ids={[row.mapping.id]} defaultTargets={[row.side === "aws" ? "aws" : "kubernetes"]}
+        onClose={() => setDeleting(false)} onCreated={(id) => nav(`/secrets/plans/${id}?env=${env}`)} />}
+    </Drawer>
+  );
+}
+
+const HIDE_AFTER_SECONDS = 120;
+
+function RevealPanel({ env, row }: { env: string; row: Row }) {
+  const key = useRef<CryptoKey | null>(null);
+  const [job, setJob] = useState<string>();
+  const [values, setValues] = useState<Revealed>();
+  const [shown, setShown] = useState<Set<string>>(new Set());
+  const [left, setLeft] = useState(0);
+  const [error, setError] = useState<unknown>();
+  const { toast } = useFeedback();
+  useEffect(() => () => { key.current = null; }, []);
+  function hide() { setValues(undefined); setShown(new Set()); setJob(undefined); key.current = null; }
+  useInterval(async () => {
+    if (!job) return;
+    try {
+      const r = await api<{ status: string; sealed?: any; error?: string }>(`/secrets/${env}/reveal/${job}`);
+      if (r.status === "succeeded" && r.sealed && key.current) {
+        setValues(await openSealed(key.current, r.sealed, job));
+        key.current = null;  // one use: the next view makes a new key
+        setJob(undefined);
+        setLeft(HIDE_AFTER_SECONDS);
+      } else if (r.status === "failed" || r.status === "cancelled") { setError(new Error(r.error || "the executor could not read the secret")); setJob(undefined); }
+    } catch (e) { setError(e); setJob(undefined); }
+  }, 1000, !!job);
+  useInterval(() => { if (left <= 1) hide(); else setLeft(left - 1); }, 1000, !!values);
+  async function start() {
+    setError(undefined);
+    try {
+      const pair = await newKeyPair();
+      key.current = pair.privateKey;
+      const r = await api<{ job_id: string }>(`/secrets/${env}/reveal`, { method: "POST", body: { inventory_id: row.id, public_key: pair.publicJwk } });
+      setJob(r.job_id);
+    } catch (e) { setError(e); key.current = null; }
+  }
+  const text = (v: { text?: string; base64?: string }) => v.text ?? v.base64 ?? "";
+  async function copy(k: string, v: { text?: string; base64?: string }) {
+    try { await navigator.clipboard.writeText(text(v)); toast(`Copied ${k}.`); } catch { toast("The browser refused clipboard access.", "bad"); }
+  }
+  return (
+    <section className="stack" aria-label="Secret values">
+      <div className="row between wrap"><strong>Values</strong>
+        {!values && <button type="button" disabled={!!job} onClick={start}>{job ? "Reading…" : "Show values"}</button>}
+        {values && <button type="button" className="ghost" onClick={hide}>Hide now ({left} s)</button>}
+      </div>
+      <p className="small muted">Every view is recorded in the audit log. The executor encrypts the values to a key made in this tab, so they never reach MOKS's database or API in readable form, and they disappear after {HIDE_AFTER_SECONDS / 60} minutes.</p>
+      <ErrorBox error={error} />
+      {values && <div className="table-wrap"><table className="small"><thead><tr><th>Key</th><th>Value</th><th /></tr></thead><tbody>
+        {Object.entries(values.keys).map(([k, v]) => (
+          <tr key={k}><td className="mono">{k}</td>
+            <td className="mono name-full">{shown.has(k) ? (text(v) === "" ? <span className="muted">empty</span> : text(v)) : "••••••••"}{v.base64 !== undefined && <span className="muted"> (binary, base64)</span>}</td>
+            <td className="row end"><button type="button" className="ghost small" onClick={() => setShown((s) => { const n = new Set(s); n.has(k) ? n.delete(k) : n.add(k); return n; })}>{shown.has(k) ? "Hide" : "Show"}</button>
+              <button type="button" className="ghost small" onClick={() => copy(k, v)}>Copy</button></td></tr>))}
+      </tbody></table></div>}
+      {values && <p className="small muted">{values.type}{values.version ? <> · version <code>{values.version}</code></> : null}</p>}
+    </section>
+  );
+}
+
+// ---- schedules ---------------------------------------------------------------------------------------------
+
+interface Schedule { id: string; name: string; status: string; paused_reason: string | null; interval_minutes: number; version: number; schedule_hash: string; requested_by: string | null;
+  namespaces: string[]; stale_mappings: string[]; mappings: { id: string; secret: string; aws_secret_name: string; direction: string; last_status: string | null }[];
+  next_run_at: string | null; last_run_at: string | null; last_plan_id: string | null;
+  last_outcome: { status?: string; written?: number; needs_review?: { mapping_id: string; secret: string; aws: string; classification: string; why: string }[]; error?: string | null };
+  approvals: { by: string | null; decision: string; comment: string; at: string | null; current: boolean }[]; allowed: Record<string, boolean> }
+
+const SCHEDULE_TONE: Record<string, Tone> = { active: "ok", pending: "warn", paused: "neutral", rejected: "bad" };
+
+function ScheduleDialog({ env, ids, onClose, onDone }: { env: string; ids: string[]; onClose: () => void; onDone: () => void }) {
+  const [name, setName] = useState("");
+  const [minutes, setMinutes] = useState(60);
+  const [error, setError] = useState<unknown>();
+  async function save(e: FormEvent) {
+    e.preventDefault();
+    try { await api(`/secrets/${env}/schedules`, { method: "POST", body: { name, mapping_ids: ids, interval_minutes: minutes } }); onDone(); } catch (err) { setError(err); }
+  }
+  return (
+    <Dialog title={`Schedule ${ids.length} mapping${ids.length === 1 ? "" : "s"}`} onClose={onClose}>
+      <form className="stack" onSubmit={save}>
+        <p className="small muted">Once someone else approves it, each run compares these mappings and writes only one-sided changes in each mapping's direction.
+          Conflicts, recreated secrets and anything blocked wait for a person. Nothing is ever deleted. Editing the schedule or a mapping needs a new approval.</p>
+        <label>Name<input required maxLength={100} pattern="[A-Za-z0-9][A-Za-z0-9 ._\-]*" value={name} onChange={(e) => setName(e.target.value)} placeholder="shop secrets" /></label>
+        <IntervalPicker value={minutes} onChange={setMinutes} />
+        <ErrorBox error={error} />
+        <div className="row end"><button>Create schedule</button></div>
+      </form>
+    </Dialog>
+  );
+}
+
+function IntervalPicker({ value, onChange }: { value: number; onChange: (m: number) => void }) {
+  const [custom, setCustom] = useState(!INTERVALS.some(([m]) => m === value));
+  return (
+    <div className="row wrap">
+      <label>Runs<select value={custom ? -1 : value} onChange={(e) => { const m = Number(e.target.value); setCustom(m === -1); if (m !== -1) onChange(m); }}>
+        {INTERVALS.map(([m, l]) => <option key={m} value={m}>{l}</option>)}<option value={-1}>Custom interval</option></select></label>
+      {custom && <label>Every (minutes)<input type="number" min={5} max={10080} required value={value} onChange={(e) => onChange(Number(e.target.value))} /></label>}
+    </div>
+  );
+}
+
+function Schedules({ env, scope }: { env: string; scope: ScopeInfo }) {
+  const list = useLoad(() => api<{ items: Schedule[] }>(`/secrets/${env}/schedules`), [env]);
+  const [open, setOpen] = useState<string>();
+  const current = list.data?.items.find((s) => s.id === open);
+  const cols: Col<Schedule>[] = [
+    { key: "name", head: "Schedule", primary: true, cell: (s) => <strong>{s.name}</strong> },
+    { key: "status", head: "Status", status: true, cell: (s) => <Badge kind={SCHEDULE_TONE[s.status] ?? "neutral"}>{s.status === "pending" ? "waiting for approval" : s.status}</Badge> },
+    { key: "every", head: "Runs", cell: (s) => `every ${every(s.interval_minutes)}` },
+    { key: "maps", head: "Mappings", cell: (s) => `${s.mappings.length}` },
+    { key: "last", head: "Last run", cell: (s) => s.last_run_at ? <><Time iso={s.last_run_at} />{" · "}{s.last_outcome.written ?? 0} written{(s.last_outcome.needs_review?.length ?? 0) > 0 && <> · <Badge kind="warn">{s.last_outcome.needs_review!.length} need review</Badge></>}</> : "—" },
+    { key: "next", head: "Next run", cell: (s) => s.status === "active" ? <Time iso={s.next_run_at} /> : "—" },
+    { key: "by", head: "Created by", wide: true, cell: (s) => s.requested_by ?? "—" },
+  ];
+  return (
+    <section className="stack">
+      <p className="small muted">Select mappings on the Mappings tab and choose Schedule sync. A schedule runs only after someone else approves it{scope.can.approve ? "" : " (secrets_approver)"}.</p>
+      <Loading load={list} />
+      {list.data && <DataTable label="Sync schedules" rows={list.data.items} cols={cols} rowKey={(s) => s.id} onRow={(s) => setOpen(s.id)}
+        empty={<Empty title="No schedules yet.">Schedule mappings from the Mappings tab, or when mapping secrets in bulk.</Empty>} />}
+      {current && <ScheduleDrawer env={env} s={current} onClose={() => setOpen(undefined)} onChange={list.reload} />}
+    </section>
+  );
+}
+
+function ScheduleDrawer({ env, s, onClose, onChange }: { env: string; s: Schedule; onClose: () => void; onChange: () => void }) {
+  const nav = useNavigate();
+  const [comment, setComment] = useState("");
+  const [minutes, setMinutes] = useState(s.interval_minutes);
+  const [error, setError] = useState<unknown>();
+  const [planFor, setPlanFor] = useState<string[]>();
+  const { toast } = useFeedback();
+  async function act(method: string, path: string, body?: any, done?: string) {
+    setError(undefined);
+    try { await api(`/secrets/${env}/schedules/${s.id}${path}`, { method, body }); if (done) toast(done); onChange(); } catch (e) { setError(e); }
+  }
+  const review = s.last_outcome.needs_review ?? [];
+  return (
+    <Drawer title={s.name} heading={<span className="row"><strong>{s.name}</strong><Badge kind={SCHEDULE_TONE[s.status] ?? "neutral"}>{s.status}</Badge></span>} onClose={onClose}
+      footer={<div className="row wrap end">
+        {s.allowed.run && <button type="button" className="ghost" onClick={() => act("POST", "/run", undefined, "The executor runs it within a few seconds.")}>Run now</button>}
+        {s.allowed.pause && <button type="button" className="ghost" onClick={() => act("POST", "/pause")}>Pause</button>}
+        {s.allowed.resume && <button type="button" onClick={() => act("POST", "/resume")}>Resume</button>}
+        {s.allowed.retire && <button type="button" className="ghost danger" onClick={() => { if (window.confirm(`Retire ${s.name}? Mappings and secrets stay as they are.`)) act("DELETE", "", undefined, "Schedule retired.").then(onClose); }}>Retire</button>}
+      </div>}>
+      <dl className="kv">
+        <dt>Runs</dt><dd>every {every(s.interval_minutes)}</dd>
+        <dt>Next run</dt><dd>{s.status === "active" ? <Time iso={s.next_run_at} /> : "—"}</dd>
+        <dt>Created by</dt><dd>{s.requested_by ?? "—"}</dd>
+        <dt>Namespaces</dt><dd>{s.namespaces.join(", ")}</dd>
+        <dt>Hash</dt><dd><code>{s.schedule_hash.slice(0, 12)}</code></dd>
+      </dl>
+      {s.paused_reason && <div className="alert warn small">{s.paused_reason}</div>}
+      {s.stale_mappings.length > 0 && <div className="alert warn small stack">Edited since approval: {s.stale_mappings.join(", ")}. The schedule does not run until it is refreshed and approved again.
+        {s.allowed.edit && <div><button type="button" className="small" onClick={() => act("PATCH", "", { version: s.version, refresh: true }, "Refreshed. It waits for approval again.")}>Refresh and ask for approval</button></div>}</div>}
+      {s.allowed.approve && <section className="card stack">
+        <strong>Approve this schedule</strong>
+        <p className="small muted">Approving lets every run write one-sided changes for these {s.mappings.length} mappings, in each mapping's direction, without asking again. Conflicts and deletions still wait for a person.</p>
+        <input aria-label="Approval comment" placeholder="Comment" value={comment} onChange={(e) => setComment(e.target.value)} />
+        <div className="row end"><button type="button" className="ghost danger" onClick={() => act("POST", "/decision", { approve: false, schedule_hash: s.schedule_hash, comment })}>Reject</button>
+          <button type="button" onClick={() => act("POST", "/decision", { approve: true, schedule_hash: s.schedule_hash, comment }, "Approved. The first run starts within seconds.")}>Approve</button></div>
+      </section>}
+      {s.last_run_at && <section className="stack">
+        <strong>Last run <Time iso={s.last_run_at} /></strong>
+        <span className="small">{s.last_outcome.status ?? "—"} · {s.last_outcome.written ?? 0} written{s.last_plan_id && <> · <Link to={`/secrets/plans/${s.last_plan_id}?env=${env}`}>open the plan</Link></>}</span>
+        {s.last_outcome.error && <div className="alert error small">{s.last_outcome.error}</div>}
+        {review.length > 0 && <div className="stack">
+          <span className="small">Waiting for a person:</span>
+          <ul className="small state-list">{review.map((r) => <li key={r.mapping_id}><span className="mono">{r.secret}</span>: {r.why}</li>)}</ul>
+          <div><button type="button" className="small" onClick={() => setPlanFor(review.map((r) => r.mapping_id))}>Compare these for review</button></div>
+        </div>}
+      </section>}
+      <section className="stack"><strong>Mappings</strong>
+        <ul className="small">{s.mappings.map((m) => <li key={m.id}><span className="mono">{m.secret}</span> ⇄ <span className="mono">{m.aws_secret_name}</span> · {DIRECTION[m.direction]} {m.last_status && <Status s={m.last_status} />}</li>)}</ul></section>
+      {s.allowed.edit && <section className="stack"><strong>Interval</strong>
+        <IntervalPicker value={minutes} onChange={setMinutes} />
+        <div><button type="button" className="ghost small" disabled={minutes === s.interval_minutes} onClick={() => act("PATCH", "", { version: s.version, interval_minutes: minutes }, "Saved. A new interval needs a new approval.")}>Save interval</button></div>
+      </section>}
+      {s.approvals.length > 0 && <section className="small stack"><strong>Decisions</strong>{s.approvals.map((a, n) => <span key={n}>{a.decision} by {a.by} <Time iso={a.at} />{a.comment && <>: {a.comment}</>}{!a.current && " (an earlier version)"}</span>)}</section>}
+      <ErrorBox error={error} />
+      {planFor && <PlanDialog env={env} kind="sync" ids={planFor} onClose={() => setPlanFor(undefined)} onCreated={(id) => nav(`/secrets/plans/${id}?env=${env}`)} />}
+    </Drawer>
   );
 }

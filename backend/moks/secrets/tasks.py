@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from sqlalchemy import delete as sql_delete, select, text
@@ -34,6 +34,7 @@ from ..db import session_scope
 from ..models import Connector, Environment, SecretInventory, SecretInventoryScope, SecretMapping, SecretPlan, SecretPlanItem
 from ..observability import span
 from . import compare, service
+from .schedules import AUTO as AUTO_CLASSIFICATIONS
 from .aws import UNCERTAIN, AwsSecretsConnector, SecretMeta
 from .content import AwsValue, Content, FormatError, assemble, content_digest, from_aws, key_id, summarize, to_aws
 from .kube import SecretsKube, consumers_of
@@ -771,3 +772,196 @@ async def schedule_discovery() -> int:
                 log.warning("secrets queue full; scheduled discovery skipped", extra={"event": "secrets_auto_discover_skipped"})
                 return queued
     return queued
+
+
+# ---- scheduled sync -----------------------------------------------------------------------------------------
+
+
+
+async def due_schedule() -> uuid.UUID | None:
+    """The oldest active schedule whose run is due and whose last run has finished."""
+    async with session_scope() as db:
+        row = (await db.execute(text("""SELECT s.id FROM secret_sync_schedules s LEFT JOIN secret_plans p ON p.id = s.last_plan_id
+                                        WHERE s.status = 'active' AND (s.next_run_at IS NULL OR s.next_run_at <= now())
+                                          AND (p.id IS NULL OR p.status NOT IN ('comparing', 'queued', 'executing'))
+                                        ORDER BY s.next_run_at NULLS FIRST LIMIT 1"""))).first()
+    return row[0] if row else None
+
+
+def _needs_review(item: SecretPlanItem, m: SecretMapping) -> str | None:
+    """Why a scheduled run leaves this item for a person, or None when it may write it."""
+    recreated = [w for w in item.warnings or [] if "recreated" in w]
+    if item.classification == "in_sync" or (item.status == "skipped" and not item.blocked):
+        return None
+    if item.classification not in AUTO_CLASSIFICATIONS:
+        return item.blocked or item.error or compare.CLASSIFICATIONS.get(item.classification or "", "not compared")
+    if recreated:
+        return recreated[0].removeprefix("compare: ")
+    if item.status != "pending" or not item.targets:
+        return item.blocked or item.error or "nothing it may write on its own"
+    return None
+
+
+async def run_schedule(schedule_id: uuid.UUID) -> dict[str, Any]:
+    """One run: compare every mapping on the schedule, then write only the one-sided changes it covers."""
+    try:
+        return await _run_schedule(schedule_id)
+    except Exception:  # the executor loop must keep going; the next tick tries the next due schedule
+        log.exception("scheduled secret sync failed", extra={"event": "secret_schedule_error"})
+        try:  # not every tick: wait for the next interval, as a run would
+            async with session_scope() as db:
+                await db.execute(text("""UPDATE secret_sync_schedules SET next_run_at = now() + make_interval(mins => interval_minutes),
+                                         last_outcome = '{"status": "error", "error": "internal error; see the executor log"}'::jsonb WHERE id = :i"""), {"i": schedule_id})
+        except Exception:
+            pass
+        return {"error": "internal"}
+
+
+async def _run_schedule(schedule_id: uuid.UUID) -> dict[str, Any]:
+    from ..models import SecretSchedule
+    from . import schedules
+
+    now = datetime.now(timezone.utc)
+    async with session_scope() as db:
+        s = await db.get(SecretSchedule, schedule_id, with_for_update=True)
+        if s is None or s.status != "active" or (s.next_run_at and s.next_run_at > now):
+            return {"skipped": "not due"}
+        env = await db.get(Environment, s.environment_id)
+        try:
+            await schedules.check(db, s, env)
+        except service.SyncError as exc:
+            s.status, s.paused_reason, s.updated_at = "paused", exc.message, now
+            s.last_outcome = {"at": now.isoformat(), "status": "paused", "error": exc.message}
+            await audit.record(db, action="secrets.schedule_pause", resource_type="secret_schedule", resource_id=str(s.id), environment=env.name,
+                               decision="deny", outcome="paused", details={"error": exc.message})
+            return {"paused": exc.message}
+        rows = await schedules.schedule_mappings(db, s)
+        plan = SecretPlan(environment_id=env.id, kind="sync", status="comparing", reason=f"Scheduled sync: {s.name}", requested_by=s.requested_by,
+                          request={"mapping_ids": [str(m.id) for m in rows], "targets": None, "schedule_id": str(s.id), "schedule_hash": s.schedule_hash},
+                          hash_version=service.HASH_VERSION)
+        db.add(plan)
+        await db.flush()
+        for pos, m in enumerate(rows):
+            db.add(SecretPlanItem(plan_id=plan.id, mapping_id=m.id, position=pos, mapping_version=m.version, baseline_seq=m.baseline_seq))
+        s.last_plan_id, s.last_run_at, s.next_run_at, s.updated_at = plan.id, now, schedules.next_after(s, now), now
+        plan_id, name, env_name, requested_by = plan.id, s.name, env.name, s.requested_by
+    await compare_plan({"plan_id": str(plan_id)})
+    needs: list[dict[str, str]] = []
+    runnable = 0
+    async with session_scope() as db:
+        plan = await db.get(SecretPlan, plan_id, with_for_update=True)
+        env = await db.get(Environment, plan.environment_id)
+        if plan.status == "draft":
+            for i in await service.items_of(db, plan):
+                m = await db.get(SecretMapping, i.mapping_id)
+                why = _needs_review(i, m)
+                if why:
+                    needs.append({"mapping_id": str(m.id), "secret": f"{m.namespace}/{m.secret_name}", "aws": m.aws_secret_name,
+                                  "classification": i.classification or "failed", "why": why})
+                if why or i.classification == "in_sync":
+                    i.included = False
+                    if i.status == "pending":
+                        i.status = "skipped"
+            items = await service.items_of(db, plan)
+            runnable = len(service.runnable(items))
+            stamp = datetime.now(timezone.utc).replace(microsecond=0)
+            plan.summary = {**(plan.summary or {}), "schedule": name, "runnable": runnable, "needs_review": len(needs)}
+            if runnable:
+                plan.expires_at, plan.submitted_at, plan.queued_at = stamp + timedelta(minutes=env.plan_ttl_minutes), stamp, stamp
+                plan.plan_hash = service.compute_hash(plan, env.name, items)
+                plan.executed_by, plan.status = requested_by, "queued"
+            else:
+                plan.status, plan.finished_at = "succeeded", stamp
+            plan.version += 1
+        status = plan.status
+    if runnable:
+        await execute_plan({"plan_id": str(plan_id), "_job_id": str(uuid.uuid4())})
+    async with session_scope() as db:
+        plan = await db.get(SecretPlan, plan_id)
+        s = await db.get(SecretSchedule, schedule_id, with_for_update=True)
+        outcome = {"at": now.isoformat(), "plan_id": str(plan_id), "status": plan.status, "written": (plan.summary or {}).get("outcomes", {}).get("succeeded", 0) if runnable else 0,
+                   "needs_review": needs, "error": plan.error}
+        s.last_outcome = outcome
+        if plan.status == "failed" and plan.error and ("approval" in plan.error or "schedule" in plan.error):
+            s.status, s.paused_reason = "paused", plan.error
+        await audit.record(db, action="secrets.schedule_run", actor_id=requested_by, resource_type="secret_schedule", resource_id=str(schedule_id), environment=env_name,
+                           decision="allow", outcome=plan.status, details={"plan": str(plan_id), "runnable": runnable, "needs_review": [n["secret"] for n in needs]})
+        status = plan.status
+    return {"plan_id": str(plan_id), "status": status, "needs_review": len(needs)}
+
+
+# ---- viewing values -------------------------------------------------------------------------------------------
+
+REVEAL_MAX_BYTES = 256 * 1024
+REVEAL_KEEP_MINUTES = 5
+
+
+def _shown(raw: bytes) -> dict[str, str]:
+    try:
+        return {"text": raw.decode("utf-8")}
+    except UnicodeDecodeError:
+        import base64
+
+        return {"base64": base64.b64encode(raw).decode()}
+
+
+async def reveal(payload: dict[str, Any]) -> dict[str, Any]:
+    """Read one secret and seal its values to the requesting browser's key (seal.py). The values exist here only
+    inside this call; what is returned and stored is ciphertext."""
+    import json
+
+    from .seal import seal
+
+    job_id = str(payload["_job_id"])
+    async with session_scope() as db:
+        env = await db.get(Environment, uuid.UUID(payload["environment_id"]))
+        row = await db.get(Connector, uuid.UUID(payload["connector_id"]))
+    side, ns, name = payload["side"], payload.get("namespace"), payload["name"]
+    backends = Backends()
+    keys: list[str] = []
+    try:
+        if side == "kubernetes":
+            kube, _ = await backends.get(row, None)
+            got = await kube.get(ns, name)
+            if got is None:
+                raise ConnectorError("not_found", f"{ns}/{name} no longer exists")
+            meta, content = got
+            doc = {"side": side, "type": content.type, "version": meta.get("resource_version"), "keys": {k: _shown(v) for k, v in sorted(content.data.items())}}
+        else:
+            _, aws = await backends.get(None, row)
+            if not aws.name_allowed(name):
+                raise ConnectorError("forbidden", f"{name} is outside the connector's allowed prefixes")
+            meta = await aws.describe(name)
+            if meta is None:
+                raise ConnectorError("not_found", f"{name} no longer exists")
+            value = await aws.get_value(meta)
+            if value.binary is not None:
+                shown = {"(binary)": _shown(value.binary)}
+            else:
+                try:
+                    parsed = json.loads(value.string or "")
+                except ValueError:
+                    parsed = None
+                shown = ({k: {"text": v if isinstance(v, str) else json.dumps(v)} for k, v in sorted(parsed.items())} if isinstance(parsed, dict)
+                         else {"(value)": {"text": value.string or ""}})
+            doc = {"side": side, "type": "SecretString" if value.binary is None else "SecretBinary", "version": value.version_id, "keys": shown}
+        keys = sorted(doc["keys"])
+        plain = json.dumps(doc).encode()
+        del doc
+        if len(plain) > REVEAL_MAX_BYTES:
+            raise ConnectorError("bad_request", f"the secret is larger than {REVEAL_MAX_BYTES // 1024} KiB and is not shown here")
+        sealed = seal(payload["public_key"], plain, job_id)
+        del plain
+    finally:
+        await backends.close()
+    async with session_scope() as db:
+        await audit.record(db, action="secrets.reveal", actor_id=payload.get("requested_by"), resource_type="secret", resource_id=f"{side}:{ns or ''}/{name}",
+                           environment=env.name, namespace=ns or "-", decision="allow", outcome="success", details={"side": side, "keys": keys})
+    return {"sealed": sealed, "key_count": len(keys)}
+
+
+async def purge_reveals() -> None:
+    """A sealed result is for one browser for a few minutes; after that only the fact of the view stays (audit)."""
+    async with session_scope() as db:
+        await db.execute(text("""UPDATE jobs SET result = '{"expired": true}'::jsonb WHERE type = 'secret_reveal' AND result ? 'sealed'
+                                 AND finished_at < now() - make_interval(mins => :m)"""), {"m": REVEAL_KEEP_MINUTES})

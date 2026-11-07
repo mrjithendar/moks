@@ -612,7 +612,7 @@ def test_secret_sync_is_off_by_default_and_adds_nothing(values):
 
 @pytest.mark.parametrize("split", [False, True])
 def test_only_the_executor_holds_the_secret_sync_secret_and_secret_verbs(split):
-    sets = ["secretsSync.enabled=true", "secretsSync.namespaces={shop,pay}"] + (list(SPLIT) if split else [])
+    sets = ["secretsSync.enabled=true", "secretsSync.namespaces={shop,pay}", "secretsSync.allowDelete=false"] + (list(SPLIT) if split else [])
     docs = render("values-minikube.yaml", *sets)
     holders = {name for name, pod in pods(docs) if "moks-secret-sync" in secrets(pod)}
     assert holders == {"moks-executor"}

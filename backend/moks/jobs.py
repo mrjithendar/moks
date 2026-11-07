@@ -56,10 +56,11 @@ POLICIES: dict[str, Policy] = {
     "secret_discover": Policy(2, True),     # read-only listing
     "secret_compare": Policy(2, True),      # read-only; the plan waits in comparing until it finishes
     "secret_execute": Policy(1, False),     # items keep their write state; a person retries them after reading the outcome
+    "secret_reveal": Policy(1, False),      # a person asks again; the encrypted result is for one browser key
 }
 DEFAULT_POLICY = Policy(3, False)
 JOB_CLASSES = {"detection_tick": "detection", "alert_poll": "detection", "knowledge_sync": "knowledge", "knowledge_reindex": "knowledge",
-               "secret_discover": "secrets", "secret_compare": "secrets", "secret_execute": "secrets"}
+               "secret_discover": "secrets", "secret_compare": "secrets", "secret_execute": "secrets", "secret_reveal": "secrets"}
 CLASSES = ("detection", "knowledge", "maintenance")  # the order a worker fills its capacity in
 EXECUTOR_CLASS = "secrets"  # claimed only by the executor, the one process with secret access; never by a worker
 
@@ -260,9 +261,9 @@ def handlers() -> dict[str, Handler]:
         if get_settings().process_role != "executor":
             raise RuntimeError("secret jobs run only in the executor")
         return await {"secret_discover": secret_tasks.discover, "secret_compare": secret_tasks.compare_plan,
-                      "secret_execute": secret_tasks.execute_plan}[p["_job_type"]](p)
+                      "secret_execute": secret_tasks.execute_plan, "secret_reveal": secret_tasks.reveal}[p["_job_type"]](p)
 
-    return {"secret_discover": secret_job, "secret_compare": secret_job, "secret_execute": secret_job,
+    return {"secret_discover": secret_job, "secret_compare": secret_job, "secret_execute": secret_job, "secret_reveal": secret_job,
             "detection_tick": detection_tick, "knowledge_sync": knowledge_sync, "knowledge_reindex": knowledge_reindex, "alert_poll": alert_poll, "eval_run": eval_run,
             "ml_anomaly_tick": ml_anomaly_tick, "ml_anomaly_train": ml_anomaly_train, "learning_purge": learning_purge}
 

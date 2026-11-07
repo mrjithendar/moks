@@ -14,6 +14,7 @@ follows boto3's request and error shapes, and the real `AwsSecretsConnector` run
 | Value-leak test sensitivity | a value deliberately copied into the stored comparison state made it fail |
 | `test_helm_render.py -k secret` | 8 passed: off by default, executor-only Secret with and without `secrets.split`, per-namespace Roles, delete only with `allowDelete` |
 | Migration 0033 | upgrade, downgrade to 0032, upgrade again on a fresh database |
+| Migration 0034 | upgrade, downgrade to 0033, upgrade again on a fresh database |
 | Frontend suite, `tsc --noEmit`, `vite build` | 165 passed, clean, built; Secrets page chunk 10.4 KB gzip |
 | `helm lint` (minikube), `helm template` (minikube and EKS, feature on and off) | clean |
 | `scripts/create-secret-sync-secret.sh` | run against a stub kubectl: values reach the Secret through an env file, never argv |

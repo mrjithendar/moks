@@ -20,7 +20,7 @@ The feature is off until `secretsSync.enabled: true` in the chart (`MOKS_SECRETS
 | Job payloads and results | Plan and mapping ids, counts |
 | Audit events | Actor, scope, action, key names, version ids, approval and outcome |
 | Logs and traces | Event names, namespaces, regions. No names of keys, no values |
-| API responses and the browser | Names, key names (with `secrets.compare`), masked fingerprints |
+| API responses and the browser | Names, key names (with `secrets.compare`), masked fingerprints. Values only as a reveal, sealed to one browser tab (below) |
 | LLM prompts, investigation tools, CrewAI | Nothing. `moks.secrets` is not a tool and no agent can call it |
 
 Values are read and written only by the executor (`MOKS_PROCESS_ROLE=executor`), the one component that already
@@ -38,10 +38,17 @@ carries values through the executor. They are dropped in the same function, and 
 because `kubectl.kubernetes.io/last-applied-configuration` holds a clear-text copy of a Secret's data. AWS
 discovery is metadata only (`ListSecrets`). AWS key names appear after the first comparison.
 
-**No reveal.** There is no "show value" action. Showing a value in the browser would mean passing it through
-PostgreSQL or opening a new network path to the executor, and both break the rule above. MOKS has never shown a
-secret value anywhere. To read one, use your own credentials (`kubectl`, the AWS console) or the web terminal,
-whose access is granted separately.
+**Viewing values.** People with `secrets.reveal` (the `secrets_approver` role, and admins) open a secret's details
+on the Inventory tab and choose Show values. The tab makes an ECDH P-256 key pair whose private half cannot be
+exported, and sends only the public half. The executor reads the secret in a `secret_reveal` job and encrypts it
+with AES-256-GCM, under a key derived with HKDF-SHA256 from the ECDH secret and the job id
+(`backend/moks/secrets/seal.py`, `frontend/src/secretReveal.ts`). PostgreSQL and the API hold only that
+ciphertext, which nobody but that tab can open. The API hands it over once, to the person who asked, then removes
+it, and the executor clears any result left after 5 minutes. The page masks each value until it is asked for and
+hides them all after 2 minutes. Both the request and the read are audited (`secrets.reveal_request`,
+`secrets.reveal`) with key names, never values. A Kubernetes Secret needs `secrets.reveal` in its namespace. An AWS
+secret needs it in the namespace it is mapped to, or for every namespace when it is unmapped. Values over 256 KiB
+are not shown.
 
 `tests/test_secret_sync.py::test_secret_values_stay_out_of_storage_logs_traces_errors_and_responses` runs whole
 flows, including failures, with marker values. It then searches every table, all captured logs, every span and
@@ -201,6 +208,7 @@ mapping are serialized by the lease.
 | `secrets.propose`: sync, rollback, deletion plans |  | ✓ |  | ✓ |
 | `secrets.approve` |  |  | ✓ | ✓ |
 | `secrets.execute`: run and retry |  | ✓ |  | ✓ |
+| `secrets.reveal`: view values (sealed, audited) |  |  | ✓ | ✓ |
 
 These roles are not part of `operator` or `approver`. A binding's environment and namespace patterns scope them,
 intersected with the environment's allowed and denied namespaces (as for every MOKS permission).
@@ -223,8 +231,46 @@ Restarts proposed from a review need `action.request`, as for any action.
 
 Audit events: `secrets.discover_request`, `secrets.discover`, `secrets.mapping_create|update|retire`,
 `secrets.plan_create|edit|submit|cancel`, `secrets.compare`, `secrets.approve|reject|approval_waived`,
-`secrets.execute_request`, `secrets.item_execute`, `secrets.execute` and `secrets.retry`. They carry names, key
+`secrets.execute_request`, `secrets.item_execute`, `secrets.execute` and `secrets.retry`; for schedules
+`secrets.schedule_create|edit|approve|reject|pause|resume|retire|run|run_now`; for values `secrets.reveal_request`
+and `secrets.reveal`. They carry names, key
 names and version ids, never values, digests or request bodies.
+
+## Mapping many secrets at once
+
+Select secrets on the Inventory tab (or Select all unmapped), then Map. Each one gets the mapping Map would
+propose: the name template, the moks-k8s-v1 format and the Secret's type. Choose the direction (sync to AWS, both
+ways, or import). For AWS secrets, also choose the cluster and the namespace to import into; the Kubernetes name is
+the last part of the AWS name. Secrets that are excluded, already mapped, outside the connector, or named so that
+they look like an ARN suffix are skipped, and the reason is shown. Optionally this also starts one comparison for all
+of them, and creates a schedule that waits for approval. Review each one instead keeps the per-secret editor.
+
+## Sync schedules
+
+Select mappings on the Mappings tab, then Schedule sync, and give a name and an interval (5 minutes to 7 days).
+A schedule runs nothing until it is approved, by someone else or, for an administrator's own schedule, by the
+administrator. The approval binds the schedule's hash: the environment, the creator, the interval and each mapping
+at its current version. Editing the interval or the mapping set, or editing one of its mappings, needs a new
+approval. Until then the schedule pauses with the reason and lists the edited mappings; its creator chooses
+Refresh to ask again.
+
+Each run is a normal sync plan, requested by the schedule's creator and marked with the schedule's name. It
+compares every mapping, then writes only one-sided changes in each mapping's direction: changed on one side since
+the last verified sync, or missing on one side. Left for a person, and listed on the schedule with the reason:
+
+- changes on both sides, and a first sync where the sides differ
+- secrets deleted and recreated since the last sync
+- anything blocked (direction, owner, format, type, immutability)
+- failures
+
+A run never deletes. Before writing, the executor checks everything again: the schedule's hash, the approval, and
+that the approver still has `secrets.approve` and the creator still has propose, compare and execute rights. If
+any check fails, the schedule pauses. Run now moves the next run to now. Pause and Resume are for the creator or
+an approver. Resuming checks the approval first.
+
+The executor creates and queues scheduled plans itself, under column grants (`backend/moks/db_roles.py`). It may
+hash and queue a plan, but it cannot waive approval or record one: it has no `requires_approval` grant and no
+insert on approvals. Only the API inserts schedule approvals, and they cannot be changed afterwards.
 
 ## Configuration
 

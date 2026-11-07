@@ -673,8 +673,9 @@ _secret_task: asyncio.Task | None = None
 
 
 async def secrets_tick(wid: str, wait: bool = False) -> None:
-    """Secret discovery, comparison and sync jobs (moks/secrets). One at a time, beside plans, so a long comparison
-    never holds up an action. They are claimed only here: the executor is the one process with secret access."""
+    """Secret discovery, comparison, sync and reveal jobs, then due sync schedules (moks/secrets). One at a time, beside
+    plans, so a long comparison never holds up an action. They run only here: the executor is the one process with
+    secret access."""
     global _secret_task
     from .. import jobs
     from ..secrets import tasks as secret_tasks
@@ -682,11 +683,15 @@ async def secrets_tick(wid: str, wait: bool = False) -> None:
     if not get_settings().secrets_sync_enabled or (_secret_task is not None and not _secret_task.done()):
         return
     await secret_tasks.reconcile_orphans()
+    await secret_tasks.purge_reveals()
     await secret_tasks.schedule_discovery()
     job_id = await jobs.claim(wid, jobs.EXECUTOR_CLASS)
-    if job_id is None:
+    if job_id is not None:
+        _secret_task = asyncio.create_task(jobs.run_one(job_id))
+    elif (schedule_id := await secret_tasks.due_schedule()) is not None:
+        _secret_task = asyncio.create_task(secret_tasks.run_schedule(schedule_id))
+    else:
         return
-    _secret_task = asyncio.create_task(jobs.run_one(job_id))
     if wait:
         await _secret_task
 

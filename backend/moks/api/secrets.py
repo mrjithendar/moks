@@ -1,9 +1,10 @@
-"""Secrets: discovery inventory, mappings, and reviewed sync, rollback and deletion plans (docs/SECRETS_SYNC.md).
+"""Secrets: discovery inventory, mappings, reviewed sync, rollback and deletion plans, sync schedules, and viewing
+values (docs/SECRETS_SYNC.md).
 
-This API never reads or returns a secret value and never calls AWS or reads a Kubernetes Secret: discovery,
-comparison and execution are executor jobs. What it returns is names, owners, versions, key names (to people with
-secrets.compare in the namespace) and masked fingerprints. There is no reveal endpoint: a value would have to pass
-through the database or a new network path to reach a browser (see the docs for why and what to use instead).
+This API never reads a secret value and never calls AWS or reads a Kubernetes Secret: discovery, comparison,
+execution and reveals are executor jobs. What it returns is names, owners, versions, key names (to people with
+secrets.compare in the namespace) and masked fingerprints. A reveal (secrets.reveal) comes back sealed to the
+requesting browser's key (secrets/seal.py): this process passes the ciphertext on once and cannot open it.
 """
 from __future__ import annotations
 
@@ -24,10 +25,12 @@ from ..config import get_settings
 from ..connectors import registry
 from ..connectors.base import ConnectorError
 from ..db import get_db
-from ..models import Connector, Environment, Job, SecretInventory, SecretInventoryScope, SecretMapping, SecretPlan, SecretPlanApproval, SecretPlanItem, User
+from ..models import (Connector, Environment, Job, SecretInventory, SecretInventoryScope, SecretMapping, SecretPlan, SecretPlanApproval, SecretPlanItem,
+                      SecretSchedule, SecretScheduleApproval, User)
 from ..rbac import P
 from ..scope import ScopeError, effective_scope
-from ..secrets import compare, service
+from ..secrets import compare, schedules, service
+from ..secrets.seal import SealError, public_key
 from ..secrets.content import FORMATS, SUPPORTED_TYPES
 from .common import env_or_404
 
@@ -102,8 +105,11 @@ async def scope(environment: str, request: Request, ctx: AuthContext = Depends(g
         uid = (await db.execute(select(SecretInventoryScope.cluster_uid).where(SecretInventoryScope.connector_id == row.id, SecretInventoryScope.cluster_uid.is_not(None))
                                 .order_by(SecretInventoryScope.discovered_at.desc()).limit(1))).scalar_one_or_none()
         kube_out.append({"id": str(row.id), "name": row.name, "writable": bool((row.config or {}).get("executor")), "cluster_uid": uid, "namespaces": visible, "error": error})
+    last = (await db.execute(select(func.max(SecretInventoryScope.discovered_at)).where(SecretInventoryScope.environment_id == env.id))).scalar_one_or_none()
     return {"environment": env.name, "kubernetes": kube_out, "aws": aws_out, "cluster_wide": sc.cluster_wide,
-            "can": {p.value.split(".", 1)[1]: ctx.principal.can_anywhere(p) for p in (P.SECRETS_DISCOVER, P.SECRETS_COMPARE, P.SECRETS_MAP, P.SECRETS_PROPOSE, P.SECRETS_APPROVE, P.SECRETS_EXECUTE)},
+            "can": {p.value.split(".", 1)[1]: ctx.principal.can_anywhere(p) for p in (P.SECRETS_DISCOVER, P.SECRETS_COMPARE, P.SECRETS_MAP, P.SECRETS_PROPOSE,
+                                                                                    P.SECRETS_APPROVE, P.SECRETS_EXECUTE, P.SECRETS_REVEAL)},
+            "discovery": {"interval_minutes": get_settings().secrets_discovery_interval_minutes, "last_at": last.isoformat() if last else None},
             "errors": kube_errors}
 
 
@@ -179,7 +185,7 @@ def _inventory_out(r: SecretInventory, mapping: SecretMapping | None, show_keys:
 
 @router.get("/{environment}/inventory")
 async def inventory(environment: str, request: Request, side: Literal["kubernetes", "aws"] = "kubernetes", q: str = Query(default="", max_length=200),
-                    namespace: list[str] = Query(default=[]), type: str = Query(default="", max_length=100), owner: str = Query(default="", max_length=60),
+                    namespace: list[str] = Query(default=[]), type: list[str] = Query(default=[], max_length=20), owner: str = Query(default="", max_length=60),
                     status: str = Query(default="", max_length=30), prefix: str = Query(default="", max_length=200), limit: int = Query(default=500, ge=1, le=2000),
                     ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     env = await _env(request, db, ctx, environment)
@@ -190,7 +196,7 @@ async def inventory(environment: str, request: Request, side: Literal["kubernete
     if namespace and side == "kubernetes":
         query = query.where(SecretInventory.namespace.in_(namespace))
     if type:
-        query = query.where(SecretInventory.type == type)
+        query = query.where(SecretInventory.type.in_(type))
     if owner:
         query = query.where(SecretInventory.owner["manager"].astext == owner) if owner != "none" else query.where(or_(SecretInventory.owner["manager"].astext.is_(None), SecretInventory.owner["manager"].astext == "moks"))
     if prefix and side == "aws":
@@ -212,9 +218,27 @@ async def inventory(environment: str, request: Request, side: Literal["kubernete
             continue
         out.append({**_inventory_out(r, m, ns is not None and _see(ctx, P.SECRETS_COMPARE, env, ns)), "sync_status": state})
     scopes = (await db.execute(select(SecretInventoryScope).where(SecretInventoryScope.environment_id == env.id, SecretInventoryScope.side == side))).scalars().all()
-    return {"items": out, "truncated": len(rows) > limit, "hidden": hidden,
+    synced = _synced(await _aws_scopes(db, env))
+    types = (await db.execute(select(SecretInventory.type).where(SecretInventory.environment_id == env.id, SecretInventory.side == side, SecretInventory.type.is_not(None))
+                              .distinct().order_by(SecretInventory.type))).scalars().all()
+    return {"items": out, "truncated": len(rows) > limit, "hidden": hidden, "types": list(types),
+            # a namespace that is no longer synced (an older, wider connector setting) keeps its last listing, but its errors are not shown
             "scopes": [{"scope": s.scope_key, "complete": s.complete, "count": s.count, "error": s.error, "discovered_at": s.discovered_at.isoformat() if s.discovered_at else None}
-                       for s in scopes if side == "aws" and cluster_wide or side == "kubernetes" and _see(ctx, P.SECRETS_DISCOVER, env, s.scope_key)]}
+                       for s in scopes if side == "aws" and cluster_wide or side == "kubernetes" and _see(ctx, P.SECRETS_DISCOVER, env, s.scope_key) and synced(s.scope_key)]}
+
+
+async def _aws_scopes(db: AsyncSession, env: Environment) -> list:
+    out = []
+    for row in (await db.execute(select(Connector).where(Connector.environment_id == env.id, Connector.type == "aws_secrets", Connector.enabled.is_(True)))).scalars().all():
+        try:
+            out.append(service.aws_scope(row))
+        except ConnectorError:
+            continue
+    return out
+
+
+def _synced(aws_scopes: list):
+    return lambda ns: any(a.namespace_allowed(ns) for a in aws_scopes)
 
 
 # ---- mappings -----------------------------------------------------------------------------------------------
@@ -336,6 +360,74 @@ async def retire_mapping(environment: str, mapping_id: uuid.UUID, version: int, 
     except service.SyncError as exc:
         raise _http(exc) from None
     return mapping_out(m, ctx, env)
+
+
+class BulkMapIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    inventory_ids: list[uuid.UUID] = Field(min_length=1, max_length=200)
+    aws_connector_id: uuid.UUID
+    kube_connector_id: uuid.UUID | None = None   # for AWS secrets: the cluster to import into (default: the first writable one)
+    namespace: str | None = Field(default=None, max_length=253)  # for AWS secrets: the namespace to import into
+    direction: Literal["export", "import", "both"] | None = None  # default: export for Kubernetes Secrets, import for AWS secrets
+    compare: bool = True                           # start one sync plan for everything mapped
+
+
+def k8s_name(aws_name: str) -> str:
+    """A Kubernetes Secret name for an imported AWS secret: its last path part, lowercased, other characters as -."""
+    import re
+
+    last = aws_name.rstrip("/").rsplit("/", 1)[-1].lower()
+    return re.sub(r"[^a-z0-9.-]+", "-", last).strip("-.")[:253] or "imported"
+
+
+@router.post("/{environment}/mappings/bulk", status_code=201)
+async def bulk_map(environment: str, body: BulkMapIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """Map many discovered secrets at once with the defaults Map would propose, skip (with the reason) what cannot be
+    mapped, and optionally start one comparison for all of them. Nothing is written to either side here."""
+    env = await _env(request, db, ctx, environment, P.SECRETS_MAP)
+    try:
+        aws_row = await service.connector(db, env, body.aws_connector_id, "aws_secrets")
+    except service.SyncError as exc:
+        raise _http(exc) from None
+    aws = service.aws_scope(aws_row)
+    rows = (await db.execute(select(SecretInventory).where(SecretInventory.id.in_(body.inventory_ids), SecretInventory.environment_id == env.id))).scalars().all()
+    kubes = {c.id: c for c in (await db.execute(select(Connector).where(Connector.environment_id == env.id, Connector.type == "kubernetes", Connector.enabled.is_(True)))).scalars().all()}
+    target = kubes.get(body.kube_connector_id) if body.kube_connector_id else next((c for c in kubes.values() if (c.config or {}).get("executor")), None)
+    created, skipped = [], []
+    for r in sorted(rows, key=lambda x: (x.namespace or "", x.name)):
+        label = f"{r.namespace}/{r.name}" if r.side == "kubernetes" else r.name
+        if r.excluded:
+            skipped.append({"inventory_id": str(r.id), "secret": label, "why": f"cannot be synced: {r.excluded}"})
+            continue
+        if r.side == "kubernetes":
+            kube = kubes.get(r.connector_id)
+            spec = {"kube_connector_id": r.connector_id, "namespace": r.namespace, "secret_name": r.name, "aws_connector_id": aws_row.id,
+                    "aws_secret_name": service.default_aws_name(aws.name_template, env, kube.name if kube else "cluster", r.namespace, r.name), "payload_format": "moks-k8s-v1",
+                    "k8s_type": r.type if r.type in SUPPORTED_TYPES else "Opaque", "direction": body.direction or "export",
+                    "expected_owner": {"kubernetes": (r.owner or {}).get("manager") or "none", "aws": "none"}, "management_policy": "refuse_managed"}
+        else:
+            if not body.namespace or target is None:
+                skipped.append({"inventory_id": str(r.id), "secret": label, "why": "choose the cluster and namespace to import AWS secrets into"})
+                continue
+            moks_made = (r.owner or {}).get("manager") == "moks"
+            spec = {"kube_connector_id": target.id, "namespace": body.namespace, "secret_name": k8s_name(r.name), "aws_connector_id": aws_row.id, "aws_secret_name": r.name,
+                    "payload_format": "moks-k8s-v1" if moks_made else "json", "k8s_type": "Opaque", "direction": body.direction or "import",
+                    "expected_owner": {"kubernetes": "none", "aws": "none" if moks_made else (r.owner or {}).get("manager") or "none"}, "management_policy": "refuse_managed"}
+        try:
+            async with db.begin_nested():
+                m = await service.create_mapping(db, ctx.principal, env, spec)
+            created.append(m)
+        except service.SyncError as exc:
+            skipped.append({"inventory_id": str(r.id), "secret": label, "why": exc.message})
+    plan_out = None
+    if created and body.compare and all(_see(ctx, P.SECRETS_PROPOSE, env, m.namespace) for m in created):
+        try:
+            plan = await service.create_plan(db, ctx.principal, env, kind="sync", mapping_ids=[m.id for m in created][:get_settings().secrets_max_plan_items],
+                                             reason=f"Compare {len(created)} newly mapped secret{'s' if len(created) != 1 else ''}")
+            plan_out = await _start_compare(db, plan, ctx, env)
+        except service.SyncError as exc:
+            skipped.append({"inventory_id": None, "secret": "comparison", "why": exc.message})
+    return {"created": [mapping_out(m, ctx, env) for m in created], "skipped": skipped, "plan_id": plan_out["id"] if plan_out else None}
 
 
 # ---- plans --------------------------------------------------------------------------------------------------
@@ -609,3 +701,206 @@ async def history(environment: str, request: Request, mapping_id: uuid.UUID | No
                     "kube_version_before": r.get("kube_version_before"), "kube_version_after": r.get("kube_version_after"),
                     "rollback_available": i.status == "succeeded" and "aws" in (i.targets or []) and bool(r.get("aws_version_before")) and p.kind == "sync"})
     return {"items": out}
+
+
+# ---- schedules ----------------------------------------------------------------------------------------------
+
+
+class ScheduleIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+    mapping_ids: list[uuid.UUID] = Field(min_length=1, max_length=schedules.MAX_MAPPINGS)
+    interval_minutes: int = Field(ge=5, le=10080)
+
+
+class SchedulePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: int
+    name: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+    mapping_ids: list[uuid.UUID] | None = Field(default=None, min_length=1, max_length=schedules.MAX_MAPPINGS)
+    interval_minutes: int | None = Field(default=None, ge=5, le=10080)
+    refresh: bool = False  # take the mappings' current versions after they were edited (needs a new approval)
+
+
+class ScheduleDecision(BaseModel):
+    approve: bool
+    schedule_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    comment: str = Field(default="", max_length=2000)
+
+
+async def schedule_out(db: AsyncSession, s: SecretSchedule, ctx: AuthContext, env: Environment) -> dict[str, Any]:
+    rows = await schedules.schedule_mappings(db, s)
+    namespaces = sorted({m.namespace for m in rows})
+    approvals = (await db.execute(select(SecretScheduleApproval).where(SecretScheduleApproval.schedule_id == s.id).order_by(SecretScheduleApproval.created_at))).scalars().all()
+    users = {u.id: u.email for u in (await db.execute(select(User).where(User.id.in_({s.requested_by} | {a.approver_id for a in approvals})))).scalars().all()}
+    own = str(s.requested_by) == ctx.principal.user_id
+    approver = all(_see(ctx, P.SECRETS_APPROVE, env, n) for n in namespaces)
+    stale = [f"{m.namespace}/{m.secret_name}" for m in rows if m.status != "active" or m.version != (s.mapping_versions or {}).get(str(m.id))]
+    return {"id": str(s.id), "name": s.name, "status": s.status, "paused_reason": s.paused_reason, "interval_minutes": s.interval_minutes, "version": s.version,
+            "schedule_hash": s.schedule_hash, "requested_by": users.get(s.requested_by), "namespaces": namespaces, "stale_mappings": stale,
+            "mappings": [{"id": str(m.id), "secret": f"{m.namespace}/{m.secret_name}", "aws_secret_name": m.aws_secret_name, "direction": m.direction,
+                          "last_status": m.last_status} for m in rows],
+            "next_run_at": s.next_run_at.isoformat() if s.next_run_at else None, "last_run_at": s.last_run_at.isoformat() if s.last_run_at else None,
+            "last_plan_id": str(s.last_plan_id) if s.last_plan_id else None, "last_outcome": s.last_outcome or {},
+            "approvals": [{"by": users.get(a.approver_id), "decision": a.decision, "comment": a.comment, "at": a.created_at.isoformat() if a.created_at else None,
+                           "current": a.schedule_hash == s.schedule_hash} for a in approvals],
+            "allowed": {"edit": own and s.status != "retired", "approve": s.status == "pending" and approver and (not own or actions.is_admin(ctx.principal)),
+                        "pause": s.status == "active" and (own or approver), "resume": s.status == "paused" and (own or approver),
+                        "run": s.status == "active" and (own or approver), "retire": own or approver}}
+
+
+async def _visible_schedule(request: Request, db: AsyncSession, ctx: AuthContext, env: Environment, schedule_id: uuid.UUID) -> SecretSchedule:
+    try:
+        s = await schedules.load(db, env, schedule_id)
+    except service.SyncError as exc:
+        raise _http(exc) from None
+    for m in await schedules.schedule_mappings(db, s):
+        if not _see(ctx, P.SECRETS_DISCOVER, env, m.namespace):
+            raise await deny(request, ctx, P.SECRETS_DISCOVER, env.name, m.namespace, f"This schedule includes {m.namespace}, which is outside your secrets scope")
+    return s
+
+
+@router.get("/{environment}/schedules")
+async def list_schedules(environment: str, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    env = await _env(request, db, ctx, environment)
+    rows = (await db.execute(select(SecretSchedule).where(SecretSchedule.environment_id == env.id, SecretSchedule.status != "retired").order_by(SecretSchedule.name))).scalars().all()
+    out = []
+    for s in rows:
+        maps = await schedules.schedule_mappings(db, s)
+        if all(_see(ctx, P.SECRETS_DISCOVER, env, m.namespace) for m in maps):
+            out.append(await schedule_out(db, s, ctx, env))
+    return {"items": out}
+
+
+@router.post("/{environment}/schedules", status_code=201)
+async def create_schedule(environment: str, body: ScheduleIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """A new schedule runs nothing until someone else (or, for an administrator, they themselves) approves it."""
+    env = await _env(request, db, ctx, environment, P.SECRETS_PROPOSE)
+    try:
+        s = await schedules.create(db, ctx.principal, env, name=body.name.strip(), mapping_ids=body.mapping_ids, interval_minutes=body.interval_minutes)
+    except service.SyncError as exc:
+        if exc.status == 403:
+            raise await deny(request, ctx, P.SECRETS_PROPOSE, env.name, None, exc.message)
+        raise _http(exc) from None
+    return await schedule_out(db, s, ctx, env)
+
+
+@router.patch("/{environment}/schedules/{schedule_id}")
+async def edit_schedule(environment: str, schedule_id: uuid.UUID, body: SchedulePatch, request: Request, ctx: AuthContext = Depends(get_auth),
+                        db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    env = await _env(request, db, ctx, environment, P.SECRETS_PROPOSE)
+    try:
+        s = await schedules.update(db, ctx.principal, env, schedule_id, body.version, name=body.name.strip() if body.name else None,
+                                   mapping_ids=body.mapping_ids, interval_minutes=body.interval_minutes, refresh=body.refresh)
+    except service.SyncError as exc:
+        raise _http(exc) from None
+    return await schedule_out(db, s, ctx, env)
+
+
+@router.post("/{environment}/schedules/{schedule_id}/decision")
+async def decide_schedule(environment: str, schedule_id: uuid.UUID, body: ScheduleDecision, request: Request, ctx: AuthContext = Depends(get_auth),
+                          db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    env = await _env(request, db, ctx, environment, P.SECRETS_APPROVE)
+    try:
+        s = await schedules.decide(db, ctx.principal, env, schedule_id, body.approve, body.comment, body.schedule_hash)
+    except service.SyncError as exc:
+        raise _http(exc) from None
+    return await schedule_out(db, s, ctx, env)
+
+
+@router.post("/{environment}/schedules/{schedule_id}/{action}")
+async def pause_schedule(environment: str, schedule_id: uuid.UUID, action: Literal["pause", "resume", "run"], request: Request, ctx: AuthContext = Depends(get_auth),
+                         db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """pause and resume; run moves an active schedule's next run to now (the executor picks it up within seconds)."""
+    env = await _env(request, db, ctx, environment)
+    try:
+        if action == "run":
+            s = await _visible_schedule(request, db, ctx, env, schedule_id)
+            if s.status != "active":
+                raise service.SyncError(409, f"schedule is {s.status}; only an active schedule runs")
+            maps = await schedules.schedule_mappings(db, s)
+            if str(s.requested_by) != ctx.principal.user_id:
+                for m in maps:
+                    service.require(ctx.principal, P.SECRETS_APPROVE, env, m.namespace)
+            s.next_run_at = datetime.now(timezone.utc)
+            s.version += 1
+            await audit.record(db, action="secrets.schedule_run_now", actor_id=ctx.principal.user_id, actor_email=ctx.principal.email, resource_type="secret_schedule",
+                               resource_id=str(s.id), environment=env.name, decision="allow")
+        else:
+            s = await schedules.set_paused(db, ctx.principal, env, schedule_id, action == "pause")
+    except service.SyncError as exc:
+        raise _http(exc) from None
+    return await schedule_out(db, s, ctx, env)
+
+
+@router.delete("/{environment}/schedules/{schedule_id}")
+async def retire_schedule(environment: str, schedule_id: uuid.UUID, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    env = await _env(request, db, ctx, environment)
+    try:
+        s = await schedules.retire(db, ctx.principal, env, schedule_id)
+    except service.SyncError as exc:
+        raise _http(exc) from None
+    return {"id": str(s.id), "status": s.status}
+
+
+# ---- viewing values -----------------------------------------------------------------------------------------
+
+
+class RevealIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    inventory_id: uuid.UUID
+    public_key: dict[str, Any]  # the browser's ECDH P-256 public JWK; its private half never leaves the tab
+
+
+@router.post("/{environment}/reveal", status_code=202)
+async def request_reveal(environment: str, body: RevealIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """Queue a read of one secret by the executor, sealed to the caller's browser key. Audited when asked and when read."""
+    env = await _env(request, db, ctx, environment, P.SECRETS_REVEAL)
+    try:
+        public_key(body.public_key)
+    except SealError as exc:
+        raise HTTPException(422, str(exc)) from None
+    r = await db.get(SecretInventory, body.inventory_id)
+    if r is None or r.environment_id != env.id:
+        raise HTTPException(404, "secret not found; discover again")
+    row = await db.get(Connector, r.connector_id)
+    if row is None or not row.enabled:
+        raise HTTPException(409, "the connector this secret was found with is gone or disabled")
+    if r.side == "kubernetes":
+        ns = r.namespace
+        if not (row.config or {}).get("executor"):
+            raise HTTPException(409, f"the kubernetes connector {row.name} has no executor target")
+    else:
+        mapped = (await db.execute(select(SecretMapping).where(SecretMapping.aws_connector_id == row.id, SecretMapping.aws_secret_name == r.name,
+                                                               SecretMapping.status == "active"))).scalar_one_or_none()
+        ns = mapped.namespace if mapped else None
+        if not service.aws_scope(row).name_allowed(r.name):
+            raise HTTPException(403, f"{r.name} is outside the connector's allowed prefixes")
+    if not _see(ctx, P.SECRETS_REVEAL, env, ns):
+        raise await deny(request, ctx, P.SECRETS_REVEAL, env.name, ns, "You need secrets.reveal " + (f"in {env.name}/{ns}" if ns else f"for every namespace in {env.name} to view an unmapped AWS secret"))
+    payload = {"environment_id": str(env.id), "requested_by": ctx.principal.user_id, "side": r.side, "connector_id": str(row.id), "namespace": r.namespace,
+               "name": r.name, "public_key": {k: body.public_key[k] for k in ("kty", "crv", "x", "y")}}
+    await db.commit()
+    job_id = await jobs.enqueue("secret_reveal", payload, created_by=ctx.user.id)
+    label = f"{r.namespace}/{r.name}" if r.side == "kubernetes" else r.name
+    await audit.record(db, action="secrets.reveal_request", actor_id=ctx.principal.user_id, actor_email=ctx.principal.email, resource_type="secret",
+                       resource_id=f"{r.side}:{label}", environment=env.name, namespace=ns or "-", decision="allow", details={"side": r.side, "job": str(job_id)})
+    return {"job_id": str(job_id)}
+
+
+@router.get("/{environment}/reveal/{job_id}")
+async def read_reveal(environment: str, job_id: uuid.UUID, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """The sealed values, once, to the person who asked. They are then removed from the job."""
+    env = await _env(request, db, ctx, environment, P.SECRETS_REVEAL)
+    job = await db.get(Job, job_id, with_for_update=True)
+    if job is None or job.type != "secret_reveal" or job.payload.get("environment_id") != str(env.id) or job.payload.get("requested_by") != ctx.principal.user_id:
+        raise HTTPException(404, "reveal not found")
+    if job.status in ("queued", "running"):
+        return {"status": job.status}
+    if job.status != "succeeded":
+        return {"status": job.status, "error": job.error}
+    result = job.result or {}
+    if "sealed" not in result:
+        raise HTTPException(410, "already shown or expired; ask again")
+    job.result = {"delivered": True, "key_count": result.get("key_count")}
+    return {"status": "succeeded", "sealed": result["sealed"], "key_count": result.get("key_count")}
