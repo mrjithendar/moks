@@ -1,10 +1,10 @@
 # roboshop-demo (EKS, 2 t4g.large arm64 nodes) behind Istio at https://eks.jithendar.com/moks
 image:
-  repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
+  repository: registry.jithendar.com/jithendar/moks
   # Same release flow as mk4: CI moves latest, and pods get it when they restart (docs/RELEASES.md).
   tag: latest
   pullPolicy: Always
-imagePullSecrets: []    # nodes pull from ECR with their node role
+imagePullSecrets: [{name: harbor-pull}]   # create it in moks first: tools deploy/minikube/harbor/registry.py pull-secrets --context <eks> --namespace moks
 
 publicUrl: https://eks.jithendar.com/moks
 basePath: /moks
@@ -101,9 +101,7 @@ diagnostics:
 # synced by hand, and docs/TERMINAL.md lists what must pass before anyone else is granted the role.
 terminal:
   enabled: true
-  image:
-    digest: sha256:a2a113027fe12b847b6f7edc3754a7cacd0a70d0b7204946aa95eb188a9fb917   # multi-arch index, built from ab99cf7
-  imagePullSecrets: []           # nodes pull from ECR with their node role
+  imagePullSecrets: [harbor-pull]   # in the terminal namespace, like moks above
   profiles:
     - name: roboshop-demo-readonly
       label: roboshop-demo, read-only
@@ -134,6 +132,6 @@ networkPolicy:
     - namespace: istio-system
       ports: [80, 15012]   # kiali-prometheus, istiod for the sidecars
 
-# Off until docs/RERANKING.md's gates pass on real questions. Set reranker.enabled and image.digest to run it.
+# Off until docs/RERANKING.md's gates pass on real questions. Set reranker.enabled to run it (moks-reranker:latest from Harbor).
 reranker:
   enabled: false

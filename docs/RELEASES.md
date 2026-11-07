@@ -17,7 +17,7 @@ Together with what MOKS records at runtime, that links a running build to its mo
 | Question | Where |
 |---|---|
 | Which commit is each pod running? | `/api/health` and the profile menu (`component_versions`), from the commit baked into the image |
-| Which digest is that commit? | the release record for that commit (`release-moks-<sha>`); ECR has no commit tags |
+| Which digest is that commit? | the release record for that commit (`release-moks-<sha>`); Harbor has no commit tags |
 | Which reranker model revision? | the reranker release record, `reranking.revision` on each search, and `MOKS_RAG_RERANK_REVISION` |
 | Which evaluation backed it? | `eval_runs.versions` (dataset, skills, model, index) for knowledge and rerank evaluations; `ml_models.metrics` and `ml_models.provenance.commit` for ML models |
 
@@ -50,9 +50,11 @@ from that commit's release record (`release-moks-<sha>/moks.json`):
 
 ```bash
 DIGEST=sha256:<digest from the release record>
-MANIFEST="$(aws ecr batch-get-image --region us-east-1 --repository-name moks --image-ids imageDigest=$DIGEST --query 'images[0].imageManifest' --output text)"
-aws ecr put-image --region us-east-1 --repository-name moks --image-tag latest --image-manifest "$MANIFEST"
+docker login registry.jithendar.com     # an account with push on project jithendar
+docker buildx imagetools create --tag registry.jithendar.com/jithendar/moks:latest "registry.jithendar.com/jithendar/moks@$DIGEST"
 ```
+
+Harbor keeps the last ten builds of each repository (tools `deploy/minikube/harbor/README.md`, Retention), so older digests are gone.
 
 The next successful `master` build moves `latest` forward again. Revert the bad commit first if it would break again.
 

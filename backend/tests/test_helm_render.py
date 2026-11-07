@@ -228,15 +228,38 @@ def test_terminals_are_off_by_default():
     assert not [d for d in render("values.yaml") if "terminal" in d["metadata"]["name"]]
 
 
-def test_a_tag_or_no_profile_is_refused():
+def test_a_bad_digest_no_image_or_no_profile_is_refused():
     with pytest.raises(subprocess.CalledProcessError):
-        render("values.yaml", "terminal.enabled=true", "terminal.profiles[0].name=ro")
+        render("values.yaml", "terminal.enabled=true", "terminal.image.digest=latest", "terminal.profiles[0].name=ro")
+    with pytest.raises(subprocess.CalledProcessError):
+        render("values.yaml", "terminal.enabled=true", "terminal.image.tag=", "terminal.profiles[0].name=ro")
     with pytest.raises(subprocess.CalledProcessError):
         render("values.yaml", "terminal.enabled=true", "terminal.image.digest=sha256:" + "a" * 64)
 
 
+def test_mk4_pulls_every_moks_image_from_harbor_as_latest():
+    docs = render("values-minikube.yaml")
+    images, secrets = set(), set()
+    for doc in docs:
+        spec = doc.get("spec", {})
+        pod = spec.get("jobTemplate", {}).get("spec", spec).get("template", {}).get("spec")
+        if not pod:
+            continue
+        for container in pod.get("containers", []) + pod.get("initContainers", []):
+            for env in container.get("env", []):
+                if env["name"] == "MOKS_TERMINAL_IMAGE":
+                    images.add(env["value"])
+            if "/jithendar/moks" in container["image"]:
+                images.add(container["image"])
+                secrets.add(tuple(s["name"] for s in pod.get("imagePullSecrets", [])))
+    assert images and all(i.startswith("registry.jithendar.com/jithendar/moks") and i.endswith(":latest") for i in images), images
+    assert "registry.jithendar.com/jithendar/moks-terminal:latest" in images
+    assert secrets == {("harbor-pull",)}
+    assert not any("dkr.ecr" in str(doc) or "ecr-pull" in str(doc) for doc in docs)
+
+
 def test_mk4_opts_into_the_terminal_with_https_only():
-    """mk4 runs terminals: a pinned digest, one read-only profile, and egress to public HTTPS only."""
+    """mk4 runs terminals: moks-terminal:latest from Harbor, one read-only profile, and egress to public HTTPS only."""
     docs = render("values-minikube.yaml")
     assert of(docs, "Namespace", "moks-terminals")["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "restricted"
     policy = of(docs, "NetworkPolicy", "terminals")["spec"]

@@ -703,3 +703,17 @@ def test_source_identity_is_a_valid_aws_value():
 def test_the_gateway_serves_no_portal_route(gateway):
     paths = {getattr(r, "path", "") for r in gateway.routes}
     assert {p for p in paths if p.startswith("/moks")} == {p for p in paths if p.startswith("/moks/api/terminal")}
+
+
+def test_session_pods_pull_a_tag_every_time_and_a_digest_once():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from uuid import uuid4
+    from moks.terminal.pods import pod_manifest
+    def policy(image):
+        session = SimpleNamespace(id=uuid4(), owner_id=uuid4(), lifetime_minutes=15, region="us-east-1", aws_account="1",
+                                  environment="mk4", pod_name="moks-term-x", pod_namespace="moks-terminals",
+                                  expires_at=datetime.now(timezone.utc), image=image)
+        return pod_manifest(session)["spec"]["containers"][0]["imagePullPolicy"]
+    assert policy("registry.jithendar.com/jithendar/moks-terminal:latest") == "Always"
+    assert policy("registry.jithendar.com/jithendar/moks-terminal@sha256:" + "a" * 64) == "IfNotPresent"

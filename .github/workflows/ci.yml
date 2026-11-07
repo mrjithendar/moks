@@ -132,25 +132,22 @@ jobs:
     timeout-minutes: 25
     permissions:
       contents: read
-      id-token: write        # GitHub OIDC token for AWS; no stored access keys
     env:
-      AWS_REGION: us-east-1
+      REGISTRY: registry.jithendar.com/jithendar
       REPOSITORY: moks
     steps:
       - uses: actions/checkout@v7
-      # Role moks-github-ci from deploy/terraform (output ci_role_arn), stored as the repository
-      # variable AWS_ROLE_ARN. It can push to the moks ECR repository only, and only from master.
-      - uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          role-session-name: moks-ci-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-      - id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      # Harbor robot robot$jithendar+moks (push and pull in project jithendar only), set as these repository secrets
+      # by tools deploy/minikube/harbor/registry.py ci-robots.
+      - name: Log in to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: printf '%s' "$HARBOR_PASSWORD" | docker login registry.jithendar.com --username "$HARBOR_USERNAME" --password-stdin
       - name: Build, smoke-test and push
         run: |
           # One tag, latest. The commit is inside the image (GIT_COMMIT, reported by /moks/api/health), not in the tag.
-          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
+          IMAGE="$REGISTRY/$REPOSITORY:latest"
           docker build --build-arg GIT_COMMIT=${{ github.sha }} -t "$IMAGE" .
           # The image must start and answer its probes without a database (readyz reports 503).
           docker run -d --name smoke -e MOKS_ENV=development -e MOKS_AUTH_MODE=local -p 8080:8080 "$IMAGE"
@@ -177,22 +174,21 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      id-token: write
     env:
-      AWS_REGION: us-east-1
-      REPOSITORY: moks-crewai   # deploy/terraform/ecr.tf aws_ecr_repository.crewai
+      REGISTRY: registry.jithendar.com/jithendar
+      REPOSITORY: moks-crewai
     steps:
       - uses: actions/checkout@v7
-      - uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          role-session-name: moks-ci-crewai-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-      - id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      # Harbor robot robot$jithendar+moks (push and pull in project jithendar only), set as these repository secrets
+      # by tools deploy/minikube/harbor/registry.py ci-robots.
+      - name: Log in to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: printf '%s' "$HARBOR_PASSWORD" | docker login registry.jithendar.com --username "$HARBOR_USERNAME" --password-stdin
       - name: Build, smoke-test and push
         run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
+          IMAGE="$REGISTRY/$REPOSITORY:latest"
           docker build --build-arg GIT_COMMIT=${{ github.sha }} --build-arg MOKS_CREWAI=true -t "$IMAGE" .
           # As in the pods: read-only root, no home directory, no network. crewai must import at the pinned version
           # with its telemetry off, or the capability would report it unavailable.
@@ -330,23 +326,22 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      id-token: write
     env:
-      AWS_REGION: us-east-1
+      REGISTRY: registry.jithendar.com/jithendar
       REPOSITORY: moks-reranker
     steps:
       - uses: actions/checkout@v7
-      - uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          role-session-name: moks-reranker-ci-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-      - id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      # Harbor robot robot$jithendar+moks (push and pull in project jithendar only), set as these repository secrets
+      # by tools deploy/minikube/harbor/registry.py ci-robots.
+      - name: Log in to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: printf '%s' "$HARBOR_PASSWORD" | docker login registry.jithendar.com --username "$HARBOR_USERNAME" --password-stdin
       - name: Build, smoke-test and push
         working-directory: reranker
         run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
+          IMAGE="$REGISTRY/$REPOSITORY:latest"
           docker build --build-arg GIT_COMMIT=${{ github.sha }} -t "$IMAGE" .
           # No network, so a runtime download would fail here rather than in production.
           docker run -d --name smoke -e RERANKER_TOKEN=ci -e RERANKER_METRICS_PORT=0 --network none --read-only --tmpfs /tmp --user 10001:10001 "$IMAGE"
@@ -374,62 +369,59 @@ jobs:
           path: release/moks-reranker.json
           retention-days: 400
 
-  # moks-search with its S3 and metrics plugins. A digest in values moves the cluster, so this changes nothing
-  # until rag.opensearch.secure.image is set to what it reports. Needs the moks-opensearch ECR repository.
+  # moks-search with its S3 and metrics plugins, as moks-opensearch:latest. Changes nothing until
+  # rag.opensearch.secure.image points at it.
   opensearch-image:
     if: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     permissions:
       contents: read
-      id-token: write
     env:
-      AWS_REGION: us-east-1
+      REGISTRY: registry.jithendar.com/jithendar
       REPOSITORY: moks-opensearch
     steps:
       - uses: actions/checkout@v7
-      - uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          role-session-name: moks-opensearch-ci-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-      - id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      # Harbor robot robot$jithendar+moks (push and pull in project jithendar only), set as these repository secrets
+      # by tools deploy/minikube/harbor/registry.py ci-robots.
+      - name: Log in to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: printf '%s' "$HARBOR_PASSWORD" | docker login registry.jithendar.com --username "$HARBOR_USERNAME" --password-stdin
       - uses: docker/setup-buildx-action@v4
       - name: Build, smoke-test and push for arm64 and amd64
         working-directory: deploy/opensearch
         run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
+          IMAGE="$REGISTRY/$REPOSITORY:latest"
           docker build -t smoke .
           docker run --rm smoke bin/opensearch-plugin list | tee plugins
           grep -q repository-s3 plugins && grep -q prometheus-exporter plugins
           docker buildx build --platform linux/arm64,linux/amd64 --provenance=false --metadata-file meta.json --push -t "$IMAGE" .
           echo "pushed $IMAGE ($(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])"))." >> "$GITHUB_STEP_SUMMARY"
 
-  # Built and pushed on every push to the default branch. Sessions run a digest, so this changes nothing
-  # until the chart's terminal.image.digest is moved to what this reports.
+  # Built and pushed on every push to the default branch as moks-terminal:latest. Each new session pulls it.
   terminal-image:
     if: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     permissions:
       contents: read
-      id-token: write
     env:
-      AWS_REGION: us-east-1
+      REGISTRY: registry.jithendar.com/jithendar
       REPOSITORY: moks-terminal
     steps:
       - uses: actions/checkout@v7
-      - uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          role-session-name: moks-ci-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-      - id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      # Harbor robot robot$jithendar+moks (push and pull in project jithendar only), set as these repository secrets
+      # by tools deploy/minikube/harbor/registry.py ci-robots.
+      - name: Log in to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: printf '%s' "$HARBOR_PASSWORD" | docker login registry.jithendar.com --username "$HARBOR_USERNAME" --password-stdin
       - uses: docker/setup-buildx-action@v4
       - name: Build and push for arm64 and amd64
         run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/$REPOSITORY:latest"
+          IMAGE="$REGISTRY/$REPOSITORY:latest"
           docker buildx build --platform linux/arm64,linux/amd64 --provenance=false --build-arg GIT_COMMIT=${{ github.sha }} -t "$IMAGE" --push --metadata-file meta.json deploy/terminal
-          echo "pushed $IMAGE. Set terminal.image.digest to $(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")." >> "$GITHUB_STEP_SUMMARY"
+          echo "pushed $IMAGE ($(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")). New sessions run it." >> "$GITHUB_STEP_SUMMARY"

@@ -7,45 +7,38 @@ been run against the cluster yet; each step says what it changes.
 ## 0. Prerequisites
 
 - `kubectl`, `helm` ≥ 3.14, `aws` CLI, `argocd` CLI (optional), and access to `mk4`.
-- An `ecr-refresh` CronJob in `roboshop-ai` (tools repository) already maintains `ecr-pull`
-  Secrets. MOKS reuses it.
+- Harbor at `registry.jithendar.com` (tools repository, `deploy/minikube/harbor`). Every MOKS image is
+  `registry.jithendar.com/jithendar/<image>:latest`.
 - Capacity: MOKS needs about 0.5 CPU and 1 GiB in steady state (2 API pods, 1 worker,
   PostgreSQL). Each mk4 node has ~32 GiB, so OpenSearch (~2.5 GiB, Phase 2) also fits.
 
-## 1. AWS resources and CI (one time, Terraform)
+## 1. AWS resources and CI (one time)
 
 ```sh
 cd deploy/terraform
 terraform init
-terraform plan -var-file=tfvars/mk4.tfvars -out=moks.tfplan     # ECR repo, GitHub OIDC + CI role, runtime IAM user
+terraform plan -var-file=tfvars/mk4.tfvars -out=moks.tfplan     # runtime IAM user (and the old ECR repositories)
 terraform apply moks.tfplan
-gh variable set AWS_ROLE_ARN --repo mrjithendar/moks --body "$(terraform output -raw ci_role_arn)"
 ```
 
-This creates the `moks` ECR repository and a CI role that GitHub Actions assumes over
-OIDC, so there are no stored access keys and only `master` can push. It also creates an IAM user
-for MOKS's Bedrock calls; that user has no key yet (step 8). Details are in
-[../deploy/terraform/README.md](../deploy/terraform/README.md), including how to check that
-mk4's `ecr-refresh` identity may pull the new repository.
+This creates an IAM user for MOKS's Bedrock calls; that user has no key yet (step 8). Details are in
+[../deploy/terraform/README.md](../deploy/terraform/README.md). Images no longer go to ECR.
 
-CI (`.github/workflows/ci.yml`) tests every push, then on `master` builds the arm64 image and
-pushes an image tagged with its commit and `latest`. It
-never touches the cluster. Commit and push this repository (`github.com/mrjithendar/moks`) and
-wait for the `release` job, whose summary prints the commit and image digest.
+CI (`.github/workflows/ci.yml`) tests every push, then on `master` builds the arm64 images and pushes each as
+`latest` to Harbor, logged in as robot `robot$jithendar+moks`. Its secrets `HARBOR_USERNAME` and `HARBOR_PASSWORD`
+come from the tools repository: `python3 deploy/minikube/harbor/registry.py ci-robots --robot moks`. CI never
+touches the cluster except through the deploy job. Push this repository and wait for the `release` job, whose
+summary prints the commit and image digest.
 
-## 2. Namespace, pull secret and refresher
+## 2. Namespace and pull secret
 
 ```sh
 kubectl --context mk4 create namespace moks
-# First ecr-pull Secret (refresh.py only patches existing Secrets):
-kubectl --context mk4 -n moks create secret docker-registry ecr-pull \
-  --docker-server=881026659929.dkr.ecr.us-east-1.amazonaws.com --docker-username=AWS \
-  --docker-password="$(aws ecr get-login-password --region us-east-1)"
+# Secret harbor-pull (read-only robot$k8s-pull, never expires), from the tools repository:
+python3 deploy/minikube/harbor/registry.py pull-secrets --namespace moks --namespace moks-terminals --namespace moks-diagnostics
 ```
 
-The `ecr-refresh` CronJob in the **tools** repository (`deploy/minikube/ecr-refresh`) covers every
-namespace except Kubernetes' own, so `moks` needs no change there. If `roboshop-ai` is missing, the
-CronJob is too, and tokens expire within 12 hours; `scripts/deploy-mk4.sh` restores it.
+Nothing refreshes it, because it does not expire. `scripts/deploy-mk4.sh` fills any namespace that lacks it.
 
 ## 3. Secrets (never committed)
 
@@ -253,7 +246,7 @@ The API's init container runs migration `0002` automatically. Take a backup firs
 
 ## Enabling the web terminal
 
-See [TERMINAL.md](TERMINAL.md). It is off until `terminal.enabled` is set, and needs a Terraform apply, a Secret, a database role and an image digest first.
+See [TERMINAL.md](TERMINAL.md). It is off until `terminal.enabled` is set, and needs a Terraform apply, a Secret and a database role first.
 
 ## OpenSearch at /opensearch
 

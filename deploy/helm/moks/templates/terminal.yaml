@@ -1,7 +1,8 @@
 {{- if .Values.terminal.enabled }}
 {{- $ns := .Values.terminal.namespace }}
 {{- $t := .Values.terminal }}
-{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (toString $t.image.digest)) }}{{- fail "terminal.image.digest must be sha256:<64 hex characters>: terminals run a pinned, scanned image, never a tag" }}{{- end }}
+{{- if and $t.image.digest (not (regexMatch "^sha256:[0-9a-f]{64}$" (toString $t.image.digest))) }}{{- fail "terminal.image.digest must be sha256:<64 hex characters>; use terminal.image.tag for a tag" }}{{- end }}
+{{- if not (or $t.image.digest $t.image.tag) }}{{- fail "terminal.image.tag or terminal.image.digest is required" }}{{- end }}
 {{- if not $t.profiles }}{{- fail "terminal.profiles is empty: a terminal needs an explicit account, role and region" }}{{- end }}
 {{- if include "moks.inGroup" (dict "root" . "group" "terminal") }}
 # One disposable pod per session, reached only through the moks-terminal gateway. A shell is arbitrary
@@ -207,7 +208,7 @@ spec:
             - {name: FORWARDED_ALLOW_IPS, value: "*"}  # only Traefik can reach :8080 (NetworkPolicy)
             - {name: MOKS_PROCESS_ROLE, value: terminal}
             - {name: MOKS_TERMINAL_NAMESPACE, value: {{ $ns | quote }}}
-            - {name: MOKS_TERMINAL_IMAGE, value: "{{ $t.image.repository }}@{{ $t.image.digest }}"}
+            - {name: MOKS_TERMINAL_IMAGE, value: "{{ $t.image.repository }}{{ if $t.image.digest }}@{{ $t.image.digest }}{{ else }}:{{ $t.image.tag }}{{ end }}"}
             - {name: MOKS_TERMINAL_IMAGE_PULL_SECRETS, value: {{ join "," $t.imagePullSecrets | quote }}}
             - {name: MOKS_TERMINAL_PROFILES, value: {{ toJson $t.profiles | quote }}}
             - {name: MOKS_TERMINAL_KUBE_NAMESPACES, value: {{ join "," $t.kubernetes.namespaces | quote }}}

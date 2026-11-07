@@ -1,10 +1,10 @@
 # mk4 (Hetzner, 4-node Minikube, arm64) behind Traefik at https://jithendar.com/moks
 image:
-  repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
+  repository: registry.jithendar.com/jithendar/moks
   # CI moves latest on every master build. Pods get it when they restart (docs/RELEASES.md).
   tag: latest
   pullPolicy: Always
-imagePullSecrets: [{name: ecr-pull}]   # refreshed by the ecr-refresh CronJob (tools repo); see docs/OPERATOR_GUIDE.md
+imagePullSecrets: [{name: harbor-pull}]   # robot$k8s-pull, never expires: tools deploy/minikube/harbor/registry.py pull-secrets
 
 # Cluster backups. Velero itself is the Argo CD app in deploy/argocd/velero.yaml.
 velero:
@@ -108,18 +108,16 @@ executor:
 
 databaseBackups:
   enabled: true
-  namespaces: [moks, jithendar]   # namespaces must exist; roboshop-ai on mk4 only holds ecr-refresh
+  namespaces: [moks, jithendar]   # namespaces must exist
 
 diagnostics:
   enabled: true
   namespace: moks-diagnostics
 
-# Web terminal (docs/TERMINAL.md). enabled: true fails to render until image.digest is set, so set both together.
+# Web terminal (docs/TERMINAL.md). Sessions run moks-terminal:latest from Harbor (values.yaml terminal.image).
 terminal:
   enabled: true
-  image:
-    digest: sha256:d509b91e99867f1333859970984904122c327dbee537c14be94d1620a2794679   # multi-arch index, built from 90a43b6
-  imagePullSecrets: [ecr-pull]   # created in every namespace by the ecr-refresh CronJob (tools repo)
+  imagePullSecrets: [harbor-pull]   # in moks-terminals: tools deploy/minikube/harbor/registry.py pull-secrets
   profiles:
     - name: mk4-readonly
       label: mk4, read-only
@@ -147,7 +145,7 @@ logCollector:
   enabled: true         # monitoring/alloy; also add "moks" to Alloy's namespaces in the tools repo
 
 ecrRefresh:
-  enabled: true         # also add "moks" to TARGET_NAMESPACES of the ecr-refresh CronJob (tools repo)
+  enabled: false        # images come from Harbor with harbor-pull, which no job has to refresh
 
 # CrewAI workload investigation (docs/crewai-investigation.md). On: the moks-crewai Argo CD app runs its worker
 # on .../moks-crewai:latest; api and the other workers stay on .../moks.

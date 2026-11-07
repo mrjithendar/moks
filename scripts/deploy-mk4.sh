@@ -40,10 +40,8 @@ for secret in moks-secrets moks-postgres moks-terminal-secrets; do
   kc -n moks get secret "$secret" -o name > /dev/null
 done
 kc -n moks get pvc data-moks-postgres-0 -o name > /dev/null || die "the Postgres claim is gone; this is no longer a redeploy onto kept data"
-[[ -d "$TOOLS/deploy/minikube/ecr-refresh" ]] || die "no tools checkout at $TOOLS"
-if ! kc -n roboshop-ai get secret roboshop-secrets -o name > /dev/null 2>&1; then
-  [[ -f "$REPO/roboshop-secrets.yaml" ]] || die "ecr-refresh needs roboshop-secrets: not on mk4 and no $REPO/roboshop-secrets.yaml"
-fi
+[[ -f "$TOOLS/deploy/minikube/harbor/registry.py" ]] || die "no tools checkout at $TOOLS (its Harbor registry.py writes harbor-pull)"
+curl -fsS -o /dev/null https://registry.jithendar.com/api/v2.0/ping || die "Harbor at registry.jithendar.com does not answer; every MOKS image comes from it"
 finalizers="$(kc -n argocd get applications -o json \
   | jq -r --arg p "$EKS_PREFIX-" '.items[] | select(.metadata.name | startswith($p)) | select(.metadata.finalizers // [] | length > 0) | .metadata.name')"
 [[ -z "$finalizers" ]] || die "these Applications have finalizers, so deleting them would cascade: $finalizers"
@@ -64,17 +62,18 @@ kc -n argocd delete appproject --ignore-not-found moks-eks
 step "Namespaces the chart writes into"
 kc apply -f "$REPO/lab/00-namespace.yaml"
 
-step "ECR pull secrets: tokens last 12 hours, so the refresher has to run before any pod can pull"
-kc create namespace roboshop-ai --dry-run=client -o yaml | kc apply -f -
-kc -n roboshop-ai get secret roboshop-secrets -o name > /dev/null 2>&1 || kc apply -f "$REPO/roboshop-secrets.yaml"
-kc kustomize "$TOOLS/deploy/minikube/ecr-refresh" | kc apply -f -
-refresh_ecr() {
-  local job="ecr-refresh-$(date +%s)"
-  kc -n roboshop-ai create job --from=cronjob/ecr-refresh "$job"
-  kc -n roboshop-ai wait --for=condition=Complete "job/$job" --timeout=300s \
-    || die "ecr-refresh failed; see: kubectl --context mk4 -n roboshop-ai logs job/$job --all-containers"
+step "Harbor pull secrets: every MOKS image comes from registry.jithendar.com/jithendar"
+# harbor-pull (robot$k8s-pull) never expires, so this only fills namespaces that lack it. registry.py asks for
+# the robot's secret when the robot already exists.
+pull_secrets() {
+  local missing=()
+  for ns in "$@"; do
+    kc get namespace "$ns" -o name > /dev/null 2>&1 || continue
+    kc -n "$ns" get secret harbor-pull -o name > /dev/null 2>&1 || missing+=(--namespace "$ns")
+  done
+  [[ ${#missing[@]} -eq 0 ]] || python3 "$TOOLS/deploy/minikube/harbor/registry.py" pull-secrets --context "$CONTEXT" "${missing[@]}"
 }
-refresh_ecr
+pull_secrets moks
 
 step "Clear the leftover moks-portal tracking on Namespace/velero"
 tracked="$(mktemp)"
@@ -107,8 +106,8 @@ for group in api worker executor terminal routing; do
   sync "$group"
 done
 
-step "ECR pull secrets again: the terminal and diagnostics namespaces only exist now"
-refresh_ecr
+step "Harbor pull secrets again: the terminal and diagnostics namespaces only exist now"
+pull_secrets moks-terminals moks-diagnostics
 
 step "Verify"
 after="$(investigations)"

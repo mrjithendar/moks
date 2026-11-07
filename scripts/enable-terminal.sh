@@ -14,7 +14,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 kc() { kubectl --context "$CONTEXT" "$@"; }
 k() { kc -n moks "$@"; }
 
-k get deploy moks-terminal >/dev/null || { echo "Deployment moks-terminal missing: set terminal.enabled and terminal.image.digest, then sync moks-terminal." >&2; exit 1; }
+k get deploy moks-terminal >/dev/null || { echo "Deployment moks-terminal missing: set terminal.enabled, then sync moks-terminal." >&2; exit 1; }
 kc get namespace "$TERMINALS" >/dev/null
 
 if [[ -z "$(k get secret moks-terminal-secrets --ignore-not-found -o name)" ]]; then
@@ -24,14 +24,12 @@ else
 fi
 k rollout status deploy/moks-terminal --timeout=180s
 
-# ecr-refresh reaches a new namespace only on its next run, up to 6 hours away.
-if [[ -z "$(kc -n "$TERMINALS" get secret ecr-pull --ignore-not-found -o name)" ]]; then
-  JOB="ecr-refresh-now-$(date +%s)"
-  kc -n roboshop-ai create job "$JOB" --from=cronjob/ecr-refresh
-  kc -n roboshop-ai wait --for=condition=complete "job/$JOB" --timeout=120s
-  kc -n "$TERMINALS" get secret ecr-pull >/dev/null
+# Session pods pull moks-terminal:latest from Harbor with harbor-pull (tools deploy/minikube/harbor/registry.py).
+if [[ -z "$(kc -n "$TERMINALS" get secret harbor-pull --ignore-not-found -o name)" ]]; then
+  python3 "$(dirname "$(dirname "$HERE")")/tools/deploy/minikube/harbor/registry.py" pull-secrets --context "$CONTEXT" --namespace "$TERMINALS"
+  kc -n "$TERMINALS" get secret harbor-pull >/dev/null
 fi
-echo "→ ecr-pull is in place"
+echo "→ harbor-pull is in place"
 
 # terminal.use belongs to the terminal role alone, so admins need this too. Without it the page has no
 # "Open a terminal" form. The API image holds the moks CLI and the database URL it needs.

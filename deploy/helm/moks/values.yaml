@@ -6,7 +6,7 @@
 resourceGroup: all
 
 image:
-  repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks
+  repository: registry.jithendar.com/jithendar/moks
   # mk4 runs tag latest. A digest (sha256:...), if set, replaces the tag.
   digest: ""
   tag: ""
@@ -82,7 +82,7 @@ crewai:
   worker:
     replicas: 1
     image:
-      repository: ""        # empty: image.repository with -crewai appended (the moks-crewai ECR repository)
+      repository: ""        # empty: image.repository with -crewai appended (moks-crewai in Harbor)
       tag: ""               # empty: image.tag
     resources:
       requests: {cpu: 100m, memory: 384Mi}
@@ -227,7 +227,8 @@ rag:
       cutoverVerified: ""
       cluster: secure      # names its generations in PostgreSQL, apart from the original cluster's
       # The upstream image: security and TLS, no snapshots, no Prometheus exporter. To have those, set this to
-      # the digest CI reports for deploy/opensearch/Dockerfile, and pluginsInstalled to true.
+      # registry.jithendar.com/jithendar/moks-opensearch:latest (CI builds deploy/opensearch/Dockerfile), and
+      # pluginsInstalled to true.
       image: opensearchproject/opensearch:3.9.0@sha256:3b55f6b6249cfdb92b52ee59adc8a266203ba9ef9f5d82544fad6f1af2f3609e
       pluginsInstalled: false
       heapSize: 1g         # measured on mk4: 254 MiB of 1 GiB heap used, 1487 MiB pod, at 1,942 chunks and 3072 dimensions
@@ -305,7 +306,7 @@ diagnostics:
 reranker:
   enabled: false
   image:
-    repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-reranker
+    repository: registry.jithendar.com/jithendar/moks-reranker
     tag: latest             # CI moves it on every master build. Pods get it when they restart (docs/RELEASES.md).
     digest: ""              # if set, replaces the tag
   model:                    # must equal what the service reports, or search keeps its existing order
@@ -338,8 +339,9 @@ terminal:
   enabled: false
   namespace: moks-terminals
   image:
-    repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-terminal
-    digest: ""             # required: terminals run a pinned, scanned image, never a tag
+    repository: registry.jithendar.com/jithendar/moks-terminal
+    tag: latest            # CI moves it on every master build; session pods pull it (Always) when they start
+    digest: ""             # if set, replaces the tag (session pods then use IfNotPresent)
   imagePullSecrets: []     # must exist in terminal.namespace
   idleMinutes: 15
   maxMinutes: 60           # a role session of over an hour needs the role's MaxSessionDuration raised
@@ -395,7 +397,8 @@ logCollector:
   serviceAccount: alloy
   namespace: monitoring
 
-# Grant an image-pull-secret refresher access to this namespace's ecr-pull Secret.
+# Grant the ECR pull-secret refresher (tools ecr-refresh) access to this namespace's ecr-pull Secret. Unused since
+# images moved to Harbor (harbor-pull never expires); kept for clusters still on ECR.
 ecrRefresh:
   enabled: false
   serviceAccount: ecr-refresh

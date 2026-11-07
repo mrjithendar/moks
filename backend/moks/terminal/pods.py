@@ -50,7 +50,7 @@ def pod_manifest(s: TerminalSession) -> dict:
             "securityContext": {"runAsNonRoot": True, "runAsUser": SHELL_USER, "runAsGroup": SHELL_USER, "seccompProfile": {"type": "RuntimeDefault"}},
             **({"imagePullSecrets": pull} if pull else {}),
             "containers": [{
-                "name": CONTAINER, "image": s.image, "imagePullPolicy": "IfNotPresent", "command": ["sleep", str(seconds + 60)],
+                "name": CONTAINER, "image": s.image, "imagePullPolicy": "IfNotPresent" if "@sha256:" in s.image else "Always", "command": ["sleep", str(seconds + 60)],
                 "env": [{"name": k, "value": v} for k, v in env.items()],
                 "securityContext": {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True, "privileged": False, "capabilities": {"drop": ["ALL"]}},
                 "resources": {"requests": {"cpu": "50m", "memory": "128Mi", "ephemeral-storage": "64Mi"},
