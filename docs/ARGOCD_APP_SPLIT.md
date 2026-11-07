@@ -15,6 +15,7 @@ The roots run in `argocd` on mk4 and only write Application objects. Sync everyt
 | database | `moks-database` | `roboshop-demo-moks-database` | PostgreSQL StatefulSet, Service, NetworkPolicy |
 | api | `moks-api` | `roboshop-demo-moks-api` | API Deployment, Service, PodDisruptionBudget. The frontend ships in this image |
 | worker | `moks-worker` | `roboshop-demo-moks-worker` | Worker Deployments, including `worker.pools` |
+| crewai | `moks-crewai` | none | The CrewAI worker Deployment `moks-crewai`, only when `crewai.enabled` (docs/crewai-investigation.md) |
 | executor | `moks-executor` | `roboshop-demo-moks-executor` | Executor, its identity and action RBAC, database-backup Roles, Velero write Role, diagnostics namespace and controls |
 | terminal | `moks-terminal` | none, the terminal stays off on EKS | Gateway, session identities, terminal namespace, quota and NetworkPolicy |
 | routing | `moks-routing` | `roboshop-demo-moks-routing` | mk4: Traefik Ingresses, IngressRoute and Middleware. EKS: VirtualService, PeerAuthentication, AuthorizationPolicies |
@@ -99,6 +100,7 @@ Namespace `moks` itself is not rendered by the chart: the old Application's `man
 | worker | Deployment | moks | `moks-worker` | moks-portal | roboshop-demo-moks-portal |
 | worker | Deployment | moks | `moks-worker-detection` | if enabled | if enabled |
 | worker | Deployment | moks | `moks-worker-knowledge` | if enabled | if enabled |
+| crewai | Deployment | moks | `moks-crewai` | if enabled | no |
 | executor | ClusterRole | (cluster) | `moks-executor` | moks-portal | roboshop-demo-moks-portal |
 | executor | ClusterRole | (cluster) | `moks-executor-cluster-identity` | moks-portal | roboshop-demo-moks-portal |
 | executor | ClusterRoleBinding | (cluster) | `moks-executor-cluster-identity` | moks-portal | roboshop-demo-moks-portal |

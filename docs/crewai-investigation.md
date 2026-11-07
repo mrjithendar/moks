@@ -38,6 +38,23 @@ the reply in the conversation.
 With the flag off, the route answers 404, `/investigate/config` reports `crewai.available: false` with a
 reason, the UI shows no option, and `moks.crew` never imports `crewai`.
 
+### Its own worker
+
+CrewAI investigations run only in the **CrewAI worker**: Deployment `moks-crewai` (Helm resource group `crewai`,
+Argo CD app `moks-crewai`, template `templates/crewai.yaml`). It is the only pod on the `moks-crewai` image. The api,
+the other workers, the executor and the terminal keep the default image, so its 76 extra packages stay out of them.
+
+- **Claiming** (`orchestrator/worker.py` `claim`): an investigation whose seq-0 event carries a `crewai` block
+  is claimed only by a worker whose `MOKS_WORKER_CLASSES` includes `crewai`, and every other investigation only
+  by workers with `interactive`. The CrewAI worker runs with `crewai` alone, so it takes no jobs and no ordinary
+  investigation. It takes up to `MOKS_CREWAI_MAX_CONCURRENT` at a time.
+- **Self-check**: a worker with the `crewai` class but without crewai at the pinned version logs
+  `crewai_worker_unusable` and takes no CrewAI investigation, so a wrong image never fails a run.
+- **Availability**: the CrewAI worker writes a `component_versions` row, component `crewai`, carrying its
+  crewai version, with the usual version heartbeat. The api never imports crewai. `/investigate/config` and the route
+  read that row (`moks.crew.worker_version`, fresh within 5 minutes). With no CrewAI worker running, the reason
+  is "no CrewAI worker is running", the route answers 503, and the UI shows no option.
+
 ## 3. CrewAI version and what was verified
 
 **Pinned: `crewai==1.15.36`** (released 2026-11-06), in `backend/requirements-crewai.txt`. These facts were checked
@@ -149,8 +166,9 @@ CI builds and Argo CD deploys (`.github/workflows/ci.yml`):
   (ECR repository `aws_ecr_repository.crewai` in `deploy/terraform/ecr.tf`). Before it pushes, it checks that crewai
   imports at the pinned version on a read-only root with no network and telemetry off.
 - **deploy** runs when variable `MK4_DEPLOY=true`. It asks Argo CD to sync the MOKS Applications from master in the
-  documented order, then runs Argo CD's restart action on `moks-worker`, `moks-api`, `moks-executor` and `moks-terminal`,
-  so they pull the new `:latest`. Finally it checks that `/moks/api/health` reports the commit. CI holds no Kubernetes credentials, only a
+  documented order (`moks-crewai` after `moks-worker`), then runs Argo CD's restart action on `moks-worker`, `moks-api`,
+  `moks-executor` and `moks-terminal`, so they pull the new `moks:latest`. It restarts `moks-crewai` only when
+  release-crewai succeeded, and otherwise warns and leaves it on its last image. Finally it checks that `/moks/api/health` reports the commit. CI holds no Kubernetes credentials, only a
   token for Argo CD project role `moks/ci` (get, sync, restart).
 - **crewai** runs on pull requests: the backend suite on the CrewAI dependency set.
 
@@ -159,14 +177,16 @@ One-time setup, then every push to master deploys:
 ```sh
 terraform -chdir=deploy/terraform apply -var-file=tfvars/mk4.tfvars   # creates ECR moks-crewai, lets CI push to it
 scripts/setup-argocd-ci.sh                          # applies the AppProject with role ci, stores ARGOCD_AUTH_TOKEN, sets MK4_DEPLOY
-# deploy/helm/moks/values-minikube.yaml: image.repository: 881026659929.dkr.ecr.us-east-1.amazonaws.com/moks-crewai
-#                                        crewai.enabled: true
-# then commit and push to master: the deploy job syncs and restarts onto moks-crewai:latest
+# deploy/helm/moks/values-minikube.yaml: crewai.enabled: true (image.repository stays .../moks)
+# commit and push to master. Then once: sync moks-root, which creates the moks-crewai Application,
+# and sync moks-foundation then moks-crewai. After that the deploy job syncs and restarts it.
 ```
 
 Verify:
 
 ```sh
+kubectl --context mk4 -n moks get deploy moks-crewai                                  # 1/1, image .../moks-crewai:latest
+kubectl --context mk4 -n moks logs deploy/moks-crewai | grep -c crewai_worker_unusable   # 0
 curl -s -b cookies https://jithendar.com/moks/api/investigate/config | jq .crewai     # available: true, version 1.15.36
 scripts/crewai-demo.sh up                                                             # namespace crewai-demo, two broken workloads
 # Investigate -> "CrewAI investigation" -> namespace crewai-demo, workload web (then worker)
@@ -177,8 +197,9 @@ Expected results: for `web`, an ImagePullBackOff on `busybox:1.38-does-not-exist
 `namespace_health`, `describe_pod` and events. For `worker`, a CrashLoopBackOff with `QUEUE_URL is not set`
 from the previous container's logs. The injected log line must change nothing.
 
-Roll back: set `crewai.enabled: false` and push (the route answers 404 again and the option disappears), and point
-`image.repository` back at `moks` so mk4 runs the default image again. There is no migration.
+Roll back: set `crewai.enabled: false` and push. The route answers 404 again and the option disappears. Then delete the
+`moks-crewai` Deployment by hand, because Argo never prunes: `kubectl --context mk4 -n moks delete deploy moks-crewai`. There is no migration.
+CrewAI investigations still queued stay queued until a CrewAI worker returns, or until they are cancelled.
 To stop CI deploying, set `MK4_DEPLOY=false`.
 
 ## What is still unverified

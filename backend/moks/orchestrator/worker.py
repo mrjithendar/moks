@@ -16,7 +16,7 @@ from typing import NamedTuple
 
 from sqlalchemy import text
 
-from .. import conversations, versions
+from .. import conversations, crew, versions
 from ..config import get_settings
 from ..db import session_scope
 from ..models import Investigation
@@ -31,11 +31,25 @@ class Claim(NamedTuple):
     attempt: int
 
 
+def crewai_version(classes: set[str]) -> str | None:
+    """The crewai version when this worker takes CrewAI investigations: the crewai class, and the image
+    built with the crewai extra at the version MOKS was checked against. Otherwise None, and it takes none."""
+    if "crewai" not in classes:
+        return None
+    found = crew.installed_version()
+    if found != crew.PINNED:
+        log.error("crewai class without crewai %s; taking no CrewAI investigations", crew.PINNED, extra={"event": "crewai_worker_unusable", "outcome": found or "not installed"})
+        return None
+    return found
+
+
 def worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}"
 
 
-async def claim(wid: str) -> Claim | None:
+async def claim(wid: str, crewai: bool = False) -> Claim | None:
+    """A CrewAI investigation (its queued event carries a "crewai" block) goes only to a worker with the
+    crewai class, which runs the moks-crewai image; every other investigation only to the rest."""
     async with session_scope() as db:
         row = (await db.execute(text(
             """
@@ -44,10 +58,12 @@ async def claim(wid: str) -> Claim | None:
             WHERE id = (
               SELECT id FROM investigations
               WHERE status = 'queued' AND NOT cancel_requested
+                AND EXISTS (SELECT 1 FROM investigation_events e WHERE e.investigation_id = investigations.id AND e.seq = 0
+                            AND e.payload->'crewai' IS NOT NULL) = :crewai
               ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
             ) RETURNING id, execution_token, attempts
             """
-        ), {"wid": wid, "lease": get_settings().investigation_lease_seconds})).first()
+        ), {"wid": wid, "lease": get_settings().investigation_lease_seconds, "crewai": crewai})).first()
         return Claim(row[0], row[1], row[2]) if row else None
 
 
@@ -104,7 +120,10 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
     running: set[asyncio.Task] = set()
     pools: dict[str, set[asyncio.Task]] = {c: set() for c in jobs.capacity()}
     sizes = jobs.capacity()
-    interactive = "interactive" in {c.strip() for c in s.worker_classes.split(",")}
+    classes = {c.strip() for c in s.worker_classes.split(",")}
+    interactive = "interactive" in classes
+    crewai = crewai_version(classes)
+    crews: set[asyncio.Task] = set()
     log.info("worker started", extra={"event": "worker_started"})
     tick = 0
     poll_every = max(1, int(s.alert_poll_seconds / max(s.worker_poll_seconds, 0.1)))
@@ -120,6 +139,8 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
 
     async def maintain(reap: bool, schedule: bool) -> None:
         await versions.report("worker")
+        if crewai:
+            await versions.report(crew.WORKER, crewai)
         if reap:
             await reap_stale()
             await jobs.reap_abandoned()
@@ -155,16 +176,17 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
                     jt = asyncio.create_task(jobs.run_one(jid))
                     tasks.add(jt)
                     jt.add_done_callback(tasks.discard)
-            if interactive:
+            if interactive or crewai:
                 await cancel_queued()
-                while len(running) < s.worker_concurrency:
-                    won = await claim(wid)
+            for kind, tasks, size in ((False, running, s.worker_concurrency if interactive else 0), (True, crews, s.crewai_max_concurrent if crewai else 0)):
+                while len(tasks) < size:
+                    won = await claim(wid, crewai=kind)
                     if won is None:
                         break
-                    log.info("claimed investigation", extra={"event": "investigation_claimed", "investigation_id": str(won.id)})
+                    log.info("claimed investigation", extra={"event": "investigation_claimed", "investigation_id": str(won.id), "operation": "crewai" if kind else "graph"})
                     t = asyncio.create_task(Investigator(won.id, wid, token=won.token, attempt=won.attempt).run())
-                    running.add(t)
-                    t.add_done_callback(running.discard)
+                    tasks.add(t)
+                    t.add_done_callback(tasks.discard)
         except Exception:
             log.exception("worker loop error", extra={"event": "worker_loop_error"})
         tick += 1
@@ -181,6 +203,6 @@ async def run_worker(stop: asyncio.Event | None = None) -> None:
     for cls in ("knowledge", "maintenance"):
         for t in list(pools.get(cls, ())):
             t.cancel()
-    pending = running | {t for tasks in pools.values() for t in tasks}
+    pending = running | crews | {t for tasks in pools.values() for t in tasks}
     if pending:
         await asyncio.wait(pending, timeout=max(5, s.max_duration_seconds))

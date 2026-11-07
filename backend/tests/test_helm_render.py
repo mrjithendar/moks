@@ -166,7 +166,7 @@ def test_mk4_always_pulls_latest():
     for name, pod in pods(render("values-minikube.yaml")):
         for c in pod["containers"]:
             if c["image"].split("/")[-1].startswith("moks"):
-                assert c["image"].endswith(("/moks:latest", "/moks-reranker:latest")) and c["imagePullPolicy"] == "Always", name
+                assert c["image"].endswith(("/moks:latest", "/moks-crewai:latest", "/moks-reranker:latest")) and c["imagePullPolicy"] == "Always", name
 
 
 def test_the_chart_ships_the_consistent_dump():

@@ -15,6 +15,7 @@ crewai = pytest.importorskip("crewai", reason="the crewai extra is not installed
 
 from sqlalchemy import select  # noqa: E402
 
+from moks import crew as crew_pkg, versions  # noqa: E402
 from moks.config import get_settings  # noqa: E402
 from moks.connectors import registry  # noqa: E402
 from moks.crew.tools import ALLOWED_MOKS_TOOLS  # noqa: E402
@@ -89,6 +90,7 @@ async def crew_on(monkeypatch):
         await db.flush()
         cfg = LLMConfig(name=f"c-{uuid.uuid4().hex[:6]}", purpose="chat", provider="openai", model="m", is_active=True)
         db.add(cfg)
+    await versions.report(crew_pkg.WORKER, crew_pkg.installed_version())  # the api sees a CrewAI worker (moks/crew worker_version)
     yield monkeypatch
     async with session_scope() as db:
         (await db.get(LLMConfig, cfg.id)).is_active = False

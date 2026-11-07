@@ -50,9 +50,29 @@ def prepare_environment() -> None:
         os.environ["HOME"] = os.environ.get("MOKS_CREWAI_HOME") or tempfile.mkdtemp(prefix="moks-crewai-")
 
 
-def capability(settings: Any, llm_cfg: Any) -> dict[str, Any]:
-    """Whether a CrewAI investigation can run here and, when not, why. `llm_cfg` is the active chat LLM or None."""
-    version = installed_version()
+_HERE = object()
+WORKER = "crewai"  # its component_versions row; written by a worker with the crewai class (orchestrator/worker.py)
+
+
+async def worker_version(db: Any) -> str | None:
+    """The crewai version of a CrewAI worker that reported recently, or None when none is running.
+    The api asks this rather than importing crewai: it runs the default image (the moks-crewai Argo CD app)."""
+    from sqlalchemy import select, text
+
+    from ..models import ComponentVersion
+    from ..versions import FRESH_SECONDS
+
+    return (await db.execute(select(ComponentVersion.version).where(ComponentVersion.component == WORKER, ComponentVersion.seen_at > text(f"now() - interval '{FRESH_SECONDS} seconds'"))
+                             .order_by(ComponentVersion.seen_at.desc()).limit(1))).scalar_one_or_none()
+
+
+def capability(settings: Any, llm_cfg: Any, version: Any = _HERE) -> dict[str, Any]:
+    """Whether a CrewAI investigation can run and, when not, why. `llm_cfg` is the active chat LLM or None.
+    `version` is what the api passes: the crewai version of a running CrewAI worker (worker_version). Left
+    out, it is the package installed in this process, which is how the CrewAI worker checks itself."""
+    here = version is _HERE
+    if here:
+        version = installed_version()
     out: dict[str, Any] = {"enabled": bool(settings.crewai_enabled), "available": False, "reason": None, "version": version,
                            "limits": {"timeout_seconds": settings.crewai_timeout_seconds, "tool_timeout_seconds": settings.crewai_tool_timeout_seconds,
                                       "max_iterations_per_agent": settings.crewai_max_iterations,
@@ -60,8 +80,10 @@ def capability(settings: Any, llm_cfg: Any) -> dict[str, Any]:
                                       "max_concurrent_per_worker": settings.crewai_max_concurrent}}
     if not settings.crewai_enabled:
         out["reason"] = "disabled: MOKS_CREWAI_ENABLED is not true"
-    elif version is None:
+    elif version is None and here:
         out["reason"] = "the crewai package is not installed in this image (build with --build-arg MOKS_CREWAI=true)"
+    elif version is None:
+        out["reason"] = "no CrewAI worker is running: deploy the moks-crewai Argo CD app (docs/crewai-investigation.md)"
     elif version != PINNED:
         out["reason"] = f"crewai {version} is installed, but MOKS was checked against {PINNED}"
     elif llm_cfg is None:

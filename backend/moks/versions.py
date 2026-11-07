@@ -20,17 +20,19 @@ def build() -> dict[str, str]:
     return {"version": __version__, "commit": get_settings().build_commit}
 
 
-async def report(component: str) -> None:
+async def report(component: str, version: str | None = None) -> None:
+    """`version` replaces MOKS's own: the CrewAI worker reports its crewai version as component "crewai"."""
     from .skills import registry
 
     b = build()
-    if component != "executor":  # the executor runs no skills
+    skilled = component not in ("executor", "crewai")  # neither runs skills
+    if skilled:
         await registry.refresh()
-    skill = registry.snapshot() if component != "executor" else {"generation": None, "digest": None, "error": None}
+    skill = registry.snapshot() if skilled else {"generation": None, "digest": None, "error": None}
     async with session_scope() as db:
         await db.execute(text("""INSERT INTO component_versions (instance, component, commit_sha, version, seen_at, skill_generation, skill_digest, skill_error) VALUES (:i, :c, :s, :v, now(), :g, :d, :e)
                                  ON CONFLICT (instance) DO UPDATE SET commit_sha = :s, version = :v, seen_at = now(), skill_generation = :g, skill_digest = :d, skill_error = :e"""),
-                         {"i": f"{component}:{socket.gethostname()}"[:120], "c": component, "s": b["commit"], "v": b["version"], "g": skill["generation"], "d": skill["digest"], "e": skill["error"]})
+                         {"i": f"{component}:{socket.gethostname()}"[:120], "c": component, "s": b["commit"], "v": version or b["version"], "g": skill["generation"], "d": skill["digest"], "e": skill["error"]})
 
 
 async def running(db: AsyncSession) -> dict[str, Any]:

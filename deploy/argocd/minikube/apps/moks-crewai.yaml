@@ -1,0 +1,27 @@
+# The CrewAI worker, moks-crewai (docs/crewai-investigation.md). Renders nothing while crewai.enabled is false.
+# Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: moks-crewai
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  project: moks
+  source:
+    repoURL: https://github.com/mrjithendar/moks.git
+    targetRevision: master
+    path: deploy/helm/moks
+    helm:
+      releaseName: moks
+      valueFiles: [values-minikube.yaml]
+      parameters:
+        - {name: resourceGroup, value: crewai}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: moks
+  syncPolicy:
+    syncOptions:
+      - PruneLast=true
+      - FailOnSharedResource=true

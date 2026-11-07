@@ -6,21 +6,25 @@ from __future__ import annotations
 
 import json
 import uuid
+from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 
+from moks import crew, versions
 from moks.config import get_settings
 from moks.connectors import registry
 from moks.crew import capability
 from moks.crew.evidence import Registry, validate
 from moks.crew.tools import ALLOWED_MOKS_TOOLS, BY_NAME, Refused, Target, bind
 from moks.db import session_scope
-from moks.models import Investigation, LLMConfig
+from moks.models import ComponentVersion, Investigation, InvestigationEvent, LLMConfig
+from moks.orchestrator import worker
 from moks.orchestrator.engine import Investigator
 from tests.conftest import login, make_env, make_user
 from tests.fakes import FakeKubernetes
 
+MODEL = SimpleNamespace(provider="openai", model="m")
 TARGET = Target(environment="e", namespace="shop", workload="payments", kind="Deployment", minutes=60, repository="")
 
 
@@ -40,6 +44,46 @@ def test_the_flag_alone_does_not_make_it_available(monkeypatch):
     monkeypatch.setattr("moks.crew.installed_version", lambda: None)
     state = capability(get_settings(), object())
     assert state["available"] is False and "not installed" in state["reason"]
+
+
+async def test_the_api_needs_a_running_crewai_worker(monkeypatch):
+    monkeypatch.setattr(get_settings(), "crewai_enabled", True)
+    async with session_scope() as db:
+        await db.execute(delete(ComponentVersion).where(ComponentVersion.component == crew.WORKER))
+    async with session_scope() as db:
+        state = capability(get_settings(), MODEL, await crew.worker_version(db))
+    assert state["available"] is False and "no CrewAI worker is running" in state["reason"]
+    await versions.report(crew.WORKER, crew.PINNED)  # what the CrewAI worker's heartbeat writes
+    async with session_scope() as db:
+        state = capability(get_settings(), MODEL, await crew.worker_version(db))
+    assert state["available"] is True and state["version"] == crew.PINNED
+    async with session_scope() as db:
+        await db.execute(delete(ComponentVersion).where(ComponentVersion.component == crew.WORKER))
+
+
+def test_only_a_worker_with_the_class_and_the_package_takes_crews(monkeypatch):
+    assert worker.crewai_version({"detection", "interactive", "knowledge", "maintenance"}) is None
+    monkeypatch.setattr("moks.crew.installed_version", lambda: None)
+    assert worker.crewai_version({"crewai"}) is None  # the default image: it logs and takes none
+    monkeypatch.setattr("moks.crew.installed_version", lambda: crew.PINNED)
+    assert worker.crewai_version({"crewai"}) == crew.PINNED
+
+
+async def test_a_crewai_investigation_goes_only_to_the_crewai_worker(client):
+    async with session_scope() as db:
+        await db.execute(update(Investigation).where(Investigation.status == "queued").values(status="cancelled"))
+    env = f"cr-{uuid.uuid4().hex[:6]}"
+    await make_env(env, connectors=[{"type": "kubernetes", "name": "k", "config": {}}])
+    await make_user(f"{env}@example.com", [f"investigator:{env}:*"])
+    h = await login(client, f"{env}@example.com")
+    plain, crewai = [(await client.post("/moks/api/investigations", json={"question": "why is payments crashing", "environment": env, "namespace": "shop"}, headers=h)).json()["id"]
+                     for _ in range(2)]
+    async with session_scope() as db:
+        queued = (await db.execute(select(InvestigationEvent).where(InvestigationEvent.investigation_id == uuid.UUID(crewai), InvestigationEvent.seq == 0))).scalar_one()
+        queued.payload = {**queued.payload, "crewai": {"workload": "payments", "kind": "Deployment"}}  # what POST /investigations/crewai stores
+    assert str((await worker.claim("crewai-worker", crewai=True)).id) == crewai
+    assert str((await worker.claim("default-worker")).id) == plain
+    assert await worker.claim("default-worker") is None and await worker.claim("crewai-worker", crewai=True) is None
 
 
 async def test_flag_off_hides_the_route_and_reports_unavailable(client):

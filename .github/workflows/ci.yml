@@ -215,9 +215,8 @@ jobs:
           retention-days: 400
 
   deploy:
-    # Waits for both images, so a restart pulls the new build whichever repository values-minikube.yaml runs. Only the
-    # default image must succeed: a failed CrewAI build leaves moks-crewai:latest where it was, and if mk4 runs that
-    # image the commit check at the end fails the job, so the failure still shows.
+    # Waits for both images. Only the default one must succeed: when the CrewAI build fails, moks-crewai (the
+    # CrewAI worker, the only pod on that image) is not restarted and keeps its last build, and the job says so.
     needs: [release, release-crewai]
     if: ${{ !cancelled() && needs.release.result == 'success' && vars.MK4_DEPLOY == 'true' }}
     runs-on: ubuntu-latest
@@ -243,7 +242,7 @@ jobs:
       - name: Sync the MOKS Applications from master
         run: |
           set -euo pipefail
-          for app in foundation database api worker executor terminal routing opensearch reranker; do
+          for app in foundation database api worker crewai executor terminal routing opensearch reranker; do
             argocd app get "moks-$app" -o name > /dev/null 2>&1 || { echo "moks-$app does not exist; skipped"; continue; }
             argocd app get "moks-$app" --refresh > /dev/null
             argocd app sync "moks-$app" --timeout 600
@@ -260,6 +259,19 @@ jobs:
             argocd app actions run "$app" restart --kind Deployment --resource-name "$deploy" --namespace moks
             argocd app wait "$app" --health --timeout 600
           done
+      # moks-crewai runs moks-crewai:latest, so it restarts only when that image was pushed for this commit.
+      - name: Restart the CrewAI worker onto the new image
+        env:
+          CREWAI_BUILD: ${{ needs.release-crewai.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$CREWAI_BUILD" != success ]]; then
+            echo "::warning::the CrewAI image build was $CREWAI_BUILD; moks-crewai keeps its last image"; exit 0
+          fi
+          if ! argocd app get moks-crewai -o name > /dev/null 2>&1; then echo "moks-crewai does not exist; skipped"; exit 0; fi
+          if ! argocd app resources moks-crewai | grep -q 'Deployment.*moks-crewai'; then echo "crewai.enabled is false: no moks-crewai Deployment"; exit 0; fi
+          argocd app actions run moks-crewai restart --kind Deployment --resource-name moks-crewai --namespace moks
+          argocd app wait moks-crewai --health --timeout 600
       - name: The site runs this commit
         run: |
           for _ in $(seq 1 30); do

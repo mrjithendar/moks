@@ -1,0 +1,49 @@
+{{- if and .Values.crewai.enabled (include "moks.inGroup" (dict "root" . "group" "crewai")) }}
+{{/* The CrewAI worker (docs/crewai-investigation.md): the only pod that runs CrewAI investigations, on the
+     moks-crewai image. It takes the crewai class alone, so ordinary investigations and jobs stay on the
+     default workers, and the api reads its crewai version from component_versions instead of importing crewai. */}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moks-crewai
+  labels: {{- include "moks.labels" . | nindent 4 }}
+    app.kubernetes.io/component: crewai
+spec:
+  replicas: {{ .Values.crewai.worker.replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: {app: moks, component: crewai}
+  template:
+    metadata:
+      labels: {app: moks, component: crewai}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/_configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "moks.serviceAccount" (dict "root" . "component" "worker") }}
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "moks.podSecurity" . | nindent 6 }}
+      terminationGracePeriodSeconds: {{ add .Values.config.maxDurationSeconds 20 }}
+      {{- include "moks.migrateInit" (dict "root" . "component" "worker") | nindent 6 }}
+      containers:
+        - name: crewai
+          image: {{ .Values.crewai.worker.image.repository | default (printf "%s-crewai" .Values.image.repository) }}:{{ .Values.crewai.worker.image.tag | default .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [worker]
+          ports:
+            - {name: metrics, containerPort: 9464}
+          {{- include "moks.env" (dict "root" . "component" "worker") | nindent 10 }}
+          env:
+            - {name: MOKS_WORKER_CLASSES, value: crewai}
+            - {name: MOKS_WORKER_CAPACITY, value: ""}
+            {{- if include "moks.searchActive" . }}
+            {{- include "moks.searchIdentities" (dict "root" . "component" "worker") | nindent 12 }}
+            {{- end }}
+          {{- include "moks.containerSecurity" . | nindent 10 }}
+          {{- include "moks.volumeMounts" (dict "root" . "component" "worker") | nindent 10 }}
+          livenessProbe: {tcpSocket: {port: metrics}, periodSeconds: 20, failureThreshold: 3}
+          resources: {{- toYaml .Values.crewai.worker.resources | nindent 12 }}
+      {{- include "moks.volumes" (dict "root" . "component" "worker") | nindent 6 }}
+{{- end }}

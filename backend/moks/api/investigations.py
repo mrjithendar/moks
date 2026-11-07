@@ -81,11 +81,11 @@ async def investigate_config(ctx: AuthContext = Depends(get_auth), db: AsyncSess
 
     cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none()
     envs = (await db.execute(select(Environment).where(~Environment.name.startswith("eval-")).order_by(Environment.name))).scalars().all()
-    from ..crew import capability
+    from ..crew import capability, worker_version
 
     return {"llm": {"provider": cfg.provider, "model": cfg.model} if cfg else None,
             "skills": sorted(skills.library().skills), "environments": [e.name for e in envs if ctx.principal.namespace_patterns(P.INVESTIGATION_RUN, e.name)],
-            "crewai": capability(get_settings(), cfg)}
+            "crewai": capability(get_settings(), cfg, await worker_version(db))}
 
 
 async def resolve_scope(db: AsyncSession, ctx: AuthContext, question: str, environment: str | None, namespace: str | None) -> tuple[Environment, str, str]:
@@ -181,14 +181,14 @@ class CrewIn(BaseModel):
 @router.post("/investigations/crewai", status_code=201)
 async def create_crewai(body: CrewIn, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     """Opt-in (docs/crewai-investigation.md). While MOKS_CREWAI_ENABLED is false this route answers 404, as if it did not exist."""
-    from ..crew import capability
+    from ..crew import capability, worker_version
     from ..models import LLMConfig
 
     s = get_settings()
     if not s.crewai_enabled:
         raise HTTPException(404, "Not Found")
     cfg = (await db.execute(select(LLMConfig).where(LLMConfig.purpose == "chat", LLMConfig.is_active.is_(True)))).scalar_one_or_none()
-    state = capability(s, cfg)
+    state = capability(s, cfg, await worker_version(db))
     if not state["available"]:
         raise HTTPException(503, f"CrewAI investigation unavailable: {state['reason']}")
     question = body.question or f"Why is {body.kind} {body.workload} in namespace {body.namespace} unhealthy?"

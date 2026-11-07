@@ -73,11 +73,20 @@ worker:
     requests: {cpu: 100m, memory: 192Mi}
     limits: {cpu: "1", memory: 512Mi}
 
-# Opt-in CrewAI workload investigation (docs/crewai-investigation.md). Needs an image built with
-# --build-arg MOKS_CREWAI=true; with the default image the capability endpoint reports it unavailable.
+# Opt-in CrewAI workload investigation (docs/crewai-investigation.md). Turning it on adds one Deployment,
+# moks-crewai (resource group crewai, Argo CD app moks-crewai): the only pod that runs CrewAI investigations,
+# on an image built with --build-arg MOKS_CREWAI=true. Everything else keeps the default image.
 # It uses the active chat LLM through MOKS's budget and nothing else; CrewAI telemetry is forced off in code.
 crewai:
   enabled: false
+  worker:
+    replicas: 1
+    image:
+      repository: ""        # empty: image.repository with -crewai appended (the moks-crewai ECR repository)
+      tag: ""               # empty: image.tag
+    resources:
+      requests: {cpu: 100m, memory: 384Mi}
+      limits: {cpu: "1", memory: 1Gi}
   timeoutSeconds: 120       # per investigation; config.maxDurationSeconds still bounds the whole run
   toolTimeoutSeconds: 30
   maxIterations: 5          # per agent
