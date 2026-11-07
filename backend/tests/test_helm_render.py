@@ -35,6 +35,8 @@ def secrets(pod) -> set[str]:
 
 
 SPLIT = ("secrets.split=true", "backup.enabled=true", "backup.bucket=b", "velero.enabled=true")
+# mk4 turns secret sync on; the checks of the posture without it switch it off again.
+SYNC_OFF = "secretsSync.enabled=false"
 TERMINAL = (
     "terminal.enabled=true",
     "terminal.image.digest=sha256:" + "0" * 64,
@@ -74,7 +76,7 @@ def test_config_changes_still_roll_consumers_though_only_foundation_renders_the_
 
 
 def test_each_component_gets_only_its_secret():
-    by = dict(pods(render("values-minikube.yaml", *SPLIT)))
+    by = dict(pods(render("values-minikube.yaml", *SPLIT, SYNC_OFF)))
     assert secrets(by["moks-api"]) == {"moks-api-secrets"}
     assert secrets(by["moks-worker"]) == {"moks-worker-secrets"}
     assert secrets(by["moks-executor"]) == {"moks-executor-secrets"}
@@ -93,7 +95,7 @@ def test_only_the_job_holds_the_schema_owner():
 
 
 def test_identities_are_separate_and_nobody_reads_secrets():
-    docs = render("values-minikube.yaml", *SPLIT)
+    docs = render("values-minikube.yaml", *SPLIT, SYNC_OFF)
     by = dict(pods(docs))
     assert len({by[n]["serviceAccountName"] for n in ("moks-api", "moks-worker", "moks-executor")}) == 3
     for d in docs:
@@ -600,7 +602,7 @@ def test_the_dashboards_identities_have_least_privilege():
 # ---- secret sync -------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("values", ["values-minikube.yaml", "values-eks.yaml"])
+@pytest.mark.parametrize("values", ["values.yaml", "values-eks.yaml"])
 def test_secret_sync_is_off_by_default_and_adds_nothing(values):
     docs = render(values)
     assert not [d for d in docs if d["metadata"]["name"] == "moks-secret-sync"]

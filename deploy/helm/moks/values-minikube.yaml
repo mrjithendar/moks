@@ -108,7 +108,7 @@ executor:
 
 databaseBackups:
   enabled: true
-  namespaces: [moks, jithendar]   # namespaces must exist
+  namespaces: [moks, jithendar, roboshop-ai]   # namespaces must exist
 
 diagnostics:
   enabled: true
@@ -159,3 +159,10 @@ reranker:
     tag: latest
   client:
     enabled: true
+# docs/SECRETS_SYNC.md. Every namespace on mk4 (2026-11-07): the chart makes one Role per name, so a namespace
+# created later needs adding here. Needs Secret moks/moks-secret-sync first (scripts/create-secret-sync-secret.sh),
+# or the executor cannot start.
+secretsSync:
+  enabled: true
+  namespaces: [argocd, harbor, jithendar, moks, velero, traefik, observability,
+               moks-diagnostics, moks-lab, moks-terminals, monitoring, roboshop-ai ]
