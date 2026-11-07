@@ -8,6 +8,13 @@ set -euo pipefail
 : "${IMAGE:?set IMAGE to a locally built terminal image}"
 [[ "$(kubectl config current-context)" == kind-* ]] || { echo "refusing: the current context is not a kind cluster" >&2; exit 1; }
 here="$(cd "$(dirname "$0")/.." && pwd)"
+
+wait_ready() {  # namespace pod: on a timeout, say why before failing
+  kubectl -n "$1" wait "pod/$2" --for=condition=Ready --timeout=120s && return
+  kubectl -n "$1" get pod "$2" -o wide || true
+  kubectl -n "$1" describe pod "$2" | sed -n '/^Conditions:/,$p' || true
+  return 1
+}
 kind load docker-image "$IMAGE" --name "${KIND_CLUSTER:-kind}"
 
 api_ip="$(kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o jsonpath='{.items[0].endpoints[0].addresses[0]}')"
@@ -20,9 +27,9 @@ helm template moks "$here/deploy/helm/moks" -n moks -s templates/terminal.yaml \
   | awk 'BEGIN{RS="---\n"; ORS="---\n"} !/kind: (Deployment|Service)\n/ || /kind: ServiceAccount/' | kubectl apply -f -
 
 # A stand-in for what a shell must not reach: the MOKS database and API, on their real ports.
-kubectl -n moks run decoy --image="$IMAGE" --labels=app=moks-postgres --command -- sh -c 'while true; do nc -lk 5432; done'
+kubectl -n moks run decoy --image="$IMAGE" --image-pull-policy=Never --labels=app=moks-postgres --command -- sh -c 'while true; do nc -lk 5432; done'
 kubectl -n moks expose pod decoy --port=5432
-kubectl -n moks wait pod/decoy --for=condition=Ready --timeout=120s
+wait_ready moks decoy
 sleep 2
 kubectl -n moks exec decoy -- nc -z -w 3 127.0.0.1 5432   # "blocked" below means nothing unless this listens
 decoy_ip="$(kubectl -n moks get pod decoy -o jsonpath='{.status.podIP}')"
@@ -37,9 +44,14 @@ from datetime import datetime, timezone
 from moks.terminal.pods import pod_manifest
 s = types.SimpleNamespace(id="test", owner_id="ci", pod_name="moks-term-test", pod_namespace="moks-terminals", image=sys.argv[1], region="us-east-1",
                           aws_account="000000000000", environment="ci", lifetime_minutes=15, expires_at=datetime.now(timezone.utc))
-print(json.dumps(pod_manifest(s)))
+m = pod_manifest(s)
+# The image was side-loaded with kind load and exists nowhere else. A tag without a digest gets imagePullPolicy
+# Always (right for :latest in production), which would send kind to Docker Hub and never start the pod.
+for c in m["spec"]["containers"] + m["spec"].get("initContainers", []):
+    c["imagePullPolicy"] = "Never"
+print(json.dumps(m))
 PY
-kubectl -n moks-terminals wait pod/moks-term-test --for=condition=Ready --timeout=120s
+wait_ready moks-terminals moks-term-test
 own_node="$(kubectl -n moks-terminals get pod moks-term-test -o jsonpath='{.status.hostIP}')"
 [[ "$own_node" != "$node_ip" ]] || { echo "FAIL  the session runs on $node_ip, so that node cannot prove anything: NetworkPolicy never applies to a pod's own node"; exit 1; }
 
