@@ -595,3 +595,36 @@ def test_the_dashboards_identities_have_least_privilege():
     mapping = yaml.safe_load((CHART / "files/opensearch/roles_mapping.yml").read_text())
     assert "moks_dashboards" not in mapping["all_access"]["users"] and "moks_viewer" not in mapping["all_access"]["users"]
     assert mapping["kibana_server"]["users"] == ["moks_dashboards"]
+
+
+# ---- secret sync -------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("values", ["values-minikube.yaml", "values-eks.yaml"])
+def test_secret_sync_is_off_by_default_and_adds_nothing(values):
+    docs = render(values)
+    assert not [d for d in docs if d["metadata"]["name"] == "moks-secret-sync"]
+    config = next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "moks-config")
+    assert config["data"]["MOKS_SECRETS_SYNC_ENABLED"] == "false"
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_only_the_executor_holds_the_secret_sync_secret_and_secret_verbs(split):
+    sets = ["secretsSync.enabled=true", "secretsSync.namespaces={shop,pay}"] + (list(SPLIT) if split else [])
+    docs = render("values-minikube.yaml", *sets)
+    holders = {name for name, pod in pods(docs) if "moks-secret-sync" in secrets(pod)}
+    assert holders == {"moks-executor"}
+    roles = {d["metadata"]["namespace"]: d for d in docs if d["kind"] == "Role" and d["metadata"]["name"] == "moks-secret-sync"}
+    assert set(roles) == {"shop", "pay"}
+    verbs = next(r["verbs"] for r in roles["shop"]["rules"] if r["resources"] == ["secrets"])
+    assert verbs == ["get", "list", "create", "update"]  # no delete unless allowDelete
+    bindings = [d for d in docs if d["kind"] == "RoleBinding" and d["metadata"]["name"] == "moks-secret-sync"]
+    assert {s["name"] for b in bindings for s in b["subjects"]} == {"moks-executor"}
+    reader = next(d for d in docs if d["kind"] == "ClusterRole" and d["metadata"]["name"] == "moks-reader")
+    assert not [r for r in reader["rules"] if "secrets" in r["resources"]]  # the read-only connector still cannot read Secrets
+
+
+def test_secret_delete_verb_needs_allow_delete():
+    docs = render("values-minikube.yaml", "secretsSync.enabled=true", "secretsSync.namespaces={shop}", "secretsSync.allowDelete=true")
+    role = next(d for d in docs if d["kind"] == "Role" and d["metadata"]["name"] == "moks-secret-sync")
+    assert "delete" in next(r["verbs"] for r in role["rules"] if r["resources"] == ["secrets"])

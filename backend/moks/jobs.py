@@ -53,10 +53,15 @@ POLICIES: dict[str, Policy] = {
     "ml_anomaly_tick": Policy(1, False),    # the scheduler queues the next one
     "ml_anomaly_train": Policy(1, False),   # an operator or the CronJob starts it again
     "learning_purge": Policy(2, True),      # deletes by expiry, so a repeat is harmless
+    "secret_discover": Policy(2, True),     # read-only listing
+    "secret_compare": Policy(2, True),      # read-only; the plan waits in comparing until it finishes
+    "secret_execute": Policy(1, False),     # items keep their write state; a person retries them after reading the outcome
 }
 DEFAULT_POLICY = Policy(3, False)
-JOB_CLASSES = {"detection_tick": "detection", "alert_poll": "detection", "knowledge_sync": "knowledge", "knowledge_reindex": "knowledge"}
+JOB_CLASSES = {"detection_tick": "detection", "alert_poll": "detection", "knowledge_sync": "knowledge", "knowledge_reindex": "knowledge",
+               "secret_discover": "secrets", "secret_compare": "secrets", "secret_execute": "secrets"}
 CLASSES = ("detection", "knowledge", "maintenance")  # the order a worker fills its capacity in
+EXECUTOR_CLASS = "secrets"  # claimed only by the executor, the one process with secret access; never by a worker
 
 
 class QueueFull(Exception):
@@ -249,7 +254,16 @@ def handlers() -> dict[str, Handler]:
 
         return await learning.purge(db)
 
-    return {"detection_tick": detection_tick, "knowledge_sync": knowledge_sync, "knowledge_reindex": knowledge_reindex, "alert_poll": alert_poll, "eval_run": eval_run,
+    async def secret_job(db: AsyncSession, p: dict) -> dict:
+        from .secrets import tasks as secret_tasks
+
+        if get_settings().process_role != "executor":
+            raise RuntimeError("secret jobs run only in the executor")
+        return await {"secret_discover": secret_tasks.discover, "secret_compare": secret_tasks.compare_plan,
+                      "secret_execute": secret_tasks.execute_plan}[p["_job_type"]](p)
+
+    return {"secret_discover": secret_job, "secret_compare": secret_job, "secret_execute": secret_job,
+            "detection_tick": detection_tick, "knowledge_sync": knowledge_sync, "knowledge_reindex": knowledge_reindex, "alert_poll": alert_poll, "eval_run": eval_run,
             "ml_anomaly_tick": ml_anomaly_tick, "ml_anomaly_train": ml_anomaly_train, "learning_purge": learning_purge}
 
 
@@ -274,7 +288,7 @@ async def _run_one(job_id: uuid.UUID, payload: dict, type_: str, attempts: int, 
         if fn is None:
             raise ValueError(f"unknown job type {type_}")
         async with session_scope() as db:
-            result = await fn(db, {**payload, "_job_id": job_id})
+            result = await fn(db, {**payload, "_job_id": job_id, "_job_type": type_})
     except asyncio.CancelledError:
         log.warning("job stopped", extra={"event": "job_cancelled", "operation": type_})
         beat.cancel()

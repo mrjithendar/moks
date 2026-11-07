@@ -1084,3 +1084,153 @@ class MLCapability(Base):
     reason: Mapped[str] = mapped_column(Text, default="")
     updated_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---- Secret sync (moks/secrets, docs/SECRETS_SYNC.md). No column here ever holds a secret value. ----------------
+
+
+class SecretMapping(Base):
+    __tablename__ = "secret_mappings"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id", ondelete="CASCADE"))
+    kube_connector_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("connectors.id", ondelete="CASCADE"))
+    cluster_uid: Mapped[str] = mapped_column(String(64))
+    cluster_name: Mapped[str] = mapped_column(String(100), default="")
+    namespace: Mapped[str] = mapped_column(String(253))
+    secret_name: Mapped[str] = mapped_column(String(253))
+    aws_connector_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("connectors.id", ondelete="CASCADE"))
+    aws_account: Mapped[str] = mapped_column(String(12))
+    aws_region: Mapped[str] = mapped_column(String(30))
+    aws_secret_name: Mapped[str] = mapped_column(String(512))
+    aws_secret_arn: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload_format: Mapped[str] = mapped_column(String(20))
+    key_mapping: Mapped[dict] = mapped_column(JSONB, default=dict)
+    k8s_type: Mapped[str] = mapped_column(String(100), default="Opaque")
+    direction: Mapped[str] = mapped_column(String(10))  # export | import | both
+    expected_owner: Mapped[dict] = mapped_column(JSONB, default=dict)  # {"kubernetes": "none"|manager, "aws": ...}
+    management_policy: Mapped[str] = mapped_column(String(20), default="refuse_managed")  # refuse_managed | override
+    status: Mapped[str] = mapped_column(String(20), default="active")  # active | retired
+    last_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    last_compared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)  # optimistic concurrency for edits
+    baseline_seq: Mapped[int] = mapped_column(Integer, default=0)  # moves with every baseline change
+    baseline: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # last verified agreement: digests and versions only
+    lease_owner: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SecretInventory(Base):
+    __tablename__ = "secret_inventory"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id", ondelete="CASCADE"))
+    side: Mapped[str] = mapped_column(String(12))  # kubernetes | aws
+    connector_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("connectors.id", ondelete="CASCADE"))
+    scope_key: Mapped[str] = mapped_column(String(300))  # the namespace, or account/region
+    cluster_uid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    namespace: Mapped[str | None] = mapped_column(String(253), nullable=True)
+    name: Mapped[str] = mapped_column(String(512))
+    arn: Mapped[str | None] = mapped_column(Text, nullable=True)
+    type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    key_names: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
+    owner: Mapped[dict] = mapped_column(JSONB, default=dict)
+    syncable: Mapped[bool] = mapped_column(Boolean, default=True)
+    excluded: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_modified: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    tags: Mapped[dict] = mapped_column(JSONB, default=dict)
+    extra: Mapped[dict] = mapped_column(JSONB, default=dict)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SecretInventoryScope(Base):
+    """One row per scope a discovery covered: whether that listing was complete, and why not."""
+    __tablename__ = "secret_inventory_scopes"
+    __table_args__ = (UniqueConstraint("environment_id", "side", "connector_id", "scope_key"),)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id", ondelete="CASCADE"))
+    side: Mapped[str] = mapped_column(String(12))
+    connector_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("connectors.id", ondelete="CASCADE"))
+    scope_key: Mapped[str] = mapped_column(String(300))
+    cluster_uid: Mapped[str | None] = mapped_column(String(64), nullable=True)  # what the executor saw, even for an empty namespace
+    complete: Mapped[bool] = mapped_column(Boolean, default=True)
+    count: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SecretPlan(Base):
+    __tablename__ = "secret_plans"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(12))  # sync | rollback | delete
+    status: Mapped[str] = mapped_column(String(20), default="comparing")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    requested_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    executed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    plan_hash: Mapped[str] = mapped_column(String(64), default="")
+    hash_version: Mapped[int] = mapped_column(Integer, default=1)
+    requires_approval: Mapped[bool] = mapped_column(Boolean, default=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    request: Mapped[dict] = mapped_column(JSONB, default=dict)  # what was asked for: mappings, rollback versions, targets
+    summary: Mapped[dict] = mapped_column(JSONB, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    compare_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    execute_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_plan_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SecretPlanItem(Base):
+    __tablename__ = "secret_plan_items"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    plan_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("secret_plans.id", ondelete="CASCADE"))
+    mapping_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("secret_mappings.id", ondelete="CASCADE"))
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    included: Mapped[bool] = mapped_column(Boolean, default=True)
+    mapping_version: Mapped[int] = mapped_column(Integer, default=0)
+    baseline_seq: Mapped[int] = mapped_column(Integer, default=0)
+    classification: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    first_sync: Mapped[bool] = mapped_column(Boolean, default=False)
+    proposal: Mapped[str | None] = mapped_column(String(20), nullable=True)  # the side MOKS suggests as source
+    resolution: Mapped[str | None] = mapped_column(String(20), nullable=True)  # kubernetes | aws | edited
+    key_choices: Mapped[dict] = mapped_column(JSONB, default=dict)  # edited: {key: kubernetes | aws | omit}
+    rollback_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    targets: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    actions: Mapped[dict] = mapped_column(JSONB, default=dict)  # {aws: create|update|restage|delete, kubernetes: ...}
+    kube_state: Mapped[dict] = mapped_column(JSONB, default=dict)
+    aws_state: Mapped[dict] = mapped_column(JSONB, default=dict)
+    source_state: Mapped[dict] = mapped_column(JSONB, default=dict)  # rollback: the version being restored
+    baseline: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    expected: Mapped[dict] = mapped_column(JSONB, default=dict)  # what the destination must hold afterwards: type, keys, digest
+    diff: Mapped[dict] = mapped_column(JSONB, default=dict)
+    warnings: Mapped[list] = mapped_column(JSONB, default=list)
+    impact: Mapped[list] = mapped_column(JSONB, default=list)
+    blocked: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending | running | succeeded | failed | stale | skipped | conflict
+    write_state: Mapped[dict] = mapped_column(JSONB, default=dict)  # {aws|kubernetes: intent | applied | verified}
+    idempotency_token: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), default=_uuid)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    result: Mapped[dict] = mapped_column(JSONB, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SecretPlanApproval(Base):
+    __tablename__ = "secret_plan_approvals"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    plan_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("secret_plans.id", ondelete="CASCADE"))
+    approver_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    decision: Mapped[str] = mapped_column(String(10))
+    plan_hash: Mapped[str] = mapped_column(String(64))
+    comment: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

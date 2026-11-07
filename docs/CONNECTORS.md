@@ -36,6 +36,14 @@ of each type per environment is used.
   `bad_request` (with the backend's own error, such as a PromQL parse error, or where a redirect leads), `not_found` (with a
   base-URL/path-prefix hint) and `too_large`.
 
+## AWS Secrets Manager (`aws_secrets`)
+
+Used only by secret sync ([SECRETS_SYNC.md](SECRETS_SYNC.md)) and only from the executor; the API validates the
+configuration and never calls AWS. Config: `account_id`, `region`, `allowed_prefixes`, `kubernetes_namespaces`,
+optional `required_tags`, `role_arn`/`external_id` (another account), `kms_key_id` (for secrets MOKS creates),
+`allow_delete`, `recovery_window_days` (7–30), `name_template`, and on Minikube `credentials` (two credential
+references). Not an investigation tool.
+
 ## Kubernetes
 
 ```json

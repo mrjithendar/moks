@@ -46,6 +46,12 @@ class P(StrEnum):
     LEARNING_REVIEW = "learning.review"      # confirm causes and resolutions, review judgments; scoped by binding
     LEARNING_EXPORT = "learning.export"      # build and export training and evaluation datasets
     ML_ADMIN = "ml.admin"                    # capability modes (the kill switch), training, model promotion and rollback
+    SECRETS_DISCOVER = "secrets.discover"    # secret names, types, owners and sync status; never key names or values
+    SECRETS_COMPARE = "secrets.compare"      # key names and masked differences; starts a read-only comparison
+    SECRETS_MAP = "secrets.map"              # create, edit and retire mappings
+    SECRETS_PROPOSE = "secrets.propose"      # propose export, import, rollback and deletion plans
+    SECRETS_APPROVE = "secrets.approve"      # approve or reject secret plans (never one's own, as with actions)
+    SECRETS_EXECUTE = "secrets.execute"      # run an approved secret plan and retry its failed items
     ADMIN_USERS = "admin.users"
     ADMIN_CONNECTORS = "admin.connectors"
     ADMIN_LLM = "admin.llm"
@@ -63,6 +69,9 @@ _INDEX_OPERATOR = _VIEWER | {P.KNOWLEDGE_TEST, P.KNOWLEDGE_INDEX}
 _SKILL_PUBLISHER = _VIEWER | {P.SKILL_REVIEW, P.SKILL_PUBLISH}
 _ML_REVIEWER = _VIEWER | {P.ML_FEEDBACK, P.LEARNING_REVIEW}
 _ML_ADMIN = _ML_REVIEWER | {P.LEARNING_EXPORT, P.ML_ADMIN}
+_SECRETS_VIEWER = {P.OVERVIEW_READ, P.SECRETS_DISCOVER, P.SECRETS_COMPARE}
+_SECRETS_OPERATOR = _SECRETS_VIEWER | {P.SECRETS_MAP, P.SECRETS_PROPOSE, P.SECRETS_EXECUTE}
+_SECRETS_APPROVER = _SECRETS_VIEWER | {P.SECRETS_APPROVE}
 _ADMIN = set(P) - {P.TERMINAL_USE}  # a shell is arbitrary code: it is granted to a person on purpose, not bundled
 
 ROLES: dict[str, frozenset[P]] = {
@@ -77,6 +86,9 @@ ROLES: dict[str, frozenset[P]] = {
     "skill_publisher": frozenset(_SKILL_PUBLISHER),
     "ml_reviewer": frozenset(_ML_REVIEWER),
     "ml_admin": frozenset(_ML_ADMIN),
+    "secrets_viewer": frozenset(_SECRETS_VIEWER),
+    "secrets_operator": frozenset(_SECRETS_OPERATOR),
+    "secrets_approver": frozenset(_SECRETS_APPROVER),
     "admin": frozenset(_ADMIN),
 }
 
@@ -92,6 +104,9 @@ ROLE_DESCRIPTIONS = {
     "skill_publisher": "Review and publish skill versions, roll back generations and set skill policy. Needs environment and namespace '*'.",
     "ml_reviewer": "Confirm causes and resolutions on learning records and review operator judgments in the bound scope.",
     "ml_admin": "Switch ML capabilities (disabled, shadow, enabled), train, promote and roll back models, and export datasets. Needs environment and namespace '*'. Grants no infrastructure access.",
+    "secrets_viewer": "See Kubernetes and AWS secret names, owners and sync status, and compare key names and masked differences in the bound namespaces. Never values.",
+    "secrets_operator": "Manage secret mappings and propose and run reviewed sync, rollback and deletion plans in the bound namespaces. Not part of operator.",
+    "secrets_approver": "Approve or reject secret plans in the bound namespaces (never their own). Not part of approver.",
     "admin": "Manage users, connectors, LLM providers and policies, and end anyone's terminal session. Their own action plans need no second approval.",
 }
 

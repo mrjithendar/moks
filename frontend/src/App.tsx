@@ -12,12 +12,14 @@ const investigate = () => import("./pages/Investigate");
 const live = () => import("./pages/Live");
 const ops = () => import("./pages/Ops");
 const backups = () => import("./pages/Backups");
+const secrets = () => import("./pages/Secrets");
 const terminal = () => import("./pages/Terminal");
 const page = <M,>(load: () => Promise<M>, name: keyof M) => lazy(() => load().then((m) => ({ default: m[name] as ComponentType })));
 
 const Audit = page(admin, "Audit"), Connectors = page(admin, "Connectors"), Environments = page(admin, "Environments"), LLMProviders = page(admin, "LLMProviders"), Users = page(admin, "Users");
 const Terminals = page(terminal, "Terminals"), TerminalView = page(terminal, "TerminalView");
 const Backups = page(backups, "Backups"), BackupStorage = page(backups, "BackupStorage");
+const Secrets = page(secrets, "Secrets"), SecretPlan = page(secrets, "SecretPlan");
 const Workspace = lazy(() => import("./pages/Conversations").then((m) => ({ default: m.Workspace })));
 const InvestigationView = page(investigate, "InvestigationView"), NewInvestigation = page(investigate, "NewInvestigation");
 const Evals = page(insights, "Evals"), FinOps = page(insights, "FinOps"), Knowledge = page(insights, "Knowledge");
@@ -55,6 +57,8 @@ export default function App() {
         <Route path="/investigations" element={<Workspace />} />
         <Route path="/investigations/:id" element={<InvestigationView />} />
         <Route path="/conversations/:id" element={<Workspace />} />
+        <Route path="/secrets" element={<Need any={["secrets.discover"]}><Secrets /></Need>} />
+        <Route path="/secrets/plans/:id" element={<Need any={["secrets.discover"]}><SecretPlan /></Need>} />
         <Route path="/backups" element={<Need any={["backup.read"]}><Backups /></Need>} />
         <Route path="/admin/backup-storage" element={<Need any={["admin.connectors"]}><BackupStorage /></Need>} />
         <Route path="/explorer" element={<Need any={["explorer.read"]}><Explorer /></Need>} />

@@ -614,3 +614,10 @@ button.selected, button[aria-pressed="true"] { outline: 2px solid var(--accent, 
 .inbox-main { align-items: stretch; }
 @media (max-width: 767px), (pointer: coarse) { .cite { min-height: 44px; min-width: 44px; display: inline-flex; align-items: center; justify-content: center; } }
 .ws-list-items, .inbox-row { position: relative; } /* keeps hidden screen-reader text inside the scrolling list */
+
+/* Secrets sync */
+.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.check { display: inline-flex; align-items: center; gap: 6px; }
+.warn-list { margin: 0; padding-left: 18px; color: var(--muted); }
+.sticky-actions { position: sticky; bottom: 0; background: var(--bg); padding: 8px 0; border-top: 1px solid var(--border); gap: 8px; }
+.sticky-actions input { min-width: 0; flex: 1 1 160px; }

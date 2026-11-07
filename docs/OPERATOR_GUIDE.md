@@ -244,6 +244,11 @@ The API's init container runs migration `0002` automatically. Take a backup firs
    model, investigations and **Analyze with AI** use rule-based reports. Set input and output prices there
    so FinOps can show cost as well as tokens. An inactive provider can be deleted; its usage history stays.
 
+## Secret sync with AWS Secrets Manager
+
+Off by default. [SECRETS_SYNC.md](SECRETS_SYNC.md#configuration) has the chart values, the executor Secret
+(`scripts/create-secret-sync-secret.sh`), IAM, KMS and RBAC examples, and a disposable smoke test for mk4.
+
 ## Enabling the web terminal
 
 See [TERMINAL.md](TERMINAL.md). It is off until `terminal.enabled` is set, and needs a Terraform apply, a Secret and a database role first.

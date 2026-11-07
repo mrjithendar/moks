@@ -120,6 +120,15 @@ class Settings(BaseSettings):
     crewai_excerpt_chars: int = Field(default=2000, ge=200, le=20000)  # what one tool result shows the model and the report
     crewai_log_lines: int = Field(default=100, ge=10, le=500)
 
+    # Kubernetes <-> AWS Secrets Manager sync (docs/SECRETS_SYNC.md). Off unless MOKS_SECRETS_SYNC_ENABLED is true in the api and
+    # the executor. Values are read and written only by the executor; nothing here schedules a sync.
+    secrets_sync_enabled: bool = False
+    secrets_digest_key: str = Field(default="", repr=False)  # executor only: keys the comparison digests (32+ characters)
+    secrets_max_plan_items: int = Field(default=100, ge=1, le=500)
+    secrets_discovery_max_pages: int = Field(default=50, ge=1, le=500)
+    secrets_lease_seconds: int = Field(default=120, ge=30, le=900)  # how long one MOKS operation holds a mapping
+    secrets_lease_wait_seconds: float = Field(default=10.0, ge=0, le=120)  # how long an item waits for another operation on its mapping
+
     # Rate limits (per process; see docs/SECURITY.md)
     rate_login_per_minute: int = 10
     rate_investigations_per_minute: int = 10
