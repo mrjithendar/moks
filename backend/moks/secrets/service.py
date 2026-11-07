@@ -11,6 +11,12 @@ goes stale; a fresh comparison and approval are needed.
 Approval follows the action-plan rules: never one's own plan, except a global administrator, whose plans need no
 second approval (recorded as secrets.approval_waived). Deletion plans are stronger: they always need someone else's
 approval, with the confirmation phrase typed back.
+
+The comparison also binds each item to its connectors (connector_binding: a fingerprint of each connector's
+environment, configuration and credential reference, the cluster UID and the AWS account and region), and the hash
+covers that. The executor checks everything again before every item and right before every write (authorize_item in
+tasks.py): reconfiguring a connector, disabling it, revoking a permission or letting the approval expire stops the
+plan between writes, and the items it did not reach say so.
 """
 from __future__ import annotations
 
@@ -33,7 +39,7 @@ from ..scope import ScopeError, effective_scope
 from . import compare
 from .content import FORMATS, SUPPORTED_TYPES
 
-HASH_VERSION = 1
+HASH_VERSION = 2  # 2: items carry connector_binding. Plans hashed as 1 are refused and refreshed, never run.
 K8S_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
 K8S_KEY = re.compile(r"^[-._a-zA-Z0-9]{1,253}$")
 AWS_NAME = re.compile(r"^[A-Za-z0-9/_+=.@-]{1,512}$")
@@ -83,6 +89,42 @@ def aws_scope(row: Connector):
     from .aws import AwsSecretsConnector
 
     return AwsSecretsConnector(row.config or {}, row.credential_ref)  # validates; never calls AWS from here
+
+
+def connector_fingerprint(row: Connector) -> str:
+    """What a connector's reads and writes depend on: its environment, type, configuration (cluster endpoint, account,
+    region, role, prefixes, required tags, namespaces, delete rights) and credential reference. Work bound to one
+    fingerprint does not run under another; any edit of the connector counts, which errs on the side of a new review."""
+    return hashlib.sha256(json.dumps({"id": str(row.id), "environment": str(row.environment_id), "type": row.type, "config": row.config or {},
+                                      "credential_ref": row.credential_ref or {}}, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def connector_binding(kube: Connector, aws_row: Connector, cluster_uid: str, aws) -> dict[str, Any]:
+    return {"kube": connector_fingerprint(kube), "aws": connector_fingerprint(aws_row), "cluster_uid": cluster_uid, "aws_account": aws.account_id, "aws_region": aws.region}
+
+
+async def current_connectors(db: AsyncSession, env: Environment, m: SecretMapping, binding: dict[str, Any] | None) -> tuple[Connector, Connector]:
+    """The mapping's connectors as they are now, refused (409) unless they are still enabled, in this environment, and
+    configured exactly as when the item was compared, and still allow this namespace and AWS name."""
+    from ..connectors.base import ConnectorError
+
+    kube, aws_row = await db.get(Connector, m.kube_connector_id), await db.get(Connector, m.aws_connector_id)
+    for row, ctype, key in ((kube, "kubernetes", "kube"), (aws_row, "aws_secrets", "aws")):
+        if row is None or not row.enabled or row.environment_id != env.id or row.type != ctype:
+            raise SyncError(409, f"the {ctype} connector of {_label(m)} was removed, disabled or moved to another environment")
+        if not binding or binding.get(key) != connector_fingerprint(row):
+            raise SyncError(409, f"the {ctype} connector {row.name} was reconfigured after the comparison (target, credentials or restrictions); refresh the plan")
+    if not (kube.config or {}).get("executor"):
+        raise SyncError(409, f"connector {kube.name} has no write target (config.executor)")
+    try:
+        aws = aws_scope(aws_row)
+    except ConnectorError as exc:
+        raise SyncError(409, f"connector {aws_row.name} is misconfigured: {exc.message}") from None
+    if aws.account_id != m.aws_account or aws.region != m.aws_region or binding.get("cluster_uid") != m.cluster_uid:
+        raise SyncError(409, "the connectors now point at a different cluster, account or region than this mapping was made for")
+    if not aws.namespace_allowed(m.namespace) or not aws.name_allowed(m.aws_secret_name):
+        raise SyncError(409, f"connector {aws_row.name} no longer allows {m.namespace} or {m.aws_secret_name}")
+    return kube, aws_row
 
 
 async def cluster_identity(db: AsyncSession, env: Environment, kube: Connector) -> str:
@@ -392,7 +434,8 @@ def canonical(plan: SecretPlan, env_name: str, items: list[SecretPlanItem]) -> s
         "items": [{"mapping": str(i.mapping_id), "included": i.included, "mapping_version": i.mapping_version, "baseline_seq": i.baseline_seq,
                    "kube": side(i.kube_state or {}), "aws": side(i.aws_state or {}), "source": side(i.source_state or {}), "rollback_version": i.rollback_version,
                    "resolution": i.resolution, "key_choices": i.key_choices or {}, "targets": list(i.targets or []), "actions": i.actions or {},
-                   "expected": (i.expected or {}).get("digest") if not (i.expected or {}).get("absent") else "absent", "diff": names(i.diff)}
+                   "expected": (i.expected or {}).get("digest") if not (i.expected or {}).get("absent") else "absent", "diff": names(i.diff),
+                   **({"connectors": i.connector_binding or {}} if plan.hash_version >= 2 else {})}
                   for i in sorted(items, key=lambda x: x.position)],
     }, sort_keys=True, separators=(",", ":"))
 
@@ -417,6 +460,7 @@ async def submit(db: AsyncSession, principal: Principal, env: Environment, plan_
         raise SyncError(409, f"plan is {plan.status}, not draft")
     if version != plan.version:
         raise SyncError(409, "the plan changed since you loaded it; reload and review again")
+    _current_version(plan)
     items = await items_of(db, plan)
     mappings = await plan_mappings(db, plan)
     for i in items:
@@ -460,6 +504,11 @@ def _expired(plan: SecretPlan) -> bool:
     return plan.expires_at is not None and datetime.now(timezone.utc) >= plan.expires_at
 
 
+def _current_version(plan: SecretPlan) -> None:
+    if plan.hash_version != HASH_VERSION:
+        raise SyncError(409, "this plan was compared by an older MOKS version, before items were bound to their connectors; refresh it to compare and review again")
+
+
 async def decide(db: AsyncSession, principal: Principal, env: Environment, plan_id: uuid.UUID, approve: bool, comment: str, presented_hash: str, confirm: str | None) -> SecretPlan:
     plan = await load_plan(db, plan_id, env, lock=True)
     if plan.status != "pending":
@@ -471,6 +520,8 @@ async def decide(db: AsyncSession, principal: Principal, env: Environment, plan_
     if own and (plan.kind == "delete" or not is_admin(principal)):
         POLICY_DENIALS.labels("self_approval").inc()
         raise SyncError(403, "you cannot approve or reject your own plan" + (" (deletion always needs someone else)" if plan.kind == "delete" else ""))
+    if approve:
+        _current_version(plan)
     items = await items_of(db, plan)
     mappings = await plan_mappings(db, plan)
     for i in items:
@@ -501,6 +552,7 @@ async def queue(db: AsyncSession, principal: Principal, env: Environment, plan_i
     if _expired(plan):
         plan.status = "expired"
         raise SyncError(409, "plan expired; refresh it to compare again")
+    _current_version(plan)
     if presented_hash != plan.plan_hash or compute_hash(plan, env.name, items) != plan.plan_hash:
         POLICY_DENIALS.labels("plan_hash").inc()
         raise SyncError(409, "plan hash mismatch; the plan changed after review")
@@ -518,6 +570,7 @@ async def retry(db: AsyncSession, principal: Principal, env: Environment, plan_i
         raise SyncError(409, f"plan is {plan.status}; only a partial or failed plan has items to retry")
     if _expired(plan):
         raise SyncError(409, "the approval for this plan expired; refresh it to compare and approve again")
+    _current_version(plan)
     items = await items_of(db, plan)
     mappings = await plan_mappings(db, plan)
     for i in items:
@@ -613,3 +666,66 @@ async def _scheduled_approval(db: AsyncSession, plan: SecretPlan, env: Environme
         raise SyncError(403, "the schedule changed after this run started")
     if not {str(m) for m in mappings} <= set(s.mapping_ids or []):
         raise SyncError(403, "this run includes a mapping the schedule does not cover")
+
+
+# ---- viewing values: what a reveal is bound to ----------------------------------------------------------------
+
+
+REVEAL_BINDING = 1
+
+
+async def reveal_namespace(db: AsyncSession, env: Environment, side: str, row: Connector, name: str, namespace: str | None) -> tuple[str | None, dict[str, Any] | None]:
+    """The namespace whose secrets.reveal grant covers a secret: a Kubernetes Secret's own; for an AWS secret, the
+    namespace of the active mapping that syncs it, or None (every namespace) when none does."""
+    if side == "kubernetes":
+        return namespace, None
+    m = (await db.execute(select(SecretMapping).where(SecretMapping.environment_id == env.id, SecretMapping.aws_connector_id == row.id,
+                                                      SecretMapping.aws_secret_name == name, SecretMapping.status == "active"))).scalar_one_or_none()
+    return (m.namespace, {"id": str(m.id), "version": m.version}) if m else (None, None)
+
+
+async def bind_reveal(db: AsyncSession, env: Environment, r: SecretInventory, row: Connector) -> dict[str, Any]:
+    """Fixed when the reveal is asked for: the exact secret, its connector as configured then, the cluster or AWS
+    account and region, and the namespace that authorizes viewing it. check_reveal compares against this."""
+    ns, mapping = await reveal_namespace(db, env, r.side, row, r.name, r.namespace)
+    b: dict[str, Any] = {"v": REVEAL_BINDING, "environment_id": str(env.id), "side": r.side, "connector_id": str(row.id), "connector": connector_fingerprint(row),
+                         "namespace": r.namespace, "name": r.name, "auth_namespace": ns, "mapping": mapping}
+    if r.side == "kubernetes":
+        b["cluster_uid"] = r.cluster_uid
+    else:
+        aws = aws_scope(row)
+        b.update(aws_account=aws.account_id, aws_region=aws.region, arn=r.arn)
+    return b
+
+
+async def check_reveal(db: AsyncSession, env: Environment, binding: dict[str, Any] | None, principal: Principal) -> Connector:
+    """Everything a reveal relied on, against current state and the given (current) permissions. The executor calls
+    it before reading the value, and the API before handing the sealed result over. Raises SyncError."""
+    from ..connectors.base import ConnectorError
+
+    if not binding or binding.get("v") != REVEAL_BINDING or binding.get("environment_id") != str(env.id):
+        raise SyncError(409, "this reveal was asked for by an older MOKS version or for another environment; ask again")
+    side = binding.get("side")
+    ctype = "kubernetes" if side == "kubernetes" else "aws_secrets"
+    row = await db.get(Connector, uuid.UUID(binding["connector_id"]))
+    if row is None or not row.enabled or row.environment_id != env.id or row.type != ctype:
+        raise SyncError(409, "the connector this secret was found with is gone, disabled or moved")
+    if connector_fingerprint(row) != binding.get("connector"):
+        raise SyncError(409, f"connector {row.name} was reconfigured after the request (target, credentials or restrictions); ask again")
+    if side == "kubernetes":
+        if not (row.config or {}).get("executor"):
+            raise SyncError(409, f"the kubernetes connector {row.name} has no executor target")
+    else:
+        try:
+            aws = aws_scope(row)
+        except ConnectorError as exc:
+            raise SyncError(409, exc.message) from None
+        if aws.account_id != binding.get("aws_account") or aws.region != binding.get("aws_region") or not aws.name_allowed(binding["name"]):
+            raise SyncError(403, f"{binding['name']} is no longer inside connector {row.name}'s account, region or prefixes")
+    ns, mapping = await reveal_namespace(db, env, side, row, binding["name"], binding.get("namespace"))
+    if ns != binding.get("auth_namespace") or mapping != binding.get("mapping"):
+        raise SyncError(403, "the secret's mapping changed after the request, and with it the namespace that authorizes viewing it; ask again")
+    if not can(principal, P.SECRETS_REVEAL, env, ns):
+        POLICY_DENIALS.labels("secrets").inc()
+        raise SyncError(403, f"{principal.email} may no longer view secrets in {env.name}/{ns or 'every namespace'}")
+    return row

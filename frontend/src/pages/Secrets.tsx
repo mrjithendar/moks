@@ -31,6 +31,12 @@ interface ScopeInfo {
   kubernetes: { id: string; name: string; writable: boolean; cluster_uid: string | null; namespaces: string[]; error: string | null }[];
   aws: { id: string; name: string; account_id?: string; region?: string; allowed_prefixes?: string[]; kubernetes_namespaces?: string[]; allow_delete?: boolean; error?: string }[];
   cluster_wide: boolean; can: Record<string, boolean>; discovery?: { interval_minutes: number; last_at: string | null };
+  policy?: { mode: "manual" | "scheduled"; schedules_run: boolean; explanation: string };
+}
+
+/** Under the manual-only policy (the default) every write is a plan someone reviews; schedules never run. */
+function canSchedule(scope: ScopeInfo): boolean {
+  return scope.policy?.schedules_run ?? false;
 }
 
 function every(minutes: number): string {
@@ -322,7 +328,7 @@ function Mappings({ env, scope, onScheduled }: { env: string; scope: ScopeInfo; 
         {scope.can.propose && <>
           <button type="button" className="ghost" onClick={() => setSelected(selected.size === rows.length ? new Set() : new Set(rows.map((m) => m.id)))}>{selected.size === rows.length && rows.length ? "Clear selection" : "Select all"}</button>
           <button type="button" disabled={!selected.size} onClick={() => setPlanKind("sync")}>Compare {selected.size || ""} selected</button>
-          <button type="button" className="ghost" disabled={!selected.size} onClick={() => setScheduling(true)}>Schedule sync</button>
+          {canSchedule(scope) && <button type="button" className="ghost" disabled={!selected.size} onClick={() => setScheduling(true)}>Schedule sync</button>}
           <button type="button" className="ghost danger" disabled={!selected.size} onClick={() => setPlanKind("delete")}>Propose deletion</button>
         </>}
       </div>
@@ -659,7 +665,7 @@ function BulkMap({ env, scope, side, ids, onClose, onReview, onDone }: { env: st
           <label>Namespace<select required value={ns} onChange={(e) => setNs(e.target.value)}><option value="" disabled>Choose</option>{namespaces.map((n) => <option key={n}>{n}</option>)}</select></label>
         </div>}
         {scope.can.propose && <label className="check"><input type="checkbox" checked={compareNow} onChange={(e) => setCompareNow(e.target.checked)} /> Compare them right away (a read-only plan to review)</label>}
-        {scope.can.propose && <label>Keep them in sync<select value={schedule} onChange={(e) => setSchedule(Number(e.target.value))}><option value={0}>No schedule</option>
+        {scope.can.propose && canSchedule(scope) && <label>Keep them in sync<select value={schedule} onChange={(e) => setSchedule(Number(e.target.value))}><option value={0}>No schedule</option>
           {INTERVALS.map(([m, l]) => <option key={m} value={m}>{l} (after approval)</option>)}</select></label>}
         <ErrorBox error={error} />
         <div className="row end">
@@ -756,12 +762,14 @@ function RevealPanel({ env, row }: { env: string; row: Row }) {
 // ---- schedules ---------------------------------------------------------------------------------------------
 
 interface Schedule { id: string; name: string; status: string; paused_reason: string | null; interval_minutes: number; version: number; schedule_hash: string; requested_by: string | null;
+  held: boolean; needs_fresh_approval: boolean; policy: "manual" | "scheduled";
   namespaces: string[]; stale_mappings: string[]; mappings: { id: string; secret: string; aws_secret_name: string; direction: string; last_status: string | null }[];
   next_run_at: string | null; last_run_at: string | null; last_plan_id: string | null;
   last_outcome: { status?: string; written?: number; needs_review?: { mapping_id: string; secret: string; aws: string; classification: string; why: string }[]; error?: string | null };
   approvals: { by: string | null; decision: string; comment: string; at: string | null; current: boolean }[]; allowed: Record<string, boolean> }
 
-const SCHEDULE_TONE: Record<string, Tone> = { active: "ok", pending: "warn", paused: "neutral", rejected: "bad" };
+const SCHEDULE_TONE: Record<string, Tone> = { active: "ok", pending: "warn", paused: "neutral", held: "warn", rejected: "bad" };
+const SCHEDULE_LABEL: Record<string, string> = { pending: "waiting for approval", held: "held by policy" };
 
 function ScheduleDialog({ env, ids, onClose, onDone }: { env: string; ids: string[]; onClose: () => void; onDone: () => void }) {
   const [name, setName] = useState("");
@@ -802,7 +810,7 @@ function Schedules({ env, scope }: { env: string; scope: ScopeInfo }) {
   const current = list.data?.items.find((s) => s.id === open);
   const cols: Col<Schedule>[] = [
     { key: "name", head: "Schedule", primary: true, cell: (s) => <strong>{s.name}</strong> },
-    { key: "status", head: "Status", status: true, cell: (s) => <Badge kind={SCHEDULE_TONE[s.status] ?? "neutral"}>{s.status === "pending" ? "waiting for approval" : s.status}</Badge> },
+    { key: "status", head: "Status", status: true, cell: (s) => <Badge kind={SCHEDULE_TONE[s.status] ?? "neutral"}>{SCHEDULE_LABEL[s.status] ?? s.status}</Badge> },
     { key: "every", head: "Runs", cell: (s) => `every ${every(s.interval_minutes)}` },
     { key: "maps", head: "Mappings", cell: (s) => `${s.mappings.length}` },
     { key: "last", head: "Last run", cell: (s) => s.last_run_at ? <><Time iso={s.last_run_at} />{" · "}{s.last_outcome.written ?? 0} written{(s.last_outcome.needs_review?.length ?? 0) > 0 && <> · <Badge kind="warn">{s.last_outcome.needs_review!.length} need review</Badge></>}</> : "—" },
@@ -811,7 +819,11 @@ function Schedules({ env, scope }: { env: string; scope: ScopeInfo }) {
   ];
   return (
     <section className="stack">
-      <p className="small muted">Select mappings on the Mappings tab and choose Schedule sync. A schedule runs only after someone else approves it{scope.can.approve ? "" : " (secrets_approver)"}.</p>
+      {canSchedule(scope)
+        ? <p className="small muted">Select mappings on the Mappings tab and choose Schedule sync. A schedule runs only after someone else approves it{scope.can.approve ? "" : " (secrets_approver)"}.</p>
+        : <div className="alert warn small" role="status"><strong>Manual-only sync.</strong> Every change to a secret is a plan someone reviews before it runs, so schedules do not run.
+          Existing schedules are held with their approvals and run history kept; discovery still refreshes names and versions on its own.
+          To sync, select mappings on the Mappings tab and choose Compare.</div>}
       <Loading load={list} />
       {list.data && <DataTable label="Sync schedules" rows={list.data.items} cols={cols} rowKey={(s) => s.id} onRow={(s) => setOpen(s.id)}
         empty={<Empty title="No schedules yet.">Schedule mappings from the Mappings tab, or when mapping secrets in bulk.</Empty>} />}
@@ -833,7 +845,7 @@ function ScheduleDrawer({ env, s, onClose, onChange }: { env: string; s: Schedul
   }
   const review = s.last_outcome.needs_review ?? [];
   return (
-    <Drawer title={s.name} heading={<span className="row"><strong>{s.name}</strong><Badge kind={SCHEDULE_TONE[s.status] ?? "neutral"}>{s.status}</Badge></span>} onClose={onClose}
+    <Drawer title={s.name} heading={<span className="row"><strong>{s.name}</strong><Badge kind={SCHEDULE_TONE[s.status] ?? "neutral"}>{SCHEDULE_LABEL[s.status] ?? s.status}</Badge></span>} onClose={onClose}
       footer={<div className="row wrap end">
         {s.allowed.run && <button type="button" className="ghost" onClick={() => act("POST", "/run", undefined, "The executor runs it within a few seconds.")}>Run now</button>}
         {s.allowed.pause && <button type="button" className="ghost" onClick={() => act("POST", "/pause")}>Pause</button>}
@@ -850,6 +862,8 @@ function ScheduleDrawer({ env, s, onClose, onChange }: { env: string; s: Schedul
       {s.paused_reason && <div className="alert warn small">{s.paused_reason}</div>}
       {s.stale_mappings.length > 0 && <div className="alert warn small stack">Edited since approval: {s.stale_mappings.join(", ")}. The schedule does not run until it is refreshed and approved again.
         {s.allowed.edit && <div><button type="button" className="small" onClick={() => act("PATCH", "", { version: s.version, refresh: true }, "Refreshed. It waits for approval again.")}>Refresh and ask for approval</button></div>}</div>}
+      {s.needs_fresh_approval && s.policy === "scheduled" && <div className="alert warn small">This schedule was held by the manual-only policy. Its earlier approval no longer counts: it runs again only after someone approves its current version.</div>}
+      {!s.allowed.approve && s.allowed.reject && <div className="row end"><button type="button" className="ghost danger" onClick={() => act("POST", "/decision", { approve: false, schedule_hash: s.schedule_hash, comment })}>Reject</button></div>}
       {s.allowed.approve && <section className="card stack">
         <strong>Approve this schedule</strong>
         <p className="small muted">Approving lets every run write one-sided changes for these {s.mappings.length} mappings, in each mapping's direction, without asking again. Conflicts and deletions still wait for a person.</p>

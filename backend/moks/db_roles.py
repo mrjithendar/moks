@@ -69,6 +69,7 @@ def statements() -> list[str]:
         out += [f"GRANT {READ} ON {t} TO {role}" for t in TABLES if t not in hidden]
     out += [f"GRANT {RW} ON {t} TO moks_api" for t in _API_RW]
     out += [f"GRANT {RW} ON {t} TO moks_worker" for t in _WORKER_RW]
+    out += ["GRANT DELETE ON learning_datasets TO moks_worker"]  # retention (learning.purge); invalidation runs in a SECURITY DEFINER trigger
     out += [f"GRANT {RW} ON {t} TO moks_executor" for t in _EXECUTOR_RW]
     out += [f"GRANT {APPEND} ON audit_events TO {r}" for r in ROLES]
     out += [f"GRANT {RW} ON terminal_sessions TO moks_terminal", "GRANT UPDATE (last_seen_at, revoked_at) ON sessions TO moks_terminal"]

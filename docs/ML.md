@@ -92,6 +92,20 @@ A **dataset** (`POST /ml/learning/datasets`, `learning.export`) is a frozen, ver
   puts the latest groups in evaluation.
 - MOKS refuses to save a dataset if any group or content hash would appear in both train and evaluation.
 - Export is JSONL with features and labels only, redacted again, and is audited.
+- **Contents are frozen at build time.** Each item keeps the redacted record exactly as exported, with its SHA-256.
+  The checksum (`checksum_version` 2) covers the export schema and fields, the purpose, realm, filters and split
+  settings, and every item's record id, split, group and payload hash. Export reads the snapshot, never today's
+  records, and refuses (409) if the snapshot no longer matches the checksum. One `name@version` and checksum
+  therefore always mean the same rows. The response carries `X-MOKS-Dataset-Checksum` and `X-MOKS-Dataset-Provenance`.
+- **When sources change.** A label edited while the record stays approved does not touch existing versions; build
+  a new version to take it in. A label withdrawn (approved to rejected or unreviewed) or a record deleted (retention
+  or its investigation deleted) **invalidates** every dataset holding it: a database trigger (migration 0035) sets
+  `state = invalidated` with the reason and clears that dataset's snapshot, and export answers 410. Item rows stay
+  as references (there is no longer a foreign key that would silently drop them). A dataset's own `expires_at`
+  deletes it with its snapshot.
+- **Legacy datasets** (built before 0035, `checksum_version` 1) have no snapshot. They are listed as
+  `legacy_live_records`, not reproducible: their export reads today's records, says `"provenance": "live"` on each
+  row, and their checksum covers record ids and splits only. Rebuild them to get a frozen version.
 
 Nothing in MOKS trains on conversations or on feedback automatically.
 

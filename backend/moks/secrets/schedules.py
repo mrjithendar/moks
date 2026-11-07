@@ -10,6 +10,11 @@ only items whose change is one-sided and allowed by the mapping's direction: cha
 verified sync, or missing on one side. Conflicts (changed on both sides, or a first sync where the sides differ),
 recreated secrets, blocked items and failures are left out and listed on the schedule for a person; nothing is
 ever deleted. The approval check runs again in the executor before anything is written.
+
+Policy. secretsSync.policy (MOKS_SECRETS_SYNC_POLICY) is manual by default: every write is a plan someone reviews,
+so schedules cannot be created, approved, resumed or run, and the executor holds existing ones (status held, with
+the reason, approvals and run history kept). Discovery still refreshes metadata on its own interval. Under the
+scheduled policy a held schedule runs again only after a fresh approval of its current hash.
 """
 from __future__ import annotations
 
@@ -24,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import audit
 from ..actions.service import is_admin, principal_of
+from ..config import get_settings
 from ..models import Environment, SecretMapping, SecretSchedule, SecretScheduleApproval
 from ..observability import POLICY_DENIALS
 from ..rbac import P, Principal
@@ -32,6 +38,18 @@ from .service import SyncError, require
 HASH_VERSION = 1
 AUTO = ("changed_kubernetes", "changed_aws", "missing_kubernetes", "missing_aws")  # one-sided: what a run may write on its own
 MAX_MAPPINGS = 200
+MANUAL = ("held by the manual-only sync policy (secretsSync.policy: manual): every sync is a plan someone reviews, so schedules do not run; "
+          "start a sync plan instead")
+HOLDABLE = ("active", "paused", "pending")
+
+
+def manual_only() -> bool:
+    return get_settings().secrets_sync_policy != "scheduled"
+
+
+def require_scheduling() -> None:
+    if manual_only():
+        raise SyncError(409, MANUAL)
 
 
 def canonical(s: SecretSchedule, env_name: str) -> str:
@@ -77,6 +95,7 @@ def _propose_rights(principal: Principal, env: Environment, rows) -> None:
 
 
 async def create(db: AsyncSession, principal: Principal, env: Environment, *, name: str, mapping_ids: list[uuid.UUID], interval_minutes: int) -> SecretSchedule:
+    require_scheduling()
     rows = await _mappings(db, env, mapping_ids)
     _propose_rights(principal, env, rows)
     if (await db.execute(select(SecretSchedule.id).where(SecretSchedule.environment_id == env.id, SecretSchedule.name == name, SecretSchedule.status != "retired"))).first():
@@ -121,6 +140,7 @@ async def update(db: AsyncSession, principal: Principal, env: Environment, sched
             raise SyncError(409, f"a schedule named {name} already exists in {env.name}")
         s.name = name
     if mapping_ids is not None or interval_minutes is not None or refresh:
+        require_scheduling()
         rows = await _mappings(db, env, mapping_ids if mapping_ids is not None else [uuid.UUID(i) for i in s.mapping_ids])
         _propose_rights(principal, env, rows)
         s.mapping_ids, s.mapping_versions = [str(m.id) for m in rows], {str(m.id): m.version for m in rows}
@@ -139,8 +159,10 @@ async def update(db: AsyncSession, principal: Principal, env: Environment, sched
 
 async def decide(db: AsyncSession, principal: Principal, env: Environment, schedule_id: uuid.UUID, approve: bool, comment: str, presented_hash: str) -> SecretSchedule:
     s = await load(db, env, schedule_id, lock=True)
-    if s.status != "pending":
-        raise SyncError(409, f"schedule is {s.status}, not pending")
+    if s.status not in ("pending", "held"):
+        raise SyncError(409, f"schedule is {s.status}, not waiting for a decision")
+    if approve:
+        require_scheduling()
     if str(s.requested_by) == principal.user_id and not is_admin(principal):
         POLICY_DENIALS.labels("self_approval").inc()
         raise SyncError(403, "you cannot approve or reject your own schedule")
@@ -157,6 +179,7 @@ async def decide(db: AsyncSession, principal: Principal, env: Environment, sched
                                   schedule_hash=s.schedule_hash, comment=comment[:2000]))
     now = datetime.now(timezone.utc)
     s.status, s.next_run_at, s.updated_at = ("active", now, now) if approve else ("rejected", None, now)
+    s.paused_reason = None
     s.version += 1
     await audit.record(db, action="secrets.schedule_approve" if approve else "secrets.schedule_reject", actor_id=principal.user_id, actor_email=principal.email,
                        resource_type="secret_schedule", resource_id=str(s.id), environment=env.name, namespace=_namespaces(rows), decision="allow",
@@ -178,7 +201,8 @@ async def set_paused(db: AsyncSession, principal: Principal, env: Environment, s
         s.status, s.paused_reason = "paused", f"paused by {principal.email}"
     else:
         if s.status != "paused":
-            raise SyncError(409, f"schedule is {s.status}, not paused")
+            raise SyncError(409, f"schedule is {s.status}, not paused" + ("; a held schedule needs a fresh approval" if s.status == "held" else ""))
+        require_scheduling()
         s.status, s.paused_reason, s.next_run_at = "active", None, now
         try:
             await check(db, s, env)
@@ -214,6 +238,8 @@ async def approval(db: AsyncSession, s: SecretSchedule) -> SecretScheduleApprova
 async def check(db: AsyncSession, s: SecretSchedule, env: Environment) -> None:
     """Everything a run relies on, against current state and permissions. The executor calls this before a run
     and again before writing; any failure pauses the schedule with the reason."""
+    if manual_only():
+        raise SyncError(409, MANUAL)
     if s.status != "active":
         raise SyncError(409, f"schedule is {s.status}")
     if compute_hash(s, env.name) != s.schedule_hash:
@@ -246,3 +272,19 @@ async def check(db: AsyncSession, s: SecretSchedule, env: Environment) -> None:
 
 def next_after(s: SecretSchedule, now: datetime) -> datetime:
     return now + timedelta(minutes=s.interval_minutes)
+
+
+async def hold_all(db: AsyncSession) -> list[SecretSchedule]:
+    """Under the manual-only policy, every schedule that could still run or be approved is held, visibly and with
+    the reason. Nothing else about it changes; its approvals and runs stay as history."""
+    if not manual_only():
+        return []
+    rows = (await db.execute(select(SecretSchedule).where(SecretSchedule.status.in_(HOLDABLE)).with_for_update(skip_locked=True))).scalars().all()
+    now = datetime.now(timezone.utc)
+    for s in rows:
+        before = s.status
+        s.status, s.paused_reason, s.next_run_at, s.updated_at = "held", MANUAL, None, now  # the executor may not touch version (db_roles)
+        env = await db.get(Environment, s.environment_id)
+        await audit.record(db, action="secrets.schedule_hold", resource_type="secret_schedule", resource_id=str(s.id), environment=env.name if env else None,
+                           decision="deny", outcome="held", details={"was": before, "policy": "manual"})
+    return list(rows)

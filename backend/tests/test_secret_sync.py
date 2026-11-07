@@ -962,7 +962,8 @@ async def run_schedules() -> list[dict]:
     return out
 
 
-async def test_an_approved_schedule_syncs_one_sided_changes_and_leaves_conflicts(world):
+async def test_an_approved_schedule_syncs_one_sided_changes_and_leaves_conflicts(world, monkeypatch):
+    monkeypatch.setattr(get_settings(), "secrets_sync_policy", "scheduled")  # the default, manual, never runs a schedule
     w = world
     m, done = await _export_one(w, {"p": b"one"}, direction="both")
     assert done["status"] == "succeeded"
@@ -1005,7 +1006,8 @@ async def test_an_approved_schedule_syncs_one_sided_changes_and_leaves_conflicts
     assert s["status"] == "pending" and s["stale_mappings"] == []
 
 
-async def test_a_run_rechecks_the_approver_before_writing(world):
+async def test_a_run_rechecks_the_approver_before_writing(world, monkeypatch):
+    monkeypatch.setattr(get_settings(), "secrets_sync_policy", "scheduled")  # the default, manual, never runs a schedule
     w = world
     m, _ = await _export_one(w, {"p": b"one"}, direction="export")
     s = (await w.call("op", "POST", "/schedules", {"name": "check", "mapping_ids": [m["id"]], "interval_minutes": 15}, expect=201)).json()

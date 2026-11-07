@@ -15,6 +15,17 @@ Labels (confirmed cause, resolution, verification) come only from a reviewer (`r
 (`capture_incident`). Datasets read approved records only, drop duplicates, and keep every record of one
 incident, deployment or document family in one split. Evaluation-realm records never mix with operational ones.
 Nothing here trains a model.
+
+Datasets are frozen. Each item keeps the redacted record exactly as it is exported, with its SHA-256, and the
+checksum (checksum_version 2) covers the export schema, the split settings and every item's record id, split, group
+and payload hash. Exports come from that snapshot, never from today's records, and are checked against the checksum,
+so one name@version and checksum always mean the same rows. What happens to the sources afterwards:
+  - a label edited while still approved: the dataset keeps its snapshot; a new build is a new version;
+  - a label withdrawn (approved -> rejected or unreviewed) or a record deleted (retention, or its investigation
+    deleted): the dataset is invalidated and its snapshot cleared (a trigger, migration 0035), and export answers 410;
+  - the dataset's own retention (expires_at) deletes it with its snapshot.
+Datasets built before snapshots (checksum_version 1) are reported as legacy: their export reads today's records and
+says so, and their checksum covers record ids and splits only.
 """
 from __future__ import annotations
 
@@ -338,33 +349,77 @@ async def build_dataset(db: AsyncSession, *, name: str, purpose: str, created_by
     if leaks:
         raise ValueError("dataset would leak: " + "; ".join(leaks[:3]))
     version = int((await db.execute(select(func.coalesce(func.max(LearningDataset.version), 0)).where(LearningDataset.name == name))).scalar_one()) + 1
-    checksum = _hash(sorted([str(i), s] for i, s in sides.items()))
     now = datetime.now(timezone.utc)
     ds = LearningDataset(name=name[:100], version=version, purpose=purpose, realm=realm, feature_schema=FEATURE_SCHEMA, filters={"environment": environment},
                          split=info, counts={"records": len(sides), "train": sum(1 for s in sides.values() if s == "train"), "eval": sum(1 for s in sides.values() if s == "eval")},
-                         checksum=checksum, created_by=created_by, expires_at=now + timedelta(days=retention_days) if retention_days else None)
+                         checksum="", checksum_version=CHECKSUM_VERSION, created_by=created_by, expires_at=now + timedelta(days=retention_days) if retention_days else None)
+    items = []
+    for i, sp in sides.items():
+        payload = export_payload(by_id[i])
+        items.append(LearningDatasetItem(record_id=i, split=sp, group_key=group_key(by_id[i])[:200], payload=payload, payload_sha256=_hash(payload)))
+    ds.checksum = contents_checksum(ds, ((str(it.record_id), it.split, it.group_key, it.payload_sha256) for it in items))
     db.add(ds)
     await db.flush()
-    db.add_all([LearningDatasetItem(dataset_id=ds.id, record_id=i, split=s, group_key=group_key(by_id[i])[:200]) for i, s in sides.items()])
+    for it in items:
+        it.dataset_id = ds.id
+    db.add_all(items)
     await db.flush()
     return ds
 
 
 EXPORT_FIELDS = ("id", "kind", "environment", "namespace", "service", "resource", "features", "label", "outcome", "versions")
+EXPORT_SCHEMA = "learning-export/2"
+CHECKSUM_VERSION = 2
+
+
+class DatasetUnavailable(Exception):
+    """The dataset cannot be exported as built: invalidated, or its snapshot no longer matches its checksum."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status, self.message = status, message
+
+
+def export_payload(rec: LearningRecord) -> dict[str, Any]:
+    """Features and labels only, already redacted at capture and redacted again here. No evidence text, no
+    passage text, no user identities."""
+    body = {k: getattr(rec, k) for k in EXPORT_FIELDS}
+    body["id"] = str(body["id"])
+    return redact_obj(json.loads(json.dumps(body, default=str)))
+
+
+def contents_checksum(ds: LearningDataset, items: Iterable[tuple[str, str, str, str]]) -> str:
+    """(record id, split, group, payload sha256) for every item: the actual exported contents, with the schema and
+    split settings that produced them."""
+    return _hash({"v": CHECKSUM_VERSION, "schema": EXPORT_SCHEMA, "fields": list(EXPORT_FIELDS), "feature_schema": ds.feature_schema, "purpose": ds.purpose,
+                  "realm": ds.realm, "filters": ds.filters, "split": ds.split, "items": sorted([list(i) for i in items])})
+
+
+def provenance(ds: LearningDataset) -> dict[str, Any]:
+    if ds.state == "invalidated":
+        return {"reproducible": False, "provenance": "invalidated", "reason": ds.invalidated_reason,
+                "invalidated_at": ds.invalidated_at.isoformat() if ds.invalidated_at else None}
+    if (ds.checksum_version or 1) < CHECKSUM_VERSION:
+        return {"reproducible": False, "provenance": "legacy_live_records",
+                "reason": "built before datasets kept snapshots: an export reads today's records, and the checksum covers record ids and splits only"}
+    return {"reproducible": True, "provenance": "snapshot", "reason": None}
 
 
 async def export_rows(db: AsyncSession, ds: LearningDataset) -> list[dict[str, Any]]:
-    """Features and labels only, already redacted at capture and redacted again here. No evidence text, no
-    passage text, no user identities."""
-    rows = (await db.execute(select(LearningDatasetItem, LearningRecord).join(LearningRecord, LearningRecord.id == LearningDatasetItem.record_id)
-                             .where(LearningDatasetItem.dataset_id == ds.id).order_by(LearningDatasetItem.split, LearningRecord.created_at))).all()
-    out = []
-    for item, rec in rows:
-        body = {k: getattr(rec, k) for k in EXPORT_FIELDS}
-        body["id"] = str(body["id"])
-        body = redact_obj(json.loads(json.dumps(body, default=str)))
-        out.append({"split": item.split, "group": item.group_key, "dataset": f"{ds.name}@{ds.version}", "record": body})
-    return out
+    """The dataset's rows. From its snapshot, checked against its checksum; for a legacy dataset, from today's
+    records, each row saying so. An invalidated dataset is refused (410)."""
+    if ds.state == "invalidated":
+        raise DatasetUnavailable(410, f"dataset {ds.name}@{ds.version} was invalidated: {ds.invalidated_reason}; build a new version")
+    if (ds.checksum_version or 1) < CHECKSUM_VERSION:
+        rows = (await db.execute(select(LearningDatasetItem, LearningRecord).join(LearningRecord, LearningRecord.id == LearningDatasetItem.record_id)
+                                 .where(LearningDatasetItem.dataset_id == ds.id).order_by(LearningDatasetItem.split, LearningRecord.created_at))).all()
+        return [{"split": item.split, "group": item.group_key, "dataset": f"{ds.name}@{ds.version}", "provenance": "live", "record": export_payload(rec)} for item, rec in rows]
+    items = (await db.execute(select(LearningDatasetItem).where(LearningDatasetItem.dataset_id == ds.id)
+                              .order_by(LearningDatasetItem.split, LearningDatasetItem.record_id))).scalars().all()
+    if any(i.payload is None or _hash(i.payload) != i.payload_sha256 for i in items) or \
+            contents_checksum(ds, ((str(i.record_id), i.split, i.group_key, i.payload_sha256) for i in items)) != ds.checksum:
+        raise DatasetUnavailable(409, f"dataset {ds.name}@{ds.version} no longer matches its checksum; it is not exported")
+    return [{"split": i.split, "group": i.group_key, "dataset": f"{ds.name}@{ds.version}", "provenance": "snapshot", "record": i.payload} for i in items]
 
 
 def record_out(r: LearningRecord) -> dict[str, Any]:

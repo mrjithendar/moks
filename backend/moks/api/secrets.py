@@ -60,6 +60,12 @@ def _see(ctx: AuthContext, perm: P, env: Environment, ns: str | None) -> bool:
     return service.can(ctx.principal, perm, env, ns)
 
 
+def _policy() -> dict[str, Any]:
+    manual = schedules.manual_only()
+    return {"mode": "manual" if manual else "scheduled", "schedules_run": not manual,
+            "explanation": schedules.MANUAL if manual else "an approved schedule writes one-sided changes on its own; conflicts are left for review"}
+
+
 # ---- scope --------------------------------------------------------------------------------------------------
 
 
@@ -110,6 +116,7 @@ async def scope(environment: str, request: Request, ctx: AuthContext = Depends(g
             "can": {p.value.split(".", 1)[1]: ctx.principal.can_anywhere(p) for p in (P.SECRETS_DISCOVER, P.SECRETS_COMPARE, P.SECRETS_MAP, P.SECRETS_PROPOSE,
                                                                                     P.SECRETS_APPROVE, P.SECRETS_EXECUTE, P.SECRETS_REVEAL)},
             "discovery": {"interval_minutes": get_settings().secrets_discovery_interval_minutes, "last_at": last.isoformat() if last else None},
+            "policy": _policy(),
             "errors": kube_errors}
 
 
@@ -736,7 +743,11 @@ async def schedule_out(db: AsyncSession, s: SecretSchedule, ctx: AuthContext, en
     own = str(s.requested_by) == ctx.principal.user_id
     approver = all(_see(ctx, P.SECRETS_APPROVE, env, n) for n in namespaces)
     stale = [f"{m.namespace}/{m.secret_name}" for m in rows if m.status != "active" or m.version != (s.mapping_versions or {}).get(str(m.id))]
-    return {"id": str(s.id), "name": s.name, "status": s.status, "paused_reason": s.paused_reason, "interval_minutes": s.interval_minutes, "version": s.version,
+    manual = schedules.manual_only()
+    # shown as held before the executor's next tick has held it, so the page never suggests it will run
+    held = s.status == "held" or (manual and s.status in schedules.HOLDABLE)
+    return {"id": str(s.id), "name": s.name, "status": "held" if held else s.status, "paused_reason": schedules.MANUAL if held and manual else s.paused_reason,
+            "held": held, "needs_fresh_approval": s.status == "held", "policy": _policy()["mode"], "interval_minutes": s.interval_minutes, "version": s.version,
             "schedule_hash": s.schedule_hash, "requested_by": users.get(s.requested_by), "namespaces": namespaces, "stale_mappings": stale,
             "mappings": [{"id": str(m.id), "secret": f"{m.namespace}/{m.secret_name}", "aws_secret_name": m.aws_secret_name, "direction": m.direction,
                           "last_status": m.last_status} for m in rows],
@@ -744,9 +755,11 @@ async def schedule_out(db: AsyncSession, s: SecretSchedule, ctx: AuthContext, en
             "last_plan_id": str(s.last_plan_id) if s.last_plan_id else None, "last_outcome": s.last_outcome or {},
             "approvals": [{"by": users.get(a.approver_id), "decision": a.decision, "comment": a.comment, "at": a.created_at.isoformat() if a.created_at else None,
                            "current": a.schedule_hash == s.schedule_hash} for a in approvals],
-            "allowed": {"edit": own and s.status != "retired", "approve": s.status == "pending" and approver and (not own or actions.is_admin(ctx.principal)),
-                        "pause": s.status == "active" and (own or approver), "resume": s.status == "paused" and (own or approver),
-                        "run": s.status == "active" and (own or approver), "retire": own or approver}}
+            "allowed": {"edit": own and s.status != "retired" and not manual,
+                        "approve": not manual and s.status in ("pending", "held") and approver and (not own or actions.is_admin(ctx.principal)),
+                        "reject": s.status in ("pending", "held") and approver and (not own or actions.is_admin(ctx.principal)),
+                        "pause": not held and s.status == "active" and (own or approver), "resume": not manual and s.status == "paused" and (own or approver),
+                        "run": not held and s.status == "active" and (own or approver), "retire": own or approver}}
 
 
 async def _visible_schedule(request: Request, db: AsyncSession, ctx: AuthContext, env: Environment, schedule_id: uuid.UUID) -> SecretSchedule:
@@ -815,6 +828,7 @@ async def pause_schedule(environment: str, schedule_id: uuid.UUID, action: Liter
     env = await _env(request, db, ctx, environment)
     try:
         if action == "run":
+            schedules.require_scheduling()
             s = await _visible_schedule(request, db, ctx, env, schedule_id)
             if s.status != "active":
                 raise service.SyncError(409, f"schedule is {s.status}; only an active schedule runs")
@@ -867,19 +881,20 @@ async def request_reveal(environment: str, body: RevealIn, request: Request, ctx
     if row is None or not row.enabled:
         raise HTTPException(409, "the connector this secret was found with is gone or disabled")
     if r.side == "kubernetes":
-        ns = r.namespace
         if not (row.config or {}).get("executor"):
             raise HTTPException(409, f"the kubernetes connector {row.name} has no executor target")
-    else:
-        mapped = (await db.execute(select(SecretMapping).where(SecretMapping.aws_connector_id == row.id, SecretMapping.aws_secret_name == r.name,
-                                                               SecretMapping.status == "active"))).scalar_one_or_none()
-        ns = mapped.namespace if mapped else None
-        if not service.aws_scope(row).name_allowed(r.name):
-            raise HTTPException(403, f"{r.name} is outside the connector's allowed prefixes")
+    elif not service.aws_scope(row).name_allowed(r.name):
+        raise HTTPException(403, f"{r.name} is outside the connector's allowed prefixes")
+    if row.environment_id != env.id:
+        raise HTTPException(409, "the connector this secret was found with belongs to another environment")
+    # the exact secret, its connector as configured now and the namespace that authorizes it; the executor and the
+    # hand-over both check these again against current state (service.check_reveal)
+    binding = await service.bind_reveal(db, env, r, row)
+    ns = binding["auth_namespace"]
     if not _see(ctx, P.SECRETS_REVEAL, env, ns):
         raise await deny(request, ctx, P.SECRETS_REVEAL, env.name, ns, "You need secrets.reveal " + (f"in {env.name}/{ns}" if ns else f"for every namespace in {env.name} to view an unmapped AWS secret"))
     payload = {"environment_id": str(env.id), "requested_by": ctx.principal.user_id, "side": r.side, "connector_id": str(row.id), "namespace": r.namespace,
-               "name": r.name, "public_key": {k: body.public_key[k] for k in ("kty", "crv", "x", "y")}}
+               "name": r.name, "binding": binding, "public_key": {k: body.public_key[k] for k in ("kty", "crv", "x", "y")}}
     await db.commit()
     job_id = await jobs.enqueue("secret_reveal", payload, created_by=ctx.user.id)
     label = f"{r.namespace}/{r.name}" if r.side == "kubernetes" else r.name
@@ -890,8 +905,10 @@ async def request_reveal(environment: str, body: RevealIn, request: Request, ctx
 
 @router.get("/{environment}/reveal/{job_id}")
 async def read_reveal(environment: str, job_id: uuid.UUID, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
-    """The sealed values, once, to the person who asked. They are then removed from the job."""
-    env = await _env(request, db, ctx, environment, P.SECRETS_REVEAL)
+    """The sealed values, once, to the person who asked, if they may still see that exact secret now. They are then
+    removed from the job. A result the person may no longer see is removed without being shown."""
+    _enabled()
+    env = await env_or_404(db, environment)
     job = await db.get(Job, job_id, with_for_update=True)
     if job is None or job.type != "secret_reveal" or job.payload.get("environment_id") != str(env.id) or job.payload.get("requested_by") != ctx.principal.user_id:
         raise HTTPException(404, "reveal not found")
@@ -901,6 +918,16 @@ async def read_reveal(environment: str, job_id: uuid.UUID, request: Request, ctx
         return {"status": job.status, "error": job.error}
     result = job.result or {}
     if "sealed" not in result:
-        raise HTTPException(410, "already shown or expired; ask again")
+        raise HTTPException(410, "already shown, withheld or expired; ask again")
+    binding = job.payload.get("binding") or {}
+    try:
+        await service.check_reveal(db, env, binding, ctx.principal)
+    except service.SyncError as exc:
+        job.result = {"withheld": True, "key_count": result.get("key_count")}
+        await audit.record(db, action="secrets.reveal_withheld", actor_id=ctx.principal.user_id, actor_email=ctx.principal.email, resource_type="secret",
+                           resource_id=f"{binding.get('side')}:{binding.get('namespace') or ''}/{binding.get('name')}", environment=env.name,
+                           namespace=binding.get("auth_namespace") or "-", decision="deny", outcome="withheld", details={"job": str(job.id), "reason": exc.message})
+        await db.commit()  # the sealed result is gone even though this request fails
+        raise await deny(request, ctx, P.SECRETS_REVEAL, env.name, binding.get("auth_namespace"), f"Not shown: {exc.message}")
     job.result = {"delivered": True, "key_count": result.get("key_count")}
     return {"status": "succeeded", "sealed": result["sealed"], "key_count": result.get("key_count")}

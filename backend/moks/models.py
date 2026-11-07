@@ -999,18 +999,25 @@ class LearningDataset(Base):
     split: Mapped[dict] = mapped_column(JSONB, default=dict)
     counts: Mapped[dict] = mapped_column(JSONB, default=dict)
     checksum: Mapped[str] = mapped_column(String(64))
-    state: Mapped[str] = mapped_column(String(20), default="built")
+    checksum_version: Mapped[int] = mapped_column(Integer, default=2)  # 1: record ids and splits only (legacy, not reproducible); 2: exported contents
+    state: Mapped[str] = mapped_column(String(20), default="built")  # built | retired | invalidated
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class LearningDatasetItem(Base):
+    """One record as the dataset froze it. record_id is a reference, not a foreign key: deleting or withdrawing the
+    record invalidates the dataset (a trigger, migration 0035) instead of silently shrinking it."""
     __tablename__ = "learning_dataset_items"
     dataset_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("learning_datasets.id", ondelete="CASCADE"), primary_key=True)
-    record_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("learning_records.id", ondelete="CASCADE"), primary_key=True)
+    record_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     split: Mapped[str] = mapped_column(String(10))  # train | eval
     group_key: Mapped[str] = mapped_column(String(200))  # every record of one group lands in one split
+    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # the redacted exported record at build time; NULL for legacy or invalidated
+    payload_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class MLArtifact(Base):
@@ -1222,6 +1229,7 @@ class SecretPlanItem(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     result: Mapped[dict] = mapped_column(JSONB, default=dict)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    connector_binding: Mapped[dict] = mapped_column(JSONB, default=dict)  # connector fingerprints, cluster UID, AWS account/region at comparison
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -1244,7 +1252,7 @@ class SecretSchedule(Base):
     mapping_ids: Mapped[list] = mapped_column(JSONB, default=list)
     mapping_versions: Mapped[dict] = mapped_column(JSONB, default=dict)  # {mapping_id: version} the approval covers
     interval_minutes: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending | active | paused | rejected | retired
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending | active | paused | held | rejected | retired (held: by the manual-only policy)
     paused_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     schedule_hash: Mapped[str] = mapped_column(String(64), default="")
     version: Mapped[int] = mapped_column(Integer, default=1)

@@ -685,6 +685,7 @@ async def secrets_tick(wid: str, wait: bool = False) -> None:
     await secret_tasks.reconcile_orphans()
     await secret_tasks.purge_reveals()
     await secret_tasks.schedule_discovery()
+    await secret_tasks.hold_schedules()
     job_id = await jobs.claim(wid, jobs.EXECUTOR_CLASS)
     if job_id is not None:
         _secret_task = asyncio.create_task(jobs.run_one(job_id))

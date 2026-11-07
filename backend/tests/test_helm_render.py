@@ -626,6 +626,15 @@ def test_only_the_executor_holds_the_secret_sync_secret_and_secret_verbs(split):
     assert not [r for r in reader["rules"] if "secrets" in r["resources"]]  # the read-only connector still cannot read Secrets
 
 
+@pytest.mark.parametrize("values", ["values-minikube.yaml", "values-eks.yaml"])
+def test_secret_sync_is_manual_only_unless_scheduling_is_chosen(values):
+    def policy(*sets):
+        docs = render(values, "secretsSync.enabled=true", "secretsSync.namespaces={shop}", *sets)
+        return next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "moks-config")["data"]["MOKS_SECRETS_SYNC_POLICY"]
+    assert policy() == "manual"
+    assert policy("secretsSync.policy=scheduled") == "scheduled"
+
+
 def test_secret_delete_verb_needs_allow_delete():
     docs = render("values-minikube.yaml", "secretsSync.enabled=true", "secretsSync.namespaces={shop}", "secretsSync.allowDelete=true")
     role = next(d for d in docs if d["kind"] == "Role" and d["metadata"]["name"] == "moks-secret-sync")
