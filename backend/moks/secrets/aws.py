@@ -85,9 +85,11 @@ class AwsSecretsConnector:
         if not self.prefixes or not all(NAME.match(p) for p in self.prefixes):
             raise ConnectorError("config", "aws_secrets needs config.allowed_prefixes: name prefixes such as moks/ (letters, digits and /_+=.@-)")
         self.required_tags = {str(k): str(v) for k, v in (config.get("required_tags") or {}).items()}
-        self.namespaces = [str(n) for n in config.get("kubernetes_namespaces") or []]
+        # Empty means every namespace in secretsSync.namespaces; a list narrows that, and never widens it (the executor has
+        # Roles only there).
+        self.namespaces = [str(n) for n in config.get("kubernetes_namespaces") or []] or get_settings().secrets_namespace_list
         if not self.namespaces:
-            raise ConnectorError("config", "aws_secrets needs config.kubernetes_namespaces: the namespaces whose Secrets it may sync")
+            raise ConnectorError("config", "aws_secrets needs config.kubernetes_namespaces, or secretsSync.namespaces in the chart")
         self.role_arn = config.get("role_arn") or None
         if self.role_arn and (self.role_arn.count(":") < 5 or self.role_arn.split(":")[4] != self.account_id):
             raise ConnectorError("config", "config.role_arn must be a role in config.account_id")
@@ -122,7 +124,8 @@ class AwsSecretsConnector:
         return all(tags.get(k) == v for k, v in self.required_tags.items())
 
     def namespace_allowed(self, namespace: str) -> bool:
-        return any(fnmatchcase(namespace, p) for p in self.namespaces)
+        chart = get_settings().secrets_namespace_list
+        return any(fnmatchcase(namespace, p) for p in self.namespaces) and (not chart or namespace in chart)
 
     def arn_for(self, name: str) -> str:
         return f"arn:aws:secretsmanager:{self.region}:{self.account_id}:secret:{name}"

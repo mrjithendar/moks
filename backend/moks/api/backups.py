@@ -59,7 +59,12 @@ class Reason(BaseModel):
     reason: str = Field(min_length=5, max_length=4000)
 
 
-class BackupIn(Reason):
+class NoReason(BaseModel):
+    """Taking a backup, scheduling one or connecting storage asks for no reason: the audit log records who and when."""
+    reason: str = Field(default="", max_length=4000)
+
+
+class BackupIn(NoReason):
     included_namespaces: list[str] = Field(default=["*"], min_length=1, max_length=100)
     include_volumes: bool = True
     ttl_days: int = Field(default=velero.KEEP_DAYS, ge=1, le=velero.KEEP_DAYS)
@@ -71,7 +76,7 @@ class ScheduleIn(BackupIn):
     paused: bool = False
 
 
-class RestoreIn(Reason):
+class RestoreIn(Reason):  # a restore is reviewed and approved, so it still says why
     backup: str = Field(max_length=253)
     included_namespaces: list[str] = Field(default=["*"], min_length=1, max_length=100)
     existing_resource_policy: Literal["none", "update"] = "none"
@@ -159,6 +164,7 @@ async def status(environment: str, request: Request, ctx: AuthContext = Depends(
 
 
 async def _plan(db: AsyncSession, ctx: AuthContext, env: Environment, action: str, kind: str, name: str, params: dict, reason: str, namespace: str = "-") -> dict[str, Any]:
+    reason = reason.strip() or f"{action.replace('_', ' ')} from the Backups page"
     try:
         plan = await service.create_plan(db, ctx.principal, env, namespace=namespace, action=action, target_name=name, target_kind=kind, params=params,
                                          reason=reason, evidence=[], auto_recover=False)
@@ -178,7 +184,7 @@ def _scoped(env: Environment, requested: list[str], never: set[str]) -> dict[str
 
 
 @router.post("/{environment}/configure", status_code=201)
-async def configure(environment: str, body: Reason, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+async def configure(environment: str, body: NoReason, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
     env = await env_or_404(db, environment)
     store = await velero.get_store(db)
     if store is None:
@@ -235,7 +241,7 @@ async def details(environment: str, name: str, request: Request, ctx: AuthContex
         return {**detail, "contents": None, "contents_note": f"The list of contents could not be read from R2 ({type(exc).__name__})."}
 
 
-class DatabaseTarget(Reason):
+class DatabaseTarget(NoReason):
     namespace: str = Field(max_length=253)
     workload: str = Field(max_length=253)
     kind: Literal["StatefulSet", "Deployment"]

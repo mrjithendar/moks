@@ -80,11 +80,12 @@ async def scope(environment: str, request: Request, ctx: AuthContext = Depends(g
     env = await _env(request, db, ctx, environment)
     kubes, kube_errors = await registry.of_type(db, env.id, "kubernetes")
     aws_rows = (await db.execute(select(Connector).where(Connector.environment_id == env.id, Connector.type == "aws_secrets", Connector.enabled.is_(True)).order_by(Connector.name))).scalars().all()
-    aws_out, patterns = [], []
+    aws_out, scopes = [], []
     for row in aws_rows:
         try:
-            s = service.aws_scope(row).describe_scope()
-            patterns += s["kubernetes_namespaces"]
+            aws = service.aws_scope(row)
+            scopes.append(aws)
+            s = aws.describe_scope()
             aws_out.append({"id": str(row.id), "name": row.name, **{k: s[k] for k in ("account_id", "region", "allowed_prefixes", "required_tags", "kubernetes_namespaces",
                                                                                         "allow_delete", "recovery_window_days", "name_template")}})
         except ConnectorError as exc:
@@ -97,9 +98,7 @@ async def scope(environment: str, request: Request, ctx: AuthContext = Depends(g
             namespaces = await inst.list_namespaces()
         except ConnectorError as exc:
             error = exc.message
-        from fnmatch import fnmatchcase
-
-        visible = [n for n in namespaces if sc.allows(n) and any(fnmatchcase(n, p) for p in patterns)]
+        visible = [n for n in namespaces if sc.allows(n) and any(a.namespace_allowed(n) for a in scopes)]
         uid = (await db.execute(select(SecretInventoryScope.cluster_uid).where(SecretInventoryScope.connector_id == row.id, SecretInventoryScope.cluster_uid.is_not(None))
                                 .order_by(SecretInventoryScope.discovered_at.desc()).limit(1))).scalar_one_or_none()
         kube_out.append({"id": str(row.id), "name": row.name, "writable": bool((row.config or {}).get("executor")), "cluster_uid": uid, "namespaces": visible, "error": error})
@@ -114,7 +113,7 @@ async def scope(environment: str, request: Request, ctx: AuthContext = Depends(g
 class DiscoverIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kube_connector_id: uuid.UUID | None = None
-    namespaces: list[str] = Field(default_factory=list, max_length=200)
+    namespaces: list[str] = Field(default_factory=list, max_length=200)  # empty: every secretsSync namespace this person may see
     aws_connector_id: uuid.UUID | None = None
 
 
@@ -130,6 +129,9 @@ async def discover(environment: str, body: DiscoverIn, request: Request, ctx: Au
             raise _http(exc) from None
         aws_rows = (await db.execute(select(Connector).where(Connector.environment_id == env.id, Connector.type == "aws_secrets", Connector.enabled.is_(True)))).scalars().all()
         allowed = []
+        if not body.namespaces:
+            body.namespaces = [ns for ns in get_settings().secrets_namespace_list if _see(ctx, P.SECRETS_DISCOVER, env, ns)
+                               and any(service.aws_scope(r).namespace_allowed(ns) for r in aws_rows)]
         for ns in body.namespaces:
             if not _see(ctx, P.SECRETS_DISCOVER, env, ns):
                 raise await deny(request, ctx, P.SECRETS_DISCOVER, env.name, ns, f"You need secrets.discover in {env.name}/{ns}")
@@ -137,7 +139,7 @@ async def discover(environment: str, body: DiscoverIn, request: Request, ctx: Au
                 raise HTTPException(403, f"no AWS secrets connector in {env.name} syncs namespace {ns}")
             allowed.append(ns)
         if not allowed:
-            raise HTTPException(422, "choose the namespaces to discover")
+            raise HTTPException(422, "no namespace in secretsSync.namespaces is both in your scope and synced by an AWS connector")
         payload.update(kube_connector_id=str(row.id), namespaces=allowed)
     if body.aws_connector_id:
         if not _see(ctx, P.SECRETS_DISCOVER, env, None):

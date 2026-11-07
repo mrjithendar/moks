@@ -726,3 +726,48 @@ async def reconcile_orphans() -> int:
             if job_id:
                 await db.execute(text("UPDATE secret_mappings SET lease_owner = NULL, lease_expires_at = NULL WHERE lease_owner = :o"), {"o": job_id})
     return len(rows)
+
+
+# ---- scheduled discovery ------------------------------------------------------------------------------------
+
+_last_auto: float | None = None
+
+
+async def schedule_discovery() -> int:
+    """Every secrets_discovery_interval_minutes (and once when the executor starts), queue a read-only listing of the
+    secretsSync namespaces for each cluster with a write target, and of each AWS connector. Only discovery: it
+    never compares or syncs. Returns the number of jobs queued; a listing already queued or running is not repeated."""
+    global _last_auto
+    import time
+
+    from .. import jobs
+
+    s = get_settings()
+    if not s.secrets_discovery_interval_minutes or (_last_auto is not None and time.monotonic() - _last_auto < s.secrets_discovery_interval_minutes * 60):
+        return 0
+    _last_auto = time.monotonic()
+    async with session_scope() as db:
+        rows = (await db.execute(select(Connector).where(Connector.enabled.is_(True), Connector.type.in_(("kubernetes", "aws_secrets"))))).scalars().all()
+    queued = 0
+    for env_id in {r.environment_id for r in rows}:
+        kubes = [r for r in rows if r.environment_id == env_id and r.type == "kubernetes" and (r.config or {}).get("executor")]
+        scopes = []
+        for r in rows:
+            if r.environment_id == env_id and r.type == "aws_secrets":
+                try:
+                    scopes.append((r, service.aws_scope(r)))
+                except ConnectorError as exc:
+                    log.warning("aws_secrets connector skipped by scheduled discovery", extra={"event": "secrets_auto_discover_skipped", "error": exc.message})
+        if not scopes:
+            continue  # no namespace is synced in this environment
+        namespaces = [ns for ns in s.secrets_namespace_list if any(a.namespace_allowed(ns) for _, a in scopes)]
+        base = {"environment_id": str(env_id), "requested_by": None, "trigger": "schedule"}
+        work = [({**base, "kube_connector_id": str(k.id), "namespaces": namespaces}, f"secret_discover:auto:{k.id}") for k in kubes if namespaces]
+        work += [({**base, "aws_connector_id": str(r.id), "namespaces": []}, f"secret_discover:auto:{r.id}") for r, _ in scopes]
+        for payload, key in work:
+            try:
+                queued += await jobs.enqueue("secret_discover", payload, dedupe_key=key) is not None
+            except jobs.QueueFull:
+                log.warning("secrets queue full; scheduled discovery skipped", extra={"event": "secrets_auto_discover_skipped"})
+                return queued
+    return queued

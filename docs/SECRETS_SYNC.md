@@ -2,7 +2,10 @@
 
 MOKS can list Kubernetes Secrets and AWS Secrets Manager secrets, compare mapped pairs, and copy content in
 either direction when a person asks and another person approves. It never syncs on a schedule and never
-propagates a change by itself. Changes on either side show up when someone refreshes or compares.
+propagates a change by itself. Only discovery runs on its own: the executor lists the `secretsSync.namespaces`
+and each AWS connector when it starts and every `secretsSync.discoveryIntervalMinutes` (default 60; 0 turns it
+off). Discovery reads metadata and never writes, so new and deleted secrets show up without anyone pressing
+Discover. Changed content still shows up only when someone compares.
 
 Every write follows **discover → select → compare → review → approve → execute → verify**.
 
@@ -233,7 +236,13 @@ secretsSync:
   namespaces: [shop, payments]   # each gets Role moks-secret-sync for moks-executor; must exist
   allowDelete: false             # true adds the delete verb, for reviewed deletion plans
   executorSecret: moks-secret-sync
+  discoveryIntervalMinutes: 60   # the executor lists `namespaces` on its own this often, and at start; 0 = on request only
 ```
+
+`namespaces` is the one list of namespaces: the executor gets a Role in each, discovery covers each, and Discover
+with nothing ticked means all of them. On Argo CD each one also needs a destination in the environment's
+`deploy/argocd/<env>/project.yaml`, or the executor's sync fails as a whole. Leave `argocd` out: write access to
+its Secrets is write access to Argo CD's cluster and repository credentials.
 
 The Role grants `get, list, create, update` on Secrets (plus `delete` with `allowDelete`), and `list` on
 Deployments, StatefulSets, DaemonSets and Pods for the impact review. It goes to `moks-executor` only. The
@@ -269,10 +278,13 @@ Admin → Connectors → AWS Secrets Manager, or seed:
 {"type": "aws_secrets", "name": "aws-secrets", "config": {
   "account_id": "123456789012", "region": "eu-west-1",
   "allowed_prefixes": ["moks/"], "required_tags": {"team": "platform"},
-  "kubernetes_namespaces": ["shop", "payments"],
+  "kubernetes_namespaces": ["shop"],
   "kms_key_id": "alias/moks-secrets", "allow_delete": false, "recovery_window_days": 30,
   "name_template": "moks/{environment}/{cluster}/{namespace}/{name}"}}
 ```
+
+`kubernetes_namespaces` is optional. Left out, the connector covers every `secretsSync.namespaces` entry; a list
+narrows that, and never widens it.
 
 The Kubernetes connector needs a write target (`config.executor`), because the executor reads and writes Secrets
 through it.

@@ -121,8 +121,10 @@ class Settings(BaseSettings):
     crewai_log_lines: int = Field(default=100, ge=10, le=500)
 
     # Kubernetes <-> AWS Secrets Manager sync (docs/SECRETS_SYNC.md). Off unless MOKS_SECRETS_SYNC_ENABLED is true in the api and
-    # the executor. Values are read and written only by the executor; nothing here schedules a sync.
+    # the executor. Values are read and written only by the executor; nothing here schedules a sync, only discovery.
     secrets_sync_enabled: bool = False
+    secrets_namespaces: str = ""  # "ns,ns": secretsSync.namespaces, where the executor has a Role; discovery covers these
+    secrets_discovery_interval_minutes: int = Field(default=0, ge=0, le=1440)  # executor lists them on its own this often; 0 = only on request
     secrets_digest_key: str = Field(default="", repr=False)  # executor only: keys the comparison digests (32+ characters)
     secrets_max_plan_items: int = Field(default=100, ge=1, le=500)
     secrets_discovery_max_pages: int = Field(default=50, ge=1, le=500)
@@ -233,6 +235,10 @@ class Settings(BaseSettings):
     @property
     def api_prefix(self) -> str:
         return f"{self.base_path}/api"
+
+    @property
+    def secrets_namespace_list(self) -> list[str]:
+        return [n.strip() for n in self.secrets_namespaces.split(",") if n.strip()]
 
     @property
     def bootstrap_admin_set(self) -> set[str]:

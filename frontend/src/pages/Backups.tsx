@@ -17,22 +17,29 @@ function PlanButton({ env, path, label, title, fields, build, ghost, approved }:
   const [reason, setReason] = useState("");
   const [error, setError] = useState<unknown>();
   const { toast } = useFeedback();
+  const [busy, setBusy] = useState(false);
+  // Only a restore (approved) asks why; everything else starts at once, and without fields it needs no dialog.
+  async function send(): Promise<void> {
+    const r = await api<{ plan_id: string }>(`/backups/${env}/${path}`, { method: "POST", body: { ...build(), ...(approved ? { reason } : {}) } as any });
+    if (approved) nav(`/actions/${r.plan_id}`);
+    else { setOpen(false); setReason(""); toast("Started. Progress shows on this page."); }
+  }
   async function submit(e: FormEvent) {
     e.preventDefault();
     setError(null);
-    try {
-      const r = await api<{ plan_id: string }>(`/backups/${env}/${path}`, { method: "POST", body: { ...build(), reason } as any });
-      if (approved) nav(`/actions/${r.plan_id}`);
-      else { setOpen(false); setReason(""); toast("Started. Progress shows on this page."); }
-    } catch (err) { setError(err); }
+    try { await send(); } catch (err) { setError(err); }
+  }
+  async function now() {
+    setBusy(true);
+    try { await send(); } catch (err) { toast(err instanceof Error ? err.message : String(err), "bad"); } finally { setBusy(false); }
   }
   return (
     <>
-      <button type="button" className={ghost ? "ghost small" : ""} onClick={() => setOpen(true)}>{label}</button>
+      <button type="button" className={ghost ? "ghost small" : ""} disabled={busy} onClick={() => (approved || fields ? setOpen(true) : now())}>{label}</button>
       {open && <Dialog title={title} onClose={() => setOpen(false)}>
         <form className="stack" onSubmit={submit}>
           {fields}
-          <label>Reason<textarea required minLength={5} rows={2} value={reason} onChange={(e) => setReason(e.target.value)} /></label>
+          {approved && <label>Reason<textarea required minLength={5} rows={2} value={reason} onChange={(e) => setReason(e.target.value)} /></label>}
           <ErrorBox error={error} />
           <div className="small muted">{approved ? "This creates an action plan. You review it next, and nothing runs until it is approved and executed." : "This starts right away, with no approval, and is recorded in the audit log."}</div>
           <div className="row end"><button>{approved ? "Review plan" : "Start"}</button></div>

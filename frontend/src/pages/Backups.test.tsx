@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FeedbackProvider } from "../ui";
+import { api } from "../api";
 import { Backups } from "./Backups";
 
 const database = { id: "1", namespace: "shop", workload: "orders-db", kind: "StatefulSet", engine: "postgresql", status: "success", trigger: "manual", started_at: "2026-10-31T00:00:00Z", finished_at: "2026-10-31T00:01:00Z", bytes: 2048, dump_bytes: 4096, sha256: "ab", image: "postgres:17", pod: "orders-db-0", object_key: "clusters/database-backups/x.dump.enc", error: null,
@@ -37,5 +38,18 @@ describe("Backups", () => {
     expect(screen.getByText(/Not in this backup: legacy/)).toBeTruthy();
     expect(screen.getByText(/shop\/cache \(redis\)/)).toBeTruthy();
     expect(screen.getByText(/no active backup schedule/)).toBeTruthy();
+  });
+  it("takes a database backup at once, without asking for a reason", async () => {
+    open();
+    await screen.findByRole("button", { name: "shop/orders-db" });
+    const database = screen.getAllByRole("button", { name: "Back up now" }).find((b) => b.classList.contains("ghost"))!;  // the cluster's is not ghost
+    fireEvent.click(database);
+    await waitFor(() => expect(api).toHaveBeenCalledWith("/backups/mk4/databases/backup", { method: "POST", body: { namespace: "shop", workload: "orders-db", kind: "StatefulSet" } }));
+    expect(screen.queryByLabelText("Reason")).toBeNull();
+  });
+  it("still asks why before a restore", async () => {
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
+    expect(await screen.findByLabelText("Reason")).toBeTruthy();
   });
 });

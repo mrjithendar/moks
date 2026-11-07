@@ -182,6 +182,20 @@ def test_aws_connector_boundaries():
     assert c.namespace_allowed("shop") and not c.namespace_allowed("kube-system")
 
 
+def test_connector_namespaces_default_to_and_stay_inside_secrets_sync_namespaces(monkeypatch):
+    from moks.connectors.base import ConnectorError
+
+    base = {"account_id": ACCOUNT, "region": REGION, "allowed_prefixes": ["moks/"]}
+    monkeypatch.setattr(get_settings(), "secrets_namespaces", "")
+    with pytest.raises(ConnectorError):
+        AwsSecretsConnector(base)
+    monkeypatch.setattr(get_settings(), "secrets_namespaces", "shop, pay")
+    c = AwsSecretsConnector(base)
+    assert c.namespaces == ["shop", "pay"] and c.namespace_allowed("pay") and not c.namespace_allowed("other")
+    narrow = AwsSecretsConnector({**base, "kubernetes_namespaces": ["shop", "other"]})
+    assert narrow.namespace_allowed("shop") and not narrow.namespace_allowed("pay") and not narrow.namespace_allowed("other")
+
+
 async def test_api_role_is_refused_by_the_connector():
     from moks.connectors.base import ConnectorError
 
@@ -839,3 +853,59 @@ async def test_workers_never_claim_or_run_secret_jobs():
     assert jobs.job_class("secret_execute") == jobs.EXECUTOR_CLASS
     with pytest.raises(RuntimeError):
         await jobs.handlers()["secret_execute"](None, {"_job_type": "secret_execute", "plan_id": str(uuid.uuid4())})
+
+
+async def _kube_names(w: World) -> set[tuple[str, str]]:
+    inv = (await w.call("op", "GET", "/inventory?side=kubernetes", expect=200)).json()
+    return {(i["namespace"], i["name"]) for i in inv["items"]}
+
+
+async def test_discover_without_namespaces_covers_every_secrets_sync_namespace(world, monkeypatch):
+    w = world
+    monkeypatch.setattr(get_settings(), "secrets_namespaces", "shop,pay")
+    w.east.put("shop", "a", {"p": b"1"})
+    w.east.put("pay", "b", {"p": b"2"})
+    w.east.put("other", "c", {"p": b"3"})
+    await w.discover(namespaces=())
+    assert {("shop", "a"), ("pay", "b")} <= await _kube_names(w) and not any(ns == "other" for ns, _ in await _kube_names(w))
+
+
+async def test_executor_discovers_secrets_sync_namespaces_on_its_own(world, monkeypatch):
+    w = world
+    s = get_settings()
+    monkeypatch.setattr(s, "secrets_namespaces", "shop,pay")
+    monkeypatch.setattr(s, "secrets_discovery_interval_minutes", 0)
+    monkeypatch.setattr(tasks, "_last_auto", None)
+    assert await tasks.schedule_discovery() == 0  # off
+
+    monkeypatch.setattr(s, "secrets_discovery_interval_minutes", 60)
+    w.east.put("shop", "auto", {"p": b"1"})
+    w.clusters["west"].put("pay", "auto", {"p": b"2"})
+
+    async def mine() -> list[dict]:
+        async with session_scope() as db:
+            rows = (await db.execute(text("SELECT payload FROM jobs WHERE type = 'secret_discover' AND status = 'queued' AND payload->>'environment_id' = :e"),
+                                     {"e": await _env_id(w.env)})).scalars().all()
+        return list(rows)
+
+    await tasks.schedule_discovery()
+    queued = await mine()
+    assert sorted(bool(p.get("kube_connector_id")) for p in queued) == [False, True, True]  # east, west, and AWS
+    assert all(p["namespaces"] == ["shop", "pay"] for p in queued if p.get("kube_connector_id"))
+    assert all(p["requested_by"] is None and p["trigger"] == "schedule" for p in queued)
+    await tasks.schedule_discovery()  # within the interval: nothing new
+    monkeypatch.setattr(tasks, "_last_auto", None)
+    await tasks.schedule_discovery()  # due again, but the same listings are still queued
+    assert len(await mine()) == 3
+
+    await run_jobs()
+    assert {("shop", "auto"), ("pay", "auto")} <= await _kube_names(w)
+    inv = (await w.call("op", "GET", "/inventory?side=aws", expect=200)).json()
+    assert inv["scopes"]
+
+
+async def _env_id(name: str) -> str:
+    from moks.models import Environment
+
+    async with session_scope() as db:
+        return str((await db.execute(select(Environment.id).where(Environment.name == name))).scalar_one())

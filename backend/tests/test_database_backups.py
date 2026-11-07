@@ -111,7 +111,7 @@ async def _env(prod=True):
     return name, op, env_id
 
 
-TARGET = {"namespace": "shop", "workload": "orders-db", "kind": "StatefulSet", "reason": "before the migration"}
+TARGET = {"namespace": "shop", "workload": "orders-db", "kind": "StatefulSet"}  # no reason: taking a backup asks for none
 
 
 async def _start(client, name, op, path="backup", **extra):
@@ -406,10 +406,13 @@ async def test_cluster_backups_start_without_approval_in_production_and_restores
     bsl = {"metadata": {"name": velero.LOCATION}, "status": {"phase": "Available"}, "spec": {"objectStorage": {"bucket": "b"}}}
     monkeypatch.setattr(FakeKubernetes, "velero", {"backupstoragelocations": [bsl], "backups": [_velero_backup()]})
     h = await login(client, op)
-    for path, body in (("backup", {"reason": "before the upgrade"}), ("schedule", {"reason": "nightly run", "name": "daily", "cron": "0 2 * * *"}), ("configure", {"reason": "new bucket"})):
+    # No reason is asked for any of these; the plan still records one for the audit trail.
+    for path, body in (("backup", {}), ("schedule", {"name": "daily", "cron": "0 2 * * *"}), ("configure", {}), ("backup", {"reason": "before the upgrade"})):
         r = await client.post(f"/moks/api/backups/{name}/{path}", json=body, headers=h)
         assert r.status_code == 201 and r.json()["requires_approval"] is False, r.text
-        assert (await client.get(f"/moks/api/actions/plans/{r.json()['plan_id']}", headers=h)).json()["status"] == "queued"
+        plan = (await client.get(f"/moks/api/actions/plans/{r.json()['plan_id']}", headers=h)).json()
+        assert plan["status"] == "queued" and plan["reason"] == (body.get("reason") or f"velero {path} from the Backups page")
+    assert (await client.post(f"/moks/api/backups/{name}/restore", json={"backup": "nightly"}, headers=h)).status_code == 422  # a restore still says why
     r = await client.post(f"/moks/api/backups/{name}/restore", json={"backup": "nightly", "reason": "bad change"}, headers=h)
     assert r.json()["requires_approval"] is True
     assert (await client.get(f"/moks/api/actions/plans/{r.json()['plan_id']}", headers=h)).json()["status"] == "pending"

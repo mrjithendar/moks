@@ -289,6 +289,7 @@ secretsSync:
   executorSecret: moks-secret-sync
   maxPlanItems: 100
   discoveryMaxPages: 50
+  discoveryIntervalMinutes: 60   # the executor lists `namespaces` (and AWS) on its own this often, and when it starts; 0 = only on request
 
 # Cluster backups through Velero (docs/CLUSTER_BACKUPS.md). Needs Velero installed in this cluster.
 velero:

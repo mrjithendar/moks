@@ -72,7 +72,7 @@ const SOURCES: Record<string, Source> = {
   aws_secrets: { label: "AWS Secrets Manager", type: "aws_secrets", hint: "Secret sync (docs/SECRETS_SYNC.md). Only the executor calls AWS. On Minikube add config.credentials references (edit as JSON); on EKS use Pod Identity.",
     defaults: { region: "us-east-1", allowed_prefixes: ["moks/"], kubernetes_namespaces: [], required_tags: {}, allow_delete: false, recovery_window_days: 30 },
     fields: [{ key: "account_id", label: "AWS account ID", required: true }, REGION, { key: "allowed_prefixes", label: "Allowed name prefixes", kind: "list", required: true, placeholder: "moks/" },
-      { key: "kubernetes_namespaces", label: "Kubernetes namespaces", kind: "list", required: true, placeholder: "shop" }, ROLE, { key: "kms_key_id", label: "KMS key for new secrets (optional)" }] },
+      { key: "kubernetes_namespaces", label: "Kubernetes namespaces (empty: all of secretsSync.namespaces)", kind: "list", placeholder: "shop" }, ROLE, { key: "kms_key_id", label: "KMS key for new secrets (optional)" }] },
   cost_model: { label: "Cluster cost model", type: "cost_model", hint: "Prices Kubernetes usage. Give the monthly cluster cost, or unit prices.", defaults: { monthly_cost_usd: 0, cpu_share: 0.5, currency: "USD" },
     fields: [{ key: "monthly_cost_usd", label: "Monthly cluster cost (USD)", kind: "number" }, { key: "cpu_hour_usd", label: "or CPU core-hour (USD)", kind: "number" }, { key: "gib_hour_usd", label: "and GiB-hour (USD)", kind: "number" },
       { key: "storage_gib_month_usd", label: "Storage GiB-month (USD)", kind: "number" }] },

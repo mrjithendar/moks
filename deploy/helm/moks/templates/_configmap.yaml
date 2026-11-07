@@ -41,6 +41,8 @@ data:
   {{- if .Values.secretsSync.enabled }}
   MOKS_SECRETS_MAX_PLAN_ITEMS: {{ .Values.secretsSync.maxPlanItems | quote }}
   MOKS_SECRETS_DISCOVERY_MAX_PAGES: {{ .Values.secretsSync.discoveryMaxPages | quote }}
+  MOKS_SECRETS_NAMESPACES: {{ join "," .Values.secretsSync.namespaces | quote }}
+  MOKS_SECRETS_DISCOVERY_INTERVAL_MINUTES: {{ .Values.secretsSync.discoveryIntervalMinutes | quote }}
   {{- end }}
   MOKS_ML_DISABLED: {{ .Values.ml.disabled | quote }}
   MOKS_ML_LEARNING_CAPTURE: {{ .Values.ml.learningCapture | quote }}

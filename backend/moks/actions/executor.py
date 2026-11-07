@@ -682,6 +682,7 @@ async def secrets_tick(wid: str, wait: bool = False) -> None:
     if not get_settings().secrets_sync_enabled or (_secret_task is not None and not _secret_task.done()):
         return
     await secret_tasks.reconcile_orphans()
+    await secret_tasks.schedule_discovery()
     job_id = await jobs.claim(wid, jobs.EXECUTOR_CLASS)
     if job_id is None:
         return

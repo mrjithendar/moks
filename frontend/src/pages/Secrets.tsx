@@ -139,7 +139,8 @@ function Inventory({ env, scope }: { env: string; scope: ScopeInfo }) {
 function DiscoverDialog({ env, scope, onClose, onDone }: { env: string; scope: ScopeInfo; onClose: () => void; onDone: () => void }) {
   const [kube, setKube] = useState(scope.kubernetes[0]?.id ?? "");
   const cluster = scope.kubernetes.find((k) => k.id === kube);
-  const [ns, setNs] = useState<string[]>([]);
+  // Every secretsSync namespace starts ticked; the executor also lists them on its own (secretsSync.discoveryIntervalMinutes).
+  const [ns, setNs] = useState<string[]>(cluster?.namespaces ?? []);
   const [aws, setAws] = useState(scope.cluster_wide ? scope.aws[0]?.id ?? "" : "");
   const [job, setJob] = useState<string>();
   const [status, setStatus] = useState<any>();
@@ -164,7 +165,7 @@ function DiscoverDialog({ env, scope, onClose, onDone }: { env: string; scope: S
     <Dialog title="Discover secrets" onClose={onClose}>
       <form className="stack" onSubmit={start}>
         <p className="small muted">Lists names, types, key names and owners. Values pass through the executor's memory and are not kept. Nothing is written.</p>
-        {scope.kubernetes.length > 0 && <label>Cluster<select value={kube} onChange={(e) => { setKube(e.target.value); setNs([]); }}>{scope.kubernetes.map((k) => <option key={k.id} value={k.id} disabled={!k.writable}>{k.name}{k.writable ? "" : " (no executor target)"}</option>)}</select></label>}
+        {scope.kubernetes.length > 0 && <label>Cluster<select value={kube} onChange={(e) => { setKube(e.target.value); setNs(scope.kubernetes.find((k) => k.id === e.target.value)?.namespaces ?? []); }}>{scope.kubernetes.map((k) => <option key={k.id} value={k.id} disabled={!k.writable}>{k.name}{k.writable ? "" : " (no executor target)"}</option>)}</select></label>}
         {cluster?.error && <div className="alert warn small">{cluster.error}</div>}
         <fieldset><legend>Namespaces</legend>
           {cluster?.namespaces.length ? cluster.namespaces.map((n) => <label key={n} className="check"><input type="checkbox" checked={ns.includes(n)} onChange={() => setNs(ns.includes(n) ? ns.filter((x) => x !== n) : [...ns, n])} /> {n}</label>)
