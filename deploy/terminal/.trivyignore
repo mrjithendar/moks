@@ -5,3 +5,7 @@
 # not moved yet. Rebuilding kubectl here would lose its published checksum. Check each new 1.37 release.
 CVE-2026-78669 exp:2026-12-01
 CVE-2026-56851 exp:2026-12-01
+# x/net/html denial of service on crafted HTML (fixed in x/net 0.62.0), also in kubectl v1.37.2's x/net 0.57.0.
+# Added 2026-11-07, when v1.37.2 was still the newest 1.37 and stable release. The terminal runs kubectl only
+# against the cluster API, which returns JSON, not HTML.
+CVE-2026-78661 exp:2026-12-01
