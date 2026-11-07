@@ -74,9 +74,10 @@ async def test_each_role_is_refused_the_others_part(world, as_components):  # no
         assert (await db.execute(text("SELECT count(*) FROM secret_plan_items WHERE id = :i"), {"i": item_id})).scalar_one() == 1
 
 
-async def test_schedules_and_reveals_run_under_the_component_roles_and_only_the_api_approves(world, as_components):  # noqa: F811
+async def test_schedules_and_reveals_run_under_the_component_roles_and_only_the_api_approves(world, as_components, monkeypatch):  # noqa: F811
     from moks.secrets.seal import open_sealed
 
+    monkeypatch.setattr(flow.get_settings(), "secrets_sync_policy", "scheduled")  # the default, manual, never runs a schedule
     w = world
     m, _ = await flow._export_one(w, {"p": b"one"}, direction="export")
     s = (await w.call("op", "POST", "/schedules", {"name": "roles", "mapping_ids": [m["id"]], "interval_minutes": 30}, expect=201)).json()
@@ -93,6 +94,20 @@ async def test_schedules_and_reveals_run_under_the_component_roles_and_only_the_
         role.reset(token)
     assert run["status"] == "succeeded", run
     assert w.aws_content(m["aws_secret_name"]).data == {"p": b"two"}
+
+    # the manual-only policy: the executor holds the schedule, within its column grants
+    monkeypatch.setattr(flow.get_settings(), "secrets_sync_policy", "manual")
+    s_ = flow.get_settings()
+    old_role, s_.process_role = s_.process_role, "executor"
+    token = role.set("moks_executor")
+    try:
+        assert await flow.tasks.hold_schedules() == 1
+    finally:
+        role.reset(token)
+        s_.process_role = old_role
+    async with session_scope() as db:
+        assert (await db.execute(text("SELECT status FROM secret_sync_schedules WHERE id = :s"), {"s": uuid.UUID(s["id"])})).scalar_one() == "held"
+        await db.execute(text("UPDATE secret_sync_schedules SET status = 'retired' WHERE id = :s"), {"s": uuid.UUID(s["id"])})
 
     rid = next(r["id"] for r in (await w.call("op", "GET", "/inventory?side=kubernetes", expect=200)).json()["items"] if r["name"] == "db")
     private, jwk = flow._browser_key()

@@ -1,8 +1,9 @@
 # Secret sync: Kubernetes ⇄ AWS Secrets Manager
 
 MOKS can list Kubernetes Secrets and AWS Secrets Manager secrets, compare mapped pairs, and copy content in
-either direction when a person asks and another person approves. It never syncs on a schedule and never
-propagates a change by itself. Only discovery runs on its own: the executor lists the `secretsSync.namespaces`
+either direction when a person asks and another person approves. By default (`secretsSync.policy: manual`) it
+never syncs on a schedule and never propagates a change by itself; see [Sync policy](#sync-policy). Only
+discovery runs on its own: the executor lists the `secretsSync.namespaces`
 and each AWS connector when it starts and every `secretsSync.discoveryIntervalMinutes` (default 60; 0 turns it
 off). Discovery reads metadata and never writes, so new and deleted secrets show up without anyone pressing
 Discover. Changed content still shows up only when someone compares.
@@ -49,6 +50,23 @@ hides them all after 2 minutes. Both the request and the read are audited (`secr
 `secrets.reveal`) with key names, never values. A Kubernetes Secret needs `secrets.reveal` in its namespace. An AWS
 secret needs it in the namespace it is mapped to, or for every namespace when it is unmapped. Values over 256 KiB
 are not shown.
+
+A reveal is bound when it is asked for (`service.bind_reveal`): the environment, the exact secret (side,
+namespace, name, and the AWS ARN or the cluster UID), a fingerprint of the connector's configuration and
+credential reference, the AWS account and region, and the namespace that authorizes it, with the mapping id and
+version for an AWS secret. `service.check_reveal` checks all of it again twice, against current state and current
+permissions:
+
+- in the executor, before the value is read: the requester is reloaded and must still be active and hold
+  `secrets.reveal` for that namespace; the connector must be enabled, in this environment and configured as
+  before; the AWS name must still be inside the connector's prefixes, account and region; and the mapping (and so
+  the authorizing namespace) must not have changed. The cluster UID and the ARN are checked on the live read.
+  Otherwise the job fails with the reason, audited as a denied `secrets.reveal`, and nothing is read;
+- in the API, before the sealed result is handed over. If the person may no longer see that secret, the result is
+  removed without being shown (`secrets.reveal_withheld`) and the request is refused. Getting access back later
+  does not bring it back; ask again.
+
+A reveal queued by an earlier version carries no binding and is never served.
 
 `tests/test_secret_sync.py::test_secret_values_stay_out_of_storage_logs_traces_errors_and_responses` runs whole
 flows, including failures, with marker values. It then searches every table, all captured logs, every span and
@@ -141,15 +159,30 @@ for the next pull. **Nothing restarts as part of a sync.** "Propose restart" cre
 `restart_deployment` action plan, which goes through the action approvals.
 
 Approval is bound to a plan hash. The hash covers every item's inclusion, mapping version, baseline sequence,
-source and destination versions and digests, resolution, actions, expected digest and changed key names, plus the
-requester and expiry. The rules match action plans: never your own plan, unless you are a global administrator,
+source and destination versions and digests, resolution, actions, expected digest and changed key names, its
+connector binding (a fingerprint of each connector's configuration and credential reference, the cluster UID, the
+AWS account and region, recorded at comparison), plus the requester and expiry. Plans compared before the binding
+existed (hash version 1) keep their history but are refused at submit, approval, execution and retry; refresh them. The rules match action plans: never your own plan, unless you are a global administrator,
 whose sync plans skip the second approval (audited as `secrets.approval_waived`). **Deletion plans always need
 someone else's approval**, and the approver types back a confirmation phrase.
 
-Before writing each item, the executor:
+Before each item, **and again right before each write**, the executor reloads from the database and checks
+(`tasks.authorize_item`): the plan is still executing; its hash and expiry; the requester, executor and approver
+(or schedule) with their current permissions for every namespace in the plan; and the item's connectors, which
+must be enabled, in this environment, configured exactly as when compared, and still allow the namespace and AWS
+name. Clients are keyed by connector configuration, so an edited connector never reuses an old client.
+
+When a check fails, nothing more is written. The items not reached are failed "not run" when authorization changed
+(a permission revoked, a user disabled, the approval gone or expired), and a retry runs them once it is valid again;
+they are stale when a connector changed (disabled, retargeted, restrictions edited), which needs a fresh comparison
+and review. `summary.halted` records which items completed before the change, which were not run and which are
+ambiguous (a write whose outcome is unknown, resolved on retry by reading what landed), audited as
+`secrets.execute_halted`.
+
+Then, for each item, the executor:
 
 1. Takes a lease on the mapping, so MOKS runs one operation per mapping at a time.
-2. Re-checks the plan hash, expiry, and the requester's, executor's and approver's current permissions.
+2. Requires the AWS connector's account and region and the Kubernetes cluster UID to be the mapping's.
 3. Requires the mapping version and baseline sequence to be the ones compared.
 4. Reads both sides again. Anything that moved makes the item **stale**: it needs a refreshed plan and a new
    approval, never a retry.
@@ -245,9 +278,21 @@ the last part of the AWS name. Secrets that are excluded, already mapped, outsid
 they look like an ARN suffix are skipped, and the reason is shown. Optionally this also starts one comparison for all
 of them, and creates a schedule that waits for approval. Review each one instead keeps the per-secret editor.
 
+## Sync policy
+
+`secretsSync.policy` (`MOKS_SECRETS_SYNC_POLICY`) decides whether anything but a person's reviewed plan may write.
+
+- **`manual`** (the default, and the intended policy): every write is a plan whose exact changes someone
+  reviewed. Schedules cannot be created, approved, resumed or run (409 from the API); the executor never runs
+  one and refuses a queued scheduled plan. Existing schedules are **held** at the executor's next tick (status
+  `held`, with the reason; audited `secrets.schedule_hold`); their approvals and run history stay. The
+  Schedules tab says so, and offers Reject and Retire. Discovery still refreshes names, versions and owners.
+- **`scheduled`**: approved schedules run as described below. A schedule held under `manual` does not run on its
+  old approval after switching: it needs a fresh approval of its current version.
+
 ## Sync schedules
 
-Select mappings on the Mappings tab, then Schedule sync, and give a name and an interval (5 minutes to 7 days).
+Only under `secretsSync.policy: scheduled`. Select mappings on the Mappings tab, then Schedule sync, and give a name and an interval (5 minutes to 7 days).
 A schedule runs nothing until it is approved, by someone else or, for an administrator's own schedule, by the
 administrator. The approval binds the schedule's hash: the environment, the creator, the interval and each mapping
 at its current version. Editing the interval or the mapping set, or editing one of its mappings, needs a new
@@ -283,6 +328,7 @@ secretsSync:
   allowDelete: false             # true adds the delete verb, for reviewed deletion plans
   executorSecret: moks-secret-sync
   discoveryIntervalMinutes: 60   # the executor lists `namespaces` on its own this often, and at start; 0 = on request only
+  policy: manual                 # manual: every write is a reviewed plan, schedules held; scheduled: approved schedules run
 ```
 
 `namespaces` is the one list of namespaces: the executor gets a Role in each, discovery covers each, and Discover

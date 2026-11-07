@@ -195,7 +195,8 @@ async def test_a_tool_timeout_gives_a_partial_report_with_the_gap(client, crew_o
     await Investigator(uuid.UUID(r.json()["id"]), "t").run()
     inv, ev = await result(r.json()["id"])
     assert inv.status == "completed"
-    assert ev["E2"].ok is False and ev["E2"].error == "timeout"
+    logs = next(e for e in ev.values() if e.tool == "k8s_pod_logs")
+    assert logs.ok is False and logs.error == "timeout"
     assert any(g["source"] == "k8s_pod_logs" and "timeout" in g["reason"] for g in inv.report["crewai"]["gaps"])
     assert any("k8s_pod_logs" in m for m in inv.report["missing_evidence"])
 
@@ -253,7 +254,8 @@ async def test_cancellation_reaches_the_crew(client, crew_on):
     await Investigator(iid, "t").run()
     inv, ev = await result(str(iid))
     assert inv.status == "cancelled"
-    assert list(ev) == ["E1"]  # kept, and nothing ran after the cancel
+    # kept, and nothing ran after the cancel: the pods resolved by owner reference, then namespace_health
+    assert [e.tool for e in ev.values()] == ["k8s_rollout_history", "k8s_list_pods", "k8s_triage"]
     await asyncio.sleep(0.5)
     assert sum(1 for who, _ in script.calls if who == "workload") == 2
 
@@ -274,7 +276,7 @@ async def test_instructions_in_a_log_line_change_nothing(client, crew_on):
     assert inv.status == "completed"
     assert {e.tool for e in ev.values()} <= ALLOWED_MOKS_TOOLS
     assert all((e.args or {}).get("namespace") in (None, "shop") for e in ev.values())
-    assert [e.tool for e in ev.values()] == ["k8s_pod_logs"]
+    assert [e.tool for e in ev.values()] == ["k8s_rollout_history", "k8s_list_pods", "k8s_pod_logs"]  # the first two resolve the workload's pods
     assert "hunter2hunter2" not in json.dumps(inv.report)
     # what the model saw of the log is wrapped as data
     shown = next(m for who, m in script.calls if who == "workload" and "IGNORE ALL PREVIOUS" in m)
@@ -335,3 +337,87 @@ async def test_the_executor_denies_what_the_person_may_not_read(client, crew_on)
     assert inv.status == "completed" and Repos.commits == 0
     assert ev["E1"].tool == "git_recent_commits" and ev["E1"].kind == "access_denied"
     assert any(g["source"] == "git_recent_commits" for g in inv.report["crewai"]["gaps"])
+
+
+async def _runbooks(iid: str) -> None:
+    """Two runbooks about a cart crash loop that the investigator may read: one scoped to carts, one to pay."""
+    from moks.models import Environment, KnowledgeSource
+    from moks.rag import ingest
+
+    async with session_scope() as db:
+        env = await db.get(Environment, (await db.get(Investigation, uuid.UUID(iid))).environment_id)
+        for ns in ("carts", "pay"):
+            src = KnowledgeSource(name=f"rb-{ns}-{uuid.uuid4().hex[:6]}", type="upload", scope_environment=env.name, scope_namespace=ns, config={})
+            db.add(src)
+            await db.flush()
+            await ingest.add_upload(db, src, f"runbooks/{ns}.md", f"# Cart crash loop\n\nWhen cart is in a crash loop, check the database. {ns}-runbook-marker\n".encode(), None)
+
+
+def _cart_scenario() -> dict:
+    from tests.fakes import pod
+
+    def owned(p, rs, uid):
+        p["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": rs, "uid": uid, "controller": True}]
+        return p
+
+    orphan = pod("cart-7d9f-orphan", "carts", {"app": "cart"})
+    orphan["metadata"]["ownerReferences"] = []
+    return {"pods": [owned(pod("cart-7d9f-abc", "carts", {"app": "cart"}, waiting="CrashLoopBackOff", restarts=4), "cart-7d9f", "rs-cart"),
+                     owned(pod("cart-worker-6c8-xyz", "carts", {"app": "cart-worker"}, waiting="CrashLoopBackOff", restarts=9), "cart-worker-6c8", "rs-worker"),
+                     owned(pod("cart-7d9f-old", "carts", {"app": "cart"}), "cart-7d9f", "rs-before-recreation"),  # left from the deleted Deployment
+                     orphan],
+            "replicasets": {"cart-7d9f": {"deployment": "cart", "uid": "rs-cart"}, "cart-worker-6c8": {"deployment": "cart-worker", "uid": "rs-worker"}},
+            "services": [], "deployments": [{"name": "cart", "replicas": 1, "ready": 0}, {"name": "cart-worker", "replicas": 1, "ready": 0}],
+            "logs": "cart says hello\n"}
+
+
+async def test_a_cart_investigation_never_reads_cart_worker(client, crew_on):
+    from tests import fakes
+
+    crew_on.setitem(fakes.SCENARIOS, "carts", _cart_scenario())
+    script = Script(workload=[act("workload_pods"), act("describe_pod", {"pod": "cart-worker-6c8-xyz"}), act("pod_logs", {"pod": "cart-7d9f-old"}),
+                              act("pod_logs", {"pod": "cart-7d9f-orphan"}), act("describe_pod", {"pod": "cart-7d9f-abc"}), act("namespace_health"), final("cart [E1]")],
+                    change=[act("search_runbooks", {"query": "cart crash loop"}), final("no runbook")],
+                    review=[final(REPORT)])
+    crew_on.setattr(budget, "complete", script)
+    r, _ = await start(client, workload="cart", namespace="carts")
+    iid = r.json()["id"]
+    await _runbooks(iid)
+    await Investigator(uuid.UUID(iid), "t").run()
+    inv, ev = await result(iid)
+    assert inv.status == "completed", inv.error
+    crew = inv.report["crewai"]
+    refused = {(x["tool"], x["reason"].split()[1]) for x in crew["refused"]}
+    assert refused == {("describe_pod", "cart-worker-6c8-xyz"), ("pod_logs", "cart-7d9f-old"), ("pod_logs", "cart-7d9f-orphan")}
+    described = [e for e in ev.values() if e.tool == "k8s_describe_pod"]
+    assert [e.args["pod"] for e in described] == ["cart-7d9f-abc"]
+    # no evidence the model was shown names another workload's pods (the model's own request and MOKS's refusal do)
+    import re
+
+    shown = " ".join(re.findall(r"<untrusted_data.*?</untrusted_data[^>]*>", " ".join(c for _, c in script.calls), re.S))
+    assert "cart-7d9f-abc" in shown and "cart-worker" not in shown and "cart-7d9f-old" not in shown and "orphan" not in shown
+    # knowledge is searched in the target's namespace, not every namespace the person may read
+    kb = [e for e in ev.values() if e.tool == "kb_search"]
+    assert kb and all(((e.source or {}).get("scope") or {}).get("namespace") == "carts" for e in kb)
+    found = json.dumps([e.data for e in kb])
+    assert "carts-runbook-marker" in found and "pay-runbook-marker" not in found  # the person may read pay's runbook, but it is not this target's
+
+
+async def test_a_workload_without_pods_gets_an_explicit_empty_result(client, crew_on):
+    from tests import fakes
+
+    sc = _cart_scenario()
+    sc["pods"] = [p for p in sc["pods"] if p["metadata"]["name"] != "cart-7d9f-abc"]
+    crew_on.setitem(fakes.SCENARIOS, "carts", sc)
+    script = Script(workload=[act("workload_pods"), act("search_logs"), final("nothing [E1]")], review=[final(REPORT)])
+    crew_on.setattr(budget, "complete", script)
+    r, _ = await start(client, workload="cart", namespace="carts")
+    await Investigator(uuid.UUID(r.json()["id"]), "t").run()
+    inv, ev = await result(r.json()["id"])
+    crew = inv.report["crewai"]
+    pods = next(e for e in crew["registry"] if e["source"] == "k8s_list_pods")
+    assert pods["ok"]
+    full = next(x for x in crew["evidence"] + [{"id": pods["id"], "excerpt": ""}] if x["id"] == pods["id"])
+    assert "cart-worker" not in full["excerpt"]
+    assert any(g["source"] == "search_logs" and "no pods are owned" in g["reason"] for g in crew["gaps"])
+    assert not any(e.tool == "loki_search" for e in ev.values())

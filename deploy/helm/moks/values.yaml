@@ -290,6 +290,10 @@ secretsSync:
   maxPlanItems: 100
   discoveryMaxPages: 50
   discoveryIntervalMinutes: 60   # the executor lists `namespaces` (and AWS) on its own this often, and when it starts; 0 = only on request
+  # manual: every write is a plan someone reviews; schedules are held and never run (discovery above still runs).
+  # scheduled: an approved schedule writes one-sided changes on its own. A schedule held under manual needs a fresh
+  # approval after switching back.
+  policy: manual
 
 # Cluster backups through Velero (docs/CLUSTER_BACKUPS.md). Needs Velero installed in this cluster.
 velero:

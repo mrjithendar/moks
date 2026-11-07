@@ -21,7 +21,9 @@ vi.mock("../auth", () => ({ useAuth: () => ({ can: () => true }) }));
 
 const scope = { kubernetes: [{ id: "k1", name: "east", writable: true, cluster_uid: "u", namespaces: ["shop"], error: null }],
   aws: [{ id: "a1", name: "aws", account_id: "123456789012", region: "eu-west-1", allowed_prefixes: ["moks/"], kubernetes_namespaces: ["shop"] }],
-  cluster_wide: true, can: { discover: true, compare: true, map: true, propose: true, approve: true, execute: true, reveal: true }, discovery: { interval_minutes: 60, last_at: "2026-11-07T00:00:00Z" } };
+  cluster_wide: true, can: { discover: true, compare: true, map: true, propose: true, approve: true, execute: true, reveal: true }, discovery: { interval_minutes: 60, last_at: "2026-11-07T00:00:00Z" },
+  policy: { mode: "manual", schedules_run: false, explanation: "held by the manual-only sync policy" } };
+const scheduledScope = { ...scope, policy: { mode: "scheduled", schedules_run: true, explanation: "" } };
 const row = (over: Record<string, any> = {}) => ({ id: "r1", side: "kubernetes", connector_id: "k1", namespace: "shop", name: "db", type: "Opaque", keys: ["password"], key_count: 1,
   owner: { manager: null, detail: "" }, syncable: true, excluded: null, last_modified: null, version: "1", sync_status: "unmapped", extra: {}, mapping: null, ...over });
 const config = { enabled: true, environments: [{ name: "mk4", display_name: "mk4", is_production: false, aws_connectors: 1 }] };
@@ -98,7 +100,7 @@ describe("Secrets sync", () => {
   });
 
   it("maps every selected secret in one go and opens the comparison", async () => {
-    responses = { "/secrets/config": config, "/secrets/mk4/scope": scope,
+    responses = { "/secrets/config": config, "/secrets/mk4/scope": scheduledScope,
       "/secrets/mk4/inventory": { items: [row(), row({ id: "r2", name: "api" })], truncated: false, hidden: 0, scopes: [], types: ["Opaque"] },
       "POST /secrets/mk4/mappings/bulk": { created: [{ ...mapping, id: "m1" }, { ...mapping, id: "m2", secret_name: "api" }], skipped: [{ secret: "shop/x", why: "cannot be synced" }], plan_id: "p9" },
       "POST /secrets/mk4/schedules": { id: "s1" } };
@@ -130,12 +132,30 @@ describe("Secrets sync", () => {
       next_run_at: null, last_run_at: "2026-11-07T00:00:00Z", last_plan_id: "p1",
       last_outcome: { status: "succeeded", written: 0, needs_review: [{ mapping_id: "m1", secret: "shop/db", aws: "moks/x", classification: "changed_both", why: "both sides changed" }] },
       approvals: [], allowed: { edit: false, approve: true, pause: false, resume: false, run: false, retire: true } };
-    responses = { "/secrets/config": config, "/secrets/mk4/scope": scope, "/secrets/mk4/schedules": { items: [sched] }, "POST /secrets/mk4/schedules/s1/decision": { ...sched, status: "active" } };
+    responses = { "/secrets/config": config, "/secrets/mk4/scope": scheduledScope, "/secrets/mk4/schedules": { items: [sched] }, "POST /secrets/mk4/schedules/s1/decision": { ...sched, status: "active" } };
     page("/secrets?env=mk4&tab=schedules");
     fireEvent.click(await screen.findByText("shop db"));
     expect(await screen.findByText("both sides changed", { exact: false })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
     await waitFor(() => expect(calls.find((c) => c.path.endsWith("/schedules/s1/decision"))?.body).toMatchObject({ approve: true, schedule_hash: "e".repeat(64) }));
+  });
+
+  it("under the manual-only policy offers no schedules and shows existing ones as held", async () => {
+    const held = { id: "s1", name: "old schedule", status: "held", paused_reason: "held by the manual-only sync policy (secretsSync.policy: manual)", interval_minutes: 60, version: 3,
+      schedule_hash: "e".repeat(64), requested_by: "op@example.com", held: true, needs_fresh_approval: true, policy: "manual", namespaces: ["shop"], stale_mappings: [],
+      mappings: [{ id: "m1", secret: "shop/db", aws_secret_name: "moks/x", direction: "both", last_status: "in_sync" }], next_run_at: null, last_run_at: null, last_plan_id: null,
+      last_outcome: {}, approvals: [{ by: "ap@example.com", decision: "approve", comment: "", at: "2026-11-06T00:00:00Z", current: true }],
+      allowed: { edit: false, approve: false, reject: true, pause: false, resume: false, run: false, retire: true } };
+    responses = { "/secrets/config": config, "/secrets/mk4/scope": scope, "/secrets/mk4/schedules": { items: [held] }, "/secrets/mk4/mappings": { items: [mapping] } };
+    page("/secrets?env=mk4&tab=schedules");
+    expect(await screen.findByText("Manual-only sync.")).toBeTruthy();
+    expect(await screen.findByText("held by policy")).toBeTruthy();
+    fireEvent.click(screen.getByText("old schedule"));
+    expect(await screen.findByText(/manual-only sync policy/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Run now" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    expect(screen.getByText(/approve by ap@example.com/)).toBeTruthy();  // history kept
   });
 
   it("opens values sealed to this tab and masks them until asked", async () => {

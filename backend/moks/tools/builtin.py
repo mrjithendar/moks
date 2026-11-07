@@ -301,7 +301,7 @@ async def prom_targets(ctx: ToolContext, a: NoArgs) -> ToolResult:
 
 class LokiSearchArgs(ToolArgs):
     namespace: str = Namespace
-    pod: str | None = Field(default=None, pattern=r"^[a-z0-9.*\-]{1,253}$", description="pod name or RE2 pattern")
+    pod: str | None = Field(default=None, pattern=r"^[a-z0-9.*\-|()\[\]^$]{1,2000}$", description="pod name or RE2 pattern, e.g. (a|b) for exact pods")
     container: str | None = Field(default=None, pattern=K8S_NAME)
     contains: str | None = Field(default=None, max_length=200, description="case-insensitive text to find")
     trace_id: str | None = Field(default=None, pattern=r"^[A-Fa-f0-9]{16,32}$")
@@ -327,7 +327,7 @@ class LokiQueryArgs(ToolArgs):
 def build_logql(a: LokiSearchArgs, ns_label: str) -> str:
     matchers = [f'{ns_label}="{logql_escape(a.namespace)}"']
     if a.pod:
-        op = "=~" if any(c in a.pod for c in "*.") else "="
+        op = "=~" if any(c in a.pod for c in "*.|([") else "="
         matchers.append(f'pod{op}"{logql_escape(a.pod.replace("*", ".*") if op == "=~" else a.pod)}"')
     if a.container:
         matchers.append(f'container="{logql_escape(a.container)}"')

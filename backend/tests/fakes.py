@@ -205,9 +205,23 @@ async def _deployment_meta(self, namespace, name):
 
 
 async def _rollout_history(self, namespace, deployment):
-    return {"deployment": {"name": deployment}, "revisions": [
-        {"revision": 3, "created": "2026-10-30T09:55:00Z", "images": ["example/app:3"]},
-        {"revision": 2, "created": "2026-10-29T09:00:00Z", "images": ["example/app:2"]}]}
+    # The ReplicaSets the Deployment owns, as the real connector finds them by the Deployment's UID: a scenario's
+    # "replicasets" ({rs: {"deployment", "uid"}}) when it has them, else those named <deployment>-<hash> after the
+    # pods' owner references (the controller's naming). The newest revisions carry them.
+    sc = SCENARIOS.get(namespace, {})
+    owned = sc.get("replicasets")
+    if owned is None:
+        owned = {o["name"]: {"deployment": o["name"].rsplit("-", 1)[0], "uid": o.get("uid")} for p in sc.get("pods", [])
+                 for o in p["metadata"].get("ownerReferences") or [] if o.get("kind") == "ReplicaSet"}
+    mine = [(rs, v.get("uid")) for rs, v in sorted(owned.items()) if v["deployment"] == deployment]
+    revisions = [{"revision": 3, "created": "2026-10-30T09:55:00Z", "images": ["example/app:3"]},
+                 {"revision": 2, "created": "2026-10-29T09:00:00Z", "images": ["example/app:2"]}]
+    for i, (rs, uid) in enumerate(mine):
+        if i < len(revisions):
+            revisions[i].update(replicaSet=rs, uid=uid)
+        else:
+            revisions.append({"revision": 0, "created": "2026-10-28T09:00:00Z", "images": ["example/app:1"], "replicaSet": rs, "uid": uid})
+    return {"deployment": {"name": deployment}, "revisions": revisions}
 
 
 FakeKubernetes.deployment_meta = _deployment_meta

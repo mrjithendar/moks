@@ -305,6 +305,7 @@ class KubernetesConnector:
             revisions.append({
                 "revision": int(ann.get("deployment.kubernetes.io/revision", "0") or 0),
                 "replicaSet": rs["metadata"]["name"],
+                "uid": rs["metadata"].get("uid"),
                 "created": rs["metadata"].get("creationTimestamp"),
                 "images": [c.get("image") for c in rs["spec"]["template"]["spec"].get("containers", [])],
                 "replicas": rs.get("status", {}).get("replicas", 0),
@@ -477,7 +478,8 @@ def summarize_pod(p: dict) -> dict:
     unscheduled = next((c for c in st.get("conditions") or [] if c.get("type") == "PodScheduled" and c.get("status") == "False"), None)
     if unscheduled:
         problems.append({"container": None, "state": "unschedulable", "reason": unscheduled.get("reason"), "message": (unscheduled.get("message") or "")[:300]})
-    owner = (meta.get("ownerReferences") or [{}])[0]
+    refs = meta.get("ownerReferences") or []
+    owner = next((o for o in refs if o.get("controller")), refs[0] if refs else {})  # the controller, when one is marked
     return {
         "name": meta.get("name"),
         "namespace": meta.get("namespace"),
@@ -488,6 +490,7 @@ def summarize_pod(p: dict) -> dict:
         "age": _age(meta.get("creationTimestamp")),
         "created": meta.get("creationTimestamp"),
         "owner": f"{owner.get('kind')}/{owner.get('name')}" if owner.get("kind") else None,
+        "ownerUid": owner.get("uid"),
         "labels": meta.get("labels") or {},
         "problems": problems,
         "reason": st.get("reason"),
@@ -557,6 +560,7 @@ def summarize_workload(kind: str, w: dict) -> dict:
     return {
         "kind": kind,
         "name": meta.get("name"),
+        "uid": meta.get("uid"),
         "desired": desired,
         "ready": ready or 0,
         "updated": st.get("updatedReplicas"),

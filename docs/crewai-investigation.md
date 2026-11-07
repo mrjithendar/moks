@@ -125,8 +125,22 @@ There is also one additive field on `GET /investigate/config`: `crewai: {enabled
   No other provider, embedding service or telemetry endpoint is contacted (see section 3).
 - **Authorization in the tool adapters** (`moks/crew/tools.py`). The model supplies only narrow arguments:
   a pod, a container, a search phrase, a path. The environment, namespace, workload and time window are bound from the
-  investigation. Any `namespace` other than the target's, or a pod not named `<workload>-…`, is refused,
-  audited (`tool.call`, outcome `not_needed`, reason `crewai: …`) and listed as a gap. Allowed calls still
+  investigation. Any `namespace` other than the target's, or a pod the workload does not own, is refused,
+  audited (`tool.call`, outcome `not_needed`, reason `crewai: …`) and listed as a gap.
+- **Workload membership by owner reference, never by name.** Before its first pod-level call the run resolves
+  the target through the `ToolExecutor`: for a Deployment, the ReplicaSets it owns by UID (`k8s_rollout_history`),
+  then the pods whose controller is one of them (`k8s_list_pods`, matched by owner name and UID); for a
+  StatefulSet or DaemonSet, the workload's UID (`k8s_workloads`) and the pods it controls. So `cart` never reads
+  `cart-worker`'s pods, a pod without owner references belongs to nothing, and pods left from a deleted and
+  recreated workload drop out by UID. Pod logs, descriptions, events, Loki searches (an exact `(a|b)` pod
+  matcher) and Prometheus pod metrics use only those pods. Namespace-wide results are narrowed to the target and
+  to an explicit empty result when nothing matches; a Loki or metrics call with no member pods is not run and is
+  recorded as a gap. These reads are evidence and count against the crew's tool limit. A pod name the run does
+  not know triggers one fresh resolution at most once a minute.
+- **Knowledge in the target's namespace.** The run sets the investigation's focus namespace before any
+  retrieval, so `kb_search` returns runbooks for the target's namespace (and shared ones), not every namespace the
+  person may read. A resumed attempt keeps the crew on its own namespace, which is checked against the person's
+  scope again. Allowed calls still
   pass the `ToolExecutor`'s RBAC and scope checks, so a cluster-scoped Git read by a namespace-scoped person
   is denied and recorded as `access_denied` evidence.
 - **Read-only allowlist.** The 14 tools above, all `read_only` and not `privileged`. There is no exec, apply,

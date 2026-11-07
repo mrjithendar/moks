@@ -36,7 +36,7 @@ from ..orchestrator.report import parse_json_object, rules_report
 from ..tools.executor import ToolExecutor
 from . import CrewUnavailable
 from .evidence import Registry, cited, validate
-from .tools import BY_NAME, CrewTool, Refused, Target, bind, focus, mine
+from .tools import BY_NAME, NEEDS_MEMBERS, NOBODY, CrewTool, Empty, Members, Refused, Target, bind, focus, mine, owned_by
 
 log = logging.getLogger("moks.crewai")
 
@@ -44,6 +44,7 @@ AGENTS = {"workload": "Workload investigator", "change": "Change investigator", 
 REPORT_TOKENS = 1500
 STEP_TOKENS = 900
 MIN_TOKENS = 200
+REFRESH_SECONDS = 60  # how stale the target's pod list may be before a pod it does not know makes MOKS read it again
 
 _lock = threading.Lock()
 _running = 0
@@ -148,6 +149,9 @@ class Run:
         self.task_span: Any = None
         self.root_context = otel_context.get_current()
         self.task_context = self.root_context
+        self.members: Members | None = None
+        self.members_at = 0.0
+        self.resolution: dict[str, dict[str, Any]] = {}  # evidence read to resolve the target, by call key
 
     # ---- progress and tracing (called from the crew's thread) --------------------------------
 
@@ -210,10 +214,67 @@ class Run:
         self.enter(tool.agent)
         return self.bridge.run(self._call_tool(tool, raw), self.s.crewai_tool_timeout_seconds + 15)
 
+    async def resolve_members(self) -> Members:
+        """The target's pods by owner reference, read through the ToolExecutor like any other call (so they are
+        evidence too): the ReplicaSets the Deployment owns (k8s_rollout_history checks the Deployment's UID), or the
+        StatefulSet or DaemonSet itself by UID (k8s_workloads), then the namespace's pods those controllers own."""
+        t = self.target
+        if t.kind == "Deployment":
+            out = await self._read("k8s_rollout_history", {"namespace": t.namespace, "deployment": t.workload})
+            if out is None or not out.ok:
+                return Members(frozenset(), frozenset(), f"its ReplicaSets could not be read ({(out.error if out else None) or 'not run'})")
+            owners = frozenset(("ReplicaSet", r["replicaSet"], r.get("uid")) for r in (out.data or {}).get("revisions") or [] if r.get("replicaSet"))
+        else:
+            out = await self._read("k8s_workloads", {"namespace": t.namespace})
+            if out is None or not out.ok:
+                return Members(frozenset(), frozenset(), f"the workloads could not be read ({(out.error if out else None) or 'not run'})")
+            found = next((w for w in out.data or [] if w.get("kind") == t.kind and w.get("name") == t.workload), None)
+            if found is None:
+                return Members(frozenset(), frozenset(), f"there is no {t.kind} {t.workload} in {t.namespace}")
+            owners = frozenset({(t.kind, t.workload, found.get("uid"))})
+        if not owners:
+            return Members(frozenset(), owners, "it owns no ReplicaSets")
+        pods = await self._read("k8s_list_pods", {"namespace": t.namespace})
+        if pods is None or not pods.ok:
+            return Members(frozenset(), owners, f"the pods could not be read ({(pods.error if pods else None) or 'not run'})")
+        names = frozenset(p["name"] for p in pods.data or [] if owned_by(p, owners))
+        return Members(names, owners, "" if names else "no pod's owner references point at it")
+
+    async def _read(self, tool: str, args: dict[str, Any]) -> Any:
+        """A read for resolving the target, counted against the crew's tool limit like any other. The first one is
+        ordinary crew evidence (the crew's own identical call then answers "already collected"); a repeat, after the
+        workload may have been recreated, reads current state again through the same ToolExecutor."""
+        key = tool + json.dumps(args, sort_keys=True)
+        if self.tool_calls >= self.tool_limit:
+            self.registry.gap("limits", f"the crew's limit of {self.tool_limit} tool calls was reached")
+            return None
+        self.tool_calls += 1
+        if key not in self.seen and key not in self.resolution:
+            out = await self.inv._call(self.executor, tool, args, "crewai: resolve the workload's pods by owner reference")
+            if out is not None and out.evidence_ref:  # registered, narrowed to the target, when the crew asks for it
+                self.resolution[key] = next(e for e in reversed(self.inv.evidence) if e["ref"] == out.evidence_ref)
+            return out
+        return await self.executor.run(tool, args)
+
+    async def _members_for(self, tool: CrewTool, raw: dict[str, Any]) -> Members:
+        if tool.name not in NEEDS_MEMBERS:
+            return self.members or NOBODY
+        named = raw.get("pod") or raw.get("object_name") if isinstance(raw, dict) else None
+        unknown = named and named != self.target.workload and named not in self.members.pods if self.members is not None else False
+        # again when a pod is not known yet, since the workload may have been recreated; at most once a minute, so
+        # naming pods that are not the target's cannot make the crew read the namespace over and over
+        if self.members is None or (unknown and time.monotonic() - self.members_at > REFRESH_SECONDS):
+            self.members, self.members_at = await self.resolve_members(), time.monotonic()
+        return self.members
+
     async def _call_tool(self, tool: CrewTool, raw: dict[str, Any]) -> str:
         with span(f"crewai tool {tool.name}", context=self.task_context, **{"moks.crewai.agent": tool.agent, "moks.tool": tool.tool}) as s:
+            members = await self._members_for(tool, raw)
             try:
-                args = bind(tool, self.target, raw if isinstance(raw, dict) else {}, log_lines=self.s.crewai_log_lines)
+                args = bind(tool, self.target, raw if isinstance(raw, dict) else {}, log_lines=self.s.crewai_log_lines, members=members)
+            except Empty as exc:
+                self.registry.gap(tool.name, str(exc))
+                return f"Empty result: {exc}. Nothing was read for {tool.name}; record this as missing evidence."
             except ValidationError as exc:
                 return f"Invalid arguments for {tool.name}: " + "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors()[:3])
             except Refused as exc:
@@ -227,6 +288,9 @@ class Run:
                 self.registry.gap(tool.needs, f"no {tool.needs} connector is configured for environment {self.target.environment}")
                 return f"Not available: no {tool.needs} source is configured here. Record this as missing evidence; do not guess."
             key = tool.tool + json.dumps(args, sort_keys=True)
+            if key in self.resolution and key not in self.seen:
+                record = self.resolution[key]
+                self.seen[key] = self.registry.add(record, agent=tool.agent, focus=focus(self.target, tool.tool, record.get("data"), members) if record.get("ok") else None)["id"]
             if key in self.seen:
                 entry = self.registry.records[self.seen[key]]
                 return self._observation(entry, again=True)
@@ -239,14 +303,14 @@ class Run:
                 self.registry.gap(tool.tool, "not run: " + (self.inv.notes[-1] if self.inv.notes else "the investigation's tool budget is spent"))
                 return "Not run: the investigation's tool budget is spent. Finish with the evidence already collected."
             record = next(e for e in reversed(self.inv.evidence) if e["ref"] == out.evidence_ref)
-            entry = self.registry.add(record, agent=tool.agent, focus=focus(self.target, tool.tool, out.data) if out.ok else None)
+            entry = self.registry.add(record, agent=tool.agent, focus=focus(self.target, tool.tool, out.data, members) if out.ok else None)
             self.seen[key] = entry["id"]
             s.set_attribute("moks.evidence", entry["id"])
             if not out.ok:
                 mark_failed(s, "tool_failed", out.error_kind or "error")
             if out.ok and tool.tool == "k8s_triage" and isinstance(out.data, dict):
                 for f in out.data.get("findings", []):
-                    if mine(self.target, f):
+                    if mine(self.target, f, members):
                         self.inv.findings.append({**f, "namespace": self.target.namespace, "evidence": [entry["id"]]})
             return self._observation(entry)
 
@@ -282,6 +346,11 @@ async def run(inv: Any, executor: ToolExecutor, ctx: Any, question: str, namespa
     state = capability(s, cfg)
     if not state["available"]:
         raise CrewUnavailable(f"CrewAI investigation unavailable: {state['reason']}")
+    if namespace == "*" or not ctx.scope.allows(namespace):
+        raise CrewUnavailable(f"CrewAI investigation unavailable: namespace {namespace} is outside this person's scope")
+    if ctx.focus_namespace not in (None, namespace):  # a resumed attempt never widens or moves the crew's target
+        inv.notes.append(f"The resumed attempt had focused on {ctx.focus_namespace}; the CrewAI investigation stays on {namespace}.")
+    ctx.focus_namespace = inv.focus_namespace = namespace  # knowledge retrieval is scoped to the target's namespace
     target = Target(environment=ctx.environment.name, namespace=namespace, workload=request["workload"], kind=request.get("kind") or "Deployment",
                     minutes=max(1, int((ctx.time_to - ctx.time_from).total_seconds() // 60)), repository=inv._repository(ctx))
     await inv._emit("phase", {"phase": "crewai", "label": "CrewAI: waiting for a crew slot"})

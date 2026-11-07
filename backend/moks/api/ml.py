@@ -296,7 +296,8 @@ class DatasetIn(BaseModel):
 
 def _dataset_out(d: LearningDataset) -> dict:
     return {"id": str(d.id), "name": d.name, "version": d.version, "purpose": d.purpose, "realm": d.realm, "feature_schema": d.feature_schema, "split": d.split, "counts": d.counts,
-            "checksum": d.checksum, "state": d.state, "created_at": d.created_at.isoformat() if d.created_at else None, "expires_at": d.expires_at.isoformat() if d.expires_at else None}
+            "checksum": d.checksum, "checksum_version": d.checksum_version, "state": d.state, **learning.provenance(d),
+            "created_at": d.created_at.isoformat() if d.created_at else None, "expires_at": d.expires_at.isoformat() if d.expires_at else None}
 
 
 @router.post("/learning/datasets", status_code=201)
@@ -320,8 +321,13 @@ async def export(did: uuid.UUID, ctx: AuthContext = Depends(needs(P.LEARNING_EXP
     ds = await db.get(LearningDataset, did)
     if ds is None:
         raise HTTPException(404, "Dataset not found")
-    rows = await learning.export_rows(db, ds)
+    try:
+        rows = await learning.export_rows(db, ds)
+    except learning.DatasetUnavailable as exc:
+        raise HTTPException(exc.status, exc.message) from None
+    prov = learning.provenance(ds)
     await audit.record(db, action="learning.dataset_export", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="learning_dataset", resource_id=str(ds.id), decision="allow",
-                       details={"rows": len(rows), "checksum": ds.checksum})
+                       details={"rows": len(rows), "checksum": ds.checksum, "provenance": prov["provenance"]})
     return PlainTextResponse("\n".join(json.dumps(r, default=str) for r in rows) + "\n", media_type="application/x-ndjson",
-                             headers={"Content-Disposition": f'attachment; filename="{ds.name}-v{ds.version}.jsonl"'})
+                             headers={"Content-Disposition": f'attachment; filename="{ds.name}-v{ds.version}.jsonl"', "X-MOKS-Dataset-Checksum": ds.checksum,
+                                      "X-MOKS-Dataset-Provenance": prov["provenance"]})

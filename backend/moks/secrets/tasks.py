@@ -13,6 +13,13 @@ Execution, per item, under a lease on its mapping (one MOKS operation per mappin
   5. The destination is read back and must hold the approved digest. Only then does the baseline move, with
      compare-and-set on the mapping's version and baseline sequence.
 
+Before every item, and again right before each write, authorize_item reloads the plan, the requester, the executor,
+the approval (or schedule), the expiry and the item's connectors (service.current_connectors). An authorization
+change (permission revoked, user disabled, approval gone or expired, plan cancelled) stops the plan: the items not
+reached are failed with "not run", and a retry runs them once authorization is valid again. A connector change
+(disabled, reconfigured, another account, region or cluster) makes them stale, which needs a fresh comparison and
+review. plan.summary.halted records what completed, what was not run and what is ambiguous.
+
 The race that remains: AWS has no precondition on PutSecretValue, so a client outside MOKS can write between the
 staged put and the conditional swap. The swap then fails and the item is stale, but that client's own write stays.
 Kubernetes is fully conditional. docs/SECRETS_SYNC.md describes both.
@@ -67,7 +74,8 @@ class Backends:
         self._built: dict[tuple, tuple[Any, Any]] = {}
 
     async def get(self, kube_row: Connector | None, aws_row: Connector | None) -> tuple[Any, Any]:
-        key = (kube_row.id if kube_row else None, aws_row.id if aws_row else None)
+        # keyed by configuration too: a connector edited during a job never reuses the client built from the old one
+        key = tuple(service.connector_fingerprint(r) if r is not None else None for r in (kube_row, aws_row))
         if key not in self._built:
             self._built[key] = await backends_factory(kube_row, aws_row)
         return self._built[key]
@@ -257,7 +265,8 @@ async def compare_plan(payload: dict[str, Any]) -> dict[str, Any]:
         for item in await service.items_of(db, plan):
             r = results[item.id]
             m = await db.get(SecretMapping, item.mapping_id)
-            for k in ("classification", "first_sync", "proposal", "kube_state", "aws_state", "source_state", "baseline", "impact", "rollback_version", "baseline_seq"):
+            for k in ("classification", "first_sync", "proposal", "kube_state", "aws_state", "source_state", "baseline", "impact", "rollback_version", "baseline_seq",
+                      "connector_binding"):
                 if k in r:
                     setattr(item, k, r[k])
             item.warnings = [f"compare: {w}" for w in r.get("warnings", [])]
@@ -298,7 +307,7 @@ async def _compare_item(backends: Backends, rows: dict, m: SecretMapping, item: 
         return {"classification": "failed", "kube_state": {}, "aws_state": {"error": reason}, "reason": reason}
     kube_state, _ = await read_kube(kube, m, dkey)
     aws_state, _, _, _ = await read_aws(aws, m, dkey)
-    out: dict[str, Any] = {"kube_state": kube_state, "aws_state": aws_state, "warnings": []}
+    out: dict[str, Any] = {"kube_state": kube_state, "aws_state": aws_state, "warnings": [], "connector_binding": service.connector_binding(kube_row, aws_row, uid, aws)}
     baseline = m.baseline
     if baseline and baseline.get("kid") != kid:
         out["warnings"].append("the digest key changed since the last sync, so the old baseline no longer applies")
@@ -385,6 +394,39 @@ class LeaseBusy(Exception):
     pass
 
 
+class Halt(Exception):
+    """Authorization or a connector changed during execution: nothing more is written. stale: a connector changed,
+    so the items not reached need a fresh comparison; otherwise they failed as "not run" and a retry may run them."""
+
+    def __init__(self, message: str, stale: bool):
+        super().__init__(message)
+        self.message, self.stale = message, stale
+
+
+async def authorize_item(plan_id: uuid.UUID, item_id: uuid.UUID) -> tuple[Connector, Connector]:
+    """Everything an item's writes rely on, read again from the database: the plan is still executing, the requester,
+    executor and approval (or schedule) are still valid for every namespace in it, the approval has not expired, and
+    the item's connectors are enabled and configured as when it was compared. Returns those connectors."""
+    from ..actions.service import PlanError
+
+    async with session_scope() as db:
+        plan = await db.get(SecretPlan, plan_id)
+        if plan is None or plan.status != "executing":
+            raise Halt(f"the plan is {plan.status if plan else 'gone'}, so nothing more is written", stale=False)
+        env = await db.get(Environment, plan.environment_id)
+        items = await service.items_of(db, plan)
+        mappings = await service.plan_mappings(db, plan)
+        try:
+            await service.verify_for_execution(db, plan, env, items, mappings)
+        except (service.SyncError, PlanError) as exc:
+            raise Halt(f"authorization changed: {exc.message}", stale=False) from None
+        item = next(i for i in items if i.id == item_id)
+        try:
+            return await service.current_connectors(db, env, mappings[item.mapping_id], item.connector_binding)
+        except service.SyncError as exc:
+            raise Halt(exc.message, stale=True) from None
+
+
 async def _lease(mapping_id: uuid.UUID, owner: uuid.UUID) -> bool:
     async with session_scope() as db:
         row = (await db.execute(text("""UPDATE secret_mappings SET lease_owner = :o, lease_expires_at = now() + make_interval(secs => :s)
@@ -451,16 +493,26 @@ async def execute_plan(payload: dict[str, Any]) -> dict[str, Any]:
             return {"error": exc.message}
         plan.status = "executing"
         todo = [i.id for i in service.runnable(items)]
-        rows = {r.id: r for r in (await db.execute(select(Connector).where(Connector.id.in_(
-            {m.kube_connector_id for m in mappings.values()} | {m.aws_connector_id for m in mappings.values()})))).scalars().all()}
         env_name, executed_by = env.name, plan.executed_by
     backends = Backends()
     outcomes: dict[str, int] = {}
+    halt: Halt | None = None
+    not_run: list[str] = []
     try:
         dkey = digest_key()
         for item_id in todo:
-            with span("secrets.execute.item"):
-                status = await _execute_item(backends, rows, item_id, plan_id, owner, dkey, env_name, executed_by)
+            if halt is None:
+                try:
+                    rows = await authorize_item(plan_id, item_id)
+                except Halt as exc:
+                    halt = exc
+            if halt is not None:
+                status = "stale" if halt.stale else "failed"
+                await _save_item(item_id, status=status, error=f"not run: {halt.message}")
+                not_run.append(str(item_id))
+            else:
+                with span("secrets.execute.item"):
+                    status, halt = await _execute_item(backends, rows, item_id, plan_id, owner, dkey, env_name, executed_by)
             outcomes[status] = outcomes.get(status, 0) + 1
     except ConnectorError as exc:  # no digest key: nothing ran
         outcomes["failed"] = len(todo)
@@ -476,12 +528,21 @@ async def execute_plan(payload: dict[str, Any]) -> dict[str, Any]:
         plan.status = "succeeded" if attempted and len(done) == len(attempted) else "partial" if done else "failed"
         plan.finished_at = datetime.now(timezone.utc)
         plan.summary = {**(plan.summary or {}), "outcomes": {s: sum(1 for i in attempted if i.status == s) for s in {i.status for i in attempted}}}
+        plan.summary.pop("halted", None)
+        if halt is not None:
+            ambiguous = [str(i.id) for i in attempted if i.status == "failed" and set((i.write_state or {}).values()) & {"intent", "applied"}]
+            plan.error = f"stopped before finishing: {halt.message}"
+            plan.summary["halted"] = {"reason": halt.message, "stale": halt.stale, "at": datetime.now(timezone.utc).isoformat(),
+                                      "completed": [str(i.id) for i in attempted if i.status == "succeeded"], "not_run": not_run, "ambiguous": ambiguous}
+            await audit.record(db, action="secrets.execute_halted", actor_id=executed_by, resource_type="secret_plan", resource_id=str(plan.id), environment=env_name,
+                               decision="deny", outcome="halted", details=plan.summary["halted"])
         await audit.record(db, action="secrets.execute", actor_id=executed_by, resource_type="secret_plan", resource_id=str(plan.id), environment=env_name,
                            decision="allow", outcome=plan.status, details={"outcomes": plan.summary["outcomes"], "hash": plan.plan_hash})
     return {"outcomes": outcomes}
 
 
-async def _execute_item(backends: Backends, rows: dict, item_id: uuid.UUID, plan_id: uuid.UUID, owner: uuid.UUID, dkey: bytes, env_name: str, executed_by) -> str:
+async def _execute_item(backends: Backends, rows: tuple[Connector, Connector], item_id: uuid.UUID, plan_id: uuid.UUID, owner: uuid.UUID, dkey: bytes, env_name: str,
+                        executed_by) -> tuple[str, Halt | None]:
     async with session_scope() as db:
         item = await db.get(SecretPlanItem, item_id)
         m = await db.get(SecretMapping, item.mapping_id)
@@ -490,14 +551,20 @@ async def _execute_item(backends: Backends, rows: dict, item_id: uuid.UUID, plan
         snap = {k: getattr(item, k) for k in ("mapping_version", "baseline_seq", "targets", "actions", "kube_state", "aws_state", "source_state", "expected",
                                                "resolution", "proposal", "key_choices", "rollback_version", "write_state", "idempotency_token", "diff")}
         kind = plan.kind
-    status, error = "failed", None
+    status, error, halt = "failed", None, None
+
+    async def guard() -> None:  # right before each write
+        await authorize_item(plan_id, item_id)
+
     try:
         await acquire(m.id, owner)
         try:
-            await _run_item(backends, rows, m, item_id, snap, kind, owner, dkey)  # it saves its result as it goes
+            await _run_item(backends, rows, m, item_id, snap, kind, owner, dkey, guard)  # it saves its result as it goes
             status = "succeeded"
         finally:
             await release(m.id, owner)
+    except Halt as exc:  # nothing of this write was attempted; a target this item already verified stays verified
+        halt, status, error = exc, "stale" if exc.stale else "failed", f"stopped before writing: {exc.message}"
     except Stale as exc:
         status, error = "stale", str(exc)
     except LeaseBusy as exc:
@@ -514,8 +581,8 @@ async def _execute_item(backends: Backends, rows: dict, item_id: uuid.UUID, plan
     async with session_scope() as db:
         item = await db.get(SecretPlanItem, item_id)
         await audit.record(db, action="secrets.item_execute", actor_id=executed_by, resource_type="secret_plan_item", resource_id=str(item_id), environment=env_name,
-                           namespace=m.namespace, decision="allow", outcome=status, details={**service._item_audit(item, m), "error": error, "result": item.result})
-    return status
+                           namespace=m.namespace, decision="deny" if halt else "allow", outcome=status, details={**service._item_audit(item, m), "error": error, "result": item.result})
+    return status, halt
 
 
 def _same(now: dict[str, Any], then: dict[str, Any], side: str) -> bool:
@@ -527,19 +594,20 @@ def _same(now: dict[str, Any], then: dict[str, Any], side: str) -> bool:
     return now.get("digest") == then.get("digest") and now.get(version) == then.get(version)
 
 
-async def _run_item(backends: Backends, rows: dict, m: SecretMapping, item_id: uuid.UUID, snap: dict[str, Any], kind: str, owner: uuid.UUID, dkey: bytes) -> dict[str, Any]:
+async def _run_item(backends: Backends, rows: tuple[Connector, Connector], m: SecretMapping, item_id: uuid.UUID, snap: dict[str, Any], kind: str, owner: uuid.UUID, dkey: bytes,
+                    guard: Callable[[], Any]) -> dict[str, Any]:
     async with session_scope() as db:
         fresh = await db.get(SecretMapping, m.id)
         if fresh.status != "active" or fresh.version != snap["mapping_version"]:
             raise Stale("the mapping was edited after the comparison; refresh the plan")
         if fresh.baseline_seq != snap["baseline_seq"]:
             raise Stale("another sync of this mapping finished after the comparison; refresh the plan")
-    kube_row, aws_row = rows.get(m.kube_connector_id), rows.get(m.aws_connector_id)
-    if kube_row is None or aws_row is None or not kube_row.enabled or not aws_row.enabled:
-        raise Stale("a connector of this mapping was removed or disabled")
+    kube_row, aws_row = rows  # checked by authorize_item just now
     kube, aws = await backends.get(kube_row, aws_row)
     if await kube.cluster_uid() != m.cluster_uid:
         raise Stale("the Kubernetes connector now points at a different cluster")
+    if aws.account_id != m.aws_account or aws.region != m.aws_region:
+        raise Stale("the AWS connector now points at a different account or region")
     write_state = dict(snap["write_state"] or {})
     expected = snap["expected"] or {}
 
@@ -595,6 +663,7 @@ async def _run_item(backends: Backends, rows: dict, m: SecretMapping, item_id: u
         if holds:
             result[f"{target}_unchanged"] = True  # nothing to write: no redundant version
         else:
+            await guard()
             await _still_ours(m.id, owner)
             await _write_state(item_id, target, "intent")
             write_state[target] = "intent"
@@ -778,8 +847,22 @@ async def schedule_discovery() -> int:
 
 
 
+async def hold_schedules() -> int:
+    """Under the manual-only policy, holds every schedule that could still run (schedules.hold_all)."""
+    from . import schedules
+
+    if not schedules.manual_only():
+        return 0
+    async with session_scope() as db:
+        return len(await schedules.hold_all(db))
+
+
 async def due_schedule() -> uuid.UUID | None:
-    """The oldest active schedule whose run is due and whose last run has finished."""
+    """The oldest active schedule whose run is due and whose last run has finished. None under the manual-only policy."""
+    from . import schedules
+
+    if schedules.manual_only():
+        return None
     async with session_scope() as db:
         row = (await db.execute(text("""SELECT s.id FROM secret_sync_schedules s LEFT JOIN secret_plans p ON p.id = s.last_plan_id
                                         WHERE s.status = 'active' AND (s.next_run_at IS NULL OR s.next_run_at <= now())
@@ -912,16 +995,33 @@ async def reveal(payload: dict[str, Any]) -> dict[str, Any]:
 
     from .seal import seal
 
+    from ..actions.service import PlanError, principal_of
+
     job_id = str(payload["_job_id"])
-    async with session_scope() as db:
+    binding = payload.get("binding") or {}
+    denied = None
+    async with session_scope() as db:  # reauthorized here, against current state, before anything is read
         env = await db.get(Environment, uuid.UUID(payload["environment_id"]))
-        row = await db.get(Connector, uuid.UUID(payload["connector_id"]))
-    side, ns, name = payload["side"], payload.get("namespace"), payload["name"]
+        try:
+            if env is None:
+                raise service.SyncError(404, "the environment is gone")
+            requester = await principal_of(db, uuid.UUID(str(payload["requested_by"])))
+            row = await service.check_reveal(db, env, binding, requester)
+        except (service.SyncError, PlanError) as exc:
+            denied = exc.message
+    if denied:
+        async with session_scope() as db:
+            await audit.record(db, action="secrets.reveal", actor_id=payload.get("requested_by"), resource_type="secret", resource_id=f"{binding.get('side')}:{binding.get('namespace') or ''}/{binding.get('name')}",
+                               environment=env.name if env else None, namespace=binding.get("auth_namespace") or "-", decision="deny", outcome="denied", details={"reason": denied})
+        raise ConnectorError("forbidden", f"not shown: {denied}")
+    side, ns, name = binding["side"], binding.get("namespace"), binding["name"]
     backends = Backends()
     keys: list[str] = []
     try:
         if side == "kubernetes":
             kube, _ = await backends.get(row, None)
+            if binding.get("cluster_uid") and await kube.cluster_uid() != binding["cluster_uid"]:
+                raise ConnectorError("forbidden", "not shown: the connector now points at a different cluster than when this was asked for")
             got = await kube.get(ns, name)
             if got is None:
                 raise ConnectorError("not_found", f"{ns}/{name} no longer exists")
@@ -934,6 +1034,8 @@ async def reveal(payload: dict[str, Any]) -> dict[str, Any]:
             meta = await aws.describe(name)
             if meta is None:
                 raise ConnectorError("not_found", f"{name} no longer exists")
+            if binding.get("arn") and meta.arn != binding["arn"]:
+                raise ConnectorError("forbidden", f"not shown: {name} was deleted and recreated after this was asked for; ask again")
             value = await aws.get_value(meta)
             if value.binary is not None:
                 shown = {"(binary)": _shown(value.binary)}
@@ -956,7 +1058,7 @@ async def reveal(payload: dict[str, Any]) -> dict[str, Any]:
         await backends.close()
     async with session_scope() as db:
         await audit.record(db, action="secrets.reveal", actor_id=payload.get("requested_by"), resource_type="secret", resource_id=f"{side}:{ns or ''}/{name}",
-                           environment=env.name, namespace=ns or "-", decision="allow", outcome="success", details={"side": side, "keys": keys})
+                           environment=env.name, namespace=binding.get("auth_namespace") or "-", decision="allow", outcome="success", details={"side": side, "keys": keys})
     return {"sealed": sealed, "key_count": len(keys)}
 
 

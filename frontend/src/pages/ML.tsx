@@ -248,7 +248,7 @@ function Datasets() {
   };
   return <>
     <h2>Datasets</h2>
-    <div className="small muted">Built from approved records only, de-duplicated, with every incident, deployment and document family kept on one side of the split. Exports carry features and labels, never evidence text.</div>
+    <div className="small muted">Built from approved records only, de-duplicated, with every incident, deployment and document family kept on one side of the split. Exports carry features and labels, never evidence text. A dataset is frozen when built: later label edits make a new version, and a withdrawn or deleted record invalidates it.</div>
     <form className="row wrap" onSubmit={build} aria-label="Build a dataset">
       <label>Name<input value={name} onChange={(e) => setName(e.target.value)} required pattern="[a-z0-9][a-z0-9-]+" /></label>
       <label>Purpose<select value={purpose} onChange={(e) => setPurpose(e.target.value)}>{["incident_similarity", "skill_ranking", "retrieval", "anomaly"].map((p) => <option key={p}>{p}</option>)}</select></label>
@@ -256,7 +256,11 @@ function Datasets() {
       <button type="submit">Build</button>
     </form>
     {sets.data ? <ul className="small">{sets.data.map((d) => <li key={d.id}><strong>{d.name} v{d.version}</strong> {d.purpose} · {d.counts.train} train / {d.counts.eval} eval · {d.split.duplicates_dropped} duplicates dropped ·
-      <span className="mono"> {d.checksum.slice(0, 12)}</span> · <a href={`${API}/ml/learning/datasets/${d.id}/export`}>Export JSONL</a></li>)}</ul> : <Loading load={sets} />}
+      <span className="mono"> {d.checksum.slice(0, 12)}</span>
+      {d.provenance === "snapshot" && <> · <Badge kind="ok">frozen</Badge></>}
+      {d.provenance === "legacy_live_records" && <> · <span title={d.reason}><Badge kind="warn">legacy: not reproducible</Badge></span></>}
+      {d.provenance === "invalidated" ? <> · <Badge kind="bad">invalidated</Badge> <span className="muted">{d.reason}</span></>
+        : <> · <a href={`${API}/ml/learning/datasets/${d.id}/export`}>Export JSONL</a></>}</li>)}</ul> : <Loading load={sets} />}
   </>;
 }
 
