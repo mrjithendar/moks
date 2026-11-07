@@ -159,8 +159,9 @@ reranker:
     tag: latest
   client:
     enabled: true
-# docs/SECRETS_SYNC.md. Every namespace on mk4 (2026-11-07): the chart makes one Role per name, so a namespace
-# created later needs adding here. Needs Secret moks/moks-secret-sync first (scripts/create-secret-sync-secret.sh),
+
+# docs/SECRETS_SYNC.md. The chart makes one Role per name and each must exist; a namespace created
+# later needs adding here. Needs Secret moks/moks-secret-sync first (scripts/create-secret-sync-secret.sh),
 # or the executor cannot start.
 secretsSync:
   enabled: true
