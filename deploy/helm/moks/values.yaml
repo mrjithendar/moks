@@ -276,6 +276,20 @@ executor:
     requests: {cpu: 50m, memory: 128Mi}
     limits: {cpu: 500m, memory: 384Mi}
 
+# Kubernetes <-> AWS Secrets Manager sync (docs/SECRETS_SYNC.md). Manual and reviewed only: nothing is scheduled.
+# Only the executor reads or writes values. It gets Secret verbs in these namespaces alone (each must exist), and
+# loads executorSecret, which must hold MOKS_SECRETS_DIGEST_KEY (32+ random characters) and, on Minikube, the
+# MOKS_CRED_* access keys the aws_secrets connector references. On EKS give moks-executor a Pod Identity
+# association instead (docs/examples/secrets-sync/). The connector itself (account, region, prefixes, tags,
+# namespaces) is created on the Connectors page or in seed.
+secretsSync:
+  enabled: false
+  namespaces: []
+  allowDelete: false          # adds delete on Secrets, for deletion plans; AWS deletion is a connector setting
+  executorSecret: moks-secret-sync
+  maxPlanItems: 100
+  discoveryMaxPages: 50
+
 # Cluster backups through Velero (docs/CLUSTER_BACKUPS.md). Needs Velero installed in this cluster.
 velero:
   enabled: false

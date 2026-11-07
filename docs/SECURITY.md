@@ -118,6 +118,10 @@ Every call, including embeddings, reserves its worst-case cost before it runs (`
 - Nothing sensitive goes to browser storage. The SPA keeps the CSRF token in memory, and
   `localStorage` is not used.
 
+Secret sync ([SECRETS_SYNC.md](SECRETS_SYNC.md)) is the one feature that reads Secret values. It does so only in
+the executor, keeps values in memory for one job, stores keyed digests (HMAC under a key only the executor has),
+has no reveal action, and is not reachable from investigations, LLM prompts or CrewAI.
+
 ## Audit
 
 `audit_events` records sign-ins (including failures), authorization denials, every tool call

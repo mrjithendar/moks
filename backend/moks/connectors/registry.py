@@ -20,6 +20,7 @@ from .grafana import GrafanaConnector
 from .kubernetes import KubernetesConnector
 from .loki import LokiConnector
 from .prometheus import PrometheusConnector
+from ..secrets.aws import AwsSecretsConnector
 
 CONNECTOR_TYPES: dict[str, Any] = {
     "kubernetes": KubernetesConnector,
@@ -30,6 +31,7 @@ CONNECTOR_TYPES: dict[str, Any] = {
     "git": GitConnector,
     "aws_cost": AwsCostConnector,
     "cost_model": CostModelConnector,
+    "aws_secrets": AwsSecretsConnector,  # calls AWS only from the executor (moks/secrets)
 }
 
 _cache: dict[uuid.UUID, tuple[str, Any]] = {}

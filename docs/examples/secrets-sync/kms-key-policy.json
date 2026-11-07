@@ -1,0 +1,11 @@
+{
+  "Sid": "AllowMoksExecutorThroughSecretsManagerOnly",
+  "Effect": "Allow",
+  "Principal": {"AWS": "arn:aws:iam::123456789012:role/moks-secret-sync"},
+  "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+  "Resource": "*",
+  "Condition": {
+    "StringEquals": {"kms:ViaService": "secretsmanager.eu-west-1.amazonaws.com", "kms:CallerAccount": "123456789012"},
+    "StringLike": {"kms:EncryptionContext:SecretARN": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:moks/*"}
+  }
+}

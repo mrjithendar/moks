@@ -28,6 +28,7 @@ export const NAV: NavGroup[] = [
     { to: "/terminal", label: "Terminal", icon: "terminal", show: (can) => can("terminal.use") || can("terminal.revoke") },
     { to: "/finops", label: "FinOps & rightsizing", icon: "coin", show: (can) => can("finops.read"), scoped: true },
     { to: "/backups", label: "Backups", icon: "archive", show: (can) => can("backup.read") },
+    { to: "/secrets", label: "Secrets sync", icon: "shield", show: (can) => can("secrets.discover") },
   ] },
   { label: "Knowledge", items: [
     { to: "/knowledge", label: "Runbooks & knowledge", icon: "book", end: true, show: read },

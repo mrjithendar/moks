@@ -37,6 +37,11 @@ data:
   CREWAI_DISABLE_TRACKING: "true"
   CREWAI_TRACING_ENABLED: "false"
   {{- end }}
+  MOKS_SECRETS_SYNC_ENABLED: {{ .Values.secretsSync.enabled | quote }}
+  {{- if .Values.secretsSync.enabled }}
+  MOKS_SECRETS_MAX_PLAN_ITEMS: {{ .Values.secretsSync.maxPlanItems | quote }}
+  MOKS_SECRETS_DISCOVERY_MAX_PAGES: {{ .Values.secretsSync.discoveryMaxPages | quote }}
+  {{- end }}
   MOKS_ML_DISABLED: {{ .Values.ml.disabled | quote }}
   MOKS_ML_LEARNING_CAPTURE: {{ .Values.ml.learningCapture | quote }}
   MOKS_ML_LEARNING_RETENTION_DAYS: {{ .Values.ml.learningRetentionDays | quote }}

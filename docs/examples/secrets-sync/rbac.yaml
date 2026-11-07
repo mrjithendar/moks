@@ -1,0 +1,34 @@
+# For clusters whose RBAC is not managed by the MOKS chart (a remote kubeconfig or EKS connector target).
+# One Role and RoleBinding per namespace that secret sync may touch. Subject: the identity in the connector's
+# config.executor (here the moks-executor ServiceAccount of the cluster running MOKS; for EKS, map the executor's
+# IAM role to a group with an access entry and bind that group instead).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: moks-secret-sync, namespace: shop}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, create, update]        # add delete only for reviewed deletion plans
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets]
+    verbs: [list]                              # workload impact in reviews
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: moks-secret-sync, namespace: shop}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: moks-secret-sync}
+subjects:
+  - {kind: ServiceAccount, name: moks-executor, namespace: moks}
+---
+# The cluster identity check reads kube-system's UID (already in the chart's moks-executor-cluster-identity).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: moks-executor-cluster-identity}
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    resourceNames: [kube-system]
+    verbs: [get]

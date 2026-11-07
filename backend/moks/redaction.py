@@ -3,7 +3,8 @@ audit details and API responses.
 
 Pattern-based redaction is a safety net, not a guarantee: it catches common credential
 shapes. Connectors additionally never read Kubernetes Secrets or environment values that
-reference them (see moks.connectors.kubernetes).
+reference them (see moks.connectors.kubernetes). The one exception is secret sync (moks.secrets), which reads
+values only in the executor and never passes them to anything that reaches this module.
 """
 from __future__ import annotations
 

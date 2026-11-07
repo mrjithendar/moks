@@ -1,5 +1,28 @@
 # Testing
 
+## Secret sync with AWS Secrets Manager (2026-11-07)
+
+Local only: PostgreSQL 17, Python 3.15 venv, Node 26, Helm. No real cluster, AWS account, KMS key or IAM policy was
+used. Kubernetes Secrets and Secrets Manager are in-memory fakes (`tests/secret_fakes.py`); the Secrets Manager fake
+follows boto3's request and error shapes, and the real `AwsSecretsConnector` runs against it.
+
+| Check | Result |
+|---|---|
+| Backend suite | 1351 passed, 48 skipped |
+| `test_secret_sync.py` | 39 passed, 3 runs in a row: encoding (binary, Unicode, empty vs absent, removed keys, json/text/binary refusals), keyed digests, three-way classification, ownership, workload impact, export, import, unchanged content, same name in two clusters and namespaces, AWS pagination and partial discovery, first-sync and both-sides conflicts, edited resolution, change after approval, hash tampering, mapping edits, concurrent plans on one mapping, ambiguous put and ambiguous swap, an outside write between stage and swap, partial bulk failure with KMS, controller ownership, IAM/KMS/RBAC/identity/namespace denials, deletion, rollback, restart as a separate action, a stopped executor, values absent from every table, log, span and response |
+| `test_secret_grants.py` | 2 passed: the whole flow under `moks_api` and `moks_executor`, and each role refused the other's columns |
+| Value-leak test sensitivity | a value deliberately copied into the stored comparison state made it fail |
+| `test_helm_render.py -k secret` | 8 passed: off by default, executor-only Secret with and without `secrets.split`, per-namespace Roles, delete only with `allowDelete` |
+| Migration 0033 | upgrade, downgrade to 0032, upgrade again on a fresh database |
+| Frontend suite, `tsc --noEmit`, `vite build` | 165 passed, clean, built; Secrets page chunk 10.4 KB gzip |
+| `helm lint` (minikube), `helm template` (minikube and EKS, feature on and off) | clean |
+| `scripts/create-secret-sync-secret.sh` | run against a stub kubectl: values reach the Secret through an env file, never argv |
+
+Not run: anything against a real API server or AWS. In particular, the real `UpdateSecretVersionStage` refusal of a
+moved `RemoveFromVersionId`, AWSPREVIOUS following it, `ClientRequestToken` idempotency, the IAM and KMS policy
+examples, and `SecretsKube` against a real API server (pagination, 409 on replace, delete preconditions) are
+modelled from AWS and Kubernetes documentation, not observed. The page was not driven in a browser.
+
 ## Evidence accuracy, readiness and ML (2026-11-05)
 
 Local only: PostgreSQL 17, Python 3.15 venv, Node 26, Helm. Nothing ran against mk4, a real Prometheus, a real

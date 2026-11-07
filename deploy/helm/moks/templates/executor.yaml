@@ -101,6 +101,37 @@ subjects:
   - {kind: ServiceAccount, name: moks-executor, namespace: {{ $.Release.Namespace }}}
 {{- end }}
 {{- end }}
+{{- if .Values.secretsSync.enabled }}
+{{- range .Values.secretsSync.namespaces }}
+---
+# Secret sync (docs/SECRETS_SYNC.md): read and write Secrets in this namespace only, plus the pod templates that
+# say which workloads read them. delete exists only with secretsSync.allowDelete, for reviewed deletion plans.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: moks-secret-sync
+  namespace: {{ . }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, create, update{{ if $.Values.secretsSync.allowDelete }}, delete{{ end }}]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets]
+    verbs: [list]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: moks-secret-sync
+  namespace: {{ . }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: moks-secret-sync}
+subjects:
+  - {kind: ServiceAccount, name: moks-executor, namespace: {{ $.Release.Namespace }}}
+{{- end }}
+{{- end }}
 {{- if .Values.velero.enabled }}
 ---
 # Velero objects, plus create or overwrite on the Secrets MOKS itself writes. No get or list:
@@ -166,6 +197,11 @@ spec:
           args: [executor]
           ports: [{name: metrics, containerPort: 9464}]
           {{- include "moks.env" (dict "root" . "component" "executor") | nindent 10 }}
+            {{- if .Values.secretsSync.enabled }}
+            # MOKS_SECRETS_DIGEST_KEY and any MOKS_CRED_* the aws_secrets connector references: the executor's alone,
+            # whether or not secrets.split is on
+            - secretRef: {name: {{ .Values.secretsSync.executorSecret }}}
+            {{- end }}
           env:
             - {name: MOKS_PROCESS_ROLE, value: executor}
           {{- include "moks.containerSecurity" . | nindent 10 }}

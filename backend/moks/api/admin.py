@@ -31,7 +31,7 @@ from ..rbac import ROLES, P
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-CONNECTOR_TYPES = ["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git", "aws_cost", "cost_model"]
+CONNECTOR_TYPES = ["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git", "aws_cost", "cost_model", "aws_secrets"]
 
 
 class CredentialRef(BaseModel):
@@ -57,7 +57,7 @@ def _check_no_secrets(config: dict[str, Any]) -> None:
 
 class ConnectorIn(BaseModel):
     environment: str
-    type: Literal["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git", "aws_cost", "cost_model"]
+    type: Literal["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git", "aws_cost", "cost_model", "aws_secrets"]
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,99}$")
     enabled: bool = True
     config: dict[str, Any] = Field(default_factory=dict)
@@ -279,7 +279,7 @@ class UserIn(BaseModel):
 
 
 class BindingIn(BaseModel):
-    role: Literal["viewer", "investigator", "operator", "approver", "knowledge_reviewer", "knowledge_admin", "index_operator", "skill_publisher", "ml_reviewer", "ml_admin", "admin"]
+    role: Literal["viewer", "investigator", "operator", "approver", "knowledge_reviewer", "knowledge_admin", "index_operator", "skill_publisher", "ml_reviewer", "ml_admin", "secrets_viewer", "secrets_operator", "secrets_approver", "admin"]
     environment: str = Field(default="*", pattern=r"^[a-z0-9*?\-]{1,100}$")
     namespace: str = Field(default="*", pattern=r"^[a-z0-9*?\-]{1,63}$")
 

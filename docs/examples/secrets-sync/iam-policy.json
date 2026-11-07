@@ -1,0 +1,53 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DiscoverList",
+      "Effect": "Allow",
+      "Action": "secretsmanager:ListSecrets",
+      "Resource": "*"
+    },
+    {
+      "Sid": "DiscoverDescribeAndCompare",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue", "secretsmanager:ListSecretVersionIds"],
+      "Resource": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:moks/*"
+    },
+    {
+      "Sid": "ExportAndRollback",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:PutSecretValue", "secretsmanager:UpdateSecretVersionStage"],
+      "Resource": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:moks/*"
+    },
+    {
+      "Sid": "CreateOnlyTaggedByMoks",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:CreateSecret", "secretsmanager:TagResource"],
+      "Resource": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:moks/*",
+      "Condition": {
+        "StringEquals": {"aws:RequestTag/moks:managed-by": "moks"},
+        "ForAllValues:StringEquals": {"aws:TagKeys": ["moks:managed-by", "moks:mapping", "team"]}
+      }
+    },
+    {
+      "Sid": "DeleteWithRecoveryOnly_RemoveUnlessAllowDelete",
+      "Effect": "Allow",
+      "Action": "secretsmanager:DeleteSecret",
+      "Resource": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:moks/*",
+      "Condition": {
+        "NumericGreaterThanEquals": {"secretsmanager:RecoveryWindowInDays": "7"},
+        "Bool": {"secretsmanager:ForceDeleteWithoutRecovery": "false"}
+      }
+    },
+    {
+      "Sid": "CustomerKmsKey_RemoveWhenUsingAwsManagedKey",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+      "Resource": "arn:aws:kms:eu-west-1:123456789012:key/REPLACE-KEY-ID",
+      "Condition": {
+        "StringEquals": {"kms:ViaService": "secretsmanager.eu-west-1.amazonaws.com"},
+        "StringLike": {"kms:EncryptionContext:SecretARN": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:moks/*"}
+      }
+    }
+  ]
+}
