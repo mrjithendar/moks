@@ -1,0 +1,64 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "foundation") }}
+{{- if .Values.mesh.enabled }}
+{{- if .Values.istio.mtls }}
+{{- fail "mesh.enabled and istio.mtls both render PeerAuthentication default; pick one (values.yaml, mesh)" }}
+{{- end }}
+# Sidecars behind Traefik (mk4). The namespace label istio-injection=enabled (Argo CD app moks-foundation)
+# injects them; Traefik is in the mesh too, so its requests arrive over mTLS. Pods without a sidecar,
+# and clients outside the mesh, can no longer connect, except to the metrics port below.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  mtls:
+    mode: STRICT
+{{- range $app := list "moks" "moks-reranker" }}
+---
+# Prometheus (outside the mesh) scrapes :9464 on the pod IPs, in plain text.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: {{ $app }}-metrics
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {app: {{ $app }}}
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    9464:
+      mode: PERMISSIVE
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+# Adds the sidecar's own traffic to the pods the other NetworkPolicies here already isolate. Only those
+# pods: selecting one that has no policy would cut off everything else it does.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: istio-sidecars
+  labels: {{- include "moks.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [moks, moks-postgres, moks-opensearch, moks-opensearch-dashboards, moks-reranker, moks-search, moks-search-dashboards]
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # 15020: health checks and merged metrics; 15090: Envoy's own (Prometheus job envoy-stats).
+    - from:
+        {{- range .Values.networkPolicy.metricsNamespaces }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ . }}}}
+        {{- end }}
+      ports: [{port: 15020, protocol: TCP}, {port: 15090, protocol: TCP}]
+  egress:
+    # Configuration and certificates from istiod. Without them the proxy never gets ready, and with
+    # holdApplicationUntilProxyStarts the application never starts.
+    - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.mesh.istiodNamespace }}}}}]
+      ports: [{port: 15012, protocol: TCP}]
+{{- end }}
+{{- end }}
+{{- end }}

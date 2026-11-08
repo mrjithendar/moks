@@ -58,6 +58,7 @@ spec:
     - {group: batch, kind: CronJob}
     - {group: batch, kind: Job}        # moks-migrate, when secrets.split is true
     - {group: rbac.authorization.k8s.io, kind: RoleBinding}
+    - {group: security.istio.io, kind: PeerAuthentication}   # values-minikube.yaml mesh
   # Secrets are deliberately absent: they are created out of band (deploy/secrets) and Argo CD
   # can neither create nor prune them.
   roles:

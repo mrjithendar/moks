@@ -130,9 +130,32 @@ def test_istio_sends_terminal_traffic_to_the_gateway_first():
     assert first["route"][0]["destination"]["host"] == "moks-terminal.moks.svc.cluster.local"
 
 
-def test_minikube_renders_no_mesh_objects():
-    kinds = {d["kind"] for d in render("values-minikube.yaml")}
-    assert not kinds & {"VirtualService", "PeerAuthentication", "AuthorizationPolicy"}
+def test_minikube_is_strict_behind_traefik_without_gateway_objects():
+    docs = render("values-minikube.yaml")
+    assert not {d["kind"] for d in docs} & {"VirtualService", "AuthorizationPolicy"}
+    peer = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "PeerAuthentication"}
+    assert peer["default"] == {"mtls": {"mode": "STRICT"}}
+    # Prometheus is outside the mesh and scrapes the pods' :9464 directly.
+    assert peer["moks-metrics"]["selector"] == {"matchLabels": {"app": "moks"}}
+    assert peer["moks-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}}
+
+
+def test_minikube_sidecars_reach_istiod_only_from_already_isolated_pods():
+    docs = render("values-minikube.yaml")
+    policies = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "NetworkPolicy"}
+    mesh = policies.pop("istio-sidecars")
+    selected = set(mesh["podSelector"]["matchExpressions"][0]["values"])
+    isolated = {p["podSelector"]["matchLabels"]["app"] for p in policies.values()
+                if set(p.get("policyTypes", [])) == {"Ingress", "Egress"} and "app" in p["podSelector"].get("matchLabels", {})}
+    assert isolated <= selected and selected - isolated <= {"moks-search", "moks-search-dashboards"}
+    assert mesh["egress"] == [{"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "istio-system"}}}],
+                               "ports": [{"port": 15012, "protocol": "TCP"}]}]
+    assert {"port": 15090, "protocol": "TCP"} in mesh["ingress"][0]["ports"]
+
+
+def test_mesh_and_gateway_mtls_are_exclusive():
+    with pytest.raises(subprocess.CalledProcessError):
+        render("values-eks.yaml", "mesh.enabled=true")
 
 
 def test_eks_is_strict_and_denies_by_default():

@@ -155,6 +155,14 @@ istio:
   mtls: false
   gatewayPrincipal: ""     # cluster.local/ns/<namespace>/sa/<ingress gateway ServiceAccount>
 
+# Sidecars and STRICT mTLS with Traefik (itself in the mesh) as the edge, no Istio Gateway: mk4. Renders
+# PeerAuthentication (metrics port 9464 stays PERMISSIVE for Prometheus) and the NetworkPolicy the sidecars
+# need. The namespace needs istio-injection=enabled, and the cluster Istio CNI (PSA baseline forbids istio-init).
+# Not together with istio.mtls.
+mesh:
+  enabled: false
+  istiodNamespace: istio-system
+
 postgres:
   bundled: true            # false: point MOKS_DATABASE_URL at an external database (e.g. RDS)
   image: postgres:17.11-alpine

@@ -52,7 +52,7 @@ seed:
           credential_ref: {type: env, name: MOKS_CRED_GRAFANA_TOKEN}   # Grafana service-account token (Viewer) in moks-secrets
         - type: git
           name: github
-          config: {provider: github, repositories: [mrjithendar/moks, mrjithendar/roboshop-ai, mrjithendar/tools, mrjithendar/jithendar.com]}
+          config: {provider: github, repositories: [mrjithendar/moks, mrjithendar/roboshop-ai, mrjithendar/tools, mrjithendar/miniKube, mrjithendar/jithendar.com]}   # miniKube is private: the GitHub token needs read access
         - type: cost_model
           name: hetzner
           config: {monthly_cost_usd: 0, cpu_share: 0.5, currency: USD}   # SET the server's real monthly price
@@ -70,6 +70,11 @@ api:
   replicas: 2
 worker:
   replicas: 1
+
+# Sidecars and STRICT mTLS (templates/mesh-sidecars.yaml). Needs tools minikube-infrastructure's Istio CNI first:
+# without it injected pods carry istio-init, which PSA baseline rejects.
+mesh:
+  enabled: true
 
 ingress:
   host: jithendar.com
