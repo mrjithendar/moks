@@ -138,31 +138,37 @@ rbac:
   clusterWide: true        # false: bind the ClusterRole only in rbac.namespaces
   namespaces: []
 
+# A plain Kubernetes Ingress for clusters with an ingress controller. HTTP to HTTPS and TLS are the controller's job.
+# The OpenSearch routes (rag.opensearch.publicRoute, dashboards) exist only with istio below: their logins and the
+# read-only rule live on the gateway.
 ingress:
-  enabled: true
-  className: traefik
+  enabled: false
+  className: ""            # empty: the cluster's default IngressClass
   host: jithendar.com
-  tlsSecretName: ""        # empty: Traefik's default TLSStore certificate
-  httpRedirect: true       # HTTP -> HTTPS via a Traefik middleware in this namespace
+  tlsSecretName: ""
   annotations: {}
 
-# Route through an existing Istio Gateway instead of an Ingress. Set ingress.enabled false with it.
+# Route through an Istio Gateway instead of an Ingress. Set ingress.enabled false with it.
 istio:
   enabled: false
   gateway: ""              # <namespace>/<name>
   host: ""
+  # true: render delegate VirtualServices (no hosts, no gateways) for a routing table that delegates this chart's
+  # prefixes to them (mk4: miniKube deploy/minikube/istio/edge). gateway and host are then unused.
+  delegate: false
   # STRICT mTLS and deny-by-default policies. Needs istio-injection on the namespace.
   mtls: false
   gatewayPrincipal: ""     # cluster.local/ns/<namespace>/sa/<ingress gateway ServiceAccount>
 
-# Sidecars and STRICT mTLS with Traefik (itself in the mesh) as the edge, no Istio Gateway: mk4. Renders
-# PeerAuthentication (metrics port 9464 stays PERMISSIVE for Prometheus) and the NetworkPolicy the sidecars
-# need. The namespace needs istio-injection=enabled, and the cluster Istio CNI (PSA baseline forbids istio-init).
-# Not together with istio.mtls.
+# Sidecars and STRICT mTLS without this chart's deny-by-default policies: mk4. Renders PeerAuthentication (metrics
+# port 9464 stays PERMISSIVE for Prometheus) and the NetworkPolicy the sidecars need. The namespace needs
+# istio-injection=enabled, and the cluster Istio CNI (PSA baseline forbids istio-init). Not together with istio.mtls.
 mesh:
   enabled: false
   istiodNamespace: istio-system
-  traefikInMesh: false     # true once Traefik has a sidecar: its routes then arrive over mTLS, so no port takes plain text
+  # true when the edge sends mTLS (an Istio ingress gateway): no port takes plain text. false keeps the edge ports
+  # (8080, 9200, 5601) PERMISSIVE for an edge outside the mesh.
+  edgeMtls: false
 
 postgres:
   bundled: true            # false: point MOKS_DATABASE_URL at an external database (e.g. RDS)
@@ -211,19 +217,20 @@ rag:
     nodeName: ""
     fixVolumePermissions: false   # true for storage that ignores fsGroup (minikube hostPath)
     diskWatermarks: {}     # {low: 3gb, high: 2gb, floodStage: 1gb} replaces the percentages. All three or none.
-    # Publish the bundled pod's read endpoints on ingress.host behind a basic-auth login. The pod has no
-    # security of its own, and this bypasses MOKS document access: the login reads every indexed chunk.
+    # Publish the bundled pod's read endpoints behind a basic-auth login. The pod has no security of its own, and
+    # this bypasses MOKS document access: the login reads every indexed chunk. Needs istio.delegate: the gateway's
+    # routing table holds the login (from authSecret) and the read-only rule (mk4: miniKube deploy/minikube/istio/edge).
     publicRoute:
       enabled: false
       path: /opensearch
-      authSecret: moks-opensearch-auth   # created out of band, see docs/OPERATOR_GUIDE.md
-    # OpenSearch Dashboards for the bundled pod, on ingress.host. This login can write and delete, because
-    # Dashboards reaches the pod directly, and it reads every chunk regardless of MOKS document access.
+      authSecret: moks-opensearch-auth   # created out of band, see docs/OPERATOR_GUIDE.md; the gateway's login comes from it
+    # OpenSearch Dashboards for the bundled pod. This login can write and delete, because Dashboards reaches the pod
+    # directly, and it reads every chunk regardless of MOKS document access. Needs istio.delegate, like publicRoute.
     dashboards:
       enabled: false
       image: opensearchproject/opensearch-dashboards:3.9.0@sha256:256d4cea5928868ac09bca642a0ac8285a2b7e4b7fdd45c4ec06e75a5cf3184c   # keep on the server's version
       path: /opensearch-dashboards
-      authSecret: moks-opensearch-dashboards-auth   # created out of band, see docs/OPERATOR_GUIDE.md
+      authSecret: moks-opensearch-dashboards-auth   # created out of band, see docs/OPERATOR_GUIDE.md; the gateway's login comes from it
     # moks-search: a second, secured single node beside the pod above (docs/OPENSEARCH.md). Persistence, not
     # high availability. enabled deploys it and moves nothing. active points search and indexing at it, and
     # the pod above stays as the way back until you remove it.
@@ -404,7 +411,7 @@ terminal:
 
 networkPolicy:
   enabled: true
-  ingressNamespaces: [traefik]       # who may reach the API port
+  ingressNamespaces: [istio-ingress] # who may reach the API port (the ingress gateway's namespace)
   metricsNamespaces: [monitoring]    # who may scrape :9464
   apiServer:                         # Kubernetes API endpoints (kubectl get endpointslices -n default)
     cidrs: []

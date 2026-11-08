@@ -1,4 +1,6 @@
-# The Traefik Ingresses and redirect Middleware.
+# The delegate VirtualServices for /moks, /opensearch and /opensearch-dashboards, which the Istio gateway's routing
+# table (miniKube deploy/minikube/istio/edge) sends here. The old Traefik Ingresses, Middlewares and IngressRoutes
+# are no longer rendered; Prune=false leaves them until they are deleted by hand.
 # Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
 apiVersion: argoproj.io/v1alpha1
 kind: Application

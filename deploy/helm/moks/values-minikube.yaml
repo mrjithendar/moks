@@ -1,4 +1,4 @@
-# mk4 (Hetzner, 4-node Minikube, arm64) behind Traefik at https://jithendar.com/moks
+# mk4 (Hetzner, Minikube, arm64) behind the Istio ingress gateway at https://jithendar.com/moks
 image:
   repository: registry.jithendar.com/jithendar/moks
   # CI moves latest on every master build. Pods get it when they restart (docs/RELEASES.md).
@@ -71,14 +71,22 @@ api:
 worker:
   replicas: 1
 
-# Sidecars and STRICT mTLS (templates/mesh-sidecars.yaml). Needs tools minikube-infrastructure's Istio CNI first:
+# Sidecars and STRICT mTLS (templates/mesh-sidecars.yaml). Needs miniKube minikube-infrastructure's Istio CNI first:
 # without it injected pods carry istio-init, which PSA baseline rejects.
 mesh:
   enabled: true
+  # false until Traefik is gone: while it still routes here directly (plain text), the edge ports stay PERMISSIVE.
+  # The Istio gateway sends mTLS either way. Set true in the cleanup after the cutover.
+  edgeMtls: false
 
+# Routed by the Istio ingress gateway: miniKube deploy/minikube/istio/edge delegates /moks, /opensearch and
+# /opensearch-dashboards to the VirtualServices this renders. TLS, HTTP to HTTPS and the OpenSearch logins and
+# read-only rule are the gateway's.
 ingress:
-  host: jithendar.com
-  tlsSecretName: ""     # Traefik default TLSStore (jithendar-com-tls) covers jithendar.com
+  enabled: false
+istio:
+  enabled: true
+  delegate: true
 
 postgres:
   bundled: true
@@ -96,8 +104,8 @@ rag:
     # All mk4 nodes share one disk, already past the default 90% limit on a 150 GiB volume. Bytes free
     # say what is really left. Below 1gb OpenSearch stops writes, which protects the other databases.
     diskWatermarks: {low: 3gb, high: 2gb, floodStage: 1gb}
-    publicRoute: {enabled: true}   # https://jithendar.com/opensearch, needs Secret moks-opensearch-auth
-    dashboards: {enabled: true}    # https://jithendar.com/opensearch-dashboards, needs Secret moks-opensearch-dashboards-auth
+    publicRoute: {enabled: true}   # https://jithendar.com/opensearch; login from Secret moks-opensearch-auth (on the gateway)
+    dashboards: {enabled: true}    # https://jithendar.com/opensearch-dashboards; login from Secret moks-opensearch-dashboards-auth
     # The secured cluster beside this one (docs/OPENSEARCH.md). Off until you run that document's steps.
     secure:
       enabled: false
@@ -142,6 +150,8 @@ terminal:
         ports: [443]
 
 networkPolicy:
+  # The Istio gateway, and Traefik until its routes here are deleted (cleanup after the cutover drops it).
+  ingressNamespaces: [istio-ingress, traefik]
   apiServer:
     cidrs: [10.96.0.1/32, 192.168.49.2/32]   # kubernetes Service VIP and the endpoint behind it
     ports: [443, 8443]
@@ -172,5 +182,5 @@ reranker:
 secretsSync:
   enabled: true
   allowDelete: true   # delete verb on Secrets, for reviewed deletion plans (always someone else's approval); AWS deletion is the connector's allow_delete
-  namespaces: [harbor, jithendar, moks, velero, traefik, observability,
+  namespaces: [harbor, jithendar, moks, velero, observability,
                moks-diagnostics, moks-lab, moks-terminals, monitoring, roboshop-ai ]

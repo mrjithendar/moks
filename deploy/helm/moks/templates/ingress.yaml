@@ -1,20 +1,21 @@
 {{- if include "moks.inGroup" (dict "root" . "group" "routing") }}
 {{- if .Values.ingress.enabled }}
-# Prefix match on the base path WITHOUT prefix stripping: MOKS serves the SPA, API, SSE and
-# auth callbacks under {{ .Values.basePath }} itself. A Prefix rule on /moks also matches /moks/...,
-# and Traefik prefers it over the site's "/" rule because it is longer.
-# No compress middleware here: compression can buffer Server-Sent Events.
+{{- if .Values.istio.enabled }}{{ fail "ingress.enabled and istio.enabled both route the portal; pick one" }}{{ end }}
+# A plain Ingress for clusters with an ingress controller (mk4 and EKS use istio.enabled instead). Prefix match on the
+# base path WITHOUT prefix stripping: MOKS serves the SPA, API, SSE and auth callbacks under {{ .Values.basePath }}
+# itself. Do not let the controller compress responses: compression can buffer Server-Sent Events.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: moks
   labels: {{- include "moks.labels" . | nindent 4 }}
-  annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: websecure
-    traefik.ingress.kubernetes.io/router.tls: "true"
-    {{- with .Values.ingress.annotations }}{{ toYaml . | nindent 4 }}{{- end }}
+  {{- with .Values.ingress.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
-  ingressClassName: {{ .Values.ingress.className }}
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
   tls:
     - hosts: [{{ .Values.ingress.host }}]
       {{- with .Values.ingress.tlsSecretName }}
@@ -25,7 +26,7 @@ spec:
       http:
         paths:
           {{- if .Values.terminal.enabled }}
-          # Longer, so it wins over the rule below. Traefik carries the WebSocket upgrade as is.
+          # Longer, so it wins over the rule below. The WebSocket upgrade must pass through as is.
           - path: {{ .Values.basePath }}/api/terminal
             pathType: Prefix
             backend: {service: {name: moks-terminal, port: {name: http}}}
@@ -33,79 +34,5 @@ spec:
           - path: {{ .Values.basePath }}
             pathType: Prefix
             backend: {service: {name: moks-api, port: {name: http}}}
-{{- if .Values.ingress.httpRedirect }}
----
-apiVersion: traefik.io/v1alpha1
-kind: Middleware
-metadata:
-  name: https-redirect
-  labels: {{- include "moks.labels" . | nindent 4 }}
-spec:
-  redirectScheme: {scheme: https, permanent: true}
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: moks-http
-  labels: {{- include "moks.labels" . | nindent 4 }}
-  annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: web
-    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-https-redirect@kubernetescrd
-spec:
-  ingressClassName: {{ .Values.ingress.className }}
-  rules:
-    - host: {{ .Values.ingress.host }}
-      http:
-        paths:
-          - path: {{ .Values.basePath }}
-            pathType: Prefix
-            backend: {service: {name: moks-api, port: {name: http}}}
-{{- end }}
-{{- with .Values.rag.opensearch.publicRoute }}
-{{- if and .enabled (eq $.Values.rag.backend "opensearch") (not $.Values.rag.opensearch.url) }}
----
-apiVersion: traefik.io/v1alpha1
-kind: Middleware
-metadata:
-  name: opensearch-auth
-  labels: {{- include "moks.labels" $ | nindent 4 }}
-spec:
-  basicAuth:
-    secret: {{ .authSecret }}
-    removeHeader: true
----
-apiVersion: traefik.io/v1alpha1
-kind: Middleware
-metadata:
-  name: opensearch-strip-prefix
-  labels: {{- include "moks.labels" $ | nindent 4 }}
-spec:
-  stripPrefix: {prefixes: [{{ .path }}]}
----
-# OpenSearch has no authentication here and POST and PUT also change data, so only reads are routed:
-# GET and HEAD, plus POST to the search endpoints, which take their query in the body. Anything else
-# under this path falls through to the site's "/" rule. A missing Secret leaves this router out too.
-apiVersion: traefik.io/v1alpha1
-kind: IngressRoute
-metadata:
-  name: opensearch
-  labels: {{- include "moks.labels" $ | nindent 4 }}
-spec:
-  entryPoints: [websecure]
-  routes:
-    - kind: Rule
-      match: >-
-        Host(`{{ $.Values.ingress.host }}`) && (Path(`{{ .path }}`) || PathPrefix(`{{ .path }}/`))
-        && (Method(`GET`) || Method(`HEAD`)
-        || (Method(`POST`) && PathRegexp(`^{{ .path }}(/[^/]+)?/_(search|msearch|count)$`)))
-      middlewares:
-        - name: opensearch-auth
-        - name: opensearch-strip-prefix
-      services:
-        - name: moks-opensearch
-          port: http
-  tls: {}
-{{- end }}
-{{- end }}
 {{- end }}
 {{- end }}

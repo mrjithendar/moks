@@ -1,5 +1,6 @@
 {{- with .Values.rag.opensearch.dashboards }}
-{{- if and .enabled $.Values.ingress.enabled (eq $.Values.rag.backend "opensearch") (not $.Values.rag.opensearch.url) }}
+{{- if and .enabled $.Values.istio.enabled (not $.Values.istio.delegate) }}{{ fail "rag.opensearch.dashboards needs istio.delegate: its login lives on the gateway's routing table" }}{{ end }}
+{{- if and .enabled $.Values.istio.delegate (eq $.Values.rag.backend "opensearch") (not $.Values.rag.opensearch.url) }}
 {{- if include "moks.inGroup" (dict "root" $ "group" "opensearch") }}
 # Web UI for the bundled pod. Settings are env vars, not a mounted file: the image's entrypoint rewrites
 # opensearch_dashboards.yml when it drops the security plugin, so that file has to stay writable.
@@ -71,35 +72,20 @@ spec:
 {{- end }}
 {{- if include "moks.inGroup" (dict "root" $ "group" "routing") }}
 ---
-# Its own login, not the API's: Dashboards reaches OpenSearch directly, so this login can write and delete.
-apiVersion: traefik.io/v1alpha1
-kind: Middleware
+# A delegate for {{ .path }}. The login is on the gateway, not here: its own (Secret {{ .authSecret }}), not
+# the API's, because Dashboards reaches OpenSearch directly, so this login can write and delete (mk4: miniKube
+# deploy/minikube/istio/edge, basicAuth opensearch-dashboards). No prefix stripping: Dashboards serves
+# everything under its base path itself.
+apiVersion: networking.istio.io/v1
+kind: VirtualService
 metadata:
-  name: opensearch-dashboards-auth
+  name: moks-opensearch-dashboards
   labels: {{- include "moks.labels" $ | nindent 4 }}
 spec:
-  basicAuth:
-    secret: {{ .authSecret }}
-    removeHeader: true
----
-# No prefix stripping: Dashboards serves everything under its base path itself. A missing Secret leaves
-# this router out, so the path shows the site's 404.
-apiVersion: traefik.io/v1alpha1
-kind: IngressRoute
-metadata:
-  name: opensearch-dashboards
-  labels: {{- include "moks.labels" $ | nindent 4 }}
-spec:
-  entryPoints: [websecure]
-  routes:
-    - kind: Rule
-      match: Host(`{{ $.Values.ingress.host }}`) && (Path(`{{ .path }}`) || PathPrefix(`{{ .path }}/`))
-      middlewares:
-        - name: opensearch-dashboards-auth
-      services:
-        - name: moks-opensearch-dashboards
-          port: http
-  tls: {}
+  http:
+    - name: opensearch-dashboards
+      route:
+        - destination: {host: moks-opensearch-dashboards.{{ $.Release.Namespace }}.svc.cluster.local, port: {number: 5601}}
 {{- end }}
 {{- end }}
 {{- end }}

@@ -2,7 +2,7 @@
 {{- with $secure.dashboards }}
 {{- if .enabled }}
 {{- if not $secure.enabled }}{{ fail "rag.opensearch.secure.dashboards needs rag.opensearch.secure.enabled: it reads moks-search" }}{{ end -}}
-{{- if and .ingress.enabled (not $.Values.ingress.enabled) }}{{ fail "rag.opensearch.secure.dashboards.ingress needs ingress.enabled" }}{{ end -}}
+{{- if and .ingress.enabled (not $.Values.istio.delegate) }}{{ fail "rag.opensearch.secure.dashboards.ingress needs istio.delegate: the gateway's routing table owns the path" }}{{ end -}}
 {{- if and .ingress.enabled $.Values.rag.opensearch.publicRoute.enabled (eq .ingress.path $.Values.rag.opensearch.publicRoute.path) }}{{ fail "rag.opensearch.secure.dashboards.ingress.path is taken by rag.opensearch.publicRoute: turn that route off, or use another path" }}{{ end -}}
 {{- if and .ingress.enabled (eq (trimSuffix "/" .ingress.path) "") }}{{ fail "rag.opensearch.secure.dashboards.ingress.path must not be the site root" }}{{ end -}}
 {{- $base := "" }}{{ if .ingress.enabled }}{{ $base = trimSuffix "/" .ingress.path }}{{ end }}
@@ -106,21 +106,20 @@ spec:
 {{- if and .ingress.enabled (include "moks.inGroup" (dict "root" $ "group" "routing")) }}
 ---
 # Optional. Everything behind this path needs an OpenSearch login: the security plugin refuses anonymous users,
-# and Dashboards serves its base path itself, so nothing strips the prefix.
-apiVersion: traefik.io/v1alpha1
-kind: IngressRoute
+# and Dashboards serves its base path itself, so nothing strips the prefix. A delegate under the name the gateway's
+# routing table uses for {{ $base }} (mk4: miniKube deploy/minikube/istio/edge, moks/moks-opensearch). Before turning
+# this on there, remove that table's "opensearch" login and read-only rule: they belong to the bundled pod's route,
+# and would block Dashboards' own login and every change it makes.
+apiVersion: networking.istio.io/v1
+kind: VirtualService
 metadata:
-  name: moks-search-dashboards
+  name: moks-opensearch
   labels: {{- include "moks.labels" $ | nindent 4 }}
 spec:
-  entryPoints: [websecure]
-  routes:
-    - kind: Rule
-      match: Host(`{{ $.Values.ingress.host }}`) && (Path(`{{ $base }}`) || PathPrefix(`{{ $base }}/`))
-      services:
-        - name: moks-search-dashboards
-          port: http
-  tls: {}
+  http:
+    - name: search-dashboards
+      route:
+        - destination: {host: moks-search-dashboards.{{ $.Release.Namespace }}.svc.cluster.local, port: {number: 5601}}
 {{- end }}
 {{- end }}
 {{- end }}

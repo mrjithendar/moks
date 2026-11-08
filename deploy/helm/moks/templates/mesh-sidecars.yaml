@@ -3,7 +3,7 @@
 {{- if .Values.istio.mtls }}
 {{- fail "mesh.enabled and istio.mtls both render PeerAuthentication default; pick one (values.yaml, mesh)" }}
 {{- end }}
-# Sidecars behind Traefik (mk4). The namespace label istio-injection=enabled (Argo CD app moks-foundation)
+# Sidecars without the istio.mtls deny-by-default policies (mk4). The namespace label istio-injection=enabled (Argo CD app moks-foundation)
 # injects them, and the istio-cni agent (miniKube repository) redirects their traffic, so Pod Security
 # "baseline" admits them. Pods without a sidecar, and clients outside the mesh, can no longer connect, except
 # to the ports listed below.
@@ -16,9 +16,10 @@ spec:
   mtls:
     mode: STRICT
 {{- /* Plain text still arrives from outside the mesh: Prometheus scrapes :9464 on the pod IPs, and, until
-       mesh.traefikInMesh, Traefik sends the edge routes there in plain text (8080 api and terminal, 9200 and
-       5601 the OpenSearch routes). Names are kept: two PeerAuthentications on one selector conflict. */}}
-{{- $edge := not .Values.mesh.traefikInMesh }}
+       mesh.edgeMtls, an edge outside the mesh (Traefik) sends the public routes there in plain text (8080 api and
+       terminal, 9200 and 5601 the OpenSearch routes). The Istio ingress gateway sends mTLS. Names are kept: two
+       PeerAuthentications on one selector conflict. */}}
+{{- $edge := not .Values.mesh.edgeMtls }}
 {{- $plain := list (dict "name" "moks-metrics" "app" "moks" "ports" (ternary (list 9464 8080) (list 9464) $edge))
                    (dict "name" "moks-reranker-metrics" "app" "moks-reranker" "ports" (list 9464)) }}
 {{- if $edge }}

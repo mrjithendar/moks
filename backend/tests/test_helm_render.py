@@ -131,19 +131,23 @@ def test_istio_sends_terminal_traffic_to_the_gateway_first():
     assert first["route"][0]["destination"]["host"] == "moks-terminal.moks.svc.cluster.local"
 
 
-def test_minikube_is_strict_behind_traefik_without_gateway_objects():
+def test_minikube_is_strict_and_routed_by_delegates_without_gateway_policies():
     docs = render("values-minikube.yaml")
-    assert not {d["kind"] for d in docs} & {"VirtualService", "AuthorizationPolicy"}
+    assert "AuthorizationPolicy" not in {d["kind"] for d in docs}
+    assert not any(d["kind"] == "Ingress" or d["apiVersion"].startswith("traefik.io/") for d in docs)
+    routes = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "VirtualService"}
+    assert set(routes) == {"moks", "moks-opensearch", "moks-opensearch-dashboards"}
+    assert not any("hosts" in r or "gateways" in r for r in routes.values())   # delegates of miniKube's routing table
     peer = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "PeerAuthentication"}
     assert peer["default"] == {"mtls": {"mode": "STRICT"}}
     # Prometheus is outside the mesh and scrapes the pods' :9464 directly.
     assert peer["moks-metrics"]["selector"] == {"matchLabels": {"app": "moks"}}
     assert peer["moks-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}, 8080: {"mode": "PERMISSIVE"}}
-    # Traefik has no sidecar yet, so each port it routes to takes plain text; nothing else does.
+    # Until mesh.edgeMtls, Traefik may still route here in plain text, so each port it routes to takes it; nothing else does.
     assert peer["moks-reranker-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}}
     assert peer["moks-opensearch-edge"]["portLevelMtls"] == {9200: {"mode": "PERMISSIVE"}}
     assert peer["moks-opensearch-dashboards-edge"]["portLevelMtls"] == {5601: {"mode": "PERMISSIVE"}}
-    meshed = {d["metadata"]["name"]: d["spec"] for d in render("values-minikube.yaml", "mesh.traefikInMesh=true") if d["kind"] == "PeerAuthentication"}
+    meshed = {d["metadata"]["name"]: d["spec"] for d in render("values-minikube.yaml", "mesh.edgeMtls=true") if d["kind"] == "PeerAuthentication"}
     assert set(meshed) == {"default", "moks-metrics", "moks-reranker-metrics"} and meshed["moks-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}}
 
 
@@ -306,7 +310,12 @@ def test_mk4_opts_into_the_terminal_with_https_only():
 
 def test_the_gateway_is_routed_under_the_base_path_and_keeps_to_its_own_identity():
     docs = render("values-minikube.yaml", *TERMINAL)
-    paths = of(docs, "Ingress", "moks")["spec"]["rules"][0]["http"]["paths"]
+    terminal, portal = of(docs, "VirtualService", "moks")["spec"]["http"]
+    # Both narrow the routing table's /moks prefix, so Istio's delegation accepts them.
+    assert terminal["match"] == [{"uri": {"prefix": "/moks/api/terminal"}}] and terminal["route"][0]["destination"]["host"] == "moks-terminal.moks.svc.cluster.local"
+    assert portal["match"] == [{"uri": {"prefix": "/moks"}}] and portal["route"][0]["destination"]["host"] == "moks-api.moks.svc.cluster.local"
+    plain = render("values-minikube.yaml", *TERMINAL, "istio.enabled=false", "ingress.enabled=true", "rag.opensearch.publicRoute.enabled=false", "rag.opensearch.dashboards.enabled=false")
+    paths = of(plain, "Ingress", "moks")["spec"]["rules"][0]["http"]["paths"]
     assert paths[0]["path"] == "/moks/api/terminal" and paths[0]["backend"]["service"]["name"] == "moks-terminal"
     assert paths[1]["path"] == "/moks" and paths[1]["backend"]["service"]["name"] == "moks-api"
     pod = dict(pods(docs))["moks-terminal"]
@@ -401,16 +410,24 @@ def test_the_mesh_allows_only_the_callers():
     assert rule["to"][0]["operation"]["ports"] == ["8090"] and all(p.startswith("cluster.local/ns/moks/sa/") for p in rule["from"][0]["source"]["principals"])
 
 
-def test_opensearch_public_route_is_read_only_behind_a_login():
+def test_opensearch_public_route_is_a_delegate_that_strips_its_prefix():
+    # The login and the read-only rule are the gateway's (miniKube deploy/minikube/istio/edge): this only routes.
     docs = render("values-minikube.yaml")
-    route = of(docs, "IngressRoute", "opensearch")["spec"]
-    match = route["routes"][0]["match"]
-    assert route["entryPoints"] == ["websecure"] and "tls" in route
-    assert [m["name"] for m in route["routes"][0]["middlewares"]] == ["opensearch-auth", "opensearch-strip-prefix"]
-    assert "PUT" not in match and "DELETE" not in match and "(search|msearch|count)$" in match
-    assert of(docs, "Middleware", "opensearch-auth")["spec"]["basicAuth"] == {"secret": "moks-opensearch-auth", "removeHeader": True}
+    route = of(docs, "VirtualService", "moks-opensearch")["spec"]
+    assert "hosts" not in route and "gateways" not in route
+    (http,) = route["http"]
+    assert "match" not in http and http["rewrite"] == {"uriRegexRewrite": {"match": "^/opensearch/?", "rewrite": "/"}}
+    assert http["route"][0]["destination"] == {"host": "moks-opensearch.moks.svc.cluster.local", "port": {"number": 9200}}
+    assert not any(d["apiVersion"].startswith("traefik.io/") for d in docs)
     rules = of(docs, "NetworkPolicy", "moks-opensearch")["spec"]["ingress"]
-    assert {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "traefik"}}} in rules[1]["from"]
+    assert {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "istio-ingress"}}} in rules[1]["from"]
+
+
+def test_opensearch_routes_need_the_gateway_routing_table():
+    # Without a delegating gateway there is nowhere for the login and the read-only rule to live.
+    with pytest.raises(subprocess.CalledProcessError) as e:
+        render("values-minikube.yaml", "istio.delegate=false", "istio.gateway=istio-ingress/public", "istio.host=jithendar.com")
+    assert "needs istio.delegate" in e.value.stderr
 
 
 def test_opensearch_dashboards_has_its_own_login_and_a_writable_config():
@@ -421,9 +438,9 @@ def test_opensearch_dashboards_has_its_own_login_and_a_writable_config():
     assert env["OPENSEARCH_HOSTS"] == '["http://moks-opensearch:9200"]' and env["DISABLE_SECURITY_DASHBOARDS_PLUGIN"] == "true"
     assert ":" + "3.9.0" in pod["containers"][0]["image"] and ":3.9.0" in of(docs, "StatefulSet", "moks-opensearch")["spec"]["template"]["spec"]["containers"][0]["image"]
     assert not pod["containers"][0].get("volumeMounts") and pod["automountServiceAccountToken"] is False
-    route = of(docs, "IngressRoute", "opensearch-dashboards")["spec"]["routes"][0]
-    assert [m["name"] for m in route["middlewares"]] == ["opensearch-dashboards-auth"]
-    assert of(docs, "Middleware", "opensearch-dashboards-auth")["spec"]["basicAuth"]["secret"] == "moks-opensearch-dashboards-auth"
+    route = of(docs, "VirtualService", "moks-opensearch-dashboards")["spec"]
+    assert "hosts" not in route and "rewrite" not in route["http"][0]   # Dashboards serves its base path itself
+    assert route["http"][0]["route"][0]["destination"]["host"] == "moks-opensearch-dashboards.moks.svc.cluster.local"
     assert {"podSelector": {"matchLabels": {"app": "moks-opensearch-dashboards"}}} in of(docs, "NetworkPolicy", "moks-opensearch")["spec"]["ingress"][2]["from"]
 
 
@@ -431,6 +448,7 @@ def test_opensearch_dashboards_has_its_own_login_and_a_writable_config():
 def test_opensearch_stays_private_unless_the_bundled_pod_is_published(sets):
     docs = render("values-minikube.yaml", *sets)
     assert not any(d["kind"] == "IngressRoute" or d["metadata"]["name"].startswith("opensearch-") for d in docs)
+    assert {d["metadata"]["name"] for d in docs if d["kind"] == "VirtualService"} == {"moks"}
 
 
 def test_mk4_runs_opensearch_on_the_node_with_its_data():
@@ -606,9 +624,10 @@ def test_secured_dashboards_can_sit_behind_a_base_path():
     assert cfg["server.basePath"] == "/opensearch" and cfg["server.rewriteBasePath"] is True and cfg["opensearch_security.cookie.secure"] is True
     pod = of(docs, "Deployment", "moks-search-dashboards")["spec"]["template"]["spec"]["containers"][0]
     assert pod["startupProbe"]["httpGet"]["path"] == "/opensearch/app/login"  # with rewriteBasePath the server answers under it
-    route = of(docs, "IngressRoute", "moks-search-dashboards")["spec"]
-    assert route["entryPoints"] == ["websecure"] and "tls" in route and "middlewares" not in route["routes"][0]  # nothing strips the prefix
-    assert "PathPrefix(`/opensearch/`)" in route["routes"][0]["match"]
+    # The delegate the gateway's routing table uses for /opensearch; nothing strips the prefix.
+    route = of(docs, "VirtualService", "moks-opensearch")["spec"]
+    assert "hosts" not in route and "rewrite" not in route["http"][0]
+    assert route["http"][0]["route"][0]["destination"]["host"] == "moks-search-dashboards.moks.svc.cluster.local"
     assert of(docs, "NetworkPolicy", "moks-search-dashboards")["spec"]["ingress"]
 
 

@@ -1,0 +1,24 @@
+{{- if include "moks.inGroup" (dict "root" . "group" "routing") }}
+{{- with .Values.rag.opensearch.publicRoute }}
+{{- if and .enabled $.Values.istio.enabled (not $.Values.istio.delegate) }}{{ fail "rag.opensearch.publicRoute needs istio.delegate: its login and read-only rule live on the gateway's routing table" }}{{ end }}
+{{- if and .enabled $.Values.istio.delegate (eq $.Values.rag.backend "opensearch") (not $.Values.rag.opensearch.url) }}
+# A delegate for {{ .path }}: the bundled pod's read endpoints. OpenSearch has no authentication here and POST and
+# PUT also change data, so the gateway that owns the prefix must hold both the login (Secret {{ .authSecret }}) and
+# the read-only rule (GET, HEAD, POST to _search/_msearch/_count). mk4: miniKube deploy/minikube/istio/edge, values
+# basicAuth "opensearch" and readOnly. This login reads every indexed chunk, past MOKS document access.
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: moks-opensearch
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+spec:
+  http:
+    - name: opensearch
+      # {{ .path }}/x → /x and {{ .path }} → /, what Traefik's stripPrefix did.
+      rewrite:
+        uriRegexRewrite: {match: {{ printf "^%s/?" .path | quote }}, rewrite: /}
+      route:
+        - destination: {host: moks-opensearch.{{ $.Release.Namespace }}.svc.cluster.local, port: {number: 9200}}
+{{- end }}
+{{- end }}
+{{- end }}

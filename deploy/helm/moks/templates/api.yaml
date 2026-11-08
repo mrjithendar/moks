@@ -35,7 +35,7 @@ spec:
             - {name: metrics, containerPort: 9464}
           {{- include "moks.env" (dict "root" . "component" "api") | nindent 10 }}
           env:
-            - {name: FORWARDED_ALLOW_IPS, value: "*"}  # only Traefik can reach :8080 (NetworkPolicy)
+            - {name: FORWARDED_ALLOW_IPS, value: "*"}  # only the ingress namespaces can reach :8080 (NetworkPolicy)
             {{- if include "moks.searchActive" . }}
             {{- include "moks.searchIdentities" (dict "root" . "component" "api") | nindent 12 }}
             {{- end }}

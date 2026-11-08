@@ -3,14 +3,20 @@
 # The Istio counterpart of ingress.yaml: a prefix match on the base path with no rewrite, because
 # MOKS serves everything under {{ .Values.basePath }} itself. No timeout field, which is Istio's "no
 # overall deadline": a route timeout would cut off SSE streams and terminal WebSockets.
+{{- if .Values.istio.delegate }}
+# A delegate: the routing table that owns the host (mk4: miniKube deploy/minikube/istio/edge) sends
+# {{ .Values.basePath }} here, so this has no hosts or gateways of its own.
+{{- end }}
 apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: moks
   labels: {{- include "moks.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.istio.delegate }}
   hosts: [{{ required "istio.host is required" .Values.istio.host }}]
   gateways: [{{ required "istio.gateway is required: <namespace>/<name>" .Values.istio.gateway }}]
+  {{- end }}
   http:
     {{- if .Values.terminal.enabled }}
     # First, so it wins over the rule below. Istio carries the WebSocket upgrade as is.
