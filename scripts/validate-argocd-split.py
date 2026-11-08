@@ -254,7 +254,8 @@ def check_common(path: Path, app: dict) -> None:
     where = str(path.relative_to(ROOT))
     policy = app["spec"].get("syncPolicy", {})
     check(app.get("kind") == "Application" and app["metadata"].get("namespace") == "argocd", f"{where}: not an Application in argocd", "applications")
-    check("automated" not in policy, f"{where}: automated sync is on", "manualSync")
+    auto = policy.get("automated") or {}
+    check(bool(policy.get("automated")) and auto.get("enabled", True) and auto.get("prune") is False, f"{where}: automated sync must be on with prune: false", "manualSync")
     check(not app["metadata"].get("finalizers"), f"{where}: a finalizer would make deletion cascade", "noFinalizers")
     check("FailOnSharedResource=true" in policy.get("syncOptions", []), f"{where}: FailOnSharedResource=true is missing", "failOnShared")
     check("PruneLast=true" in policy.get("syncOptions", []), f"{where}: PruneLast=true is missing", "applications")

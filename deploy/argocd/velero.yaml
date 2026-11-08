@@ -51,6 +51,10 @@ spec:
     server: https://kubernetes.default.svc
     namespace: velero
   syncPolicy:
+    automated:
+      enabled: true
+      prune: false
+      selfHeal: true
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true        # Velero's CRDs are too large for client-side apply

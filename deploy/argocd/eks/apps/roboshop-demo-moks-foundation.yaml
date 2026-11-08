@@ -26,6 +26,10 @@ spec:
     name: roboshop-demo
     namespace: moks
   syncPolicy:
+    automated:
+      enabled: true
+      prune: false
+      selfHeal: true
     syncOptions:
       - CreateNamespace=true
       - PruneLast=true
