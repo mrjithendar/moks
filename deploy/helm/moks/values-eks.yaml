@@ -100,7 +100,7 @@ diagnostics:
 # Read-only shells. A push changes nothing here: the gateway exists after roboshop-demo-moks-terminal is
 # synced by hand, and docs/TERMINAL.md lists what must pass before anyone else is granted the role.
 terminal:
-  enabled: true
+  enabled: false
   imagePullSecrets: [harbor-pull]   # in the terminal namespace, like moks above
   profiles:
     - name: roboshop-demo-readonly

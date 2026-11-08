@@ -24,7 +24,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CHART = ROOT / "deploy/helm/moks"
 ARGOCD = ROOT / "deploy/argocd"
-GROUPS = ["foundation", "database", "migrate", "opensearch", "api", "worker", "executor", "terminal", "reranker", "routing", "backup"]
+GROUPS = ["foundation", "database", "migrate", "opensearch", "api", "worker", "executor", "terminal", "reranker", "routing", "backup", "crewai"]
 CLUSTER_SCOPED = {"Namespace", "ClusterRole", "ClusterRoleBinding"}
 REPO = "https://github.com/mrjithendar/moks.git"
 TERMINAL_ON = ["--set", "terminal.enabled=true", "--set", "terminal.image.digest=sha256:" + "a" * 64, "--set", "terminal.profiles[0].name=ro",
@@ -57,6 +57,8 @@ SCENARIOS = {
     "backup-split": (BACKUP + SPLIT, {"backup", "migrate"}, set()),
     "reranker-on": (RERANKER, {"reranker"}, set()),
     "reranker-off": (["--set", "reranker.enabled=false"], set(), {"reranker"}),
+    "crewai-on": (["--set", "crewai.enabled=true"], {"crewai"}, set()),
+    "crewai-off": (["--set", "crewai.enabled=false"], set(), {"crewai"}),
     "custom-skills": (["--set", "customSkills.runbook=body"], {"foundation"}, set()),
     "namespaced-rbac": (["--set", "rbac.clusterWide=false", "--set", "rbac.namespaces={moks}"], set(), set()),
     "no-network-policy": (["--set", "networkPolicy.enabled=false"], set(), set()),
@@ -71,7 +73,8 @@ ENVIRONMENTS = {
     "minikube": {
         "prefix": "moks", "project": "moks", "projectFile": "minikube/project.yaml", "values": "values-minikube.yaml", "legacy": "legacy/application.yaml",
         "old": "moks-portal", "destination": {"server": "https://kubernetes.default.svc", "namespace": "moks"},
-        "namespaceLabels": {"app.kubernetes.io/part-of": "moks", "pod-security.kubernetes.io/enforce": "baseline", "pod-security.kubernetes.io/warn": "restricted"},
+        "namespaceLabels": {"app.kubernetes.io/part-of": "moks", "pod-security.kubernetes.io/enforce": "baseline", "pod-security.kubernetes.io/warn": "restricted",
+                            "istio-injection": "enabled"},
     },
     "eks": {
         "prefix": "roboshop-demo-moks", "project": "moks-eks", "projectFile": "eks/project.yaml", "values": "values-eks.yaml", "legacy": "legacy/application-eks.yaml",
@@ -334,7 +337,8 @@ def check_root_project() -> None:
 
 def check_eks_terminal() -> None:
     check(load(CHART / "values-eks.yaml")["terminal"]["enabled"] is False, "values-eks.yaml turns the terminal on", "eksTerminalOff")
-    check(not list((ARGOCD / "eks").rglob("*terminal*")), "eks has a terminal Application", "eksTerminalOff")
+    # optional/ may hold the hand-applied Application for later; the root never reads it, and it renders nothing while off.
+    check(not list((ARGOCD / "eks" / "apps").glob("*terminal*")), "eks has a terminal Application under the root", "eksTerminalOff")
 
 
 def compare_live(environment: str, path: Path) -> int:

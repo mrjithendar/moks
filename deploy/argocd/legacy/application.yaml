@@ -32,3 +32,4 @@ spec:
         app.kubernetes.io/part-of: moks
         pod-security.kubernetes.io/enforce: baseline
         pod-security.kubernetes.io/warn: restricted
+        istio-injection: enabled   # matches moks-foundation, so a rollback keeps the sidecars
