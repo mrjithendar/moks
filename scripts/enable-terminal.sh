@@ -24,9 +24,9 @@ else
 fi
 k rollout status deploy/moks-terminal --timeout=180s
 
-# Session pods pull moks-terminal:latest from Harbor with harbor-pull (tools deploy/minikube/harbor/registry.py).
+# Session pods pull moks-terminal:latest from Harbor with harbor-pull (miniKube deploy/minikube/harbor/registry.py).
 if [[ -z "$(kc -n "$TERMINALS" get secret harbor-pull --ignore-not-found -o name)" ]]; then
-  python3 "$(dirname "$(dirname "$HERE")")/tools/deploy/minikube/harbor/registry.py" pull-secrets --context "$CONTEXT" --namespace "$TERMINALS"
+  python3 "${MINIKUBE_DIR:-$(dirname "$(dirname "$HERE")")/miniKube}/deploy/minikube/harbor/registry.py" pull-secrets --context "$CONTEXT" --namespace "$TERMINALS"
   kc -n "$TERMINALS" get secret harbor-pull >/dev/null
 fi
 echo "→ harbor-pull is in place"
