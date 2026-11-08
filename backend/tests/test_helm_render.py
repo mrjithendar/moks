@@ -119,7 +119,8 @@ def test_eks_routes_through_istio_without_traefik():
     docs = render("values-eks.yaml")
     route = next(d for d in docs if d["kind"] == "VirtualService")
     assert route["spec"]["gateways"] == ["istio-ingress/public"] and route["spec"]["hosts"] == ["eks.jithendar.com"]
-    assert [r["name"] for r in route["spec"]["http"]] == ["terminal", "portal"]
+    # The terminal is off on EKS (values-eks.yaml); the next test turns it on and checks its route comes first.
+    assert [r["name"] for r in route["spec"]["http"]] == ["portal"]
     assert not any(d["kind"] in ("Ingress", "Middleware") for d in docs)
 
 
@@ -137,7 +138,13 @@ def test_minikube_is_strict_behind_traefik_without_gateway_objects():
     assert peer["default"] == {"mtls": {"mode": "STRICT"}}
     # Prometheus is outside the mesh and scrapes the pods' :9464 directly.
     assert peer["moks-metrics"]["selector"] == {"matchLabels": {"app": "moks"}}
-    assert peer["moks-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}}
+    assert peer["moks-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}, 8080: {"mode": "PERMISSIVE"}}
+    # Traefik has no sidecar yet, so each port it routes to takes plain text; nothing else does.
+    assert peer["moks-reranker-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}}
+    assert peer["moks-opensearch-edge"]["portLevelMtls"] == {9200: {"mode": "PERMISSIVE"}}
+    assert peer["moks-opensearch-dashboards-edge"]["portLevelMtls"] == {5601: {"mode": "PERMISSIVE"}}
+    meshed = {d["metadata"]["name"]: d["spec"] for d in render("values-minikube.yaml", "mesh.traefikInMesh=true") if d["kind"] == "PeerAuthentication"}
+    assert set(meshed) == {"default", "moks-metrics", "moks-reranker-metrics"} and meshed["moks-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}}
 
 
 def test_minikube_sidecars_reach_istiod_only_from_already_isolated_pods():
@@ -148,7 +155,11 @@ def test_minikube_sidecars_reach_istiod_only_from_already_isolated_pods():
     isolated = {p["podSelector"]["matchLabels"]["app"] for p in policies.values()
                 if set(p.get("policyTypes", [])) == {"Ingress", "Egress"} and "app" in p["podSelector"].get("matchLabels", {})}
     assert isolated <= selected and selected - isolated <= {"moks-search", "moks-search-dashboards"}
-    assert mesh["egress"] == [{"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "istio-system"}}}],
+    # DNS too: the proxy resolves istiod by name, and postgres, opensearch and reranker have no DNS rule of their own.
+    assert mesh["egress"] == [{"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+                                       "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}],
+                               "ports": [{"port": 53, "protocol": "UDP"}, {"port": 53, "protocol": "TCP"}]},
+                              {"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "istio-system"}}}],
                                "ports": [{"port": 15012, "protocol": "TCP"}]}]
     assert {"port": 15090, "protocol": "TCP"} in mesh["ingress"][0]["ports"]
 

@@ -4,8 +4,9 @@
 {{- fail "mesh.enabled and istio.mtls both render PeerAuthentication default; pick one (values.yaml, mesh)" }}
 {{- end }}
 # Sidecars behind Traefik (mk4). The namespace label istio-injection=enabled (Argo CD app moks-foundation)
-# injects them; Traefik is in the mesh too, so its requests arrive over mTLS. Pods without a sidecar,
-# and clients outside the mesh, can no longer connect, except to the metrics port below.
+# injects them, and the istio-cni agent (miniKube repository) redirects their traffic, so Pod Security
+# "baseline" admits them. Pods without a sidecar, and clients outside the mesh, can no longer connect, except
+# to the ports listed below.
 apiVersion: security.istio.io/v1
 kind: PeerAuthentication
 metadata:
@@ -14,22 +15,33 @@ metadata:
 spec:
   mtls:
     mode: STRICT
-{{- range $app := list "moks" "moks-reranker" }}
+{{- /* Plain text still arrives from outside the mesh: Prometheus scrapes :9464 on the pod IPs, and, until
+       mesh.traefikInMesh, Traefik sends the edge routes there in plain text (8080 api and terminal, 9200 and
+       5601 the OpenSearch routes). Names are kept: two PeerAuthentications on one selector conflict. */}}
+{{- $edge := not .Values.mesh.traefikInMesh }}
+{{- $plain := list (dict "name" "moks-metrics" "app" "moks" "ports" (ternary (list 9464 8080) (list 9464) $edge))
+                   (dict "name" "moks-reranker-metrics" "app" "moks-reranker" "ports" (list 9464)) }}
+{{- if $edge }}
+{{- $plain = concat $plain (list (dict "name" "moks-opensearch-edge" "app" "moks-opensearch" "ports" (list 9200))
+                                 (dict "name" "moks-opensearch-dashboards-edge" "app" "moks-opensearch-dashboards" "ports" (list 5601))) }}
+{{- end }}
+{{- range $plain }}
 ---
-# Prometheus (outside the mesh) scrapes :9464 on the pod IPs, in plain text.
 apiVersion: security.istio.io/v1
 kind: PeerAuthentication
 metadata:
-  name: {{ $app }}-metrics
+  name: {{ .name }}
   labels: {{- include "moks.labels" $ | nindent 4 }}
 spec:
   selector:
-    matchLabels: {app: {{ $app }}}
+    matchLabels: {app: {{ .app }}}
   mtls:
     mode: STRICT
   portLevelMtls:
-    9464:
+    {{- range .ports }}
+    {{ . }}:
       mode: PERMISSIVE
+    {{- end }}
 {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
@@ -55,6 +67,10 @@ spec:
         {{- end }}
       ports: [{port: 15020, protocol: TCP}, {port: 15090, protocol: TCP}]
   egress:
+    # The proxy finds istiod by name (istiod.istio-system.svc). Postgres, OpenSearch and the reranker have no
+    # DNS rule of their own, so without this their proxies never start, and neither do they.
+    - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
     # Configuration and certificates from istiod. Without them the proxy never gets ready, and with
     # holdApplicationUntilProxyStarts the application never starts.
     - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.mesh.istiodNamespace }}}}}]

@@ -162,6 +162,7 @@ istio:
 mesh:
   enabled: false
   istiodNamespace: istio-system
+  traefikInMesh: false     # true once Traefik has a sidecar: its routes then arrive over mTLS, so no port takes plain text
 
 postgres:
   bundled: true            # false: point MOKS_DATABASE_URL at an external database (e.g. RDS)
