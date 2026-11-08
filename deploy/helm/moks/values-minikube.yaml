@@ -71,6 +71,11 @@ api:
 worker:
   replicas: 1
 
+# Sidecars and STRICT mTLS (templates/mesh-sidecars.yaml). Needs tools minikube-infrastructure's Istio CNI first:
+# without it injected pods carry istio-init, which PSA baseline rejects.
+mesh:
+  enabled: true
+
 ingress:
   host: jithendar.com
   tlsSecretName: ""     # Traefik default TLSStore (jithendar-com-tls) covers jithendar.com

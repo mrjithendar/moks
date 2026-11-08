@@ -84,7 +84,7 @@ spec:
     - name: postgres
       port: 5432
       targetPort: postgres
-      {{- if .Values.istio.mtls }}
+      {{- if or .Values.istio.mtls .Values.mesh.enabled }}
       appProtocol: tcp   # plain TCP to the sidecars, with no protocol sniffing
       {{- end }}
 {{- if .Values.networkPolicy.enabled }}
