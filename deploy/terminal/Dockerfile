@@ -4,7 +4,7 @@
 # See docs/TERMINAL.md for updating it and for asking for another package.
 # Build context: deploy/terminal. Works on arm64 (mk4) and amd64 through BuildKit's TARGETARCH.
 
-FROM debian:trixie-20261027-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS base
+FROM debian:trixie-20261104-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS base
 # Debian packages come from deb.debian.org by default, so each build gets current security fixes; the image digest
 # that CI reports is what pins a release. DEBIAN_SNAPSHOT=<YYYYMMDDTHHMMSSZ> rebuilds against a fixed archive
 # snapshot instead, for a reproducible build. snapshot.debian.org was answering 504 for hours on 2026-11-05, which is
