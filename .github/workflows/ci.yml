@@ -161,7 +161,7 @@ jobs:
           # The release record: which commit became which digest (docs/RELEASES.md).
           mkdir -p release && printf '{"component":"moks","commit":"%s","repository":"%s","tag":"%s","digest":"%s","run":"%s"}\n' \
             "${{ github.sha }}" "$REPOSITORY" latest "$DIGEST" "${{ github.run_id }}" > release/moks.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-moks-${{ github.sha }}
           path: release/moks.json
@@ -204,7 +204,7 @@ jobs:
           echo "pushed $IMAGE (commit ${{ github.sha }}, $DIGEST)." >> "$GITHUB_STEP_SUMMARY"
           mkdir -p release && printf '{"component":"moks-crewai","commit":"%s","repository":"%s","tag":"%s","digest":"%s","run":"%s"}\n' \
             "${{ github.sha }}" "$REPOSITORY" latest "$DIGEST" "${{ github.run_id }}" > release/moks-crewai.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-moks-crewai-${{ github.sha }}
           path: release/moks-crewai.json
@@ -363,7 +363,7 @@ jobs:
           MODEL="$(python3 -c 'import json; l=json.load(open("model.lock.json")); print(l["model_id"] + "@" + l["revision"])')"
           mkdir -p ../release && printf '{"component":"moks-reranker","commit":"%s","repository":"%s","tag":"%s","digest":"%s","model":"%s","run":"%s"}\n' \
             "${{ github.sha }}" "$REPOSITORY" latest "$DIGEST" "$MODEL" "${{ github.run_id }}" > ../release/moks-reranker.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-moks-reranker-${{ github.sha }}
           path: release/moks-reranker.json
