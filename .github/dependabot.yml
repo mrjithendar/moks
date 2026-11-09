@@ -103,7 +103,63 @@ updates:
       # The MOKS image is built by CI and runs as latest.
       - dependency-name: "*/moks"
 
-  # Demo lab manifests (nginx-unprivileged, busybox, python)
+  # Reranker: reranker/requirements.txt (+ requirements-test.txt). torch is pinned as 2.x+cpu from the PyTorch CPU
+  # index; a plain PyPI bump would pull the CUDA build, so torch is moved by hand (docs/RERANKING.md).
+  - package-ecosystem: pip
+    directory: /reranker
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    cooldown:
+      default-days: 3
+    commit-message:
+      prefix: "deps(reranker)"
+      include: scope
+    labels: [dependencies, python]
+    groups:
+      # sentence-transformers, transformers, tokenizers and huggingface_hub move together.
+      models:
+        patterns: [sentence-transformers, transformers, tokenizers, huggingface_hub, safetensors, hf-xet]
+      web-framework:
+        patterns: [fastapi, starlette, "uvicorn*"]
+      reranker-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: torch
+
+  # Base images: reranker/Dockerfile (python) and deploy/terminal/Dockerfile (debian, pinned by tag + digest;
+  # AWS CLI and kubectl there are ARG versions with checksums and are bumped by hand, docs/TERMINAL.md).
+  # deploy/opensearch/Dockerfile is left out: the exporter plugin URL must match the server version exactly, and
+  # the chart and the live pod run the same version, so OpenSearch moves by hand.
+  - package-ecosystem: docker
+    directories:
+      - /reranker
+      - /deploy/terminal
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    commit-message:
+      prefix: "deps(docker)"
+    labels: [dependencies, docker]
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # Velero plugin image (deploy/velero; Velero is not installed on mk4 yet)
+  - package-ecosystem: docker
+    directory: /deploy/velero
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps(velero)"
+    labels: [dependencies, kubernetes]
+
+  # Demo lab manifests (nginx-unprivileged, busybox, python). lab/crewai-demo is left out on purpose: its
+  # broken image tag is the fault the demo investigates.
   - package-ecosystem: docker
     directory: /lab
     schedule:

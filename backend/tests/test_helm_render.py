@@ -133,23 +133,32 @@ def test_istio_sends_terminal_traffic_to_the_gateway_first():
 
 def test_minikube_is_strict_and_routed_by_delegates_without_gateway_policies():
     docs = render("values-minikube.yaml")
-    assert "AuthorizationPolicy" not in {d["kind"] for d in docs}
+    # Only the namespace's allow-known-callers (mesh.authorization), none of istio.mtls's gateway policies.
+    assert [d["metadata"]["name"] for d in docs if d["kind"] == "AuthorizationPolicy"] == ["allow-known-callers"]
     assert not any(d["kind"] == "Ingress" or d["apiVersion"].startswith("traefik.io/") for d in docs)
     routes = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "VirtualService"}
     assert set(routes) == {"moks", "moks-opensearch", "moks-opensearch-dashboards"}
     assert not any("hosts" in r or "gateways" in r for r in routes.values())   # delegates of miniKube's routing table
     peer = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "PeerAuthentication"}
     assert peer["default"] == {"mtls": {"mode": "STRICT"}}
-    # Prometheus is outside the mesh and scrapes the pods' :9464 directly.
+    # mk4: the Istio gateway is the only edge and Prometheus scrapes through its sidecar, so no port takes plain text.
+    # Every name still renders (Argo CD never prunes here, so a dropped policy would keep its old exceptions live).
+    assert set(peer) == {"default", "moks-metrics", "moks-reranker-metrics", "moks-opensearch-edge",
+                         "moks-opensearch-dashboards-edge"}
+    assert all("portLevelMtls" not in spec and spec["mtls"] == {"mode": "STRICT"} for spec in peer.values())
     assert peer["moks-metrics"]["selector"] == {"matchLabels": {"app": "moks"}}
-    assert peer["moks-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}, 8080: {"mode": "PERMISSIVE"}}
-    # Until mesh.edgeMtls, Traefik may still route here in plain text, so each port it routes to takes it; nothing else does.
-    assert peer["moks-reranker-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}}
-    assert peer["moks-opensearch-edge"]["portLevelMtls"] == {9200: {"mode": "PERMISSIVE"}}
-    assert peer["moks-opensearch-dashboards-edge"]["portLevelMtls"] == {5601: {"mode": "PERMISSIVE"}}
-    meshed = {d["metadata"]["name"]: d["spec"] for d in render("values-minikube.yaml", "mesh.edgeMtls=true") if d["kind"] == "PeerAuthentication"}
-    assert set(meshed) == {"default", "moks-metrics", "moks-reranker-metrics"} and meshed["moks-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}}
-
+    # An edge or a scraper outside the mesh gets exactly its ports back.
+    legacy = {d["metadata"]["name"]: d["spec"] for d in render("values-minikube.yaml", "mesh.edgeMtls=false", "mesh.metricsMtls=false")
+              if d["kind"] == "PeerAuthentication"}
+    assert legacy["moks-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}, 8080: {"mode": "PERMISSIVE"}}
+    assert legacy["moks-reranker-metrics"]["portLevelMtls"] == {9464: {"mode": "PERMISSIVE"}}
+    assert legacy["moks-opensearch-edge"]["portLevelMtls"] == {9200: {"mode": "PERMISSIVE"}}
+    assert legacy["moks-opensearch-dashboards-edge"]["portLevelMtls"] == {5601: {"mode": "PERMISSIVE"}}
+    policy = next(d for d in docs if d["kind"] == "AuthorizationPolicy")
+    assert policy["metadata"]["annotations"] == {"istio.io/dry-run": "true"}
+    assert policy["spec"] == {"action": "ALLOW", "rules": [{"from": [{"source": {"namespaces": ["moks", "istio-ingress", "monitoring"]}}]}]}
+    policies = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "NetworkPolicy"}
+    assert "traefik" not in str(policies)
 
 def test_minikube_sidecars_reach_istiod_only_from_already_isolated_pods():
     docs = render("values-minikube.yaml")

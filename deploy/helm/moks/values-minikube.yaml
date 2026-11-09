@@ -75,9 +75,14 @@ worker:
 # without it injected pods carry istio-init, which PSA baseline rejects.
 mesh:
   enabled: true
-  # false until Traefik is gone: while it still routes here directly (plain text), the edge ports stay PERMISSIVE.
-  # The Istio gateway sends mTLS either way. Set true in the cleanup after the cutover.
-  edgeMtls: false
+  # Traefik is gone (2026-11-09): the Istio gateway is the only edge and sends mTLS, and Prometheus scrapes :9464
+  # through its sidecar. No port takes plain text, matching the mesh-wide STRICT default (miniKube istio/mesh).
+  edgeMtls: true
+  metricsMtls: true
+  authorization:
+    enabled: true
+    dryRun: true
+    namespaces: [istio-ingress, monitoring]
 
 # Routed by the Istio ingress gateway: miniKube deploy/minikube/istio/edge delegates /moks, /opensearch and
 # /opensearch-dashboards to the VirtualServices this renders. TLS, HTTP to HTTPS and the OpenSearch logins and
@@ -150,8 +155,8 @@ terminal:
         ports: [443]
 
 networkPolicy:
-  # The Istio gateway, and Traefik until its routes here are deleted (cleanup after the cutover drops it).
-  ingressNamespaces: [istio-ingress, traefik]
+  # The Istio gateway.
+  ingressNamespaces: [istio-ingress]
   apiServer:
     cidrs: [10.96.0.1/32, 192.168.49.2/32]   # kubernetes Service VIP and the endpoint behind it
     ports: [443, 8443]

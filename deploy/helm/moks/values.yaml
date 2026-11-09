@@ -169,6 +169,14 @@ mesh:
   # true when the edge sends mTLS (an Istio ingress gateway): no port takes plain text. false keeps the edge ports
   # (8080, 9200, 5601) PERMISSIVE for an edge outside the mesh.
   edgeMtls: false
+  # true when Prometheus scrapes through its own sidecar (mTLS); false keeps :9464 PERMISSIVE for a scraper outside
+  # the mesh.
+  metricsMtls: false
+  # ALLOW AuthorizationPolicy for the namespace: its own pods plus these namespaces. dryRun only counts refusals.
+  authorization:
+    enabled: false
+    dryRun: true
+    namespaces: []
 
 postgres:
   bundled: true            # false: point MOKS_DATABASE_URL at an external database (e.g. RDS)

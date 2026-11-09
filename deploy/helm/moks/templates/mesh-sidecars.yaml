@@ -15,17 +15,17 @@ metadata:
 spec:
   mtls:
     mode: STRICT
-{{- /* Plain text still arrives from outside the mesh: Prometheus scrapes :9464 on the pod IPs, and, until
-       mesh.edgeMtls, an edge outside the mesh (Traefik) sends the public routes there in plain text (8080 api and
-       terminal, 9200 and 5601 the OpenSearch routes). The Istio ingress gateway sends mTLS. Names are kept: two
-       PeerAuthentications on one selector conflict. */}}
+{{- /* Ports that still take plain text from outside the mesh: :9464 unless mesh.metricsMtls (Prometheus scrapes
+       through its own sidecar), and unless mesh.edgeMtls the ports an edge outside the mesh routes to (8080 api and
+       terminal, 9200 and 5601 the OpenSearch routes). The Istio ingress gateway sends mTLS. All four are always
+       rendered, with no port exception once both are true: Argo CD never prunes here, so a policy that stopped
+       rendering would stay live with its old exceptions. Two PeerAuthentications on one selector conflict. */}}
 {{- $edge := not .Values.mesh.edgeMtls }}
-{{- $plain := list (dict "name" "moks-metrics" "app" "moks" "ports" (ternary (list 9464 8080) (list 9464) $edge))
-                   (dict "name" "moks-reranker-metrics" "app" "moks-reranker" "ports" (list 9464)) }}
-{{- if $edge }}
-{{- $plain = concat $plain (list (dict "name" "moks-opensearch-edge" "app" "moks-opensearch" "ports" (list 9200))
-                                 (dict "name" "moks-opensearch-dashboards-edge" "app" "moks-opensearch-dashboards" "ports" (list 5601))) }}
-{{- end }}
+{{- $metrics := ternary (list) (list 9464) .Values.mesh.metricsMtls }}
+{{- $plain := list (dict "name" "moks-metrics" "app" "moks" "ports" (ternary (append $metrics 8080) $metrics $edge))
+                   (dict "name" "moks-reranker-metrics" "app" "moks-reranker" "ports" $metrics)
+                   (dict "name" "moks-opensearch-edge" "app" "moks-opensearch" "ports" (ternary (list 9200) (list) $edge))
+                   (dict "name" "moks-opensearch-dashboards-edge" "app" "moks-opensearch-dashboards" "ports" (ternary (list 5601) (list) $edge)) }}
 {{- range $plain }}
 ---
 apiVersion: security.istio.io/v1
@@ -38,11 +38,36 @@ spec:
     matchLabels: {app: {{ .app }}}
   mtls:
     mode: STRICT
+  {{- with .ports }}
   portLevelMtls:
-    {{- range .ports }}
+    {{- range . }}
     {{ . }}:
       mode: PERMISSIVE
     {{- end }}
+  {{- end }}
+{{- end }}
+{{- with .Values.mesh.authorization }}
+{{- if .enabled }}
+---
+# Only these callers' workloads (their mTLS identity) reach anything in this namespace: its own pods and
+# mesh.authorization.namespaces (the ingress gateway, Prometheus/Grafana). dryRun: Envoy only counts what it would
+# refuse (miniKube scripts/istio/authz-dry-run-report.py); set false once the counts stay at 0.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-known-callers
+  labels: {{- include "moks.labels" $ | nindent 4 }}
+  {{- if .dryRun }}
+  annotations:
+    istio.io/dry-run: "true"
+  {{- end }}
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: {{ toJson (prepend .namespaces $.Release.Namespace) }}
+{{- end }}
 {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---

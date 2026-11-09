@@ -205,7 +205,7 @@ spec:
             - configMapRef: {name: moks-config}
             - secretRef: {name: {{ $t.gateway.existingSecret }}}   # database, session secret and AWS base identity; nothing else
           env:
-            - {name: FORWARDED_ALLOW_IPS, value: "*"}  # only Traefik can reach :8080 (NetworkPolicy)
+            - {name: FORWARDED_ALLOW_IPS, value: "*"}  # only the Istio gateway can reach :8080 (NetworkPolicy)
             - {name: MOKS_PROCESS_ROLE, value: terminal}
             - {name: MOKS_TERMINAL_NAMESPACE, value: {{ $ns | quote }}}
             - {name: MOKS_TERMINAL_IMAGE, value: "{{ $t.image.repository }}{{ if $t.image.digest }}@{{ $t.image.digest }}{{ else }}:{{ $t.image.tag }}{{ end }}"}

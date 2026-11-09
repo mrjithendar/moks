@@ -32,8 +32,6 @@ spec:
       namespace: monitoring           # Role for secret sync (secretsSync.namespaces)
     - server: https://kubernetes.default.svc
       namespace: observability        # Role for secret sync (secretsSync.namespaces)
-    - server: https://kubernetes.default.svc
-      namespace: traefik              # Role for secret sync (secretsSync.namespaces)
   clusterResourceWhitelist:
     - {group: "", kind: Namespace}
     - {group: rbac.authorization.k8s.io, kind: ClusterRole}
@@ -51,10 +49,7 @@ spec:
     - {group: networking.k8s.io, kind: NetworkPolicy}
     - {group: policy, kind: PodDisruptionBudget}
     - {group: networking.istio.io, kind: VirtualService}   # delegates of the Istio gateway's routing table
-    # Traefik kinds and the traefik destination stay until the old routes are deleted (Prune=false keeps them
-    # tracked); the cleanup after the cutover removes them.
-    - {group: traefik.io, kind: Middleware}
-    - {group: traefik.io, kind: IngressRoute}
+    - {group: security.istio.io, kind: AuthorizationPolicy}  # mesh.authorization
     - {group: rbac.authorization.k8s.io, kind: Role}
     - {group: "", kind: ResourceQuota}
     - {group: "", kind: LimitRange}
