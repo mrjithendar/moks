@@ -128,6 +128,9 @@ updates:
         update-types: [minor, patch]
     ignore:
       - dependency-name: torch
+      # sympy 1.14.0 (pulled in by torch) requires mpmath<1.4; PR #26 moved it to 1.4.1 and broke the install.
+      - dependency-name: mpmath
+        versions: [">=1.4"]
 
   # Base images: reranker/Dockerfile (python) and deploy/terminal/Dockerfile (debian, pinned by tag + digest;
   # AWS CLI and kubectl there are ARG versions with checksums and are bumped by hand, docs/TERMINAL.md).
