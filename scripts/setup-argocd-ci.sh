@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-time: lets CI deploy MOKS through Argo CD. CI builds and pushes moks:latest; its deploy job then asks Argo CD
 # to sync the MOKS Applications in order and restart the Deployments that run the image. CI holds no Kubernetes
-# credentials, only a token for Argo CD project role moks/ci (deploy/argocd/minikube/project.yaml): get, sync and
+# credentials, only a token for Argo CD project role moks/ci (deploy/argocd/hetzner/project.yaml): get, sync and
 # restart Applications of project moks.
 #
 #   scripts/setup-argocd-ci.sh             apply the project (adds the role), issue a token, store it in GitHub
@@ -21,8 +21,8 @@ EXPIRY="${TOKEN_EXPIRY:-365d}"
 ARGO=(--server "$SERVER" --grpc-web --grpc-web-root-path /argocd)
 cd "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
-echo "→ Applying deploy/argocd/minikube/project.yaml (adds role ci)"
-kubectl --context "$CONTEXT" apply -f deploy/argocd/minikube/project.yaml
+echo "→ Applying deploy/argocd/hetzner/project.yaml (adds role ci)"
+kubectl --context "$CONTEXT" apply -f deploy/argocd/hetzner/project.yaml
 
 if [[ "${ROTATE:-0}" == "1" ]]; then
   echo "→ Revoking existing tokens of moks/ci"

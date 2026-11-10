@@ -34,7 +34,7 @@ Store all four in your password manager. Without the encryption key and the repo
 ## Set up
 
 1. Create an R2 bucket and token. Add the four variables to the executor's Secret, and the first three to the API's for the storage test.
-2. Argo CD deploys Velero. Once only, apply its project and app with the MOKS project: `kubectl --context mk4 apply -f deploy/argocd/minikube/project.yaml -f deploy/argocd/velero.yaml`. Then sync `velero`, `moks-foundation` and `moks-executor` by hand, without prune. `velero` and foundation can go in either order, and executor needs foundation, which holds `Namespace/velero`. `velero.enabled: true` in the MOKS chart gives MOKS its access. On EKS, point a copy of the app at `values-r2.yaml`, which adds the privileged node agent. On an EKS cluster reached remotely, grant the same two Roles to the identities in its connector.
+2. Argo CD deploys Velero. Once only, apply its project and app with the MOKS project: `kubectl --context mk4 apply -f deploy/argocd/hetzner/project.yaml -f deploy/argocd/velero.yaml`. Then sync `velero`, `moks-foundation` and `moks-executor` by hand, without prune. `velero` and foundation can go in either order, and executor needs foundation, which holds `Namespace/velero`. `velero.enabled: true` in the MOKS chart gives MOKS its access. On EKS, point a copy of the app at `values-r2.yaml`, which adds the privileged node agent. On an EKS cluster reached remotely, grant the same two Roles to the identities in its connector.
 3. In **Admin > Backup storage**, enter the account, bucket and variable names, then run the test.
 4. In **Operate > Backups**, choose **Connect to R2**, then **Set schedule**. Neither needs an approval.
 

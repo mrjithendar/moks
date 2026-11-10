@@ -122,7 +122,7 @@ A slot belongs to the computation. It is released when the work really ends, so 
 
 1. Apply Terraform for the `moks-reranker` ECR repository, and let CI build.
 2. Create the Secret from `deploy/secrets/moks-reranker-secrets.example.yaml`, and put the same token in `moks-secrets`.
-3. Set `reranker.enabled: true`. Move `deploy/argocd/minikube/optional/moks-reranker.yaml` to `apps/`, sync `moks-root`, `moks-foundation`, `moks-reranker`, and restart the API and worker for the new configuration.
+3. Set `reranker.enabled: true`. Move `deploy/argocd/hetzner/optional/moks-reranker.yaml` to `apps/`, sync `moks-root`, `moks-foundation`, `moks-reranker`, and restart the API and worker for the new configuration.
 4. Check the service under **Knowledge > Index health > Reranking**, and measure real CPU and memory.
 5. Run `moks eval rerank` in a worker pod, and build a dataset from real questions before trusting the result.
 6. Set `reranker.client.enabled: true` only if the gates pass. Watch `moks_rerank_calls_total` by outcome.

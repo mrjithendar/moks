@@ -1,10 +1,10 @@
 output "repository_url" {
-  description = "Image repository; matches image.repository in deploy/helm/moks/values-minikube.yaml."
+  description = "Image repository; matches image.repository in deploy/helm/moks/values-hetzner.yaml."
   value       = aws_ecr_repository.moks.repository_url
 }
 
 output "crewai_repository_url" {
-  description = "The CrewAI image (moks built with MOKS_CREWAI=true); set image.repository to this in values-minikube.yaml to run it."
+  description = "The CrewAI image (moks built with MOKS_CREWAI=true); set image.repository to this in values-hetzner.yaml to run it."
   value       = aws_ecr_repository.crewai.repository_url
 }
 

@@ -60,7 +60,7 @@ resource "aws_ecr_repository" "opensearch" {
 
 # The MOKS image built with the CrewAI extra (Dockerfile --build-arg MOKS_CREWAI=true, docs/crewai-investigation.md).
 # Its own repository, so the default moks:latest never carries crewai and its dependencies. mk4 runs it only when
-# values-minikube.yaml points image.repository here.
+# values-hetzner.yaml points image.repository here.
 resource "aws_ecr_repository" "crewai" {
   name                 = "${var.repository_name}-crewai"
   image_tag_mutability = "MUTABLE" # latest has to move, like the moks repository

@@ -1,10 +1,9 @@
-# The executor and its identity, action RBAC, database-backup Roles, Velero write Role and
-# the diagnostic namespace with its quota and NetworkPolicy.
+# The API Deployment, its Service and PodDisruptionBudget. It also serves the frontend.
 # Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: moks-executor
+  name: moks-api
   namespace: argocd
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -16,9 +15,9 @@ spec:
     path: deploy/helm/moks
     helm:
       releaseName: moks
-      valueFiles: [values-minikube.yaml]
+      valueFiles: [values-hetzner.yaml]
       parameters:
-        - {name: resourceGroup, value: executor}
+        - {name: resourceGroup, value: api}
   destination:
     server: https://kubernetes.default.svc
     namespace: moks

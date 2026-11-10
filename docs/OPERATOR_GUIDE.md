@@ -38,7 +38,7 @@ kubectl --context mk4 create namespace moks
 python3 deploy/minikube/harbor/registry.py pull-secrets --namespace moks --namespace moks-terminals --namespace moks-diagnostics
 ```
 
-Nothing refreshes it, because it does not expire. `scripts/deploy-mk4.sh` fills any namespace that lacks it.
+Nothing refreshes it, because it does not expire. Fill a namespace that lacks it with tools `deploy/minikube/harbor/registry.py pull-secrets`.
 
 ## 3. Secrets (never committed)
 
@@ -62,8 +62,8 @@ before the next. [ARGOCD_APP_SPLIT.md](ARGOCD_APP_SPLIT.md) has what each one ow
 shared configuration, and how to migrate an install that still runs `moks-portal`.
 
 ```sh
-kubectl --context mk4 apply -f deploy/argocd/project-root.yaml -f deploy/argocd/minikube/project.yaml \
-  -f deploy/argocd/minikube/root.yaml
+kubectl --context mk4 apply -f deploy/argocd/project-root.yaml -f deploy/argocd/hetzner/project.yaml \
+  -f deploy/argocd/hetzner/root.yaml
 argocd app sync moks-root            # or the Argo CD UI at https://jithendar.com/argocd
 argocd app sync moks-foundation      # never tick "Prune" for any of these
 argocd app sync moks-database
@@ -136,7 +136,7 @@ Grant others with `moks grant <email> <role>[:<env>[:<ns>]]` or in **Users & rol
 To switch to OIDC (for example Google), create a web OAuth client with redirect URI
 `https://jithendar.com/moks/api/auth/oidc/callback`. Set `config.authMode: oidc`,
 `config.oidcIssuer: https://accounts.google.com`, `config.oidcClientId` and
-`config.bootstrapAdmins` in `values-minikube.yaml`, and add the client secret:
+`config.bootstrapAdmins` in `values-hetzner.yaml`, and add the client secret:
 
 ```sh
 kubectl --context mk4 -n moks patch secret moks-secrets --type merge \
@@ -203,7 +203,7 @@ sync **without prune**. Apply the AppProject first (it now allows `moks-diagnost
 `ResourceQuota`, `LimitRange` and `Role`):
 
 ```sh
-kubectl --context mk4 apply -f deploy/argocd/minikube/project.yaml
+kubectl --context mk4 apply -f deploy/argocd/hetzner/project.yaml
 argocd app diff moks-foundation && argocd app sync moks-foundation
 argocd app diff moks-executor && argocd app sync moks-executor
 kubectl --context mk4 -n moks rollout status deploy/moks-api deploy/moks-worker deploy/moks-executor
@@ -220,7 +220,7 @@ The API's init container runs migration `0002` automatically. Take a backup firs
    Service accounts), add a token, then:
    `kubectl -n moks patch secret moks-secrets --type merge -p '{"stringData":{"MOKS_CRED_GRAFANA_TOKEN":"glsa_…"}}'`
    and restart the API and worker. **Connectors → Test** should then pass.
-3. **FinOps:** set the real monthly server price in `values-minikube.yaml` (`cost_model.monthly_cost_usd`).
+3. **FinOps:** set the real monthly server price in `values-hetzner.yaml` (`cost_model.monthly_cost_usd`).
    For AWS spend: `terraform apply` (with `finops_enabled = true`), run `scripts/create-runtime-key.sh mk4`,
    then uncomment the `aws_cost` connector. See [FINOPS.md](FINOPS.md).
 4. **Remediation:** the executor acts only in `executor.namespaces` (default `[moks-lab]`). To let
@@ -267,7 +267,7 @@ PASS=$(openssl rand -hex 32)
 kubectl --context mk4 -n moks create secret generic moks-opensearch-auth \
   --type=kubernetes.io/basic-auth --from-literal=username=moks --from-literal=password="$PASS"
 echo "$PASS"   # kept nowhere else
-kubectl --context mk4 apply -f deploy/argocd/minikube/project.yaml
+kubectl --context mk4 apply -f deploy/argocd/hetzner/project.yaml
 argocd app sync moks-opensearch && argocd app sync moks-routing   # never --prune
 curl -u "moks:$PASS" 'https://jithendar.com/opensearch/_cat/indices?v'
 ```
@@ -465,7 +465,7 @@ can lose is about an hour.
 3. Create the Secret, using `--from-env-file` or similar so values stay out of your shell history. Its keys
    are `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `MOKS_BACKUP_ENCRYPTION_KEY`. Name it `moks-backup`.
 4. Set `backup.enabled`, `backup.bucket`, and for R2 `backup.endpoint` and `backup.region: auto`.
-5. Apply `deploy/argocd/minikube/project.yaml`, which now allows CronJobs, move `deploy/argocd/minikube/optional/moks-backup.yaml` into `apps/`, push, sync `moks-root`, then sync `moks-backup`.
+5. Apply `deploy/argocd/hetzner/project.yaml`, which now allows CronJobs, move `deploy/argocd/hetzner/optional/moks-backup.yaml` into `apps/`, push, sync `moks-root`, then sync `moks-backup`.
 6. Run one by hand and check the stored copy:
    `kubectl --context mk4 -n moks create job --from=cronjob/moks-backup first-backup`
 
@@ -647,3 +647,15 @@ The API's init container applies migrations 0025 to 0029 on the first rollout. T
 - **Old evidence is classified from `ok` and `truncated`.** Denials were not stored before, so none appear in older runs.
 
 Rollback: redeploy the previous image digest. The extra columns and tables are ignored by older code, but an older worker claims and runs investigations without tokens, so do not run two versions side by side.
+
+## Deploying to mk4 (Hetzner k3s)
+
+mk4 is the Hetzner k3s cluster (`jithendar-master1` and two workers). MOKS uses the shared CloudNativePG
+database `postgres-db/postgres-cluster` (Secret `moks/postgres-db-credentials`), and Argo CD deploys
+`deploy/argocd/hetzner` with `values-hetzner.yaml` from origin/master.
+
+1. `scripts/create-secrets-hetzner.sh`: moks-secrets (database URL from postgres-db-credentials), moks-terminal-secrets,
+   moks-reranker-secrets and moks-secret-sync. Saved keys in the gitignored `moks-*-secrets.yaml` files are carried over.
+2. `scripts/deploy-hetzner.sh --check`, then `scripts/deploy-hetzner.sh`: applies the AppProjects and `moks-root`, which
+   writes one auto-syncing Application per component, and waits until all are Synced and Healthy.
+3. Create the first user with `moks create-user` (authMode local).

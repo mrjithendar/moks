@@ -1,10 +1,10 @@
-# The delegate VirtualServices for /moks, /opensearch and /opensearch-dashboards, which the Istio gateway's routing
-# table (miniKube deploy/minikube/istio/edge) sends here.
+# The executor and its identity, action RBAC, database-backup Roles, Velero write Role and
+# the diagnostic namespace with its quota and NetworkPolicy.
 # Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: moks-routing
+  name: moks-executor
   namespace: argocd
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -16,9 +16,9 @@ spec:
     path: deploy/helm/moks
     helm:
       releaseName: moks
-      valueFiles: [values-minikube.yaml]
+      valueFiles: [values-hetzner.yaml]
       parameters:
-        - {name: resourceGroup, value: routing}
+        - {name: resourceGroup, value: executor}
   destination:
     server: https://kubernetes.default.svc
     namespace: moks

@@ -14,7 +14,7 @@ spec:
   source:
     repoURL: https://github.com/mrjithendar/moks.git
     targetRevision: master
-    path: deploy/argocd/minikube/apps
+    path: deploy/argocd/hetzner/apps
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd

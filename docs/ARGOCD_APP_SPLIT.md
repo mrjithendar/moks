@@ -361,7 +361,7 @@ If `moks-portal` is gone, as on 2026-11-01, nothing is adopted. This is a fresh 
 
 Three things block it:
 
-- **Namespace `moks-lab` is missing**, but `values-minikube.yaml` writes Roles there (`executor.namespaces`, `terminal.kubernetes.namespaces`), so the executor and terminal syncs fail. `lab/00-namespace.yaml` creates it.
+- **Namespace `moks-lab` is missing**, but `values-hetzner.yaml` writes Roles there (`executor.namespaces`, `terminal.kubernetes.namespaces`), so the executor and terminal syncs fail. `lab/00-namespace.yaml` creates it.
 - **`ecr-pull` has expired.** ECR tokens last 12 hours, and the refresher, `roboshop-ai/ecr-refresh` from the tools repository, is gone with its namespace. Recreate the namespace and `roboshop-secrets`, which hold only the refresher on mk4, then install the CronJob and run it once, or new pods will not pull.
 - **`data-moks-postgres-0` holds the only copy of the mk4 investigations, and its PV has reclaim policy `Delete`.** Deleting the claim or the namespace loses them. It binds to the new StatefulSet by name, on `mk4-m04`. Switch it to `Retain` first, as in section 2.
 
@@ -466,7 +466,7 @@ The old Application sets no `resourceGroup`, so the default `all` renders everyt
 Push first, because everything reads `master`. Create the Secrets as in the [operator guide](OPERATOR_GUIDE.md), then:
 
 ```bash
-kubectl --context mk4 apply -f deploy/argocd/project-root.yaml -f deploy/argocd/minikube/project.yaml -f deploy/argocd/minikube/root.yaml
+kubectl --context mk4 apply -f deploy/argocd/project-root.yaml -f deploy/argocd/hetzner/project.yaml -f deploy/argocd/hetzner/root.yaml
 argocd app sync moks-root
 
 kubectl --context mk4 apply -f deploy/argocd/project-root.yaml -f deploy/argocd/eks/project.yaml -f deploy/argocd/eks/root.yaml

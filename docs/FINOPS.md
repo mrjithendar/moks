@@ -70,7 +70,7 @@ selects the `oomkilled-memory` skill, which runs rightsizing and turns at-risk c
    `budgets:ViewBudget`, read-only.
 2. Make sure Cost Explorer is enabled for the account. Cost Anomaly Detection needs at least one
    monitor (AWS creates a default services monitor).
-3. Add the connector (Connectors → `aws_cost`, or uncomment it in `values-minikube.yaml`).
+3. Add the connector (Connectors → `aws_cost`, or uncomment it in `values-hetzner.yaml`).
    Allocation tags must be activated as cost allocation tags in Billing before grouping by them.
 
 **Cost of the tool itself:** Cost Explorer charges $0.01 per API request. MOKS caches identical

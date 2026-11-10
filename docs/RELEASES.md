@@ -59,7 +59,7 @@ Harbor keeps the last ten builds of each repository (tools `deploy/minikube/harb
 The next successful `master` build moves `latest` forward again. Revert the bad commit first if it would break again.
 
 To hold a component on an earlier build instead (for instance, while `master` keeps building), pin it from its
-release record: `image.digest: sha256:...` (or `reranker.image.digest`) in `values-minikube.yaml`, push, and sync that
+release record: `image.digest: sha256:...` (or `reranker.image.digest`) in `values-hetzner.yaml`, push, and sync that
 one Application. Remove the pin once the fix is released. ML models roll back separately and without a release:
 see [ML.md](ML.md#roll-back).
 

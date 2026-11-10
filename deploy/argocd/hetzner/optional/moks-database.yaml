@@ -16,7 +16,7 @@ spec:
     path: deploy/helm/moks
     helm:
       releaseName: moks
-      valueFiles: [values-minikube.yaml]
+      valueFiles: [values-hetzner.yaml]
       parameters:
         - {name: resourceGroup, value: database}
   destination:

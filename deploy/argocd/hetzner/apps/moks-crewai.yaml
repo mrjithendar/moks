@@ -1,9 +1,9 @@
-# The worker Deployment, or one Deployment per worker.pools entry.
+# The CrewAI worker, moks-crewai (docs/crewai-investigation.md). Renders nothing while crewai.enabled is false.
 # Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: moks-worker
+  name: moks-crewai
   namespace: argocd
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -15,9 +15,9 @@ spec:
     path: deploy/helm/moks
     helm:
       releaseName: moks
-      valueFiles: [values-minikube.yaml]
+      valueFiles: [values-hetzner.yaml]
       parameters:
-        - {name: resourceGroup, value: worker}
+        - {name: resourceGroup, value: crewai}
   destination:
     server: https://kubernetes.default.svc
     namespace: moks

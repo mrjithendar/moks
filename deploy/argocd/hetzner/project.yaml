@@ -1,6 +1,6 @@
 # AppProject for MOKS: only this repository, only namespace moks, and only the cluster-scoped
 # kinds the chart needs (its read-only ClusterRole/Binding and the namespace).
-# The child Applications in minikube/apps run here. The root does not: it writes Applications, so it has
+# The child Applications in hetzner/apps run here. The root does not: it writes Applications, so it has
 # its own project (project-root.yaml) and this one never gains the argocd namespace.
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
@@ -56,7 +56,7 @@ spec:
     - {group: batch, kind: CronJob}
     - {group: batch, kind: Job}        # moks-migrate, when secrets.split is true
     - {group: rbac.authorization.k8s.io, kind: RoleBinding}
-    - {group: security.istio.io, kind: PeerAuthentication}   # values-minikube.yaml mesh
+    - {group: security.istio.io, kind: PeerAuthentication}   # values-hetzner.yaml mesh
   # Secrets are deliberately absent: they are created out of band (deploy/secrets) and Argo CD
   # can neither create nor prune them.
   roles:

@@ -191,7 +191,7 @@ One-time setup, then every push to master deploys:
 ```sh
 terraform -chdir=deploy/terraform apply -var-file=tfvars/mk4.tfvars   # creates ECR moks-crewai, lets CI push to it
 scripts/setup-argocd-ci.sh                          # applies the AppProject with role ci, stores ARGOCD_AUTH_TOKEN, sets MK4_DEPLOY
-# deploy/helm/moks/values-minikube.yaml: crewai.enabled: true (image.repository stays .../moks)
+# deploy/helm/moks/values-hetzner.yaml: crewai.enabled: true (image.repository stays .../moks)
 # commit and push to master. Then once: sync moks-root, which creates the moks-crewai Application,
 # and sync moks-foundation then moks-crewai. After that the deploy job syncs and restarts it.
 ```

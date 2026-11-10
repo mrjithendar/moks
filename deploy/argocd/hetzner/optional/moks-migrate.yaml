@@ -1,9 +1,10 @@
-# The API Deployment, its Service and PodDisruptionBudget. It also serves the frontend.
+# The moks-migrate Job. Move this file to ../apps/ when secrets.split is true, and
+# not before: with split off the group is empty. See docs/ARGOCD_APP_SPLIT.md.
 # Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: moks-api
+  name: moks-migrate
   namespace: argocd
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -15,9 +16,9 @@ spec:
     path: deploy/helm/moks
     helm:
       releaseName: moks
-      valueFiles: [values-minikube.yaml]
+      valueFiles: [values-hetzner.yaml]
       parameters:
-        - {name: resourceGroup, value: api}
+        - {name: resourceGroup, value: migrate}
   destination:
     server: https://kubernetes.default.svc
     namespace: moks

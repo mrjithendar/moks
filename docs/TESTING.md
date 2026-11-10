@@ -249,7 +249,7 @@ MOKS_LIVE_PROMETHEUS=http://localhost:19090/prometheus MOKS_LIVE_LOKI=http://loc
 python -m pytest -q -s tests/live
 
 cd ../frontend && npm test && npm run build
-helm lint deploy/helm/moks -f deploy/helm/moks/values-minikube.yaml
+helm lint deploy/helm/moks -f deploy/helm/moks/values-hetzner.yaml
 scripts/validate-argocd-split.py
 ```
 

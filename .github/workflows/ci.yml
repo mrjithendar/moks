@@ -7,7 +7,7 @@ name: moks
 #            backend/requirements-crewai.txt), which is what an image built with MOKS_CREWAI=true runs
 # release -> default branch: build the arm64 image once and push it as latest, the only tag. The commit is baked in.
 # release-crewai -> the same image with the CrewAI extra (MOKS_CREWAI=true), pushed as moks-crewai:latest. mk4 runs
-#            it only when values-minikube.yaml points image.repository there (docs/crewai-investigation.md).
+#            it only when values-hetzner.yaml points image.repository there (docs/crewai-investigation.md).
 # deploy  -> after release, only when repository variable MK4_DEPLOY is "true": Argo CD deploys. CI asks it to
 #            sync the MOKS Applications from master in order, then to restart the Deployments that run
 #            moks:latest, and checks the site reports the new commit. CI has no Kubernetes credentials: only an
@@ -62,10 +62,10 @@ jobs:
       - uses: azure/setup-helm@v5
       - name: Helm
         run: |
-          helm lint deploy/helm/moks -f deploy/helm/moks/values-minikube.yaml
+          helm lint deploy/helm/moks -f deploy/helm/moks/values-hetzner.yaml
           helm lint deploy/helm/moks -f deploy/helm/moks/values-eks.yaml --set image.tag=ci
-          helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-minikube.yaml > /dev/null
-          helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-minikube.yaml --set secrets.split=true,backup.enabled=true,backup.bucket=ci,velero.enabled=true > /dev/null
+          helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-hetzner.yaml > /dev/null
+          helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-hetzner.yaml --set secrets.split=true,backup.enabled=true,backup.bucket=ci,velero.enabled=true > /dev/null
           helm template moks deploy/helm/moks -n moks -f deploy/helm/moks/values-eks.yaml --set image.tag=ci,secrets.split=true > /dev/null
       - name: Argo CD Applications add up to the chart
         run: |
@@ -222,7 +222,7 @@ jobs:
       group: moks-deploy-mk4
       cancel-in-progress: false
     env:
-      # Argo CD at https://jithendar.com/argocd. The token is project role moks/ci (deploy/argocd/minikube/project.yaml):
+      # Argo CD at https://jithendar.com/argocd. The token is project role moks/ci (deploy/argocd/hetzner/project.yaml):
       # get, sync and restart Applications of project moks, nothing else. scripts/setup-argocd-ci.sh issues it.
       ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER || 'jithendar.com' }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}

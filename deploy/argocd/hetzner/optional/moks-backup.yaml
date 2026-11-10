@@ -1,9 +1,10 @@
-# Internal reranking service, part of the mk4 deployment since reranker.enabled is true.
+# The moks-backup CronJob and its script ConfigMap. Move this file to ../apps/ when
+# backup.enabled is true, and not before.
 # Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: moks-reranker
+  name: moks-backup
   namespace: argocd
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -15,9 +16,9 @@ spec:
     path: deploy/helm/moks
     helm:
       releaseName: moks
-      valueFiles: [values-minikube.yaml]
+      valueFiles: [values-hetzner.yaml]
       parameters:
-        - {name: resourceGroup, value: reranker}
+        - {name: resourceGroup, value: backup}
   destination:
     server: https://kubernetes.default.svc
     namespace: moks

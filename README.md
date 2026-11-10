@@ -34,7 +34,7 @@ real API server.
 backend/          FastAPI app, worker, connectors, tools, orchestrator, migrations, tests
 frontend/         React portal
 reranker/         Optional internal PyTorch reranking service (docs/RERANKING.md)
-deploy/helm/moks  Helm chart (values-minikube.yaml for mk4; values-eks.yaml is unused since roboshop-demo was deleted)
+deploy/helm/moks  Helm chart (values-hetzner.yaml for mk4, the Hetzner k3s cluster; values-eks.yaml is unused since roboshop-demo was deleted)
 deploy/argocd     AppProjects, root and child Applications per environment
 deploy/secrets    Secret templates (no real values)
 deploy/terraform  AWS: ECR repo, GitHub OIDC CI role, MOKS runtime IAM user (Bedrock)
@@ -42,7 +42,7 @@ deploy/rbac, iam  Kubernetes RBAC and AWS IAM examples
 deploy/grafana    Dashboard JSON and Prometheus scrape job
 lab/              Four reproducible incidents with expected evidence and fixes
 dev/              Local run script and seed
-scripts/          create-secrets, backup, deploy-mk4
+scripts/          create-secrets(-hetzner), backup, deploy-hetzner
 docs/             Architecture, security/RBAC, connectors, operator guide, testing, limitations
 ```
 

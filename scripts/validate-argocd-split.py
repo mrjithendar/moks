@@ -33,7 +33,10 @@ POOLS = ["--set-json", 'worker.pools=[{"name":"detection","classes":"detection",
                        '{"name":"knowledge","classes":"knowledge,maintenance","capacity":"knowledge=1,maintenance=1","replicas":2}]']
 OPENSEARCH = ["--set", "rag.backend=opensearch"]
 RERANKER = ["--set", "reranker.enabled=true", "--set", "reranker.image.digest=sha256:" + "b" * 64]
-BACKUP = ["--set", "backup.enabled=true", "--set", "backup.bucket=ci"]
+# Backups dump the bundled database, so these scenarios need it whatever the environment says.
+BUNDLED = ["--set", "postgres.bundled=true"]
+BACKUP_ONLY = ["--set", "backup.enabled=true", "--set", "backup.bucket=ci"]
+BACKUP = BUNDLED + BACKUP_ONLY
 SPLIT = ["--set", "secrets.split=true"]
 # name -> (extra helm arguments, groups that must render something, groups that must render nothing)
 SCENARIOS = {
@@ -43,9 +46,9 @@ SCENARIOS = {
     "terminal-on-split": (TERMINAL_ON + SPLIT, {"terminal", "migrate"}, set()),
     "terminal-off": (["--set", "terminal.enabled=false"], set(), {"terminal"}),
     "external-postgres": (["--set", "postgres.bundled=false"], set(), {"database"}),
-    "external-postgres-split-backup": (["--set", "postgres.bundled=false"] + SPLIT + BACKUP, {"migrate"}, {"database", "backup"}),
+    "external-postgres-split-backup": (["--set", "postgres.bundled=false"] + SPLIT + BACKUP_ONLY, {"migrate"}, {"database", "backup"}),
     "rag-postgres": (["--set", "rag.backend=postgres"], set(), {"opensearch"}),
-    "rag-pgvector": (["--set", "rag.backend=pgvector", "--set", "postgres.image=pgvector/pgvector:0.8.7-pg17", "--set", "postgres.uid=999"], {"database"}, {"opensearch"}),
+    "rag-pgvector": (BUNDLED + ["--set", "rag.backend=pgvector", "--set", "postgres.image=pgvector/pgvector:0.8.7-pg17", "--set", "postgres.uid=999"], {"database"}, {"opensearch"}),
     "rag-pinecone": (["--set", "rag.backend=pinecone"], set(), {"opensearch"}),
     "rag-opensearch-bundled": (OPENSEARCH, {"opensearch"}, set()),
     "rag-opensearch-managed": (OPENSEARCH + ["--set", "rag.opensearch.url=https://search.example", "--set", "rag.opensearch.awsRegion=us-east-1"], set(), {"opensearch"}),
@@ -70,8 +73,8 @@ SCENARIOS = {
 # What each optional Application needs before it may leave optional/, for the project checks.
 OPTIONAL_SCENARIO = {"migrate": "split", "opensearch": "rag-opensearch-bundled", "backup": "backup", "reranker": "reranker-on"}
 ENVIRONMENTS = {
-    "minikube": {
-        "prefix": "moks", "project": "moks", "projectFile": "minikube/project.yaml", "values": "values-minikube.yaml", "legacy": "legacy/application.yaml",
+    "hetzner": {   # mk4: Hetzner k3s, the shared CloudNativePG database (postgres.bundled false)
+        "prefix": "moks", "project": "moks", "projectFile": "hetzner/project.yaml", "values": "values-hetzner.yaml", "legacy": "legacy/application.yaml",
         "old": "moks-portal", "destination": {"server": "https://kubernetes.default.svc", "namespace": "moks"},
         "namespaceLabels": {"app.kubernetes.io/part-of": "moks", "pod-security.kubernetes.io/enforce": "baseline", "pod-security.kubernetes.io/warn": "restricted",
                             "istio-injection": "enabled"},
@@ -368,7 +371,7 @@ def ownership_table() -> None:
                     row[environment] = ENVIRONMENTS[environment]["old"] if k in active else row.get(environment, "if enabled")
     print("| New group | Kind | Namespace | Name | Old owner on mk4 | Old owner on EKS |\n|---|---|---|---|---|---|")
     for (group, kind, namespace, name), row in sorted(rows.items(), key=lambda r: (GROUPS.index(r[0][0]), r[0][1], r[0][2], r[0][3])):
-        print(f"| {group} | {kind} | {namespace or '(cluster)'} | `{name}` | {row.get('minikube', '-')} | {row.get('eks', '-')} |")
+        print(f"| {group} | {kind} | {namespace or '(cluster)'} | `{name}` | {row.get('hetzner', '-')} | {row.get('eks', '-')} |")
 
 
 def main() -> int:

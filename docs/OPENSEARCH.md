@@ -81,7 +81,7 @@ Refuses if any exists. Needs `openssl` and `htpasswd`. The CA key is discarded o
 
 ### 4. Deploy beside the original
 
-In `values-minikube.yaml`, set `rag.opensearch.secure.enabled: true`. Push.
+In `values-hetzner.yaml`, set `rag.opensearch.secure.enabled: true`. Push.
 
 ```sh
 argocd app sync moks-foundation     # lets MOKS pods reach moks-search; never --prune
@@ -114,7 +114,7 @@ If it fails, fix the cause and build again: the failed generation is cleaned up,
 
 ### 6. Cut over
 
-The original's `publicRoute` and `dashboards` both reach the unauthenticated pod and cannot follow, so the chart refuses to cut over until they are off. Decide what replaces them first. Then set in `values-minikube.yaml`:
+The original's `publicRoute` and `dashboards` both reach the unauthenticated pod and cannot follow, so the chart refuses to cut over until they are off. Decide what replaces them first. Then set in `values-hetzner.yaml`:
 
 ```yaml
 rag:
@@ -180,7 +180,7 @@ Optional and off by default: `rag.opensearch.secure.dashboards`. It needs `moks-
 To turn it on, with `moks-search` running:
 
 1. If `moks-search-users` already exists from before this was added, it lacks these identities. Delete all the Secrets and rerun `scripts/opensearch-secrets.sh`, which issues new passwords for everything. On a fresh install, step 3 above already made them.
-2. Set `rag.opensearch.secure.dashboards.enabled: true` in `values-minikube.yaml`, push, then `argocd app sync moks-foundation moks-opensearch`. The security Job loads the new role and users.
+2. Set `rag.opensearch.secure.dashboards.enabled: true` in `values-hetzner.yaml`, push, then `argocd app sync moks-foundation moks-opensearch`. The security Job loads the new role and users.
 3. Connect and sign in as `moks_viewer`:
 
 ```sh

@@ -1,4 +1,4 @@
-# Defaults. Environment-specific files (values-minikube.yaml, values-eks.yaml) override these.
+# Defaults. Environment-specific files (values-hetzner.yaml, values-eks.yaml) override these.
 
 # What to render: all, or one of foundation, database, migrate, opensearch, api, worker, executor,
 # terminal, reranker, routing, backup. Each child Argo CD Application sets its own group as a parameter and

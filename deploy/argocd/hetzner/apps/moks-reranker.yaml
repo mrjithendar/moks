@@ -1,10 +1,9 @@
-# The moks-migrate Job. Move this file to ../apps/ when secrets.split is true, and
-# not before: with split off the group is empty. See docs/ARGOCD_APP_SPLIT.md.
+# Internal reranking service, part of the mk4 deployment since reranker.enabled is true.
 # Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: moks-migrate
+  name: moks-reranker
   namespace: argocd
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -16,9 +15,9 @@ spec:
     path: deploy/helm/moks
     helm:
       releaseName: moks
-      valueFiles: [values-minikube.yaml]
+      valueFiles: [values-hetzner.yaml]
       parameters:
-        - {name: resourceGroup, value: migrate}
+        - {name: resourceGroup, value: reranker}
   destination:
     server: https://kubernetes.default.svc
     namespace: moks

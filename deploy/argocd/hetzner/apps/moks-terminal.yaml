@@ -1,10 +1,10 @@
-# Bundled OpenSearch, because rag.backend is opensearch with no rag.opensearch.url. Move this file back to
-# ../optional/ when that changes. Amazon OpenSearch Service and Pinecone are never Applications.
+# The terminal gateway, session identities and the moks-terminals namespace with its quota and
+# default-deny NetworkPolicy.
 # Manual sync, never with prune (docs/ARGOCD_APP_SPLIT.md).
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: moks-opensearch
+  name: moks-terminal
   namespace: argocd
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -16,9 +16,9 @@ spec:
     path: deploy/helm/moks
     helm:
       releaseName: moks
-      valueFiles: [values-minikube.yaml]
+      valueFiles: [values-hetzner.yaml]
       parameters:
-        - {name: resourceGroup, value: opensearch}
+        - {name: resourceGroup, value: terminal}
   destination:
     server: https://kubernetes.default.svc
     namespace: moks
