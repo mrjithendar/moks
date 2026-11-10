@@ -7,7 +7,10 @@ column; otherwise the Postgres retrieval backend is keyword-only (OpenSearch pro
 Revision ID: 0002
 Revises: 0001
 """
+import logging
+
 from alembic import op
+from sqlalchemy.exc import DBAPIError
 
 from moks.migrations import split_sql
 
@@ -25,11 +28,17 @@ def upgrade() -> None:
         bind.exec_driver_sql(statement)
     has_vector = bind.exec_driver_sql("SELECT 1 FROM pg_available_extensions WHERE name = 'vector'").first()
     if has_vector:
+        # A failed statement aborts the whole transaction in PostgreSQL, so catching the error is not enough:
+        # the savepoint rolls back just this attempt and the migration carries on. A role that may not create
+        # extensions (the shared CloudNativePG cluster's tenant roles) gets the keyword-only backend.
         try:
-            bind.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
-            bind.exec_driver_sql("ALTER TABLE chunk_embeddings ADD COLUMN embedding vector")
-        except Exception:  # extension present but not creatable by this role: stay keyword-only
-            pass
+            with bind.begin_nested():
+                bind.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
+                bind.exec_driver_sql("ALTER TABLE chunk_embeddings ADD COLUMN embedding vector")
+        except DBAPIError as error:  # extension present but not creatable by this role: stay keyword-only
+            logging.getLogger("alembic.runtime.migration").warning(
+                "pgvector not enabled (%s); the Postgres retrieval backend stays keyword-only",
+                str(error.orig).splitlines()[0])
 
 
 SCHEMA = """
