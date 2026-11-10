@@ -68,6 +68,9 @@ spec:
         annotations: {argocd.argoproj.io/sync-options: "Prune=false,Delete=false"}
       spec:
         accessModes: [ReadWriteOnce]
+        {{- with .Values.rag.opensearch.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
         resources: {requests: {storage: {{ .Values.rag.opensearch.storage }}}}
 ---
 apiVersion: v1

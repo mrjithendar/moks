@@ -1,4 +1,4 @@
-# mk4 (Hetzner, Minikube, arm64) behind the Istio ingress gateway at https://jithendar.com/moks
+# mk4 (Hetzner k3s, arm64: jithendar-master1 and two workers) behind the Istio ingress gateway at https://jithendar.com/moks
 image:
   repository: registry.jithendar.com/jithendar/moks
   # CI moves latest on every master build. Pods get it when they restart (docs/RELEASES.md).
@@ -6,9 +6,10 @@ image:
   pullPolicy: Always
 imagePullSecrets: [{name: harbor-pull}]   # robot$k8s-pull, never expires: tools deploy/minikube/harbor/registry.py pull-secrets
 
-# Cluster backups. Velero itself is the Argo CD app in deploy/argocd/velero.yaml.
+# Cluster backups. Velero itself is the Argo CD app in deploy/argocd/velero.yaml. Off on the k3s cluster until
+# Velero is installed: the chart's Roles need the velero namespace.
 velero:
-  enabled: true
+  enabled: false
 
 # Investigations read Argo CD's sync status and errors.
 argocd:
@@ -93,21 +94,20 @@ istio:
   enabled: true
   delegate: true
 
+# The shared CloudNativePG cluster postgres-db/postgres-cluster (miniKube minikube-infrastructure/postgres.tf).
+# MOKS_DATABASE_URL in moks-secrets points at its pooler, from Secret moks/postgres-db-credentials.
 postgres:
-  bundled: true
-  storage: 10Gi
-  nodeName: mk4-m04     # hostPath PVs have no node affinity; keep the pod on the node holding the data
-  fixVolumePermissions: true   # hostPath ignores fsGroup; chown the data dir to postgres (uid 70)
+  bundled: false
 
 rag:
   backend: opensearch    # ~2.5 GiB; mk4 nodes have ~32 GiB. Changing this moves nothing: run `moks reindex` after.
   # backend: pinecone    # needs MOKS_CRED_PINECONE_API_KEY, and a reindex
   opensearch:
     storage: 20Gi
-    nodeName: mk4-m02    # hostPath volume: keep OpenSearch on the node holding its data
-    fixVolumePermissions: true   # hostPath ignores fsGroup; chown the data dir to opensearch (uid 1000)
-    # All mk4 nodes share one disk, already past the default 90% limit on a 150 GiB volume. Bytes free
-    # say what is really left. Below 1gb OpenSearch stops writes, which protects the other databases.
+    storageClass: local-path     # like every other volume on the cluster; local-path PVs carry node affinity
+    fixVolumePermissions: true   # local-path is a hostPath; chown the data dir to opensearch (uid 1000)
+    # local-path volumes share the node's disk with the other databases. Bytes free say what is really
+    # left. Below 1gb OpenSearch stops writes, which protects the other databases.
     diskWatermarks: {low: 3gb, high: 2gb, floodStage: 1gb}
     publicRoute: {enabled: true}   # https://jithendar.com/opensearch; login from Secret moks-opensearch-auth (on the gateway)
     dashboards: {enabled: true}    # https://jithendar.com/opensearch-dashboards; login from Secret moks-opensearch-dashboards-auth
@@ -115,7 +115,6 @@ rag:
     secure:
       enabled: false
       active: false
-      nodeName: mk4-m02
       fixVolumePermissions: true
       allowMmap: true      # mk4 nodes report vm.max_map_count 1048576
       diskWatermarks: {low: 3gb, high: 2gb, floodStage: 1gb}
@@ -158,8 +157,15 @@ networkPolicy:
   # The Istio gateway.
   ingressNamespaces: [istio-ingress]
   apiServer:
-    cidrs: [10.96.0.1/32, 192.168.49.2/32]   # kubernetes Service VIP and the endpoint behind it
-    ports: [443, 8443]
+    cidrs: [10.43.0.1/32, 10.0.0.2/32]   # k3s kubernetes Service VIP and the endpoint behind it (jithendar-master1)
+    ports: [443, 6443]
+  inCluster:                     # values.yaml's list, plus the shared PostgreSQL
+    - namespace: monitoring
+      ports: [9090, 3100, 80, 3000]
+    - namespace: observability
+      ports: [4318]
+    - namespace: postgres-db
+      ports: [5432]
 
 logCollector:
   enabled: true         # monitoring/alloy; also add "moks" to Alloy's namespaces in the tools repo
@@ -187,5 +193,5 @@ reranker:
 secretsSync:
   enabled: true
   allowDelete: true   # delete verb on Secrets, for reviewed deletion plans (always someone else's approval); AWS deletion is the connector's allow_delete
-  namespaces: [harbor, jithendar, moks, velero, observability,
+  namespaces: [harbor, jithendar, moks, observability,
                moks-diagnostics, moks-lab, moks-terminals, monitoring, roboshop-ai ]
