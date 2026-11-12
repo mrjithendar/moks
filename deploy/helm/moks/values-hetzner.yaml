@@ -15,6 +15,10 @@ velero:
 argocd:
   enabled: true
 
+# The Backups page reports on the shared CloudNativePG cluster (postgres-db/postgres-cluster) and any other.
+cnpg:
+  enabled: true
+
 publicUrl: https://jithendar.com/moks
 basePath: /moks
 

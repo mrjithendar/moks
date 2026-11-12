@@ -621,3 +621,15 @@ button.selected, button[aria-pressed="true"] { outline: 2px solid var(--accent, 
 .warn-list { margin: 0; padding-left: 18px; color: var(--muted); }
 .sticky-actions { position: sticky; bottom: 0; background: var(--bg); padding: 8px 0; border-top: 1px solid var(--border); gap: 8px; }
 .sticky-actions input { min-width: 0; flex: 1 1 160px; }
+
+/* Backups: one tile per protection layer */
+.bk-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: var(--gap); }
+button.bk-tile { display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: var(--sp-1); text-align: left; white-space: normal; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-left: 3px solid var(--border); border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); min-height: 0; font-weight: 400; min-width: 0; }
+button.bk-tile:hover { border-color: var(--accent); filter: none; }
+button.bk-tile.ok { border-left-color: var(--ok); }
+button.bk-tile.warn { border-left-color: var(--warn); }
+button.bk-tile.bad { border-left-color: var(--bad); }
+button.bk-tile.info { border-left-color: var(--info); }
+.bk-tile-top { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); }
+.bk-tile-label { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.bk-tile-value { font-size: var(--fs-xl); font-weight: 650; line-height: 1.3; overflow-wrap: anywhere; }

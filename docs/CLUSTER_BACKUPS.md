@@ -86,3 +86,18 @@ Backups default to 3650 days, so nothing is removed automatically unless you cho
 ## Not yet proven
 
 Written and checked against Velero's published schemas, but **not run against real Velero or R2**. Prove it on a scratch cluster first. Check R2 with `checksumAlgorithm: ""` and `customerKeyEncryptionSecret` with real backups, and on EKS, Kopia volume data on R2 with SSE-C set on the location.
+
+## PostgreSQL clusters (CloudNativePG)
+
+Clusters run by the CloudNativePG operator, such as the shared `postgres-db/postgres-cluster` on mk4, back themselves up: a base backup from a `ScheduledBackup`, and every WAL segment as it fills. MOKS does not take these backups. The Backups page reads their status and shows, per cluster:
+
+- whether a backup is configured at all (`spec.backup` or a WAL-archiving plugin), where it is stored and how long it is kept;
+- whether WAL archiving works (the `ContinuousArchiving` condition), which is what point-in-time recovery depends on;
+- the last completed base backup, how far back recovery can reach (`firstRecoverabilityPoint`) and which schedules cover it;
+- the `Backup` objects themselves, newest first (200 at most).
+
+Findings are deterministic (`backend/moks/cnpg.py`): no backup configured, archiving failing, no completed base backup, the last one older than 26 hours, the most recent one failed, no schedule or every schedule suspended.
+
+Turn it on with `cnpg.enabled: true` in the values. That adds `get` and `list` on `clusters`, `backups` and `scheduledbackups` in `postgresql.cnpg.io` to the `moks-reader` ClusterRole, so it needs `rbac.clusterWide`. MOKS reads no Secret for this: the rows hold names, phases, timestamps and the destination path, never the object-store credentials.
+
+**Not built:** starting a base backup, changing a schedule, or restoring a cluster from the portal. A restore with CloudNativePG creates a new `Cluster` that bootstraps from the object store, which is a reviewed change in Git, not a button. MOKS's own database lives in this cluster, so these backups, not the hourly dump, are what a point-in-time recovery of MOKS would use.

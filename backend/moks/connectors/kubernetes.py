@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from .. import argocd, velero
+from .. import argocd, cnpg, velero
 from ..redaction import redact
 from .base import ConnectorError, resolve_credential_path
 
@@ -173,6 +173,13 @@ class KubernetesConnector:
     async def velero_get(self, plural: str, name: str) -> dict:
         custom = await self.custom()
         return await self._call(f"get velero {plural}/{name}", custom.get_namespaced_custom_object, velero.GROUP, velero.VERSION, velero.namespace(), plural, name)
+
+    # ---- CloudNativePG (clusters, backups and schedules in every namespace; status only, never a Secret) ---
+
+    async def cnpg_list(self, plural: str) -> list[dict]:
+        custom = await self.custom()
+        items, _ = await self._list(f"list cloudnative-pg {plural}", custom.list_cluster_custom_object, cnpg.GROUP, cnpg.VERSION, plural)
+        return items
 
     # ---- Argo CD (Application status; the moks.argocd row keeps no Helm parameters or values) ---
 

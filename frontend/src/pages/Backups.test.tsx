@@ -12,6 +12,12 @@ const responses: Record<string, unknown> = {
   "/backups/mk4": { installed: true, volumes_supported: false, findings: [], locations: [], restores: [], schedules: [], store: null,
     backups: [{ name: "nightly", phase: "Completed", started: null, expires: null, items: 3, items_total: 3, volumes: false, errors: 0, warnings: 0 }] },
   "/backups/mk4/databases": { targets: [{ namespace: "shop", workload: "orders-db", kind: "StatefulSet", engine: "postgresql", enabled: true }], not_covered: [{ namespace: "shop", workload: "cache", service: "redis" }], backups: [database], schedules: [], findings: [{ severity: "warn", code: "x", text: "orders-db has no active backup schedule." }] },
+  "/backups/mk4/postgres": { installed: true, truncated: false, environment: "mk4",
+    clusters: [{ namespace: "postgres-db", name: "postgres-cluster", phase: "Cluster in healthy state", healthy: true, instances: 3, ready: 3, primary: "postgres-cluster-1", image: "postgresql:17.6", storage: "20Gi",
+      backup_method: "barmanObjectStore", destination: "s3://backups/postgres", retention: "30d", archiving: false, archiving_message: "exit status 1", first_recoverability_point: "2026-11-01T00:00:00Z", last_successful_backup: "2026-11-12T02:01:30Z", last_failed_backup: null }],
+    backups: [{ namespace: "postgres-db", name: "daily-20261112", cluster: "postgres-cluster", phase: "completed", method: "barmanObjectStore", started: "2026-11-12T02:00:00Z", stopped: "2026-11-12T02:01:30Z", duration_seconds: 90, schedule: "daily", error: null }],
+    schedules: [{ namespace: "postgres-db", name: "daily", cluster: "postgres-cluster", cron: "0 0 2 * * *", suspended: false, last_run: "2026-11-12T02:00:00Z", next_run: "2026-11-13T02:00:00Z" }],
+    findings: [{ severity: "bad", code: "cnpg_archiving:postgres-db/postgres-cluster", text: "WAL archiving is failing for postgres-db/postgres-cluster." }] },
   "/backups/mk4/items/nightly": { name: "nightly", phase: "Completed", errors: 0, warnings: 0, namespaces: ["*"], excluded_namespaces: ["velero"], included_resources: ["*"], excluded_resources: [], duration_seconds: 15, ttl: "87600h", uid: "u1", storage_location: "moks-r2", format_version: "1.1.0", fs_backups: { completed: 0, attempted: 0 },
     contents: { total: 2, kinds: [{ kind: "Pod", count: 2 }], namespaces: [{ namespace: "shop", count: 2, kinds: { Pod: 2 } }], items: [{ kind: "Pod", namespace: "shop", name: "checkout" }], truncated: false, errors: {}, warnings: {} }, contents_note: null },
 };
@@ -46,6 +52,15 @@ describe("Backups", () => {
     fireEvent.click(database);
     await waitFor(() => expect(api).toHaveBeenCalledWith("/backups/mk4/databases/backup", { method: "POST", body: { namespace: "shop", workload: "orders-db", kind: "StatefulSet" } }));
     expect(screen.queryByLabelText("Reason")).toBeNull();
+  });
+  it("reports PostgreSQL clusters run by CloudNativePG, read-only", async () => {
+    open();
+    expect(await screen.findByText(/WAL archiving is failing for postgres-db\/postgres-cluster/)).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Protection summary" }).textContent).toContain("0 of 1");
+    fireEvent.click(screen.getByRole("button", { name: "postgres-db/postgres-cluster" }));
+    expect(await screen.findByText("s3://backups/postgres")).toBeTruthy();
+    expect(screen.getByText("exit status 1")).toBeTruthy();
+    expect(screen.getByText(/does not start, change or restore them/)).toBeTruthy();
   });
   it("still asks why before a restore", async () => {
     open();

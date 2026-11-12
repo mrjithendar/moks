@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import audit, dbbackup, velero
+from .. import audit, cnpg, dbbackup, velero
 from ..actions import service
 from ..auth.deps import deny, get_auth, needs
 from ..auth.sessions import AuthContext
@@ -239,6 +239,20 @@ async def details(environment: str, name: str, request: Request, ctx: AuthContex
         return {**detail, "contents": await asyncio.to_thread(velero.contents, store, env.name, name), "contents_note": None}
     except Exception as exc:  # the metadata above is still worth showing
         return {**detail, "contents": None, "contents_note": f"The list of contents could not be read from R2 ({type(exc).__name__})."}
+
+
+@router.get("/{environment}/postgres")
+async def postgres_clusters(environment: str, request: Request, ctx: AuthContext = Depends(get_auth), db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """CloudNativePG clusters with their base backups, WAL archiving and schedules. Read-only: the operator takes these."""
+    env = await _env(request, db, ctx, environment)
+    connectors, _ = await registry.for_environment(db, env.id)
+    k8s = connectors.get("kubernetes")
+    if k8s is None:
+        raise HTTPException(409, "No kubernetes connector in this environment")
+    try:
+        return {**await cnpg.status(k8s[1]), "environment": env.name}
+    except ConnectorError as exc:
+        raise HTTPException(502, exc.message) from None
 
 
 class DatabaseTarget(NoReason):
