@@ -85,7 +85,7 @@ the root is what updates a child's.
 
 ### roboshop-demo (EKS)
 
-**Retired on 2026-11-02:** the cluster was deleted and MOKS runs on mk4 only (`scripts/deploy-mk4.sh`).
+**Retired on 2026-11-02:** the cluster was deleted and MOKS runs on mk4 only (`scripts/deploy-hetzner.sh`).
 `values-eks.yaml` and `deploy/argocd/eks` stay for a rebuild; nothing live reads them, and the rest of
 this section applies only if the cluster comes back.
 
@@ -236,7 +236,7 @@ The API's init container runs migration `0002` automatically. Take a backup firs
    `Authorization: Bearer <token>`.
 6. **Diagnostic sessions:** the chart creates `moks-diagnostics` (quota, limits, egress policy).
    Start sessions under **Diagnostics**. They need no approval. **Quick check** tests DNS, the port, the certificate and HTTP for one target.
-7. **SRE skills:** 14 built-in skills are active. Add your own through `customSkills` in the values
+7. **SRE skills:** 51 built-in skills ship in the image. Add your own through `customSkills` in the values
    ([SKILLS.md](SKILLS.md)).
 8. **Evaluation:** **Evaluation → Run lab** (rules mode) should score 1.0. Run it again in LLM mode
    after configuring a provider, to compare.

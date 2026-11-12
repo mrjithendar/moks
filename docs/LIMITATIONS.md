@@ -9,7 +9,7 @@
 | 3 | Approvals, allowlisted remediation with pre/post validation and recovery, diagnostic sessions | Tested with fakes only. No plan has run against a real API server |
 | 4 | Alert-triggered investigations (webhook + poller) with dedup/cooldowns, incident reports and postmortems, evaluation datasets | Tested with fakes. Not exercised on mk4 since the rewrite |
 | + | FinOps (AWS cost, anomalies, budgets, Kubernetes allocation and rightsizing, LLM spend) | Kubernetes allocation runs live but reports 0 until a price is set. AWS side tested with fakes only |
-| + | SRE skills (`SKILL.md`) | 50 built-in skills; custom skills via ConfigMap |
+| + | SRE skills (`SKILL.md`) | 51 built-in skills; custom skills via ConfigMap |
 
 See [TESTING.md](TESTING.md#live-status-2026-10-30) for the evidence behind each line.
 
@@ -70,7 +70,8 @@ backends does not move vectors: run a reindex afterwards, which pays to embed ev
   cross-encoder. pgvector search is exact (no ANN index). GitHub sync reads at most 3,000 files of
   300 KB per source.
 - **Alerts:** the poller reads Prometheus rule state only (no Alertmanager silences or inhibition).
-  The automatic-investigation cap (6/hour/environment) is fixed in code.
+  The automatic-investigation cap is one number for every environment (`config.autoInvestigationsPerHour`, default 6
+  per hour); there is no per-environment setting.
 - **Executor:** the write path has only been tested with an in-memory writer. No plan has run against a
   real API server.
 - **FinOps:** allocation covers current pods only; Cost Explorer lags up to 24 h and costs $0.01/request (cached and capped).

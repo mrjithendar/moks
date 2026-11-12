@@ -7,7 +7,7 @@ fingerprinted (alertname + identifying labels). Per environment:
 - an open incident with the same fingerprint absorbs the alert (deduplicated);
 - otherwise, if the fingerprint was investigated within alert_cooldown_minutes -> cooldown;
 - otherwise a new incident opens; with auto_investigate, MOKS investigates as the automation
-  principal, capped at MAX_AUTO_PER_HOUR per environment (rate_limited beyond that).
+  principal, capped at MOKS_AUTO_INVESTIGATIONS_PER_HOUR per environment (rate_limited beyond that).
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from .rbac import P, Binding, Principal
 from .scope import ScopeError, effective_scope
 
 log = logging.getLogger("moks.alerts")
-MAX_AUTO_PER_HOUR = 6
+MAX_AUTO_PER_HOUR = 6  # the default of settings.auto_investigations_per_hour
 VOLATILE = {"pod", "instance", "pod_template_hash", "endpoint", "job_instance", "container_id", "uid"}
 
 
@@ -123,9 +123,10 @@ async def _process_one(db: AsyncSession, env_id: uuid.UUID, a: dict[str, Any], s
         hour_ago = now - timedelta(hours=1)
         count = (await db.execute(select(func.count()).select_from(Investigation).where(
             Investigation.environment_id == env_id, Investigation.trigger == "alert", Investigation.created_at > hour_ago))).scalar_one()
-        if count >= MAX_AUTO_PER_HOUR:
+        cap = get_settings().auto_investigations_per_hour
+        if count >= cap:
             ev.decision = result["decision"] = "rate_limited"
-            await add_event(db, inc.id, "note", {"text": f"Automatic investigation skipped: {MAX_AUTO_PER_HOUR}/hour cap reached"})
+            await add_event(db, inc.id, "note", {"text": f"Automatic investigation skipped: {cap}/hour cap reached"})
         else:
             principal = await automation_principal(db)
             try:

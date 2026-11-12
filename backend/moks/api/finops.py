@@ -186,12 +186,3 @@ async def analyze(request: Request, body: dict, ctx: AuthContext = Depends(get_a
          "Break cost down by resource type (cpu, memory, storage), cloud services and LLM usage, rank the biggest savings and the risks "
          "(OOM, throttling, missing requests), and propose concrete rightsizing and configuration changes.")
     return await create(CreateIn(question=q, environment=env, namespace=ns, minutes=60), request, ctx, db)
-    by_model: dict[str, list] = {}
-    total = 0.0
-    for d, prov, model, tin, tout, cost, n in rows:
-        key = f"{prov}/{model}"
-        by_model.setdefault(key, []).append([int(d.timestamp()), float(cost or 0)])
-        total += float(cost or 0)
-    return {"days": days, "total_usd": round(total, 4), "series": [{"metric": {"model": k}, "values": v} for k, v in by_model.items()],
-            "rows": [{"day": d.date().isoformat(), "model": f"{p}/{m}", "tokens_in": int(ti or 0), "tokens_out": int(to or 0),
-                      "cost_usd": round(float(c or 0), 4), "calls": n} for d, p, m, ti, to, c, n in rows]}
