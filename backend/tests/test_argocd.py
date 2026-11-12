@@ -241,7 +241,7 @@ def test_the_chart_grants_read_only_argo_access_and_only_when_enabled():
     chart = Path(__file__).resolve().parents[2] / "deploy/helm/moks"
 
     def rules(*sets):
-        args = ["helm", "template", "moks", str(chart), "-n", "moks", "-f", str(chart / "values-minikube.yaml")]
+        args = ["helm", "template", "moks", str(chart), "-n", "moks", "-f", str(chart / "values-hetzner.yaml")]
         for s in sets:
             args += ["--set", s]
         docs = yaml.safe_load_all(subprocess.run(args, check=True, capture_output=True, text=True).stdout)
