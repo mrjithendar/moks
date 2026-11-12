@@ -35,6 +35,10 @@ def secrets(pod) -> set[str]:
 
 
 SPLIT = ("secrets.split=true", "backup.enabled=true", "backup.bucket=b", "velero.enabled=true")
+# mk4 uses the shared CloudNativePG database and has no Velero yet (values-hetzner.yaml), so the checks of the bundled
+# database, its backup CronJob and the Velero roles turn those on.
+BUNDLED = "postgres.bundled=true"
+VELERO = "velero.enabled=true"
 # mk4 turns secret sync on; the checks of the posture without it switch it off again.
 SYNC_OFF = "secretsSync.enabled=false"
 TERMINAL = (
@@ -76,7 +80,7 @@ def test_config_changes_still_roll_consumers_though_only_foundation_renders_the_
 
 
 def test_each_component_gets_only_its_secret():
-    by = dict(pods(render("values-hetzner.yaml", *SPLIT, SYNC_OFF)))
+    by = dict(pods(render("values-hetzner.yaml", *SPLIT, SYNC_OFF, BUNDLED)))
     assert secrets(by["moks-api"]) == {"moks-api-secrets"}
     assert secrets(by["moks-worker"]) == {"moks-worker-secrets"}
     assert secrets(by["moks-executor"]) == {"moks-executor-secrets"}
@@ -167,7 +171,8 @@ def test_minikube_sidecars_reach_istiod_only_from_already_isolated_pods():
     selected = set(mesh["podSelector"]["matchExpressions"][0]["values"])
     isolated = {p["podSelector"]["matchLabels"]["app"] for p in policies.values()
                 if set(p.get("policyTypes", [])) == {"Ingress", "Egress"} and "app" in p["podSelector"].get("matchLabels", {})}
-    assert isolated <= selected and selected - isolated <= {"moks-search", "moks-search-dashboards"}
+    # moks-postgres is always selected; with the shared database no such pod exists, so the selector matches nothing.
+    assert isolated <= selected and selected - isolated <= {"moks-search", "moks-search-dashboards", "moks-postgres"}
     # DNS too: the proxy resolves istiod by name, and postgres, opensearch and reranker have no DNS rule of their own.
     assert mesh["egress"] == [{"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
                                        "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}],
@@ -197,7 +202,7 @@ def test_meshed_postgres_can_reach_istiod_when_policy_is_enforced():
     docs = render("values-eks.yaml")
     egress = next(d for d in docs if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "moks-postgres")["spec"]["egress"]
     assert {"port": 15012, "protocol": "TCP"} in egress[1]["ports"]
-    assert next(d for d in render("values-hetzner.yaml") if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "moks-postgres")["spec"]["egress"] == []
+    assert next(d for d in render("values-hetzner.yaml", BUNDLED) if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "moks-postgres")["spec"]["egress"] == []
 
 
 def test_mtls_needs_a_gateway_identity():
@@ -219,7 +224,7 @@ def test_mk4_always_pulls_latest():
 
 
 def test_the_chart_ships_the_consistent_dump():
-    docs = render("values-hetzner.yaml", *SPLIT)
+    docs = render("values-hetzner.yaml", *SPLIT, BUNDLED)
     by = dict(pods(docs))
     dump = by["moks-backup"]["initContainers"][0]["command"][2]
     assert "consistent-dump.sql" in dump and "--manifest" in by["moks-backup"]["containers"][0]["args"]
@@ -234,14 +239,14 @@ def test_a_malformed_digest_is_refused(digest):
 
 
 def test_mk4_has_velero_access_and_no_node_agent():
-    docs = render("values-hetzner.yaml")
+    docs = render("values-hetzner.yaml", VELERO)
     assert {"moks-velero-reader", "moks-executor-velero"} <= {d["metadata"]["name"] for d in docs if d["kind"] == "Role"}
     values = yaml.safe_load((CHART.parents[1] / "velero/values-r2-minikube.yaml").read_text())
     assert values["deployNodeAgent"] is False and values["configuration"]["defaultVolumesToFsBackup"] is False
 
 
 def test_argo_can_deploy_velero_in_either_order():
-    docs = render("values-hetzner.yaml")
+    docs = render("values-hetzner.yaml", VELERO)
     ns = next(d for d in docs if d["kind"] == "Namespace" and d["metadata"]["name"] == "velero")
     assert ns["metadata"]["annotations"]["argocd.argoproj.io/sync-wave"] == "-1"  # before the Roles inside it
     assert "Prune=false" in ns["metadata"]["annotations"]["argocd.argoproj.io/sync-options"]
@@ -461,7 +466,8 @@ def test_opensearch_stays_private_unless_the_bundled_pod_is_published(sets):
 
 
 def test_mk4_runs_opensearch_on_the_node_with_its_data():
-    docs = render("values-hetzner.yaml")
+    # On k3s the local-path volume's own node affinity places the pod; nodeName is for clusters where it does not.
+    docs = render("values-hetzner.yaml", "rag.opensearch.nodeName=mk4-m02")
     spec = of(docs, "StatefulSet", "moks-opensearch")["spec"]["template"]["spec"]
     assert spec["nodeSelector"] == {"kubernetes.io/hostname": "mk4-m02"} and spec["initContainers"][0]["name"] == "volume-permissions"
     env = {e["name"]: e["value"] for e in spec["containers"][0]["env"]}
@@ -496,7 +502,7 @@ def test_enabling_it_deploys_beside_the_old_pod_and_moves_nothing():
 
 
 def test_the_secured_pod_is_hardened_and_never_disables_security():
-    docs = render("values-hetzner.yaml", *SECURE)
+    docs = render("values-hetzner.yaml", *SECURE, "rag.opensearch.secure.nodeName=mk4-m02")
     sts = of(docs, "StatefulSet", "moks-search")["spec"]
     spec = sts["template"]["spec"]
     c = spec["containers"][0]
