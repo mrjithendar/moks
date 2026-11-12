@@ -251,7 +251,10 @@ def test_argo_can_deploy_velero_in_either_order():
     assert ns["metadata"]["annotations"]["argocd.argoproj.io/sync-wave"] == "-1"  # before the Roles inside it
     assert "Prune=false" in ns["metadata"]["annotations"]["argocd.argoproj.io/sync-options"]
     project, app = yaml.safe_load_all((CHART.parents[1] / "argocd/velero.yaml").read_text())
-    assert app["spec"]["project"] == project["metadata"]["name"] and "automated" not in app["spec"]["syncPolicy"]
+    assert app["spec"]["project"] == project["metadata"]["name"]
+    # Automated sync is allowed, pruning never is: the namespace holds backups' Secrets and Velero's state.
+    assert app["spec"]["syncPolicy"].get("automated", {}).get("prune", False) is False
+    assert "Prune=false" in app["metadata"]["annotations"]["argocd.argoproj.io/sync-options"]
     values = app["spec"]["sources"][0]["helm"]["valueFiles"][0].replace("$values/", "")
     assert (CHART.parents[2] / values).exists()
     assert {s["repoURL"] for s in app["spec"]["sources"]} <= set(project["spec"]["sourceRepos"])
