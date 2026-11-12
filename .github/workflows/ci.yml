@@ -232,10 +232,18 @@ jobs:
       ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER || 'jithendar.com' }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
       ARGOCD_OPTS: --grpc-web --grpc-web-root-path /argocd
+      # Cloudflare Access in front of /argocd (miniKube: istio/edge values cloudflare.access): an Access service token,
+      # sent as two headers on every call. Unset = no headers (before Access is switched on).
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
     steps:
       - name: Install the argocd CLI
         run: |
           [[ -n "$ARGOCD_AUTH_TOKEN" ]] || { echo "::error::ARGOCD_AUTH_TOKEN is not set; run scripts/setup-argocd-ci.sh"; exit 1; }
+          if [[ -n "$CF_ACCESS_CLIENT_ID" && -n "$CF_ACCESS_CLIENT_SECRET" ]]; then
+            # argocd splits each --header at its first ":" and keeps the rest as is: no space after the colon.
+            echo "ARGOCD_OPTS=$ARGOCD_OPTS --header CF-Access-Client-Id:$CF_ACCESS_CLIENT_ID --header CF-Access-Client-Secret:$CF_ACCESS_CLIENT_SECRET" >> "$GITHUB_ENV"
+          fi
           curl -fsSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/download/v3.5.6/argocd-linux-amd64
           chmod +x /usr/local/bin/argocd
           argocd version --client --short
