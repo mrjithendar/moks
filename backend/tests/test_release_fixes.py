@@ -281,7 +281,7 @@ def test_mk4_seeds_no_llm_provider():
     import yaml
     from pathlib import Path
 
-    values = yaml.safe_load((Path(__file__).parents[2] / "deploy/helm/moks/values-minikube.yaml").read_text())
+    values = yaml.safe_load((Path(__file__).parents[2] / "deploy/helm/moks/values-hetzner.yaml").read_text())
     assert not values["seed"].get("llm")
 
 
