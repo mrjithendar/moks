@@ -401,7 +401,7 @@ async def test_tools_enforce_the_cluster_namespace(fake_pg):
         {"type": "postgres", "name": "pay-db", "config": {"host": "pay", "namespace": "payments"}},
         {"type": "postgres", "name": "rds", "config": {"host": "rds"}},
     ])
-    shop_only = Principal("u", "u@x", [Binding("investigator", name, "shop")])
+    shop_only = Principal(str(uuid.uuid4()), "u@x", [Binding("investigator", name, "shop")])
     ctx = await _ctx(env_id, shop_only, ("shop",))
     ex = ToolExecutor(None, ctx)
     assert {"datastore_clusters", "pg_overview", "pg_locks"} <= {t.name for t in tools_for_planner(ctx)}
