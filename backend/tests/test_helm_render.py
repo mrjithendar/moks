@@ -707,3 +707,11 @@ def test_secret_delete_verb_needs_allow_delete():
     docs = render("values-hetzner.yaml", "secretsSync.enabled=true", "secretsSync.namespaces={shop}", "secretsSync.allowDelete=true")
     role = next(d for d in docs if d["kind"] == "Role" and d["metadata"]["name"] == "moks-secret-sync")
     assert "delete" in next(r["verbs"] for r in role["rules"] if r["resources"] == ["secrets"])
+
+
+def test_cnpg_status_is_readable_on_mk4_only_and_never_writable():
+    def rule(values):
+        reader = next(d for d in render(values) if d["kind"] == "ClusterRole" and d["metadata"]["name"] == "moks-reader")
+        return [r for r in reader["rules"] if r["apiGroups"] == ["postgresql.cnpg.io"]]
+    assert rule("values-hetzner.yaml") == [{"apiGroups": ["postgresql.cnpg.io"], "resources": ["clusters", "backups", "scheduledbackups"], "verbs": ["get", "list"]}]
+    assert rule("values-eks.yaml") == []  # off unless cnpg.enabled
