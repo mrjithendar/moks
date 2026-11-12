@@ -37,6 +37,7 @@ config:
   otelEndpoint: ""        # e.g. http://otel-collector.observability:4318
   traceSampleRatio: 1     # share of new traces kept when otelEndpoint is set; children follow their parent
   alertPollSeconds: 60    # Prometheus alert polling for environments with auto_investigate
+  autoInvestigationsPerHour: 6  # automatic investigations per environment per hour, per trigger (alerts, detection); 1 to 120
   # Alertmanager/Grafana webhook: put MOKS_ALERT_WEBHOOK_TOKEN in existingSecret (unset = webhook disabled)
 
 # Existing Secret with MOKS_DATABASE_URL, MOKS_SESSION_SECRET, MOKS_OIDC_CLIENT_SECRET and any

@@ -35,6 +35,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import audit, skills
+from .config import get_settings
 from .connectors import registry
 from .skills.registry import allowed as registry_allowed
 from .skills.registry import policy as skill_policy
@@ -56,7 +57,7 @@ MAX_SIGNALS = 50
 MAX_SERIES_READ = 5000  # the Prometheus connector's own cap
 LOKI_LIMIT = 500
 CLOUDWATCH_PAGE = 100
-MAX_AUTO_PER_HOUR = 6
+MAX_AUTO_PER_HOUR = 6  # the default of settings.auto_investigations_per_hour
 ACTIVE = ("open", "mitigated")
 RULE_TOOL_CONNECTOR = {"finding": "kubernetes", "prometheus": "prometheus", "prometheus_alert": "prometheus", "loki": "loki", "cloudwatch_alarm": "cloudwatch"}
 
@@ -340,8 +341,9 @@ async def _investigate(db: AsyncSession, env: Environment, inc: Incident, rule: 
 
     count = (await db.execute(select(func.count()).select_from(Investigation).where(
         Investigation.environment_id == env.id, Investigation.trigger == "detection", Investigation.created_at > now - timedelta(hours=1)))).scalar_one()
-    if count >= MAX_AUTO_PER_HOUR:
-        await add_event(db, inc.id, "note", {"text": f"Automatic investigation skipped: {MAX_AUTO_PER_HOUR}/hour cap reached"})
+    cap = get_settings().auto_investigations_per_hour
+    if count >= cap:
+        await add_event(db, inc.id, "note", {"text": f"Automatic investigation skipped: {cap}/hour cap reached"})
         return
     inv = Investigation(created_by=AUTOMATION_USER_ID, environment_id=env.id, namespace=sig.namespace or "*", incident_id=inc.id, trigger="detection", status="queued",
                         question=f"{inc.title}. {sig.detail}. What is happening and what is the likely cause?"[:2000],

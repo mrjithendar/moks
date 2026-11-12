@@ -134,6 +134,10 @@ class Settings(BaseSettings):
     secrets_lease_seconds: int = Field(default=120, ge=30, le=900)  # how long one MOKS operation holds a mapping
     secrets_lease_wait_seconds: float = Field(default=10.0, ge=0, le=120)  # how long an item waits for another operation on its mapping
 
+    # Automatic investigations (alert- and detection-triggered) allowed per environment per hour, counted
+    # separately for each trigger. Beyond it the incident still opens and notes that the run was skipped.
+    auto_investigations_per_hour: int = Field(default=6, ge=1, le=120)
+
     # Rate limits (per process; see docs/SECURITY.md)
     rate_login_per_minute: int = 10
     rate_investigations_per_minute: int = 10

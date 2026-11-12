@@ -194,7 +194,8 @@ A separate component, disposable pods and a role of its own: see [TERMINAL.md](T
 The webhook requires `Authorization: Bearer $MOKS_ALERT_WEBHOOK_TOKEN` (disabled when unset) and is
 rate-limited. Automatic investigations run as `automation@moks.system`, which has bindings only in
 environments with `auto_investigate` enabled. Environment deny lists still apply, and investigations
-are capped at 6 per environment per hour.
+are capped per environment per hour, for alerts and for detection separately (`config.autoInvestigationsPerHour`,
+`MOKS_AUTO_INVESTIGATIONS_PER_HOUR`, default 6).
 
 ## Knowledge and skills
 
