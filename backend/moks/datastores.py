@@ -37,6 +37,15 @@ DEFAULTS: dict[str, float] = {
 }
 
 
+# Every finding kind the functions below emit (the code before the first colon). Skills and detection rules name these.
+FINDING_KINDS = ("pg_connections", "pg_long_xact", "pg_blocked", "pg_xid_age", "pg_cache_hit", "pg_replica_lag", "pg_replica_state", "pg_slot_lost",
+                 "pg_slot_retained", "pg_standby_receiver", "pg_standby_delay",
+                 "redis_cluster_state", "redis_slots_fail", "redis_slots_pfail", "redis_unreachable", "redis_memory", "redis_no_maxmemory",
+                 "redis_fragmentation", "redis_swap", "redis_clients", "redis_rdb", "redis_aof", "redis_loading", "redis_master_link",
+                 "redis_replica_state", "redis_replica_lag")
+SEVERITY = {"bad": "high", "warn": "medium", "info": "low"}  # findings severity -> investigation finding severity
+
+
 def thresholds(config: dict[str, Any] | None) -> dict[str, float]:
     over = (config or {}).get("thresholds") or {}
     return {k: float(over[k]) if isinstance(over.get(k), (int, float)) else v for k, v in DEFAULTS.items()}
@@ -219,6 +228,27 @@ def redis_findings(name: str, ov: dict[str, Any], t: dict[str, float] | None = N
                 _add(out, "warn", f"redis_replica_state:{code}:{r.get('addr')}", f"{who}: replica {r.get('addr')} is {r.get('state')}.")
             elif (r.get("lag_s") or 0) >= t["redis_replica_lag_warn_s"]:
                 _add(out, "warn", f"redis_replica_lag:{code}:{r.get('addr')}", f"{who}: replica {r.get('addr')} last acknowledged {r.get('lag_s')}s ago.")
+    return out
+
+
+def as_investigation_findings(tool: str, data: Any, source: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Investigation findings from a datastore tool result, so skills can iterate over them (for_each: finding.pg_blocked)
+    with {cluster} filled from the resource. Resources are spelled postgres/<cluster> and redis/<cluster>."""
+    clusters: list[dict[str, Any]] = []
+    if tool == "datastore_clusters" and isinstance(data, list):
+        clusters = [c for c in data if isinstance(c, dict) and c.get("findings")]
+    elif tool in ("pg_overview", "redis_overview") and isinstance(data, dict):
+        clusters = [{"name": (source or {}).get("cluster"), "kind": (source or {}).get("kind"), "namespace": (source or {}).get("namespace"),
+                     "findings": data.get("findings") or []}]
+    out = []
+    for c in clusters:
+        for f in c.get("findings") or []:
+            kind = str(f.get("code", "")).split(":", 1)[0]
+            if kind not in FINDING_KINDS or not c.get("name"):
+                continue
+            out.append({"kind": kind, "severity": SEVERITY.get(f.get("severity"), "low"), "title": f.get("text", kind)[:200], "detail": f.get("text", ""),
+                        "resources": [f"{c.get('kind')}/{c['name']}"], "namespace": c.get("namespace"), "code": f.get("code"),
+                        "suspected_cause": None, "next_checks": [], "remediation_hint": None})
     return out
 
 

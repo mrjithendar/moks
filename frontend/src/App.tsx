@@ -28,6 +28,7 @@ const KnowledgeExplorer = page(knowledge, "KnowledgeExplorer"), RetrievalWorkspa
 const Skills = lazy(() => import("./pages/Skills").then((m) => ({ default: m.Skills })));
 const Explorer = page(live, "Explorer");
 const Logs = lazy(() => import("./pages/Logs").then((m) => ({ default: m.Logs })));
+const DataStores = lazy(() => import("./pages/DataStores").then((m) => ({ default: m.DataStores })));
 const Detections = lazy(() => import("./pages/Detections").then((m) => ({ default: m.Detections })));
 const Metrics = lazy(() => import("./pages/Metrics").then((m) => ({ default: m.Metrics })));
 const Actions = page(ops, "Actions"), DiagnosticView = page(ops, "DiagnosticView"), Diagnostics = page(ops, "Diagnostics"), IncidentView = page(ops, "IncidentView"), Incidents = page(ops, "Incidents"), PlanView = page(ops, "PlanView");
@@ -64,6 +65,7 @@ export default function App() {
         <Route path="/explorer" element={<Need any={["explorer.read"]}><Explorer /></Need>} />
         <Route path="/metrics" element={<Need any={["explorer.read"]}><Metrics /></Need>} />
         <Route path="/logs" element={<Need any={["explorer.read"]}><Logs /></Need>} />
+        <Route path="/data" element={<Need any={["explorer.read"]}><DataStores /></Need>} />
         <Route path="/detections" element={<Detections />} />
         <Route path="/incidents" element={<Incidents />} />
         <Route path="/incidents/:id" element={<IncidentView />} />

@@ -43,7 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 log = logging.getLogger("moks.skills")
 BUILTIN = Path(__file__).parent / "builtin"
-VARS = {"namespace", "pod", "workload", "deployment", "service", "question", "resource", "trace_id", "repository"}
+VARS = {"namespace", "pod", "workload", "deployment", "service", "question", "resource", "trace_id", "repository", "cluster"}
 _VAR = re.compile(r"\{([a-z_]+)\}")
 
 
@@ -125,8 +125,8 @@ class DetectionSpec(BaseModel):
     authorizes a change: remediation stays behind action plans and approvals."""
     model_config = ConfigDict(extra="forbid")
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,80}$")
-    kind: Literal["finding", "prometheus", "prometheus_alert", "loki", "cloudwatch_alarm"]
-    finding: str | None = Field(default=None, pattern=r"^[a-z_]+$")   # kind finding
+    kind: Literal["finding", "prometheus", "prometheus_alert", "loki", "cloudwatch_alarm", "datastore"]
+    finding: str | None = Field(default=None, pattern=r"^[a-z_]+$")   # kinds finding and datastore (moks/datastores.FINDING_KINDS)
     query: str | None = Field(default=None, max_length=2000)          # prometheus: PromQL; loki: text; alert kinds: name regex
     resource_label: list[str] = Field(default_factory=list, max_length=4)
     operator: Literal[">", ">=", "<", "<=", "==", "!="] = ">"
@@ -149,9 +149,9 @@ class DetectionSpec(BaseModel):
 
     @model_validator(mode="after")
     def _shape(self) -> "DetectionSpec":
-        if self.kind == "finding" and not self.finding:
-            raise ValueError(f"{self.id}: a finding rule needs finding")
-        if self.kind != "finding" and not self.query:
+        if self.kind in ("finding", "datastore") and not self.finding:
+            raise ValueError(f"{self.id}: a {self.kind} rule needs finding")
+        if self.kind not in ("finding", "datastore") and not self.query:
             raise ValueError(f"{self.id}: a {self.kind} rule needs query")
         return self
 
@@ -318,7 +318,9 @@ def parse(text: str, path: str, source: str) -> Skill:
 
 def availability(sk: "Skill", connectors: set[str], metrics: set[str] | None) -> dict[str, Any]:
     """Whether a skill can work in an environment, and if not, why. metrics None: not known."""
-    missing = sorted(sk.meta.needs() - connectors)
+    from ..tools.contracts import has_connector
+
+    missing = sorted(c for c in sk.meta.needs() if not has_connector(c, connectors))
     gaps = sorted(set(sk.meta.telemetry) - metrics) if metrics is not None else []
     reasons = [f"needs the {c} connector" for c in missing] + [f"needs metric {m}" for m in gaps]
     return {"available": not reasons, "reasons": reasons}
@@ -485,5 +487,7 @@ def contexts_for(step: StepSpec, findings: list[dict], base: dict[str, str]) -> 
                 ctx["deployment"] = ctx["workload"] = rname
             elif rkind == "service":
                 ctx["service"] = rname
+            elif rkind in ("postgres", "redis"):  # data-store findings (moks/datastores.py) name the cluster
+                ctx["cluster"] = rname
             out.append(ctx)
     return out[: step.limit]
