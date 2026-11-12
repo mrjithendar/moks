@@ -47,7 +47,7 @@ function FormSection({ title, help, children }: { title: string; help?: string; 
 
 const REGIONS = ["us-east-1", "us-east-2", "us-west-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-south-1", "ap-southeast-1", "ap-northeast-1"];
 
-interface Field { key: string; label: string; kind?: "number" | "list" | "bool" | "region"; placeholder?: string; required?: boolean }
+interface Field { key: string; label: string; kind?: "number" | "list" | "bool" | "region" | "select"; placeholder?: string; required?: boolean; options?: string[] }
 interface Source { label: string; type: string; hint: string; defaults: any; fields: Field[]; auth?: boolean; cred?: string }
 
 const REGION: Field = { key: "region", label: "Region", kind: "region", required: true };
@@ -74,6 +74,20 @@ const SOURCES: Record<string, Source> = {
     fields: [{ key: "account_id", label: "AWS account ID", required: true }, REGION, { key: "allowed_prefixes", label: "Allowed name prefixes", kind: "list", required: true, placeholder: "moks/" },
       { key: "kubernetes_namespaces", label: "Kubernetes namespaces (empty: all of secretsSync.namespaces)", kind: "list", placeholder: "shop" }, ROLE, { key: "kms_key_id", label: "KMS key for new secrets (optional)" },
       { key: "allow_delete", label: "Allow reviewed deletion of AWS secrets", kind: "bool" }, { key: "recovery_window_days", label: "AWS recovery window (7-30 days)", kind: "number" }] },
+  postgres: { label: "PostgreSQL cluster", type: "postgres", hint: "Read-only SRE views: connections, long transactions, lock chains, replication, vacuum and top queries. Use a role holding only pg_monitor; the password is the credential (docs/DATASTORES.md). Add one connector per cluster.",
+    cred: "MOKS_CRED_PG_SHOP", defaults: { host: "", port: 5432, database: "postgres", username: "moks_monitor", sslmode: "prefer", namespace: "", timeout_seconds: 10, query_text: "normalized" },
+    fields: [{ key: "host", label: "Host (Service DNS name)", required: true, placeholder: "shop-db-rw.shop.svc" }, { key: "port", label: "Port", kind: "number" },
+      { key: "database", label: "Database", required: true }, { key: "username", label: "Monitoring role", required: true },
+      { key: "sslmode", label: "TLS (sslmode)", kind: "select", options: ["disable", "prefer", "require", "verify-ca", "verify-full"] },
+      { key: "namespace", label: "Kubernetes namespace (scopes who may read it)", placeholder: "shop" }, { key: "service", label: "Service (optional)" },
+      { key: "query_text", label: "Query text shown", kind: "select", options: ["normalized", "none", "raw"] }] },
+  redis: { label: "Redis / Valkey cluster", type: "redis", hint: "Read-only SRE views: memory, evictions, clients, slowlog, replication, persistence and cluster slots. Use an ACL user limited to the read commands in docs/DATASTORES.md; the password is the credential. Key values are never read.",
+    cred: "MOKS_CRED_REDIS_CACHE", defaults: { host: "", port: 6379, mode: "standalone", username: "moks", namespace: "", tls: false, timeout_seconds: 10 },
+    fields: [{ key: "host", label: "Host (Service DNS name)", required: true, placeholder: "redis-master.cache.svc" }, { key: "port", label: "Port", kind: "number" },
+      { key: "mode", label: "Mode", kind: "select", options: ["standalone", "sentinel", "cluster"] }, { key: "sentinel_master", label: "Sentinel master name (Sentinel mode)", placeholder: "mymaster" },
+      { key: "username", label: "ACL user (empty: default user)" }, { key: "tls", label: "TLS", kind: "bool" },
+      { key: "namespace", label: "Kubernetes namespace (scopes who may read it)", placeholder: "cache" }, { key: "service", label: "Service (optional)" },
+      { key: "show_key_names", label: "Show key names (otherwise hashed)", kind: "bool" }] },
   cost_model: { label: "Cluster cost model", type: "cost_model", hint: "Prices Kubernetes usage. Give the monthly cluster cost, or unit prices.", defaults: { monthly_cost_usd: 0, cpu_share: 0.5, currency: "USD" },
     fields: [{ key: "monthly_cost_usd", label: "Monthly cluster cost (USD)", kind: "number" }, { key: "cpu_hour_usd", label: "or CPU core-hour (USD)", kind: "number" }, { key: "gib_hour_usd", label: "and GiB-hour (USD)", kind: "number" },
       { key: "storage_gib_month_usd", label: "Storage GiB-month (USD)", kind: "number" }] },
@@ -104,6 +118,8 @@ function sourceOf(c: any): string {
   return c.config.mode === "eks" ? "eks" : c.config.mode === "kubeconfig" ? "kubeconfig" : "in_cluster";
 }
 
+export const endpointOf = (c: any): string => c.config.base_url ?? (c.config.host ? `${c.config.host}:${c.config.port ?? ""}` : c.config.mode ?? "");
+
 export function connectorBody(v: SourceValue, environment: string) {
   const config = v.advanced ? JSON.parse(v.json) : v.config;
   // With no authentication the connector ignores any credential, so do not store one that looks in use.
@@ -127,6 +143,8 @@ function SourceFields({ value, onChange }: { value: SourceValue; onChange: (v: S
         {!value.advanced && src.fields.map((f) => {
           const cur = value.config[f.key];
           if (f.kind === "list") return <label key={f.key}>{f.label}<input required={f.required} placeholder={f.placeholder} value={(cur ?? []).join(", ")} onChange={(e) => setCfg(f.key, e.target.value.split(/[\s,]+/).filter(Boolean))} /></label>;
+          if (f.kind === "select") return <label key={f.key}>{f.label}<select value={cur ?? f.options?.[0]} onChange={(e) => setCfg(f.key, e.target.value)}>{f.options?.map((o) => <option key={o}>{o}</option>)}</select></label>;
+          if (f.kind === "bool") return <label key={f.key} className="inline"><input type="checkbox" checked={!!cur} onChange={(e) => setCfg(f.key, e.target.checked)} /> {f.label}</label>;
           if (f.kind === "number") return <label key={f.key}>{f.label}<input type="number" step="any" min={0} value={cur ?? ""} onChange={(e) => setCfg(f.key, e.target.value === "" ? undefined : Number(e.target.value))} /></label>;
           return <label key={f.key}>{f.label}<input required={f.required} list={f.kind === "region" ? "aws-regions" : undefined} placeholder={f.placeholder} value={cur ?? ""} onChange={(e) => setCfg(f.key, e.target.value || undefined)} /></label>;
         })}
@@ -283,9 +301,21 @@ export function Connectors() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [tests, setTests] = useState<Record<string, any>>({});
+  const [found, setFound] = useState<any>(null);
   const a = useAction();
   const connectors: any[] = list.data ?? [];
   const activeEnv = environment || envs.data?.[0]?.name;
+
+  async function discover() {
+    const r = await a.run(() => api<any>(`/admin/datastores/discover?environment=${encodeURIComponent(activeEnv)}`));
+    if (r) setFound(r);
+  }
+  function addFound(kind: string, cand: any) {
+    a.clear();
+    setEditing(null);
+    setForm({ ...blankSource(kind), name: cand.name, config: { ...SOURCES[kind].defaults, ...cand.config }, credType: "env", credName: `MOKS_CRED_${kind === "postgres" ? "PG" : "REDIS"}_${cand.name.toUpperCase().replace(/-/g, "_")}` });
+    setOpen(true);
+  }
   const clash = duplicateConnector(connectors, activeEnv, form.name, editing);
   const gaps = (envs.data ?? []).flatMap((e) => missingSources(connectors, e.name).map((r) => ({ environment: e.name, ...r })));
 
@@ -327,8 +357,21 @@ export function Connectors() {
   return (
     <>
       <PageHead title="Connectors" sub="Live data sources per environment. Credentials are references to mounted Secrets, never stored here.">
+        <button className="ghost" onClick={discover} disabled={!activeEnv || a.busy}>Discover databases</button>
         <button onClick={() => add("prometheus")}>Add connector</button>
       </PageHead>
+      {found && <div className="card stack" style={{ marginBottom: 14 }}>
+        <div className="row between"><h2>PostgreSQL and Redis found in {found.environment}</h2><button className="ghost small" onClick={() => setFound(null)}>Close</button></div>
+        <div className="small muted">From Services and CloudNativePG clusters. MOKS never reads their Secrets: each one needs a monitoring role or ACL user and a credential (docs/DATASTORES.md).</div>
+        {found.notes?.map((n: string) => <div key={n} className="small muted">{n}</div>)}
+        {[...found.postgres.map((c: any) => ["postgres", c]), ...found.redis.map((c: any) => ["redis", c])].map(([kind, c]: any) => (
+          <div key={kind + c.namespace + c.name} className="row between">
+            <span className="small"><Badge kind="neutral">{kind === "postgres" ? "PostgreSQL" : "Redis"}</Badge> <strong>{c.name}</strong> <span className="mono">{c.config.host}:{c.config.port}</span> <span className="muted">{c.source}{c.config.mode ? `, ${c.config.mode}` : ""}</span></span>
+            {c.configured ? <Badge kind="ok">added</Badge> : <button className="ghost small" aria-label={`Add ${c.name}`} onClick={() => addFound(kind, c)}>Add</button>}
+          </div>
+        ))}
+        {found.postgres.length + found.redis.length === 0 && <Empty title="Nothing found.">Add a cluster by hand with Add connector.</Empty>}
+      </div>}
       {!open && <ErrorBox error={a.error} />}
       {list.data && gaps.length > 0 && <div className="card stack" style={{ marginBottom: 14 }}>
         <h2>Finish setup</h2>
@@ -348,7 +391,7 @@ export function Connectors() {
             { key: "t", head: "Last test", status: true, cell: (c) => <>{tests[c.id]?.busy ? "testing…" : c.last_test_ok == null ? <span className="muted small">never</span> : <Badge kind={c.last_test_ok ? "ok" : "bad"}>{c.last_test_ok ? "ok" : "failed"}</Badge>}</> },
             { key: "ty", head: "Type", cell: (c) => <>{c.type} {!c.implemented && <Badge kind="neutral">planned</Badge>} {!c.enabled && <Badge>disabled</Badge>}</> },
             { key: "e", head: "Environment", cell: (c) => <span className="mono small">{c.environment}</span> },
-            { key: "u", head: "Endpoint", cell: (c) => <Truncate text={c.config.base_url ?? c.config.mode ?? ""} mono />, meta: (c) => <Truncate text={c.config.base_url ?? c.config.mode ?? ""} mono /> },
+            { key: "u", head: "Endpoint", cell: (c) => <Truncate text={endpointOf(c)} mono />, meta: (c) => <Truncate text={endpointOf(c)} mono /> },
             { key: "c", head: "Credential", wide: true, cell: (c) => <Truncate text={c.credential ?? ""} mono /> },
             { key: "m", head: "Test result", cell: (c) => <span className="small">{c.last_test_at && <Time iso={c.last_test_at} />}{c.last_test_message && <span className="muted clamp-2">{c.last_test_message}</span>}</span> },
           ]} />}

@@ -3,7 +3,8 @@
 Connectors are configured per environment in **Administration → Connectors** (or seeded from
 Helm values). A row holds non-secret JSON config and a credential *reference*. **Test** runs a
 real request and stores the outcome, which the Overview shows. Only the first enabled connector
-of each type per environment is used.
+of each type per environment is used, except PostgreSQL and Redis clusters, which are addressed by name
+([DATASTORES.md](DATASTORES.md)).
 
 ## Status
 
@@ -16,6 +17,8 @@ of each type per environment is used.
 | Git (GitHub) | Implemented; ingestion verified live against the public `mrjithendar/moks` repository |
 | AWS cost (Cost Explorer, anomalies, budgets) | Implemented; tested against the Stubber. Needs `finops_enabled` in Terraform to verify live |
 | Cost model | Implemented; verified live (allocation and rightsizing of `roboshop-ai`) |
+| PostgreSQL (`postgres`), several per environment | Implemented; tested against PostgreSQL 16/17 as a `pg_monitor`-only role, including a live lock chain. Not yet run against a CloudNativePG cluster on mk4. See [DATASTORES.md](DATASTORES.md) |
+| Redis / Valkey (`redis`), several per environment | Implemented; tested against Redis 7.0 standalone with a minimal ACL, Sentinel and a 3-node cluster with one node down, and a fake RESP server in CI. See [DATASTORES.md](DATASTORES.md) |
 
 ## Common behaviour
 

@@ -637,9 +637,10 @@ TOOLS: list[ToolSpec] = [
 ]
 
 def _all_tools() -> list[ToolSpec]:
+    from .datastores import TOOLS as DATASTORES
     from .phase2 import TOOLS as PHASE2
 
-    specs = TOOLS + PHASE2
+    specs = TOOLS + PHASE2 + DATASTORES
     # FinOps Kubernetes tools also need live cluster and metrics connectors.
     return [ToolSpec(**{**t.__dict__, "also_requires": ("kubernetes", "prometheus")}) if t.connector_type == "cost_model" else
             ToolSpec(**{**t.__dict__, "also_requires": ("kubernetes",)}) if t.name == "git_compare_deployment" else t for t in specs]

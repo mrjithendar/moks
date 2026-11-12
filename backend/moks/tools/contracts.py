@@ -24,6 +24,12 @@ K8S_NAME = r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
 K8S_NAME_RE = re.compile(K8S_NAME)
 # Tool "connectors" served by MOKS itself (no external system to configure).
 PSEUDO_CONNECTORS = {"knowledge"}
+# Tool "connectors" that stand for any of several real connector types.
+ANY_OF_CONNECTORS = {"datastore": ("postgres", "redis")}
+
+
+def has_connector(ctype: str, present) -> bool:
+    return ctype in PSEUDO_CONNECTORS or ctype in present or any(c in present for c in ANY_OF_CONNECTORS.get(ctype, ()))
 
 
 class ToolArgs(BaseModel):
@@ -51,7 +57,7 @@ class ToolContext:
     guard: Any = None  # AccessGuard for long-running work; checked before every tool call
 
     def available(self, ctype: str) -> bool:
-        return ctype in PSEUDO_CONNECTORS or ctype in self.connectors
+        return has_connector(ctype, self.connectors)
 
     def connector(self, ctype: str):
         entry = self.connectors.get(ctype)

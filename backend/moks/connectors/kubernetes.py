@@ -397,6 +397,13 @@ class KubernetesConnector:
             })
         return out
 
+    async def list_services_all(self) -> list[dict]:
+        """Every Service's metadata and spec (no endpoints), for data-store discovery. Callers filter by scope."""
+        core = await self.core()
+        items, _ = await self._list("list services", core.list_service_for_all_namespaces)
+        return [{"metadata": {k: i.get("metadata", {}).get(k) for k in ("name", "namespace", "labels")},
+                 "spec": {k: (i.get("spec") or {}).get(k) for k in ("selector", "ports", "clusterIP", "type")}} for i in items]
+
     async def ingresses(self, namespace: str) -> list[dict]:
         from kubernetes_asyncio import client
 

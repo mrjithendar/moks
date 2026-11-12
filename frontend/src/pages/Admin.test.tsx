@@ -12,7 +12,7 @@ vi.mock("../api", async (orig) => ({ ...(await orig<any>()), api: vi.fn(async (p
 }) }));
 
 import { FeedbackProvider } from "../ui";
-import { connectorBody, Connectors, duplicateConnector, LLM_PRESETS, matchesUser, missingSources, presetOf } from "./Admin";
+import { connectorBody, Connectors, duplicateConnector, endpointOf, LLM_PRESETS, matchesUser, missingSources, presetOf } from "./Admin";
 
 afterEach(() => { cleanup(); state.calls.length = 0; });
 
@@ -37,6 +37,14 @@ describe("LLM presets", () => {
 const source = (extra: any = {}) => ({ source: "prometheus", name: "prom", enabled: true, config: { base_url: "http://p", auth: "none" }, advanced: false, json: "", credType: "env", credName: "MOKS_CRED_X", credPath: "", ...extra });
 
 describe("connector form rules", () => {
+  it("sends data-store clusters with their password as a credential reference, never in config", () => {
+    const pg = connectorBody(source({ source: "postgres", name: "shop-db", config: { host: "shop-db-rw.shop.svc", port: 5432, database: "app", username: "moks_monitor", sslmode: "require", namespace: "shop" }, credName: "MOKS_CRED_PG_SHOP" }), "demo");
+    expect(pg).toMatchObject({ type: "postgres", name: "shop-db", credential_ref: { type: "env", name: "MOKS_CRED_PG_SHOP" } });
+    expect(JSON.stringify(pg.config)).not.toMatch(/password/i);
+    expect(connectorBody(source({ source: "redis", name: "cache", config: { host: "redis", mode: "sentinel" } }), "demo").type).toBe("redis");
+    expect(endpointOf({ config: { host: "redis.cache.svc", port: 6379 } })).toBe("redis.cache.svc:6379");
+    expect(endpointOf({ config: { base_url: "http://p" } })).toBe("http://p");
+  });
   it("does not store a credential the connector would ignore", () => {
     expect(connectorBody(source(), "demo").credential_ref).toEqual({ type: "none" });
     expect(connectorBody(source({ config: { base_url: "http://p", auth: "basic", username: "eks" } }), "demo").credential_ref).toEqual({ type: "env", name: "MOKS_CRED_X" });
