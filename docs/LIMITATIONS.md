@@ -42,6 +42,10 @@ See [TERMINAL.md](TERMINAL.md#limitations). The image has never been built, and 
 - **Verified from logs** means the process itself reported this failure just before exiting. It is the
   stated reason, and the underlying cause can lie deeper.
 
+## PostgreSQL clusters (CloudNativePG)
+
+Read-only, and written without a cluster to test against: the status rows and findings were checked against hand-written objects in the shape of `postgresql.cnpg.io/v1`, not a live operator. MOKS cannot start a base backup, change a schedule or restore a cluster. See [CLUSTER_BACKUPS.md](CLUSTER_BACKUPS.md#postgresql-clusters-cloudnativepg).
+
 ## Pinecone
 
 Tested against a stand-in for the `2026-07` API only: no real Pinecone call has been made. Each reindex needs

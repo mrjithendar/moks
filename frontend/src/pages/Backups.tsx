@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
@@ -7,6 +7,10 @@ import { Dialog, Drawer, Empty, Identifier, useFeedback } from "../ui";
 
 const PHASE: Record<string, "ok" | "warn" | "bad" | "info"> = { Completed: "ok", PartiallyFailed: "warn", Failed: "bad", FailedValidation: "bad", InProgress: "info" };
 const DB_STATUS: Record<string, "ok" | "bad" | "info"> = { success: "ok", failed: "bad", queued: "info", running: "info" };
+const PG_PHASE: Record<string, Tone> = { completed: "ok", failed: "bad", walArchivingFailing: "bad", running: "info", started: "info", pending: "info", finalizing: "info" };
+const TONE_WORD: Record<Tone, string> = { ok: "healthy", warn: "needs attention", bad: "at risk", info: "checking", neutral: "not set up" };
+type Tone = "ok" | "warn" | "bad" | "info" | "neutral";
+type Load = { data: any; error: unknown; loading: boolean; reload: () => void };
 const REFS = [["access_key_id", "Variable holding the R2 access key id"], ["secret_access_key", "Variable holding the R2 secret access key"], ["sse_key", "Variable holding the encryption key (32 bytes, base64)"], ["repo_password", "Variable holding the volume repository password"]];
 
 function parseList(text: string): string[] { return text.split(/[\s,]+/).filter(Boolean); }
@@ -139,19 +143,143 @@ function DatabaseDetails({ b, onClose }: { b: any; onClose: () => void }) {
   );
 }
 
-function Databases({ env }: { env: string }) {
+/** The worst finding decides the colour; no findings on something that exists is healthy. */
+function toneOf(findings: any[] | undefined, exists: boolean): Tone {
+  if (!findings) return "info";
+  if (findings.some((f) => f.severity === "bad")) return "bad";
+  if (findings.length) return "warn";
+  return exists ? "ok" : "neutral";
+}
+
+function newest(times: (string | null | undefined)[]): string | null {
+  return times.filter((t): t is string => !!t).sort().pop() ?? null;
+}
+
+/** One protection layer at a glance. Selecting it moves to that layer's section. */
+function Tile({ label, tone, value, detail, target }: { label: string; tone: Tone; value: ReactNode; detail: ReactNode; target: string }) {
+  const go = () => document.getElementById(target)?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+  return (
+    <button type="button" className={`bk-tile ${tone}`} onClick={go}>
+      <span className="bk-tile-top"><span className="bk-tile-label">{label}</span><Badge kind={tone}>{TONE_WORD[tone]}</Badge></span>
+      <span className="bk-tile-value">{value}</span>
+      <span className="small muted">{detail}</span>
+    </button>
+  );
+}
+
+function Summary({ cluster, databases, postgres }: { cluster: any; databases: any; postgres: any }) {
+  const done = cluster.backups.filter((b: any) => b.phase === "Completed");
+  const active = cluster.schedules.filter((x: any) => !x.paused).length;
+  const targets: any[] = databases?.targets ?? [];
+  const dumped = targets.filter((t) => databases.backups.some((b: any) => b.namespace === t.namespace && b.workload === t.workload && b.status === "success")).length;
+  const planned = targets.filter((t) => databases.schedules.some((x: any) => x.namespace === t.namespace && x.workload === t.workload && !x.paused)).length;
+  const clusters: any[] = postgres?.clusters ?? [];
+  const archiving = clusters.filter((c) => c.archiving === true).length;
+  const base = postgres ? newest([...postgres.backups.filter((b: any) => b.phase === "completed").map((b: any) => b.stopped), ...clusters.map((c) => c.last_successful_backup)]) : null;
+  return (
+    <div className="bk-tiles" role="group" aria-label="Protection summary">
+      <Tile label="Cluster objects" target="bk-cluster" tone={cluster.installed ? toneOf(cluster.findings, true) : "neutral"}
+        value={cluster.installed ? (done.length ? <Time iso={done[0].completed ?? done[0].started} /> : "never") : "—"}
+        detail={cluster.installed ? `${cluster.backups.length} kept, ${active} active ${active === 1 ? "schedule" : "schedules"}` : "Velero is not installed here"} />
+      <Tile label="Database dumps" target="bk-databases" tone={toneOf(databases?.findings, targets.length > 0)}
+        value={databases ? `${dumped} of ${targets.length}` : "—"}
+        detail={databases ? (targets.length ? `have a dump, ${planned} on a timer` : "no PostgreSQL or MongoDB workloads") : "loading"} />
+      <Tile label="PostgreSQL clusters" target="bk-postgres" tone={toneOf(postgres?.findings, clusters.length > 0)}
+        value={postgres ? (clusters.length ? `${archiving} of ${clusters.length}` : "—") : "—"}
+        detail={!postgres ? "loading" : !postgres.installed ? "CloudNativePG is not installed here" : clusters.length ? <>archiving WAL, last base backup <Time iso={base} /></> : "no clusters"} />
+      <Tile label="Storage" target="bk-cluster" tone={cluster.store ? "ok" : "neutral"}
+        value={cluster.store ? "Cloudflare R2" : "—"}
+        detail={cluster.store ? <span className="mono">{cluster.store.bucket}/{cluster.store.prefix}</span> : "an admin has not saved the R2 settings"} />
+    </div>
+  );
+}
+
+function PostgresCluster({ c, schedules, onClose }: { c: any; schedules: any[]; onClose: () => void }) {
+  return (
+    <Drawer title={`${c.namespace}/${c.name}`} onClose={onClose}>
+      <div className="stack">
+        <dl className="kv">
+          <dt>Status</dt><dd><Badge kind={c.healthy ? "ok" : "warn"}>{c.phase}</Badge></dd>
+          <dt>Instances</dt><dd>{c.ready} of {c.instances ?? "—"} ready</dd>
+          <dt>Primary</dt><dd className="mono small">{c.primary ?? "—"}</dd>
+          <dt>Image</dt><dd className="mono small">{c.image ?? "—"}</dd>
+          <dt>Volume size</dt><dd>{c.storage ?? "—"}</dd>
+          <dt>Backed up by</dt><dd>{c.backup_method ? (c.plugin ? `plugin ${c.plugin}` : c.backup_method) : "nothing"}</dd>
+          <dt>Stored in</dt><dd className="mono small">{c.destination ?? "—"}</dd>
+          <dt>Kept for</dt><dd>{c.retention ?? "not set on the cluster"}</dd>
+          <dt>WAL archiving</dt><dd><Archiving c={c} /></dd>
+          <dt>Recoverable from</dt><dd><Time iso={c.first_recoverability_point} /></dd>
+          <dt>Last good backup</dt><dd><Time iso={c.last_successful_backup} /></dd>
+          <dt>Last failed backup</dt><dd><Time iso={c.last_failed_backup} /></dd>
+        </dl>
+        {c.archiving_message && <div className="alert error small">{c.archiving_message}</div>}
+        <h3>Schedules</h3>
+        <DataTable label={`Schedules of ${c.name}`} rows={schedules} rowKey={(x) => x.name} empty={<Empty title="No ScheduledBackup covers this cluster." />} cols={[
+          { key: "n", head: "Name", primary: true, cell: (x) => <span className="mono small">{x.name}</span> },
+          { key: "st", head: "State", status: true, cell: (x) => (x.suspended ? <Badge kind="warn">suspended</Badge> : <Badge kind="ok">active</Badge>) },
+          { key: "c", head: "Cron", cell: (x) => <span className="mono small">{x.cron}</span> },
+          { key: "l", head: "Last run", cell: (x) => <Time iso={x.last_run} /> },
+          { key: "x", head: "Next run", cell: (x) => <Time iso={x.next_run} /> }]} />
+        <div className="small muted">CloudNativePG takes and keeps these backups. MOKS reports on them and does not start, change or restore them.</div>
+      </div>
+    </Drawer>
+  );
+}
+
+function Archiving({ c }: { c: any }) {
+  if (!c.backup_method) return <Badge kind="bad">no backup configured</Badge>;
+  if (c.archiving === true) return <Badge kind="ok">working</Badge>;
+  if (c.archiving === false) return <Badge kind="bad">failing</Badge>;
+  return <Badge kind="neutral">not reported</Badge>;
+}
+
+/** CloudNativePG clusters: base backups, WAL archiving and schedules, as the operator reports them. */
+function Postgres({ load }: { load: Load }) {
+  const [open, setOpen] = useState<any>(null);
+  const d = load.data;
+  if (!d) return <div className="card" id="bk-postgres"><h2>PostgreSQL clusters</h2><Loading load={load} rows={3} /></div>;
+  const of = (c: any) => (x: any) => x.namespace === c.namespace && x.cluster === c.name;
+  const lastGood = (c: any) => newest([...d.backups.filter(of(c)).filter((b: any) => b.phase === "completed").map((b: any) => b.stopped), c.last_successful_backup]);
+  const plan = (c: any) => { const mine = d.schedules.filter(of(c)); return !mine.length ? "none" : mine.every((x: any) => x.suspended) ? "suspended" : mine.filter((x: any) => !x.suspended).map((x: any) => x.cron).join(", "); };
+  return (
+    <div className="card stack" id="bk-postgres"><h2>PostgreSQL clusters ({d.clusters.length})</h2>
+      <p className="small muted" style={{ margin: 0 }}>Clusters run by CloudNativePG back themselves up: a base backup on a schedule, and every WAL segment as it fills, which is what allows recovery to a point in time. MOKS reads their status.</p>
+      {!d.installed && <div className="alert info small">{d.error}</div>}
+      {d.findings.map((f: any) => <div key={f.code} className={`alert small ${f.severity === "bad" ? "error" : "warn"}`}>{f.text}</div>)}
+      {d.installed && <>
+        <DataTable label="PostgreSQL clusters" rows={d.clusters as any[]} rowKey={(c) => `${c.namespace}/${c.name}`} empty={<Empty title="No CloudNativePG clusters in this cluster." />} cols={[
+          { key: "n", head: "Cluster", primary: true, cell: (c) => <button type="button" className="ghost small" onClick={() => setOpen(c)}>{c.namespace}/{c.name}</button> },
+          { key: "h", head: "Instances", status: true, cell: (c) => <Badge kind={c.healthy ? "ok" : "warn"}>{c.ready}/{c.instances ?? "?"} ready</Badge> },
+          { key: "w", head: "WAL archiving", cell: (c) => <Archiving c={c} /> },
+          { key: "l", head: "Last base backup", cell: (c) => <Time iso={lastGood(c)} /> },
+          { key: "r", head: "Recoverable from", wide: true, cell: (c) => <Time iso={c.first_recoverability_point} /> },
+          { key: "s", head: "Schedule", cell: (c) => <span className="mono small">{plan(c)}</span> }]} />
+        <h3>Base backups</h3>
+        <DataTable label="PostgreSQL base backups" rows={d.backups as any[]} rowKey={(b) => `${b.namespace}/${b.name}`} empty={<Empty title="No base backups yet." />} cols={[
+          { key: "n", head: "Backup", primary: true, cell: (b) => <><Identifier name={b.name} what="backup name" />{b.error && <span className="small muted">{b.error}</span>}</> },
+          { key: "p", head: "Status", status: true, cell: (b) => <Badge kind={PG_PHASE[b.phase] ?? "neutral"}>{b.phase}</Badge> },
+          { key: "c", head: "Cluster", cell: (b) => <span className="mono small">{b.namespace}/{b.cluster}</span> },
+          { key: "s", head: "Started", cell: (b) => <Time iso={b.started} /> },
+          { key: "t", head: "Took", cell: (b) => duration(b.duration_seconds) },
+          { key: "b", head: "Started by", wide: true, cell: (b) => (b.schedule ? `schedule ${b.schedule}` : "on demand") }]} />
+        {d.truncated && <div className="small muted">Showing the newest {d.backups.length} backups.</div>}
+      </>}
+      {open && <PostgresCluster c={open} schedules={d.schedules.filter(of(open))} onClose={() => setOpen(null)} />}
+    </div>
+  );
+}
+
+function Databases({ env, load: s }: { env: string; load: Load }) {
   const { can } = useAuth();
-  const s = useLoad(() => (env ? api<any>(`/backups/${env}/databases`) : Promise.resolve(null)), [env]);
-  useInterval(() => { if (!s.loading) s.reload(); }, 15000);
   const [open, setOpen] = useState<any>(null);
   const [hours, setHours] = useState(24);
   const [paused, setPaused] = useState(false);
   const d = s.data;
-  if (!d) return <div className="card"><h2>Databases</h2><Loading load={s} rows={3} /></div>;
+  if (!d) return <div className="card" id="bk-databases"><h2>Databases</h2><Loading load={s} rows={3} /></div>;
   const last = (t: any) => d.backups.find((b: any) => b.namespace === t.namespace && b.workload === t.workload);
   const schedule = (t: any) => d.schedules.find((x: any) => x.namespace === t.namespace && x.workload === t.workload);
   return (
-    <div className="card stack"><h2>Databases ({d.targets.length})</h2>
+    <div className="card stack" id="bk-databases"><h2>Databases ({d.targets.length})</h2>
       <p className="small muted" style={{ margin: 0 }}>Velero cannot copy these volumes, so MOKS runs each database's own dump tool, encrypts the result and stores it in R2. Backups are kept until someone removes them.</p>
       {d.findings.map((f: any) => <div key={f.code} className={`alert small ${f.severity === "bad" ? "error" : "warn"}`}>{f.text}</div>)}
       <DataTable label="Databases" rows={d.targets as any[]} rowKey={(t) => `${t.namespace}/${t.workload}`} empty={<Empty title="No PostgreSQL or MongoDB found in this cluster." />} cols={[
@@ -184,7 +312,9 @@ export function Backups() {
   const [picked, setPicked] = useState("");
   const env = picked || envs.data?.[0]?.name || "";
   const s = useLoad(() => (env ? api<any>(`/backups/${env}`) : Promise.resolve(null)), [env]);
-  useInterval(() => { if (!s.loading) s.reload(); }, 15000);
+  const dbs = useLoad(() => (env ? api<any>(`/backups/${env}/databases`) : Promise.resolve(null)), [env]);
+  const pg = useLoad(() => (env ? api<any>(`/backups/${env}/postgres`) : Promise.resolve(null)), [env]);
+  useInterval(() => { for (const l of [s, dbs, pg]) if (!l.loading) l.reload(); }, 15000);
   const [ns, setNs] = useState("*");
   const [volumes, setVolumes] = useState(true);
   const [days, setDays] = useState(3650);
@@ -200,12 +330,13 @@ export function Backups() {
   const q = encodeURIComponent(`Review cluster backups: are they healthy, complete and restorable? Explain any failure.`);
   return (
     <>
-      <PageHead title="Backups" sub="Cluster objects including Secrets, and volume data where the cluster supports it, stored encrypted in Cloudflare R2 by Velero.">
+      <PageHead title="Backups" sub="What is protected in this environment and how recently: cluster objects by Velero, database dumps by MOKS, and PostgreSQL clusters by CloudNativePG.">
         <label>Environment<select value={env} onChange={(e) => setPicked(e.target.value)}>{envs.data?.map((e) => <option key={e.name} value={e.name}>{e.display_name}{e.is_production ? " (production)" : ""}</option>)}</select></label>
       </PageHead>
       <Loading load={s} rows={5} />
       <ErrorBox error={envs.error} />
       {d && <div className="stack">
+        <Summary cluster={d} databases={dbs.data} postgres={pg.data} />
         {d.findings.map((f: any) => <div key={f.code} className={`alert ${f.severity === "bad" ? "error" : "warn"}`}>{f.text}</div>)}
         {!d.findings.length && <div className="alert info">No problems found. A backup is only proven by a test restore.</div>}
         <div className="row">
@@ -215,7 +346,8 @@ export function Backups() {
             build={() => ({ name: "daily", cron, included_namespaces: namespaces, include_volumes: volumes, ttl_days: days })} />}
           {can("investigation.run") && <a className="btn ghost" href={`${import.meta.env.BASE_URL}investigate?env=${env}&ns=*&q=${q}`}>Ask MOKS to review</a>}
         </div>
-        <div className="card"><h2>Backups ({d.backups.length})</h2>
+        <div className="card" id="bk-cluster"><h2>Cluster backups ({d.backups.length})</h2>
+          <p className="small muted" style={{ margin: "0 0 10px" }}>Every API object including Secrets, and volume data where the cluster supports it, stored encrypted in Cloudflare R2 by Velero.</p>
           <DataTable label="Backups" rows={d.backups as any[]} rowKey={(b) => b.name} empty={<Empty title="No backups in this cluster yet.">Back up now, or set a schedule.</Empty>} cols={[
             { key: "n", head: "Name", primary: true, cell: (b) => <><button type="button" className="ghost small" onClick={() => setDetails(b.name)}>{b.name}</button>{b.failure && <span className="small muted">{b.failure}</span>}</> },
             { key: "p", head: "Status", status: true, cell: (b) => <Badge kind={PHASE[b.phase] ?? "neutral"}>{b.phase}</Badge> },
@@ -231,7 +363,8 @@ export function Backups() {
           ]} />
         </div>
         {details && <BackupDetails env={env} name={details} onClose={() => setDetails("")} />}
-        <Databases env={env} />
+        <Databases env={env} load={dbs} />
+        <Postgres load={pg} />
         {d.schedules.length > 0 && <div className="card"><h2>Schedules</h2><DataTable label="Schedules" rows={d.schedules as any[]} rowKey={(x) => x.name} cols={[
           { key: "n", head: "Name", primary: true, cell: (x) => <Identifier name={x.name} /> },
           { key: "st", head: "State", status: true, cell: (x) => (x.paused ? <Badge kind="warn">paused</Badge> : <Badge kind="ok">active</Badge>) },

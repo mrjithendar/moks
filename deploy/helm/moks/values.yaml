@@ -338,6 +338,11 @@ databaseBackups:
 argocd:
   enabled: false
 
+# Lets the Backups page read CloudNativePG clusters, base backups and ScheduledBackups (docs/CLUSTER_BACKUPS.md).
+# Read-only, in every namespace: it needs rbac.clusterWide. MOKS does not take or restore these backups.
+cnpg:
+  enabled: false
+
 # Disposable diagnostic session pods (no service account token, quota, egress-only network policy).
 diagnostics:
   enabled: true

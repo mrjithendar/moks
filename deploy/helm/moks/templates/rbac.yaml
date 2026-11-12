@@ -39,6 +39,12 @@ rules:
     resources: [applications]
     verbs: [get, list]
   {{- end }}
+  {{- if .Values.cnpg.enabled }}
+  # CloudNativePG status for the Backups page: clusters, their base backups and schedules. Never their Secrets.
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters, backups, scheduledbackups]
+    verbs: [get, list]
+  {{- end }}
 ---
 {{- if .Values.rbac.clusterWide }}
 apiVersion: rbac.authorization.k8s.io/v1

@@ -75,6 +75,13 @@ class FakeKubernetes:
     async def velero_list(self, plural):
         return self.velero.get(plural, [])
 
+    cnpg: dict[str, list[dict]] | None = None  # None: the operator is not installed
+
+    async def cnpg_list(self, plural):
+        if self.cnpg is None:
+            raise ConnectorError("not_found", f"list cloudnative-pg {plural}: not found")
+        return self.cnpg.get(plural, [])
+
     async def velero_get(self, plural, name):
         for item in self.velero.get(plural, []):
             if item["metadata"]["name"] == name:
