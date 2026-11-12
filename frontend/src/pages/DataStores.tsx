@@ -1,8 +1,9 @@
-import { useState, type ReactNode } from "react";
+import { createContext, useContext, useState, type FormEvent, type ReactNode } from "react";
+import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
 import { Badge, type Col, DataTable, ErrorBox, fmtBytes, Loading, PageHead, Time, useInterval, useLoad, type Env } from "../components";
-import { Drawer, Empty, Truncate } from "../ui";
+import { Dialog, Drawer, Empty, Truncate } from "../ui";
 
 /** PostgreSQL and Redis/Valkey clusters the engineer may read. Every view is one read-only tool call, checked and audited by the backend. */
 
@@ -23,6 +24,53 @@ export function health(c: any): Tone {
 const secs = (s?: number | null) => (s == null ? "—" : s < 120 ? `${Math.round(s)} s` : s < 7200 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`);
 const bytes = (b?: number | null) => (b == null ? "—" : fmtBytes(b));
 const pct = (v?: number | null) => (v == null ? "—" : `${v}%`);
+
+/** The cluster an action would act on. Set by the drawer, so tables deep inside it need no props threaded through. */
+const Target = createContext<{ env: string; c: any } | null>(null);
+
+export function actionBody(env: string, c: any, action: string, params: Record<string, unknown>, reason: string) {
+  return { environment: env, namespace: c.namespace, action, target_kind: c.kind === "postgres" ? "Postgres" : "Redis", target_name: c.name, params, reason, auto_recover: false };
+}
+
+/** Proposes one action plan. Nothing runs here: the plan is reviewed, approved where policy says so, and executed from Approvals & actions. */
+function PlanAction({ action, label, params, what }: { action: string; label: string; params: Record<string, unknown>; what: string }) {
+  const t = useContext(Target);
+  const { can } = useAuth();
+  const nav = useNavigate();
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  const [error, setError] = useState<unknown>();
+  if (!t || !t.c.namespace || !can("action.request")) return null;
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    try {
+      const plan = await api<any>("/actions/plans", { method: "POST", body: actionBody(t!.env, t!.c, action, params, reason) as any });
+      nav(`/actions/${plan.id}`);
+    } catch (err) { setError(err); }
+  }
+  return (
+    <>
+      <button type="button" className="ghost small" onClick={(e) => { e.stopPropagation(); setOpen(true); }}>{label}</button>
+      {open && <Dialog title={`${label}: ${what}`} onClose={() => setOpen(false)}>
+        <form className="stack" onSubmit={submit}>
+          <label>Reason<textarea required minLength={5} rows={2} value={reason} onChange={(e) => setReason(e.target.value)} /></label>
+          <ErrorBox error={error} />
+          <div className="small muted">This creates an action plan for exactly this {t.c.kind === "postgres" ? "session" : "client"}. You review it next; nothing runs until it is approved (where policy requires) and executed.</div>
+          <div className="row end"><button>Review plan</button></div>
+        </form>
+      </Dialog>}
+    </>
+  );
+}
+
+function SessionActions({ s }: { s: any }) {
+  if (!s?.pid || !s?.backend_start) return null;
+  return <span className="row">
+    {s.state === "active" && <PlanAction action="pg_cancel_query" label="Cancel query" params={{ pid: s.pid, backend_start: s.backend_start }} what={`pid ${s.pid}`} />}
+    <PlanAction action="pg_terminate_session" label="End session" params={{ pid: s.pid, backend_start: s.backend_start }} what={`pid ${s.pid}`} />
+  </span>;
+}
 
 function Findings({ items }: { items?: any[] }) {
   if (!items?.length) return <div className="small muted">No findings.</div>;
@@ -49,7 +97,7 @@ function PgView({ view, d }: { view: string; d: any }) {
       <Table label="Connections by client" rows={d.connections?.by_source} cols={[["Application", (r) => r.application || "—"], ["User", (r) => r.user], ["Database", (r) => r.database], ["Connections", (r) => r.n], ["Idle in tx", (r) => r.idle_in_transaction]]} />
     </div>
   );
-  if (view === "sessions") return <Table label="Sessions" rows={d} cols={[["PID", (r) => r.pid], ["State", (r) => r.state], ["Application", (r) => r.application || r.user], ["Transaction", (r) => secs(r.xact_age_s)], ["Waiting on", (r) => r.wait_event_type ? `${r.wait_event_type}/${r.wait_event}` : "—"], ["Query", (r) => <Truncate text={r.query ?? ""} mono lines={2} />]]} />;
+  if (view === "sessions") return <Table label="Sessions" rows={d} cols={[["PID", (r) => r.pid], ["State", (r) => r.state], ["Application", (r) => r.application || r.user], ["Transaction", (r) => secs(r.xact_age_s)], ["Waiting on", (r) => r.wait_event_type ? `${r.wait_event_type}/${r.wait_event}` : "—"], ["Query", (r) => <Truncate text={r.query ?? ""} mono lines={2} />], ["", (r) => <SessionActions s={r} />]]} />;
   if (view === "locks") return (
     <div className="stack">
       {!d.root_blockers?.length && <Empty title="No lock waits." />}
@@ -59,6 +107,7 @@ function PgView({ view, d }: { view: string; d: any }) {
           <div className="small">{b.blocker.application || b.blocker.user} · {b.blocker.state} · transaction open {secs(b.blocker.xact_age_s)}</div>
           {b.blocker.query && <code className="small">{b.blocker.query}</code>}
           <div className="small muted">Waiting: {b.waiting_pids.join(", ")}</div>
+          <SessionActions s={b.blocker} />
         </div>
       ))}
     </div>
@@ -101,6 +150,9 @@ function RedisView({ view, d }: { view: string; d: any }) {
     <div className="stack">
       <div className="small">{d.total} connections, {d.blocked} blocked</div>
       <Table label="Clients by source" rows={d.by_source} cols={[["Source", (r) => r.source], ["Connections", (r) => r.connections]]} />
+      <h3>Longest idle</h3>
+      <Table label="Longest idle clients" rows={d.longest_idle} cols={[["Client", (r) => `${r.id} · ${r.name || r.addr}`], ["Idle", (r) => secs(r.idle)], ["Command", (r) => r.cmd],
+        ["", (r) => <PlanAction action="redis_kill_client" label="Close" params={{ client_id: r.id, addr: r.addr }} what={`client ${r.id} (${r.addr})`} />]]} />
     </div>
   );
   if (view === "keyspace") return (
@@ -125,10 +177,10 @@ function ClusterDrawer({ env, c, onClose }: { env: string; c: any; onClose: () =
         {VIEWS[c.kind].map(([k, label]) => <button key={k} role="tab" aria-selected={view === k} className={view === k ? "small" : "ghost small"} onClick={() => setView(k)}>{label}</button>)}
       </div>
       <Loading load={r} rows={6} />
-      {r.data && <div className="stack">
+      {r.data && <Target.Provider value={{ env, c }}><div className="stack">
         <div className="small muted">{r.data.summary} · read <Time iso={r.data.collected_at} />{r.data.truncated && " · truncated"}</div>
         {c.kind === "postgres" ? <PgView view={view} d={r.data.data} /> : <RedisView view={view} d={r.data.data} />}
-      </div>}
+      </div></Target.Provider>}
       {can("investigation.run") && <a className="btn ghost" href={`${import.meta.env.BASE_URL}investigate?env=${env}&ns=${c.namespace ?? "*"}&q=${q}`}>Investigate with MOKS</a>}
     </Drawer>
   );

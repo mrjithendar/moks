@@ -46,7 +46,9 @@ def key_label(key: str, show: bool) -> str:
 class RedisConnector:
     type = "redis"
 
-    def __init__(self, config: dict[str, Any], credential_ref: dict[str, Any] | None = None):
+    def __init__(self, config: dict[str, Any], credential_ref: dict[str, Any] | None = None, *, operator: bool = False):
+        # Only the executor builds an operator connector (moks/actions/datastore.py), and only it may send CLIENT KILL.
+        self.operator = operator
         self.mode = config.get("mode", "standalone")
         if self.mode not in MODES:
             raise ConnectorError("config", f"redis mode must be one of {', '.join(MODES)}")
@@ -222,6 +224,27 @@ class RedisConnector:
             "largest_output_buffers": [{k: r.get(k) for k in ("id", "addr", "name", "omem", "cmd")}
                                        for r in sorted(rows, key=lambda r: -int(r.get("omem", 0) or 0))[:10] if int(r.get("omem", 0) or 0) > 0],
         }
+
+    async def server_identity(self) -> str:
+        """run_id of the primary: it changes on restart, which is also when client IDs start again."""
+        return str((await self.info()).get("server", {}).get("run_id") or "")
+
+    async def client(self, client_id: int) -> dict[str, Any] | None:
+        rows = parse_client_list(await self._call("client_list", "CLIENT", "LIST"))
+        return next((r for r in rows if r.get("id") == int(client_id)), None)
+
+    async def kill_client(self, client_id: int) -> int:
+        """CLIENT KILL ID: client IDs are never reused while the server runs, so this reaches only the reviewed client.
+        Returns how many clients were closed (0 or 1). Never retried."""
+        if not self.operator:
+            raise ConnectorError("forbidden", "only the executor's operator connection may end Redis clients")
+        if self.mode == "cluster":
+            raise ConnectorError("bad_request", "ending clients is not supported in cluster mode: a client lives on one node")
+        host, port = await self._primary()
+        async with self._lock:
+            conn = await self._conn(host, port)
+            reply = await conn.call("CLIENT", "KILL", "ID", int(client_id))
+        return int(raise_for(reply, "CLIENT KILL") or 0)
 
     async def keyspace_sample(self, sample: int = 500, top: int = 15) -> dict[str, Any]:
         """Big keys from a bounded SCAN sample (never KEYS, never values). Approximate by design."""

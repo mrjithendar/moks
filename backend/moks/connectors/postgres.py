@@ -69,6 +69,7 @@ QUERIES: dict[str, str] = {
         FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) > 0 ORDER BY query_start LIMIT 100""",
     "sessions_by_pid": """
         SELECT pid, datname AS database, usename AS "user", application_name AS application, client_addr::text AS client, state,
+               backend_type, query_start, (SELECT rolsuper FROM pg_roles WHERE rolname = usename) AS superuser,
                wait_event_type, wait_event, backend_start, extract(epoch FROM now() - xact_start)::float AS xact_age_s,
                extract(epoch FROM now() - query_start)::float AS query_age_s, left(query, 1000) AS query
         FROM pg_stat_activity WHERE pid = ANY($1::int[])""",
@@ -111,8 +112,19 @@ QUERIES: dict[str, str] = {
         SELECT p.pid, p.datname AS database, p.relid::regclass::text AS relation, p.phase,
                p.heap_blks_total, p.heap_blks_scanned, extract(epoch FROM now() - a.xact_start)::float AS running_s
         FROM pg_stat_progress_vacuum p LEFT JOIN pg_stat_activity a ON a.pid = p.pid""",
+    "server_identity": "SELECT system_identifier::text AS system_identifier FROM pg_control_system()",
     "has_pg_stat_statements": "SELECT count(*)::int AS n FROM pg_extension WHERE extname = 'pg_stat_statements'",
     "settings": "SELECT name, setting, unit, source, pending_restart FROM pg_settings WHERE name = ANY($1::text[]) ORDER BY name",
+}
+
+# The only statements that change anything. They run only on an operator connector the executor builds
+# (moks/actions/datastore.py), still inside a read-only session (signalling a backend writes no data), and they act
+# only on the exact session that was reviewed: same pid AND same backend_start, and only a client backend.
+SIGNALS = {
+    "cancel": """SELECT pg_cancel_backend(pid) AS signalled FROM pg_stat_activity
+                 WHERE pid = $1 AND backend_start = $2::timestamptz AND backend_type = 'client backend'""",
+    "terminate": """SELECT pg_terminate_backend(pid) AS signalled FROM pg_stat_activity
+                    WHERE pid = $1 AND backend_start = $2::timestamptz AND backend_type = 'client backend'""",
 }
 
 # ORDER BY for pg_stat_statements comes from this map, never from the caller.
@@ -340,6 +352,41 @@ class PostgresConnector:
 
     async def settings(self) -> list[dict[str, Any]]:
         return await self.fetch("settings", WATCHED_SETTINGS)
+
+    async def server_identity(self) -> str:
+        """The cluster's system identifier: the same for a primary and its physical replicas, different for any other cluster."""
+        return str((await self.fetch("server_identity"))[0]["system_identifier"])
+
+    async def session(self, pid: int) -> dict[str, Any] | None:
+        rows = await self.fetch("sessions_by_pid", [int(pid)])
+        return self._session(rows[0]) if rows else None
+
+    async def signal(self, kind: str, pid: int, backend_start: str) -> bool:
+        """Cancel or terminate one reviewed session. True when PostgreSQL accepted the signal; False when that session is gone
+        or is not the one reviewed. Never retried: a lost answer is for a person to reconcile."""
+        from datetime import datetime
+
+        import asyncpg
+
+        if kind not in SIGNALS:
+            raise ConnectorError("bad_request", f"unknown signal {kind!r}")
+        try:
+            started = datetime.fromisoformat(backend_start)
+        except ValueError:
+            raise ConnectorError("invalid_args", "backend_start is not a timestamp") from None
+        try:
+            async with self._lock:
+                if self._conn is None or self._conn.is_closed():
+                    self._conn = await self._connect()
+                rows = await self._conn.fetch(SIGNALS[kind], int(pid), started, timeout=self.timeout)
+        except asyncpg.InsufficientPrivilegeError:
+            raise ConnectorError("forbidden", f"the role {self.username!r} may not signal this session; grant pg_signal_backend (it can never signal a superuser)") from None
+        except asyncpg.PostgresError as exc:
+            raise ConnectorError("bad_request", f"{kind} failed ({exc.sqlstate}: {str(exc)[:200]})") from None
+        except (asyncpg.InterfaceError, OSError, asyncio.TimeoutError) as exc:
+            await self.aclose()
+            raise ConnectorError("timeout" if isinstance(exc, asyncio.TimeoutError) else "unavailable", f"{kind}: connection lost ({type(exc).__name__})") from None
+        return bool(rows and rows[0]["signalled"])
 
 
 def _victims(root: int, blocked: list[dict[str, Any]]) -> list[int]:

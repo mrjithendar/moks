@@ -517,6 +517,10 @@ async def _perform(fence: Fence, snapshot: dict, identity: dict | None, env, tim
             result["steps"].append({"step": "execute", "pull_request": pr})
             result["validation"] = {"ok": bool(pr.get("number")), "pull_request": pr.get("url")}
             return "succeeded" if pr.get("number") else "failed"
+        if snapshot["target_kind"] in ("Postgres", "Redis"):
+            from . import datastore
+
+            return await datastore.execute(fence, snapshot, identity, timeout, result)
         writer = await writer_factory(env, (identity or {}).get("connector_id"))
         run = _execute_velero if snapshot["action"] in velero.ACTIONS else _execute_database if snapshot["action"].startswith("database_") else _execute_object
         return await run(fence, writer, snapshot, identity, timeout, result)

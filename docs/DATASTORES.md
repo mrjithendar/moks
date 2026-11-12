@@ -136,6 +136,49 @@ networkPolicy:
   PostgreSQL; overview, slowlog, clients and big keys for Redis. The page uses `GET /datastores/{env}` and
   `GET /datastores/{env}/{kind}/{cluster}/{view}`, which are ordinary tool calls.
 
+## Actions (approval-gated)
+
+From the Data page (and through `POST /actions/plans`), a person with `action.request` in the cluster's namespace can
+propose one of three actions on exactly one session or client:
+
+| Action | What it does | Approval |
+|---|---|---|
+| `pg_cancel_query` | `pg_cancel_backend`: the running statement fails, the session stays | in production |
+| `pg_terminate_session` | `pg_terminate_backend`: the session ends, its transaction rolls back, its locks are released | always |
+| `redis_kill_client` | `CLIENT KILL ID`: one client connection closes | always |
+
+The plans go through the normal lifecycle: they are hashed and approved, expire, run once and are audited. Some
+checks are specific to data stores:
+
+- **The plan's namespace must be the cluster's own.** A cluster without `config.namespace` cannot be acted on.
+- **A reused pid is never signalled.** A PostgreSQL plan pins the session's `pid` *and* `backend_start`. The
+  signal statement itself matches both, and also `backend_type = 'client backend'`. Superuser sessions are
+  refused, because `pg_signal_backend` cannot signal them anyway.
+- **A plan cannot land on another server.** The plan records the server's identity: PostgreSQL's system
+  identifier, or Redis's `run_id`, which also changes on restart, when client IDs start again. The executor
+  refuses if it differs.
+- **A signal is sent once.** If its outcome is unknown, the plan goes to `reconciliation_required`. Nothing can
+  be undone automatically, so automatic recovery is off.
+
+Acting needs a second, **executor-only** identity on the connector. Without it, the connector is read-only and
+plans are refused with "no write target".
+
+```json
+"executor": {"username": "moks_operator"},
+"executor_credential_ref": {"type": "env", "name": "MOKS_CRED_PG_SHOP_OPERATOR"}
+```
+
+```sql
+CREATE ROLE moks_operator LOGIN PASSWORD '…' IN ROLE pg_signal_backend, pg_monitor;
+```
+
+```
+ACL SETUSER moks-operator on >… resetkeys resetchannels -@all +ping +info +client|list +client|kill
+```
+
+Put the operator password only in the executor's Secret (`secrets.split`), so the API pods never hold it. Even
+the operator connection runs in a read-only PostgreSQL session: signalling a backend writes no data.
+
 ## Discovery
 
 **Administration → Connectors → Discover databases** lists the CloudNativePG clusters and the PostgreSQL and
