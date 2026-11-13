@@ -116,6 +116,17 @@ class RestoreP(NamespacesP):
     pre_restore_backup: bool = True
 
 
+class PgSessionP(Params):
+    pid: int = Field(ge=1, le=2**31 - 1)
+    backend_start: str = Field(max_length=40, pattern=r"^\d{4}-\d{2}-\d{2}T[0-9:.]+([+-]\d{2}:\d{2}|Z)?$",
+                               description="the session's backend_start as reviewed: a pid alone can be reused by a new session")
+
+
+class RedisClientP(Params):
+    client_id: int = Field(ge=1)
+    addr: str = Field(max_length=100, pattern=r"^[0-9A-Za-z.:\[\]-]{1,100}$", description="the client's address as reviewed")
+
+
 class ConfigureP(Params):
     store_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     endpoint: str = Field(max_length=200)
@@ -292,7 +303,15 @@ CATALOG: dict[str, ActionDef] = {a.name: a for a in [
               "Record a schedule; the executor runs the same dump at each interval", never_approved=True),
     ActionDef("velero_restore", "Restore this cluster from a backup", ("Restore",), RestoreP, True,
               "CREATE velero.io/v1 Restore", cluster_wide=True),
+    # Data stores (moks/actions/datastore.py): one reviewed session or client, through an executor-only operator credential.
+    ActionDef("pg_cancel_query", "Cancel the running query of one PostgreSQL session", ("Postgres",), PgSessionP, False,
+              "SELECT pg_cancel_backend(pid) for the reviewed pid and backend_start only"),
+    ActionDef("pg_terminate_session", "End one PostgreSQL session (rolls back its transaction)", ("Postgres",), PgSessionP, True,
+              "SELECT pg_terminate_backend(pid) for the reviewed pid and backend_start only"),
+    ActionDef("redis_kill_client", "Close one Redis client connection", ("Redis",), RedisClientP, True,
+              "CLIENT KILL ID for the reviewed client id"),
 ]}
+DATASTORE_ACTIONS = frozenset({"pg_cancel_query", "pg_terminate_session", "redis_kill_client"})
 
 
 def needs_approval(action: ActionDef, env: Environment) -> bool:
@@ -307,6 +326,15 @@ def check_policy(action: str, params: Params, env: Environment, pre: dict | None
             raise ConnectorError("invalid_args", f"{env.name} uses hostPath volumes, which Velero cannot back up or restore")
     if action == "apply_config_patch":
         check_patch(target_kind or "", params.patch, env, {"spec": pre["spec"]} if pre and "spec" in pre else None)  # type: ignore[attr-defined]
+    if action in ("pg_cancel_query", "pg_terminate_session") and pre is not None:
+        if pre.get("backend_type") != "client backend":
+            raise ConnectorError("forbidden", f"pid {pre.get('pid')} is a {pre.get('backend_type')} process, not a client session; MOKS only signals client sessions")
+        if pre.get("superuser"):
+            raise ConnectorError("forbidden", "the session belongs to a superuser, which pg_signal_backend cannot signal")
+        if str(pre.get("backend_start")) != str(params.backend_start):  # type: ignore[attr-defined]
+            raise ConnectorError("conflict", "that pid now belongs to a different session than the one reviewed")
+    if action == "redis_kill_client" and pre is not None and pre.get("addr") != params.addr:  # type: ignore[attr-defined]
+        raise ConnectorError("conflict", "that client id now has a different address than the one reviewed")
     if action == "delete_pod" and pre is not None and not pre.get("owner"):
         raise ConnectorError("forbidden", "this pod has no controller, so nothing would replace it")
     if action == "scale_deployment":
@@ -357,6 +385,35 @@ def _describe_velero(action: str, params: Params, target: str, pre: dict) -> dic
             "validation": ["Velero accepts the restore. It then runs on its own: follow it on the Backups page."],
             "rollback": ("Restore the pre-restore backup. " if p3.pre_restore_backup else "No pre-restore backup was requested, so this cannot be undone from MOKS. ")
                         + "Objects created by the restore are not removed automatically."}
+
+
+def _describe_datastore(action: str, params: Params, target: str, ns: str, pre: dict) -> dict[str, Any]:
+    who = f"{pre.get('application') or pre.get('user') or '?'} ({pre.get('user')}@{pre.get('database')}, from {pre.get('client') or 'local'})"
+    same = "the server is still the one reviewed (same system identifier), and the session still has that pid and backend_start"
+    if action == "pg_cancel_query":
+        p: PgSessionP = params  # type: ignore[assignment]
+        return {"impact": f"The statement running in session {p.pid} of {target} ({who}) is cancelled; the client gets an error. "
+                          "The session stays connected. Inside a transaction block, that transaction is aborted.",
+                "blast_radius": f"One session of {target} in {ns}. Sessions waiting on its locks may proceed.",
+                "preconditions": [same, "the session is a client backend and not a superuser's"],
+                "validation": ["the session is no longer running the statement it was running (or has ended) within the timeout"],
+                "rollback": "None: a cancelled statement cannot be resumed. The client may retry it."}
+    if action == "pg_terminate_session":
+        p = params  # type: ignore[assignment]
+        return {"impact": f"Session {p.pid} of {target} ({who}) is ended. Its open transaction"  # type: ignore[attr-defined]
+                          + (f", open for {round((pre.get('xact_age_s') or 0) / 60)} min," if pre.get("xact_age_s") else "")
+                          + " is rolled back and its locks are released. The application must reconnect.",
+                "blast_radius": f"One session of {target} in {ns}; any work it had not committed is lost.",
+                "preconditions": [same, "the session is a client backend and not a superuser's"],
+                "validation": ["the session is gone within the timeout"],
+                "rollback": "None: the rolled-back work must be redone by the application."}
+    p3: RedisClientP = params  # type: ignore[assignment]
+    return {"impact": f"Client {p3.client_id} of {target} ({pre.get('name') or 'unnamed'}, {p3.addr}, running {pre.get('cmd')}) is disconnected. "
+                      "A blocked command it was waiting on is dropped; the client must reconnect.",
+            "blast_radius": f"One client connection of {target} in {ns}.",
+            "preconditions": ["the server is still the one reviewed (same run_id, so client IDs were not reset)", f"client {p3.client_id} still has address {p3.addr}"],
+            "validation": [f"client {p3.client_id} is gone from CLIENT LIST within the timeout"],
+            "rollback": "None. The client reconnects on its own if it is written to."}
 
 
 def describe(action: str, params: Params, target: str, ns: str, pre: dict | None, history: dict | None = None) -> dict[str, Any]:
@@ -422,6 +479,8 @@ def describe(action: str, params: Params, target: str, ns: str, pre: dict | None
                 "blast_radius": f"One pod of {owner} in {ns}.", "preconditions": [f"the pod is still the one reviewed (same UID) and still owned by {owner}"],
                 "validation": ["the reviewed pod is gone within the timeout", f"{owner} still has running pods"],
                 "rollback": "None: a deleted pod cannot be restored. Its controller replaces it."}
+    if action in DATASTORE_ACTIONS:
+        return _describe_datastore(action, params, target, ns, pre or {})
     if action == "open_pull_request":
         p2: PullRequestP = params  # type: ignore[assignment]
         return {"impact": f"A draft pull request to {p2.repository}@{p2.base} changing {p2.path}. Nothing is deployed.",

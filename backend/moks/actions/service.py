@@ -104,7 +104,13 @@ async def create_plan(db: AsyncSession, principal: Principal, env: Environment, 
     history = None
     identity: dict[str, Any] | None = None
     try:
-        if target_kind == "Repository":
+        if target_kind in ("Postgres", "Redis"):
+            from . import datastore
+
+            row, pre = await datastore.preflight(db, env, action, target_kind, target_name, namespace, parsed)
+            identity = {**write_target(row), "server": pre["server"]}
+            auto_recover = False  # a signal cannot be undone
+        elif target_kind == "Repository":
             git = connectors.get("git")
             if git is None:
                 raise PlanError(409, "no git connector in this environment")
