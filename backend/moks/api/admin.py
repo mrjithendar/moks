@@ -31,7 +31,7 @@ from ..rbac import ROLES, P
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-CONNECTOR_TYPES = ["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git", "aws_cost", "cost_model", "aws_secrets"]
+CONNECTOR_TYPES = ["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git", "aws_cost", "cost_model", "aws_secrets", "postgres", "redis"]
 
 
 class CredentialRef(BaseModel):
@@ -57,7 +57,7 @@ def _check_no_secrets(config: dict[str, Any]) -> None:
 
 class ConnectorIn(BaseModel):
     environment: str
-    type: Literal["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git", "aws_cost", "cost_model", "aws_secrets"]
+    type: Literal["kubernetes", "prometheus", "loki", "grafana", "cloudwatch", "git", "aws_cost", "cost_model", "aws_secrets", "postgres", "redis"]
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,99}$")
     enabled: bool = True
     config: dict[str, Any] = Field(default_factory=dict)
@@ -144,6 +144,34 @@ async def test_connector(cid: uuid.UUID, ctx: AuthContext = Depends(needs(P.ADMI
     await audit.record(db, action="connector.test", actor_id=ctx.user.id, actor_email=ctx.user.email, resource_type="connector",
                        resource_id=str(cid), outcome="success" if ok else "failure", details={"message": msg[:500]})
     return {"ok": ok, "message": msg}
+
+
+@router.get("/datastores/discover")
+async def discover_datastores(environment: str, ctx: AuthContext = Depends(needs(P.ADMIN_CONNECTORS)),
+                              db: AsyncSession = Depends(get_db, scope="function")) -> dict[str, Any]:
+    """PostgreSQL and Redis candidates from the environment's Kubernetes connector, for the add-cluster form.
+    Reads Services and CloudNativePG Clusters within the environment's namespace scope; never Secrets."""
+    from .. import datastores
+    from ..connectors.base import ConnectorError
+    from ..scope import Scope
+
+    env = (await db.execute(select(Environment).where(Environment.name == environment))).scalar_one_or_none()
+    if env is None:
+        raise HTTPException(404, f"Unknown environment {environment!r}")
+    connectors, _ = await registry.for_environment(db, env.id)
+    k8s = connectors.get("kubernetes")
+    if k8s is None:
+        raise HTTPException(409, "Discovery needs a kubernetes connector in this environment")
+    scope = Scope(env.name, ("*",), tuple(env.allowed_namespaces or ["*"]), tuple(env.denied_namespaces or []))
+    try:
+        found = await datastores.discover(k8s[1], scope)
+    except ConnectorError as exc:
+        raise HTTPException(502, exc.message) from None
+    configured = {(c.type, (c.config or {}).get("host")) for c in (await db.execute(select(Connector).where(Connector.environment_id == env.id))).scalars()}
+    for kind in ("postgres", "redis"):
+        for cand in found[kind]:
+            cand["configured"] = (kind, cand["config"]["host"]) in configured
+    return {"environment": env.name, **found}
 
 
 # ---- LLM ---------------------------------------------------------------------------------------

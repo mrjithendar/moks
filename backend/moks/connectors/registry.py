@@ -19,7 +19,9 @@ from .git import GitConnector
 from .grafana import GrafanaConnector
 from .kubernetes import KubernetesConnector
 from .loki import LokiConnector
+from .postgres import PostgresConnector
 from .prometheus import PrometheusConnector
+from .redis import RedisConnector
 from ..secrets.aws import AwsSecretsConnector
 
 CONNECTOR_TYPES: dict[str, Any] = {
@@ -32,6 +34,8 @@ CONNECTOR_TYPES: dict[str, Any] = {
     "aws_cost": AwsCostConnector,
     "cost_model": CostModelConnector,
     "aws_secrets": AwsSecretsConnector,  # calls AWS only from the executor (moks/secrets)
+    "postgres": PostgresConnector,  # several per environment, addressed by name (moks/datastores.py)
+    "redis": RedisConnector,
 }
 
 _cache: dict[uuid.UUID, tuple[str, Any]] = {}

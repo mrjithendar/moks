@@ -45,14 +45,14 @@ def readiness(sk: "Skill", connectors: set[str], metrics: set[str] | None = None
     `resources` are the kinds this run is about: a skill for something else can still run, but only in part.
     A metric counts as present only if it reported in the last hour, so stale telemetry reads as missing."""
     from ..tools.builtin import REGISTRY
-    from ..tools.contracts import PSEUDO_CONNECTORS
+    from ..tools.contracts import ANY_OF_CONNECTORS, PSEUDO_CONNECTORS
 
     checks: list[dict[str, str]] = []
 
     def add(kind: str, name: str, status: str, required: bool) -> None:
         checks.append({"kind": kind, "name": name, "status": status, "required": required})
 
-    have = connectors | set(PSEUDO_CONNECTORS)
+    have = connectors | set(PSEUDO_CONNECTORS) | {k for k, v in ANY_OF_CONNECTORS.items() if any(c in connectors for c in v)}
     for c in sorted(sk.meta.requires):
         add("connector", c, "ok" if c in have else "missing", True)
     runnable = 0
