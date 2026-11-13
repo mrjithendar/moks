@@ -20,12 +20,14 @@ def _known_findings() -> set[str]:
         source = f.read_text()
         found |= set(re.findall(r'_finding\(\s*"([a-z_]+)"', source)) | set(re.findall(r'"kind":\s*"([a-z_]+)"', source))
         found |= {x for pair in re.findall(r'"kind":\s*"([a-z_]+)" if [^"]* else "([a-z_]+)"', source) for x in pair}
-    return found
+    from ..datastores import FINDING_KINDS
+
+    return found | set(FINDING_KINDS)
 
 
 RESOURCE_KINDS = {"Pod", "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "CronJob", "Service", "Ingress", "Node", "Namespace", "PersistentVolumeClaim", "ConfigMap", "Secret", "HPA", "HorizontalPodAutoscaler",
-                  "VirtualService", "Gateway", "Application", "Cluster", "Volume", "Alert"}
-FROM_FINDINGS = {"pod", "workload", "deployment", "service", "resource"}  # only a step that iterates over findings can fill these
+                  "VirtualService", "Gateway", "Application", "Cluster", "Volume", "Alert", "Postgres", "Redis"}
+FROM_FINDINGS = {"pod", "workload", "deployment", "service", "resource", "cluster"}  # only a step that iterates over findings can fill these
 
 
 def _is_finding(name: str, known: set[str]) -> bool:
@@ -167,6 +169,11 @@ def validate(sk: "Skill", others: dict[str, "Skill"] | None = None) -> list[dict
                 add("error", f"detection.{rule.id}", f"query is not a valid regular expression: {exc}")
         if rule.kind == "finding" and not _is_finding(rule.finding or "", known):
             add("error", f"detection.{rule.id}", f"no detector produces finding {rule.finding}")
+        if rule.kind == "datastore":
+            from ..datastores import FINDING_KINDS
+
+            if rule.finding not in FINDING_KINDS:
+                add("error", f"detection.{rule.id}", f"no data-store check produces finding {rule.finding}")
     for other in (others or {}).values():
         if other.name != sk.name:
             for rule in other.meta.detection:

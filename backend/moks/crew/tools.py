@@ -59,6 +59,10 @@ class PathArgs(Narrow):
     path: str | None = Field(default=None, max_length=300, pattern=r"^[A-Za-z0-9_./-]{1,300}$", description="limit to commits touching this path")
 
 
+class ClusterArgs(Narrow):
+    cluster: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,99}$", description="a PostgreSQL or Redis cluster name, as listed by datastore_health")
+
+
 class QueryArgs(Narrow):
     query: str = Field(min_length=2, max_length=300, description="what to look for in runbooks and docs")
 
@@ -164,6 +168,16 @@ TOOLS: tuple[CrewTool, ...] = (
              NoArgs, lambda t, a, m: {"namespace": t.namespace, "pod_regex": _pods(t, m), "minutes": max(5, t.minutes)}, "prometheus"),
     CrewTool("firing_alerts", "prom_alerts", "workload", "Prometheus alerts firing within your scope.",
              NoArgs, lambda t, a, m: {"firing_only": True}, "prometheus"),
+    # Databases and caches the workload may depend on. Who may read each cluster is checked by the executor against the
+    # cluster's own namespace, so naming a cluster here widens nothing.
+    CrewTool("datastore_health", "datastore_clusters", "workload", "PostgreSQL and Redis clusters you may read, with reachability and findings (connections, locks, replication, memory, evictions).",
+             NoArgs, lambda t, a, m: {"health": True}, "datastore"),
+    CrewTool("database_locks", "pg_locks", "workload", "Lock waits on one PostgreSQL cluster as blocking chains, with the root blocker sessions.",
+             ClusterArgs, lambda t, a, m: {"cluster": a.cluster}, "postgres"),
+    CrewTool("database_sessions", "pg_sessions", "workload", "Non-idle sessions on one PostgreSQL cluster, oldest first (long and idle-in-transaction).",
+             ClusterArgs, lambda t, a, m: {"cluster": a.cluster, "limit": 50}, "postgres"),
+    CrewTool("cache_overview", "redis_overview", "workload", "One Redis cluster: memory against maxmemory, evictions, clients, persistence and replication.",
+             ClusterArgs, lambda t, a, m: {"cluster": a.cluster}, "redis"),
     CrewTool("rollout_history", "k8s_rollout_history", "change", "Revisions of the target Deployment with images and creation times.",
              NoArgs, lambda t, a, m: {"namespace": t.namespace, "deployment": t.workload}, "kubernetes"),
     CrewTool("config_audit", "k8s_config_audit", "change", "Configuration of the namespace's workloads: requests, probes, image pinning, missing Secret/ConfigMap references (contents never read).",

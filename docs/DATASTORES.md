@@ -115,6 +115,27 @@ networkPolicy:
     - {namespace: cache, ports: [6379, 26379]}
 ```
 
+## Detection, investigations and the Data page
+
+- **Detection rules.** Rules of kind `datastore` raise incidents from these findings, with the usual sustain,
+  recovery, cooldown and maintenance-window handling. `finding` names a kind from `FINDING_KINDS`, for example
+  `pg_blocked` or `redis_memory`, and a rule fires on `warn` or `bad`. If a cluster cannot be read, its namespace
+  proves nothing, so no incident there is resolved on that check.
+- **Built-in rules.** The `postgres-health` skill ships rules for connection saturation, lock contention, long
+  transactions, replica lag, slots retaining WAL and transaction-ID age. The `redis-health` skill ships rules for
+  memory pressure, failing snapshots, unreachable nodes, a degraded cluster, lost replica links and client
+  saturation. Like every rule, they are off until they are enabled for an environment.
+- **Investigations.** The findings of `datastore_clusters`, `pg_overview` and `redis_overview` become
+  investigation findings on `postgres/<cluster>` or `redis/<cluster>`. Skill steps use `for_each:
+  finding.<kind>` with `{cluster}` to follow each finding to the right cluster, so `pg_blocked` leads to
+  `pg_locks` and `redis_memory` leads to `redis_keyspace`.
+- **CrewAI.** The crew gets `datastore_health`, `database_locks`, `database_sessions` and `cache_overview`. The
+  executor checks each cluster's own namespace, so naming a cluster widens nothing.
+- **Data page.** **Monitor → Databases & caches** lists every cluster a person may read, with health and
+  findings. Each cluster opens per-view tabs: overview, sessions, locks, replication, vacuum and top queries for
+  PostgreSQL; overview, slowlog, clients and big keys for Redis. The page uses `GET /datastores/{env}` and
+  `GET /datastores/{env}/{kind}/{cluster}/{view}`, which are ordinary tool calls.
+
 ## Discovery
 
 **Administration → Connectors → Discover databases** lists the CloudNativePG clusters and the PostgreSQL and

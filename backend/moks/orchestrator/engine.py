@@ -712,7 +712,19 @@ class Investigator:
         self.trace["tools"].append({"tool": tool, "purpose": purpose, "namespace": args.get("namespace"), "ref": out.evidence_ref, "ok": out.ok})
         if tool == "k8s_argocd_status" and out.ok and isinstance(out.data, dict):
             self._argo_findings(out)
+        if tool in ("datastore_clusters", "pg_overview", "redis_overview") and out.ok:
+            self._datastore_findings(out)
         return out
+
+    def _datastore_findings(self, out: ToolOutcome) -> None:
+        """Data-store findings become investigation findings, so skills can follow them with the cluster's own tools."""
+        from .. import datastores
+
+        known = {(f["kind"], tuple(f.get("resources", []))) for f in self.findings}
+        for f in datastores.as_investigation_findings(out.tool, out.data, out.source):
+            if (f["kind"], tuple(f["resources"])) not in known:
+                known.add((f["kind"], tuple(f["resources"])))
+                self.findings.append({**f, "evidence": [out.evidence_ref]})
 
     def _argo_findings(self, out: ToolOutcome) -> None:
         """Argo CD reports on every application it manages. Those of the target are findings; others that fail

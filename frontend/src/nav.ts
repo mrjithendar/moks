@@ -19,6 +19,7 @@ export const NAV: NavGroup[] = [
     { to: "/explorer", label: "Kubernetes explorer", icon: "cube", show: live, scoped: true },
     { to: "/metrics", label: "Metrics", icon: "chart", show: live },
     { to: "/logs", label: "Logs", icon: "lines", show: live },
+    { to: "/data", label: "Databases & caches", icon: "database", show: live },
     { to: "/detections", label: "Detection rules", icon: "radar", show: read },
     { to: "/ml", label: "ML insights", icon: "spark2", end: true, show: (can) => can("ml.read") },
   ] },

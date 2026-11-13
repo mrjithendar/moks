@@ -59,7 +59,8 @@ LOKI_LIMIT = 500
 CLOUDWATCH_PAGE = 100
 MAX_AUTO_PER_HOUR = 6  # the default of settings.auto_investigations_per_hour
 ACTIVE = ("open", "mitigated")
-RULE_TOOL_CONNECTOR = {"finding": "kubernetes", "prometheus": "prometheus", "prometheus_alert": "prometheus", "loki": "loki", "cloudwatch_alarm": "cloudwatch"}
+RULE_TOOL_CONNECTOR = {"finding": "kubernetes", "prometheus": "prometheus", "prometheus_alert": "prometheus", "loki": "loki", "cloudwatch_alarm": "cloudwatch",
+                       "datastore": "datastore"}
 
 
 @dataclass
@@ -245,7 +246,36 @@ async def _evaluate_cloudwatch(spec, ex: ToolExecutor) -> Check:
     return Check("firing" if signals else "ok", signals, complete=not out.truncated and len(out.data) < CLOUDWATCH_PAGE)
 
 
-EVALUATORS = {"finding": _evaluate_finding, "prometheus": _evaluate_prometheus, "prometheus_alert": _evaluate_alert, "loki": _evaluate_loki, "cloudwatch_alarm": _evaluate_cloudwatch}
+async def _evaluate_datastore(spec, ex: ToolExecutor) -> Check:
+    """PostgreSQL and Redis findings (moks/datastores.py) of every cluster the automation may read. A cluster that could
+    not be read, or was beyond the tool's cap, proves nothing: its namespace is left out of what the check covers."""
+    out = await ex.run("datastore_clusters", {"health": True})
+    if not out.ok:
+        return Check("unknown", reason=out.summary)
+    clusters = [c for c in out.data or [] if _in_scope(c.get("namespace"), spec.namespaces)]
+    if not clusters:
+        return Check("ok" if spec.empty_means_ok else "unknown", reason=None if spec.empty_means_ok else "no data-store cluster to check")
+    signals, covered, unread = [], set(), set()
+    for c in clusters:
+        ns = c.get("namespace")
+        if not c.get("reachable", False) or "findings" not in c:
+            unread.add(ns or "")
+            continue
+        covered.add(ns or "")
+        for f in c["findings"]:
+            kind, _, rest = str(f.get("code", "")).partition(":")
+            if kind == spec.finding and f.get("severity") in ("warn", "bad"):
+                signals.append(Signal(f"datastore/{rest or c['name']}", ns, f.get("text", kind), kind="datastore",
+                                      evidence=[{"tool": "datastore_clusters", "cluster": c["name"], "summary": f.get("text", "")[:300], "collected_at": out.collected_at}]))
+    covered -= unread  # two clusters can share a namespace: one unread one leaves it unproven
+    complete = not unread and not (out.source or {}).get("partial") and not out.truncated
+    if not covered and unread:
+        return Check("unknown", reason="no data-store cluster could be read", complete=False)
+    return Check("firing" if signals else "ok", signals, complete=complete, covered={n for n in covered if n},
+                 reason=None if complete else f"{len(unread)} cluster namespace(s) could not be read")
+
+
+EVALUATORS = {"finding": _evaluate_finding, "prometheus": _evaluate_prometheus, "prometheus_alert": _evaluate_alert, "loki": _evaluate_loki, "cloudwatch_alarm": _evaluate_cloudwatch, "datastore": _evaluate_datastore}
 
 
 async def _executor(db: AsyncSession, env: Environment, spec, principal=None) -> ToolExecutor | None:
@@ -267,7 +297,7 @@ async def evaluate(db: AsyncSession, env: Environment, spec, principal=None, cur
     if ex is None:
         return Check("unknown", reason="no access to this environment")
     needed = RULE_TOOL_CONNECTOR[spec.kind]
-    if needed not in ex.ctx.connectors:
+    if not ex.ctx.available(needed):
         return Check("unknown", reason=f"no {needed} connector")
     try:
         check = await (_evaluate_finding(spec, ex, cursor) if spec.kind == "finding" else EVALUATORS[spec.kind](spec, ex))

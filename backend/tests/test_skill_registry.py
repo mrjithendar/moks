@@ -55,7 +55,7 @@ async def reviewed_publish(db, digest, uid, note=""):
 
 async def test_builtins_publish_as_one_generation_and_every_version_is_pinned_by_digest():
     gen = await active()
-    assert gen.status == "active" and len(gen.manifest) == 51
+    assert gen.status == "active" and len(gen.manifest) == 53
     lib = skills.library()
     assert lib.generation == gen.generation and lib.digest == gen.digest
     sk = lib.skills["crashloop-triage"]
